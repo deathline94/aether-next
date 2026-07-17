@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-app:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: lukka/get-cmake@latest
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Build engine
+        working-directory: aether
+        run: cargo build --release
+
+      - name: Stage engine
+        shell: pwsh
+        run: |
+          $res = "apps/desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force -Path $res | Out-Null
+          Copy-Item -Force "aether/target/release/aether.exe" "$res/aether.exe"
+          Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
+
+      - name: Build app
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+          npm run tauri build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "dist-windows"
+          New-Item -ItemType Directory -Force -Path $out, "$out/portable/engine" | Out-Null
+          $nsis = Get-ChildItem "apps/desktop/src-tauri/target/release/bundle/nsis" -Filter "*setup.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $nsis) { throw "installer missing" }
+          Copy-Item $nsis.FullName "$out/AetherNext-windows-x64-setup.exe"
+          $gui = @(
+            "apps/desktop/src-tauri/target/release/Aether Next.exe",
+            "apps/desktop/src-tauri/target/release/aether-desktop.exe",
+            "apps/desktop/src-tauri/target/release/Aether.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $gui) { throw "gui missing" }
+          Copy-Item $gui "$out/portable/AetherNext-Desktop.exe"
+          Copy-Item "aether/target/release/aether.exe" "$out/portable/engine/aether.exe"
+          Copy-Item "packaging/wintun.dll" "$out/portable/wintun.dll"
+          Copy-Item "packaging/wintun.dll" "$out/portable/engine/wintun.dll"
+          "Run AetherNext-Desktop.exe" | Set-Content "$out/portable/README.txt"
+          Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext-portable-windows-x64.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist-windows/AetherNext-windows-x64-setup.exe
+            dist-windows/AetherNext-portable-windows-x64.zip
+          if-no-files-found: error
+
+  android-apk:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: lukka/get-cmake@latest
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/android/package-lock.json
+      - name: NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+          link-to-sdk: true
+      - uses: android-actions/setup-android@v3
+      - run: cargo install cargo-ndk --locked
+      - name: Engine + stage
+        working-directory: aether
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            cargo ndk -t "$abi" --platform 26 build --release
+          done
+          mkdir -p ../apps/android/android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
+          mkdir -p ../apps/android/android/app/src/main/assets/engine
+          cp target/aarch64-linux-android/release/aether ../apps/android/android/app/src/main/jniLibs/arm64-v8a/libaether.so
+          cp target/armv7-linux-androideabi/release/aether ../apps/android/android/app/src/main/jniLibs/armeabi-v7a/libaether.so
+          cp target/x86_64-linux-android/release/aether ../apps/android/android/app/src/main/jniLibs/x86_64/libaether.so
+          cp target/aarch64-linux-android/release/aether ../apps/android/android/app/src/main/assets/engine/aether
+      - name: UI
+        working-directory: apps/android
+        run: |
+          npm ci
+          npm run sync-www
+      - name: APK
+        working-directory: apps/android/android
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "ndk.dir=${{ steps.ndk.outputs.ndk-path }}" >> local.properties
+          chmod +x ./gradlew
+          ./gradlew assembleDebug assembleRelease --stacktrace
+      - name: Collect
+        run: |
+          mkdir -p dist-android
+          cp apps/android/android/app/build/outputs/apk/debug/app-debug.apk \
+            dist-android/AetherNext-android.apk
+          if [ -f apps/android/android/app/build/outputs/apk/release/app-release-unsigned.apk ]; then
+            cp apps/android/android/app/build/outputs/apk/release/app-release-unsigned.apk \
+              dist-android/AetherNext-android-unsigned.apk
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist-android/*.apk
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [windows-app, android-apk]
+    runs-on: ubuntu-latest
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) -exec cp -v {} out/ \;
+          cd out
+          shopt -s nullglob
+          files=(*)
+          test ${#files[@]} -gt 0
+          for f in "${files[@]}"; do sha256sum "$f" | tee "$f.sha256"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: out/**
+          body: |
+            Windows x64 installer + portable, Android APK.

@@ -1,0 +1,90 @@
+# ── Rust / Cargo ──────────────────────────────────────────────
+**/target/
+**/.cargo/config.toml
+**/.cargo/config.local.toml
+Cargo.lock.bak
+
+# ── Node / frontend ───────────────────────────────────────────
+**/node_modules/
+**/dist/
+**/.vite/
+**/*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ── Android / Gradle ──────────────────────────────────────────
+apps/android/android/.gradle/
+apps/android/android/**/build/
+apps/android/android/local.properties
+apps/android/android/app/src/main/assets/www/
+# Engine binaries staged into APK (rebuilt by CI / scripts)
+apps/android/android/app/src/main/jniLibs/**/libaether.so
+apps/android/android/app/src/main/assets/engine/aether
+apps/android/android/app/src/main/assets/engine/README_ENGINE.txt
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ── Tauri / desktop packaging ─────────────────────────────────
+apps/desktop/src-tauri/resources/aether.exe
+apps/desktop/src-tauri/resources/wintun.dll
+apps/desktop/src-tauri/gen/schemas/
+# keep resources/.gitkeep
+
+# ── Local release drops (produced by package scripts / CI) ────
+dist-windows/
+dist-android/
+portable/
+Aether_*.exe
+Aether*.exe
+Aether-*.zip
+AetherNext*.zip
+Aether-*.apk
+AetherNext*.apk
+*.msi
+*.nsis.zip
+
+# ── Tooling / OS / IDE ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+*.iml
+
+# ── Debug / temp ──────────────────────────────────────────────
+*.pdb
+*.ilk
+*.exp
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+temp/
+.kotlin/
+
+# ── Secrets / local env ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+google-services.json
+local.properties
+
+# ── Archives (do not commit build products) ───────────────────
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+!packaging/**
