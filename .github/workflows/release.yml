@@ -133,22 +133,29 @@ jobs:
         run: |
           npm ci
           npm run sync-www
-      - name: APK
+      - name: APK (release, per-ABI + universal)
         working-directory: apps/android/android
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           echo "ndk.dir=${{ steps.ndk.outputs.ndk-path }}" >> local.properties
           chmod +x ./gradlew
-          ./gradlew assembleDebug assembleRelease --stacktrace
+          ./gradlew assembleRelease --stacktrace
+          ls -la app/build/outputs/apk/release/
       - name: Collect
         run: |
+          set -euo pipefail
           mkdir -p dist-android
-          cp apps/android/android/app/build/outputs/apk/debug/app-debug.apk \
-            dist-android/AetherNext-android.apk
-          if [ -f apps/android/android/app/build/outputs/apk/release/app-release-unsigned.apk ]; then
-            cp apps/android/android/app/build/outputs/apk/release/app-release-unsigned.apk \
-              dist-android/AetherNext-android-unsigned.apk
-          fi
+          rel=apps/android/android/app/build/outputs/apk/release
+          # Expected names from ABI splits (AGP 8):
+          #   app-arm64-v8a-release.apk
+          #   app-armeabi-v7a-release.apk
+          #   app-x86_64-release.apk
+          #   app-universal-release.apk
+          cp "$rel"/app-arm64-v8a-release.apk    dist-android/AetherNext-android-arm64-v8a.apk
+          cp "$rel"/app-armeabi-v7a-release.apk  dist-android/AetherNext-android-armeabi-v7a.apk
+          cp "$rel"/app-x86_64-release.apk       dist-android/AetherNext-android-x86_64.apk
+          cp "$rel"/app-universal-release.apk    dist-android/AetherNext-android-universal.apk
+          ls -la dist-android/
       - uses: actions/upload-artifact@v4
         with:
           name: android
@@ -182,4 +189,11 @@ jobs:
           fail_on_unmatched_files: false
           files: out/**
           body: |
-            Windows x64 installer + portable, Android APK.
+            **Windows x64**
+            - Installer + portable zip
+
+            **Android** (release, installable)
+            - `AetherNext-android-arm64-v8a.apk` — modern phones (recommended)
+            - `AetherNext-android-armeabi-v7a.apk` — older 32-bit ARM
+            - `AetherNext-android-x86_64.apk` — emulators / x86 devices
+            - `AetherNext-android-universal.apk` — all ABIs in one APK

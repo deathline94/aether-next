@@ -85,7 +85,12 @@ More detail: [Docs/GUIDE.en.md](Docs/GUIDE.en.md).
 
 - `AetherNext-windows-x64-setup.exe` — Windows installer  
 - `AetherNext-portable-windows-x64.zip` — portable Windows  
-- `AetherNext-android.apk` — Android  
+- `AetherNext-android-arm64-v8a.apk` — most phones (recommended)  
+- `AetherNext-android-armeabi-v7a.apk` — older 32-bit ARM  
+- `AetherNext-android-x86_64.apk` — emulators / rare x86 devices  
+- `AetherNext-android-universal.apk` — one APK with all ABIs  
+
+Pick **arm64-v8a** on a normal phone. Use **universal** if you are not sure.
 
 ---
 

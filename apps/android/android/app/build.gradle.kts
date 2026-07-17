@@ -13,9 +13,15 @@ android {
         targetSdk = 34
         versionCode = 100
         versionName = "1.0.0"
-        ndk {
-            // Common phone + emulator ABIs (engine binaries staged under jniLibs/)
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+    }
+
+    // Per-ABI APKs + one fat universal (all engines inside).
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true
         }
     }
 
@@ -26,9 +32,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-        }
-        debug {
-            applicationIdSuffix = ".debug"
+            // Sideload-ready: no Play Store keystore in CI yet.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
