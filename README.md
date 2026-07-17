@@ -1,6 +1,6 @@
 # Aether Next
 
-**Aether Next** is a full product build of the Aether tunnel idea â€” not a CLI-only drop, and not a thin wrapper on someone elseâ€™s release zip.
+**Aether Next** is a full product build of the Aether tunnel idea - not a CLI-only drop, and not a thin wrapper on someone else's release zip.
 
 By **[deathline94](https://github.com/deathline94)**.
 
@@ -15,15 +15,15 @@ It still does the core job: find a working path out of a restricted network, ope
 
 The original open-source **Aether** project (see [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether)) shipped a capable **command-line** tunnel engine: MASQUE, WireGuard, nested WG (`gool`), scanning, obfuscation, Termux builds, etc. That engine lineage is real prior art and this tree still stands on that kind of tunnel stack (including quiche / BoringSSL under the hood).
 
-**What was missing for day-to-day use** was a polished, shippable **client product** â€” something normal people can install, click Connect on, and trust to manage proxy / VPN without living in a terminal.
+**What was missing for day-to-day use** was a polished, shippable **client product** - something normal people can install, click Connect on, and trust to manage proxy / VPN without living in a terminal.
 
 **Aether Next is that rework:** same class of tunnel, rebuilt into a **full Windows desktop app** and a **full Android app**, with engine-side fixes, packaging, and UX aimed at real use on hard networks.
 
 ---
 
-## The apps (this is the point)
+## Apps
 
-### Windows desktop â€” full GUI
+### Windows desktop (full GUI)
 
 A proper **Windows application** (Tauri + React), not a console window:
 
@@ -35,7 +35,7 @@ A proper **Windows application** (Tauri + React), not a console window:
 - Tray, session log, connection test  
 - **Installer + portable** builds in Releases  
 
-### Android â€” full app
+### Android (full app)
 
 A real **Android client** with the same product surface as desktop:
 
@@ -49,7 +49,7 @@ If you only wanted a binary in PATH, the original CLI world was already enough. 
 
 ---
 
-## Whatâ€™s better / different here
+## What's better / different here
 
 | Area | Aether Next |
 |------|-------------|
@@ -83,14 +83,14 @@ More detail: [Docs/GUIDE.en.md](Docs/GUIDE.en.md).
 
 **Always grab the newest build here:**
 
-→ **[Latest release](https://github.com/deathline94/aether-next/releases/tag/latest)**
+-> **[Latest release](https://github.com/deathline94/aether-next/releases/tag/latest)**
 
 Every push to `main` rebuilds and **overwrites** that page with:
 
 - Windows installer + portable
 - Android: arm64-v8a, armeabi-v7a, x86_64, and universal APKs
 
-Version tags (`v1.0.0`, `v1.1.0`, …) create/update a frozen release with the same file names.
+Version tags (`v1.0.0`, `v1.1.0`, ...) create/update a frozen release with the same file names.
 
 | File | What |
 |------|------|
@@ -125,7 +125,7 @@ npm install
 npm run sync-www
 # stage arm64/armv7/x86_64 engines as jniLibs/*/libaether.so
 cd android
-gradlew assembleDebug
+gradlew assembleRelease
 ```
 
 Engine crate alone: `cd aether && cargo build --release`.
@@ -135,7 +135,7 @@ Engine crate alone: `cd aether && cargo build --release`.
 ## Credits & lineage
 
 - **Aether Next** product, apps, packaging, and engine rework: **deathline94**  
-- Original open-source **Aether** CLI / tunnel project: [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether) â€” thanks for the baseline idea and public engine work  
+- Original open-source **Aether** CLI / tunnel project: [CluvexStudio/Aether](https://github.com/CluvexStudio/Aether) - thanks for the baseline idea and public engine work  
 - MASQUE / QUIC path uses **Cloudflare quiche** and related open-source components (see their licenses in-tree)
 
 ---
