@@ -69,7 +69,7 @@ Transports and ideas (MASQUE / WG / gool / scan / noise) come from the same prob
 - Automatic endpoint discovery (turbo / balanced / thorough / stealth)  
 - **MASQUE** over **HTTP/2** and **HTTP/3**  
 - **WireGuard** and **nested WireGuard (gool)**  
-- Obfuscation profiles (firewall, gfw, balanced, aggressive, light, off, â€¦)  
+- Obfuscation profiles (firewall, gfw, balanced, aggressive, light, off, ...)  
 - Local **SOCKS5** + **HTTP CONNECT**  
 - Windows: system proxy, optional TUN  
 - Android: in-app control, optional VPN  
@@ -91,6 +91,16 @@ Every push to `main` rebuilds and **overwrites** that page with:
 - Android: arm64-v8a, armeabi-v7a, x86_64, and universal APKs
 
 Version tags (`v1.0.0`, `v1.1.0`, …) create/update a frozen release with the same file names.
+
+| File | What |
+|------|------|
+| `AetherNext-windows-x64-setup.exe` | Windows installer |
+| `AetherNext-portable-windows-x64.zip` | Windows portable |
+| `AetherNext-android-arm64-v8a.apk` | Phones (recommended) |
+| `AetherNext-android-armeabi-v7a.apk` | Older 32-bit ARM |
+| `AetherNext-android-x86_64.apk` | Emulators / x86 |
+| `AetherNext-android-universal.apk` | All ABIs in one APK |
+
 ---
 
 ## Build from source
