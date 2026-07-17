@@ -1,10 +1,16 @@
-name: Release
+# Builds real installable apps on every push to main (and on tags / manual run).
+# Downloads: Actions → run → Artifacts, or the "Latest" GitHub Release (updated every main push).
+name: Build apps
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
+
+concurrency:
+  group: build-apps-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -82,7 +88,7 @@ jobs:
           if-no-files-found: error
 
   android-apk:
-    name: Android APK
+    name: Android APKs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,7 +139,7 @@ jobs:
         run: |
           npm ci
           npm run sync-www
-      - name: APK (release, per-ABI + universal)
+      - name: APKs
         working-directory: apps/android/android
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -146,11 +152,6 @@ jobs:
           set -euo pipefail
           mkdir -p dist-android
           rel=apps/android/android/app/build/outputs/apk/release
-          # Expected names from ABI splits (AGP 8):
-          #   app-arm64-v8a-release.apk
-          #   app-armeabi-v7a-release.apk
-          #   app-x86_64-release.apk
-          #   app-universal-release.apk
           cp "$rel"/app-arm64-v8a-release.apk    dist-android/AetherNext-android-arm64-v8a.apk
           cp "$rel"/app-armeabi-v7a-release.apk  dist-android/AetherNext-android-armeabi-v7a.apk
           cp "$rel"/app-x86_64-release.apk       dist-android/AetherNext-android-x86_64.apk
@@ -162,38 +163,64 @@ jobs:
           path: dist-android/*.apk
           if-no-files-found: error
 
+  # Always refresh the GitHub Release so downloads stay in one place.
+  # - push to main / manual → updates release "Latest" (tag: latest)
+  # - push tag v1.2.3 → updates that versioned release
   publish:
-    name: Publish
+    name: Publish downloads
     needs: [windows-app, android-apk]
+    if: ${{ always() && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/') }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
+      - name: Pack + checksums
+        id: pack
         run: |
           set -euo pipefail
           mkdir -p out
           find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) -exec cp -v {} out/ \;
           cd out
-          shopt -s nullglob
-          files=(*)
-          test ${#files[@]} -gt 0
-          for f in "${files[@]}"; do sha256sum "$f" | tee "$f.sha256"; done
-          sha256sum "${files[@]}" > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: false
-          files: out/**
-          body: |
-            **Windows x64**
-            - Installer + portable zip
+          ls -la
+          for f in *; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" | tee "$f.sha256"
+          done
+          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "title=Latest build" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pack.outputs.tag }}"
+          TITLE="${{ steps.pack.outputs.title }}"
+          PRE="${{ steps.pack.outputs.prerelease }}"
+          NOTES="Windows installer + portable, Android APKs (arm64 / armv7 / x86_64 / universal).
 
-            **Android** (release, installable)
-            - `AetherNext-android-arm64-v8a.apk` — modern phones (recommended)
-            - `AetherNext-android-armeabi-v7a.apk` — older 32-bit ARM
-            - `AetherNext-android-x86_64.apk` — emulators / x86 devices
-            - `AetherNext-android-universal.apk` — all ABIs in one APK
+          Commit: ${GITHUB_SHA}
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          # Create or reuse release for this tag; move lightweight tag to this commit on main builds
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES" --target "$GITHUB_SHA"
+            if [ "$PRE" = "true" ]; then gh release edit "$TAG" --prerelease; else gh release edit "$TAG" --latest; fi
+          else
+            EXTRA=()
+            if [ "$PRE" = "true" ]; then EXTRA+=(--prerelease); else EXTRA+=(--latest); fi
+            gh release create "$TAG" --title "$TITLE" --notes "$NOTES" --target "$GITHUB_SHA" "${EXTRA[@]}"
+          fi
+
+          # Overwrite files with the same names
+          gh release upload "$TAG" out/* --clobber
