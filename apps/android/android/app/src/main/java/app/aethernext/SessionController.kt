@@ -9,6 +9,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Mirrors desktop session orchestration: start engine, parse logs/events, VPN optional.
+ *
+ * Full VPN mode: after local SOCKS is up, start [AetherVpnService] which runs
+ * hev-socks5-tunnel (tun2socks) against 127.0.0.1:socksPort.
  */
 class SessionController(
     private val context: Context,
@@ -17,11 +20,13 @@ class SessionController(
     fun setEmitter(fn: (event: String, payload: JSONObject) -> Unit) {
         emit = fn
     }
+
     private val store = SettingsStore(context)
     private val runtime = RuntimeState()
     private val connectedOnce = AtomicBoolean(false)
     private val socksSeen = AtomicBoolean(false)
     private val tunnelSeen = AtomicBoolean(false)
+    private val vpnStarted = AtomicBoolean(false)
     private var settings = store.load()
 
     private val runner = EngineRunner(
@@ -31,6 +36,7 @@ class SessionController(
             connectedOnce.set(false)
             socksSeen.set(false)
             tunnelSeen.set(false)
+            vpnStarted.set(false)
             setRuntime(
                 "disconnected",
                 if (code == 0 || code == null) "Engine stopped" else "Engine exited ($code)",
@@ -38,7 +44,7 @@ class SessionController(
                 null,
             )
             context.stopService(Intent(context, EngineService::class.java))
-            context.stopService(Intent(context, AetherVpnService::class.java))
+            stopVpnService()
         },
     )
 
@@ -64,6 +70,7 @@ class SessionController(
         connectedOnce.set(false)
         socksSeen.set(false)
         tunnelSeen.set(false)
+        vpnStarted.set(false)
 
         if (s.routingMode == "tun") {
             val prep = VpnService.prepare(context)
@@ -72,7 +79,6 @@ class SessionController(
             }
         }
 
-        // Foreground service keeps process alive while scanning/connected.
         val svc = Intent(context, EngineService::class.java)
         context.startForegroundService(svc)
 
@@ -84,21 +90,18 @@ class SessionController(
             return err
         }
         setRuntime("connecting", "Scanning reachable routes", runner.pid(), null)
-
-        if (s.routingMode == "tun") {
-            val vpn = Intent(context, AetherVpnService::class.java)
-            context.startForegroundService(vpn)
-        }
+        // VPN (hev) starts once local SOCKS is listening — see maybeStartVpn().
         return null
     }
 
     fun disconnect() {
         runner.stop()
         context.stopService(Intent(context, EngineService::class.java))
-        context.stopService(Intent(context, AetherVpnService::class.java))
+        stopVpnService()
         connectedOnce.set(false)
         socksSeen.set(false)
         tunnelSeen.set(false)
+        vpnStarted.set(false)
         setRuntime("disconnected", "Ready", null, null)
     }
 
@@ -124,13 +127,13 @@ class SessionController(
                 ?: "unknown"
             val loc = body.lineSequence().firstOrNull { it.startsWith("loc=") }?.removePrefix("loc=")
                 ?: "?"
-            return "OK via $proxy Â· ip=$ip loc=$loc"
+            return "OK via $proxy - ip=$ip loc=$loc"
         }
     }
 
     private fun validate(s: Settings) {
         if (s.socksPort < 1024 || s.httpPort < 1024) {
-            throw IllegalArgumentException("Ports must be 1024â€“65535")
+            throw IllegalArgumentException("Ports must be 1024-65535")
         }
         if (s.socksPort == s.httpPort) {
             throw IllegalArgumentException("HTTP and SOCKS5 ports must differ")
@@ -139,7 +142,6 @@ class SessionController(
 
     private fun handleEngineLine(line: String) {
         emitLog(line)
-        // Structured events
         val idx = line.indexOf("AETHER_EVENT ")
         if (idx >= 0) {
             try {
@@ -149,19 +151,23 @@ class SessionController(
                         runtime.endpoint = json.optString("addr").ifEmpty { null }
                         emitState()
                     }
-                    "proxy_ready" -> socksSeen.set(true)
+                    "proxy_ready" -> {
+                        socksSeen.set(true)
+                        maybeStartVpn()
+                    }
                     "tunnel_ready", "tun_ready", "connected" -> {
                         socksSeen.set(true)
                         tunnelSeen.set(true)
+                        maybeStartVpn()
                     }
                     "error" -> emitLog("engine error: ${json.optString("message")}")
                 }
             } catch (_: Exception) {
             }
         }
-        // Legacy markers
         if (line.contains("socks5 server listening") || line.contains("http proxy listening")) {
             socksSeen.set(true)
+            maybeStartVpn()
         }
         if (
             line.contains("connect-ip status: 200") ||
@@ -182,6 +188,35 @@ class SessionController(
             socksSeen.get() || tunnelSeen.get()
         }
         if (ready) markConnected()
+    }
+
+    private fun maybeStartVpn() {
+        if (settings.routingMode != "tun") return
+        if (!socksSeen.get()) return
+        if (!vpnStarted.compareAndSet(false, true)) return
+        try {
+            val vpn = Intent(context, AetherVpnService::class.java).apply {
+                putExtra(AetherVpnService.EXTRA_SOCKS_PORT, settings.socksPort)
+            }
+            context.startForegroundService(vpn)
+            Log.i(TAG, "started AetherVpnService socks=${settings.socksPort}")
+            emitLog("VPN: starting tun2socks -> 127.0.0.1:${settings.socksPort}")
+        } catch (e: Exception) {
+            vpnStarted.set(false)
+            Log.e(TAG, "VPN start failed: ${e.message}", e)
+            emitLog("VPN start failed: ${e.message}")
+        }
+    }
+
+    private fun stopVpnService() {
+        try {
+            val stop = Intent(context, AetherVpnService::class.java).apply {
+                action = AetherVpnService.ACTION_STOP
+            }
+            context.startService(stop)
+        } catch (_: Exception) {
+        }
+        context.stopService(Intent(context, AetherVpnService::class.java))
     }
 
     private fun parseEndpoint(line: String): String? {
@@ -208,7 +243,7 @@ class SessionController(
     private fun markConnected() {
         if (!connectedOnce.compareAndSet(false, true)) return
         val detail = when (settings.routingMode) {
-            "tun" -> "VPN active (full system)"
+            "tun" -> "VPN active (full device)"
             "system-proxy" -> "App proxy active"
             else -> "Proxy only active"
         }
@@ -249,6 +284,8 @@ class SessionController(
     }
 
     companion object {
+        private const val TAG = "SessionController"
+
         @Volatile
         private var instance: SessionController? = null
 

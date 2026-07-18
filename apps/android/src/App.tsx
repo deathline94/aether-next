@@ -62,8 +62,8 @@ const defaults: Settings = {
   scanMode: "balanced",
   ipVersion: "v4",
   noize: "firewall",
-  // Android: proxy-only is default; tun = VpnService full device tunnel.
-  routingMode: "proxy-only",
+  // Android default: full-device VPN (VpnService + hev tun2socks).
+  routingMode: "tun",
   socksPort: 1819,
   httpPort: 1820,
   startMinimized: false,
@@ -84,7 +84,7 @@ const navigation = [
   { id: "logs" as const, label: "Activity", icon: ScrollText },
 ];
 
-/** One-click profiles â€” apply recommended combos for speed / system / UDP. */
+/** One-click profiles - apply recommended combos for speed / system / UDP. */
 const speedProfiles: {
   id: string;
   label: string;
@@ -94,20 +94,20 @@ const speedProfiles: {
   {
     id: "speed",
     label: "Speed",
-    hint: "MASQUE h2 Â· firewall Â· balanced Â· local proxy",
+    hint: "MASQUE h2 - firewall - balanced - full VPN",
     patch: {
       protocol: "masque",
       transport: "h2",
       noize: "firewall",
       scanMode: "balanced",
       ipVersion: "v4",
-      routingMode: "proxy-only",
+      routingMode: "tun",
     },
   },
   {
     id: "max-tun",
     label: "Max (VPN)",
-    hint: "Same as Speed + Android VpnService full tunnel",
+    hint: "Same as Speed + full-device VpnService tunnel",
     patch: {
       protocol: "masque",
       transport: "h2",
@@ -120,27 +120,27 @@ const speedProfiles: {
   {
     id: "wireguard",
     label: "WireGuard",
-    hint: "UDP path Â· aggressive Â· turbo hunt Â· proxy only",
+    hint: "UDP path - aggressive - turbo hunt - full VPN",
     patch: {
       protocol: "wireguard",
       transport: "h2",
       noize: "aggressive",
       scanMode: "turbo",
       ipVersion: "v4",
-      routingMode: "proxy-only",
+      routingMode: "tun",
     },
   },
   {
     id: "quic",
     label: "QUIC h3",
-    hint: "MASQUE HTTP/3 when UDP/QUIC is open",
+    hint: "MASQUE HTTP/3 when UDP/QUIC is open - full VPN",
     patch: {
       protocol: "masque",
       transport: "h3",
       noize: "off",
       scanMode: "balanced",
       ipVersion: "v4",
-      routingMode: "proxy-only",
+      routingMode: "tun",
     },
   },
 ];
@@ -459,7 +459,7 @@ function App() {
                         patchSettings(profile.patch);
                         appendLog({
                           level: "info",
-                          message: `Applied profile: ${profile.label} â€” ${profile.hint}`,
+                          message: `Applied profile: ${profile.label} - ${profile.hint}`,
                         });
                       }}
                     >
@@ -511,9 +511,9 @@ function App() {
                   <Gauge size={19} />
                 </div>
                 <span>Endpoint</span>
-                <strong>{runtime.endpoint || (running ? "Scanningâ€¦" : "â€”")}</strong>
+                <strong>{runtime.endpoint || (running ? "Scanning..." : "-")}</strong>
                 <small>
-                  {settings.scanMode} Â· {settings.ipVersion.toUpperCase()}
+                  {settings.scanMode} - {settings.ipVersion.toUpperCase()}
                 </small>
               </article>
               <article>

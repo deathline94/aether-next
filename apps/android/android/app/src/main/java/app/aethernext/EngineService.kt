@@ -26,7 +26,7 @@ class EngineService : Service() {
         val n: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.notif_running))
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(open)
             .setOngoing(true)
             .build()

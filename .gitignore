@@ -21,6 +21,8 @@ apps/android/android/app/src/main/assets/www/
 apps/android/android/app/src/main/jniLibs/**/libaether.so
 apps/android/android/app/src/main/assets/engine/aether
 apps/android/android/app/src/main/assets/engine/README_ENGINE.txt
+# hev-socks5-tunnel source clone (prebuilt .so committed under jniLibs)
+third_party/
 *.apk
 *.aab
 *.ap_

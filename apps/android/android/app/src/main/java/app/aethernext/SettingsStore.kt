@@ -9,7 +9,7 @@ data class Settings(
     var scanMode: String = "balanced",
     var ipVersion: String = "v4",
     var noize: String = "firewall",
-    var routingMode: String = "proxy-only",
+    var routingMode: String = "tun",
     var socksPort: Int = 1819,
     var httpPort: Int = 1820,
     var startMinimized: Boolean = false,
@@ -37,7 +37,7 @@ data class Settings(
             scanMode = o.optString("scanMode", "balanced"),
             ipVersion = o.optString("ipVersion", "v4"),
             noize = o.optString("noize", "firewall"),
-            routingMode = o.optString("routingMode", "proxy-only"),
+            routingMode = o.optString("routingMode", "tun"),
             socksPort = o.optInt("socksPort", 1819),
             httpPort = o.optInt("httpPort", 1820),
             startMinimized = o.optBoolean("startMinimized", false),
@@ -65,6 +65,26 @@ class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("aether_settings", Context.MODE_PRIVATE)
 
     fun load(): Settings {
+        // One-shot: 1.0.2 switches default routing to full VPN (tun).
+        if (!prefs.getBoolean(KEY_DEFAULTS_V102, false)) {
+            val s = readRaw()
+            if (s.routingMode == "proxy-only" || s.routingMode == "system-proxy") {
+                s.routingMode = "tun"
+            }
+            prefs.edit()
+                .putString("json", s.toJson().toString())
+                .putBoolean(KEY_DEFAULTS_V102, true)
+                .apply()
+            return s
+        }
+        return readRaw()
+    }
+
+    fun save(settings: Settings) {
+        prefs.edit().putString("json", settings.toJson().toString()).apply()
+    }
+
+    private fun readRaw(): Settings {
         val raw = prefs.getString("json", null) ?: return Settings()
         return try {
             Settings.fromJson(JSONObject(raw))
@@ -73,7 +93,7 @@ class SettingsStore(context: Context) {
         }
     }
 
-    fun save(settings: Settings) {
-        prefs.edit().putString("json", settings.toJson().toString()).apply()
+    companion object {
+        private const val KEY_DEFAULTS_V102 = "defaults_v102"
     }
 }

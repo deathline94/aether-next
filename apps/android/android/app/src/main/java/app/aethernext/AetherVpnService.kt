@@ -5,84 +5,94 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.io.FileInputStream
-import java.util.concurrent.atomic.AtomicBoolean
+import java.io.File
+import java.io.FileOutputStream
 
 /**
- * Full-device routing via Android VpnService.
+ * Full-device VPN via Android [VpnService] + hev-socks5-tunnel (tun2socks).
  *
- * The userspace aether engine still owns encryption (MASQUE/WG). This service
- * establishes a TUN fd and routes app traffic; a companion pump thread can
- * bridge packets when the engine is built with Android TUN support.
- *
- * For the current engine (SOCKS/HTTP first), establishing VPN with a local
- * protect + route still requires engine-side TUN. Until then we:
- *  - create a VpnService session so "Full VPN" permission/profile works
- *  - set disallowed routes carefully
- *  - log that proxy mode remains available on 127.0.0.1
- *
- * When AETHER_TUN=1 and the binary supports Linux TUN, packagers can extend
- * this class to pass the fd via local socket (future hook).
+ * App traffic is routed into a TUN interface. hev forwards TCP/UDP through the
+ * local aether SOCKS5 proxy (127.0.0.1:socksPort). Our own package is excluded
+ * so the engine's outbound CF connections are not looped back into the TUN.
  */
 class AetherVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
-    private val alive = AtomicBoolean(false)
+    private var hevStarted = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            stopTunnel()
+            stopSelf()
+            return START_NOT_STICKY
+        }
         startForegroundNotification()
         if (tun == null) {
+            val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, 1819) ?: 1819
             try {
-                establishTun()
+                establishTun(socksPort)
             } catch (e: Exception) {
-                Log.e(TAG, "VPN establish failed: ${e.message}")
+                Log.e(TAG, "VPN establish failed: ${e.message}", e)
+                stopTunnel()
                 stopSelf()
             }
         }
         return START_STICKY
     }
 
-    private fun establishTun() {
+    private fun establishTun(socksPort: Int) {
         val builder = Builder()
-            .setSession("Aether")
-            .setMtu(1280)
+            .setSession("Aether Next")
+            .setMtu(MTU)
+            .setBlocking(false)
             .addAddress("10.0.0.2", 32)
             .addDnsServer("1.1.1.1")
             .addDnsServer("1.0.0.1")
             .addRoute("0.0.0.0", 0)
 
-        // Don't capture ourselves in a loop if using local proxy path.
+        // Keep engine + hev sockets off the TUN (otherwise infinite loop).
         try {
             builder.addDisallowedApplication(packageName)
         } catch (_: Exception) {
         }
 
-        tun = builder.establish()
-        if (tun == null) {
+        val established = builder.establish()
+        if (established == null) {
             throw IllegalStateException("VpnService.Builder.establish() returned null")
         }
-        alive.set(true)
-        Log.i(TAG, "VPN interface up (full tunnel). Engine handles crypto via AETHER_TUN when supported.")
+        tun = established
 
-        // Drain/drop loop keeps the interface from filling; replace with engine bridge later.
-        Thread({
-            val fd = tun ?: return@Thread
-            val input = FileInputStream(fd.fileDescriptor)
-            val buf = ByteArray(32767)
-            try {
-                while (alive.get()) {
-                    val n = input.read(buf)
-                    if (n <= 0) break
-                    // Packets would be forwarded to aether TUN writer when wired.
-                }
-            } catch (e: Exception) {
-                Log.d(TAG, "tun read ended: ${e.message}")
-            }
-        }, "aether-vpn-drain").start()
+        val configPath = writeHevConfig(socksPort)
+        Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")
+        TProxyStartService(configPath, established.fd)
+        hevStarted = true
+        Log.i(TAG, "VPN + hev-socks5-tunnel active")
+    }
+
+    private fun writeHevConfig(socksPort: Int): String {
+        val conf = File(cacheDir, "hev-socks5-tunnel.yml")
+        // udp:tcp — relay UDP over SOCKS TCP (works with aether SOCKS without UDP ASSOCIATE).
+        val yaml = """
+            |tunnel:
+            |  mtu: $MTU
+            |  ipv4: 10.0.0.2
+            |  icmp: 'reply'
+            |socks5:
+            |  port: $socksPort
+            |  address: 127.0.0.1
+            |  udp: 'tcp'
+            |misc:
+            |  task-stack-size: 86016
+            |  connect-timeout: 10000
+            |  log-level: warn
+            |""".trimMargin()
+        FileOutputStream(conf, false).use { it.write(yaml.toByteArray(Charsets.UTF_8)) }
+        return conf.absolutePath
     }
 
     private fun startForegroundNotification() {
@@ -103,20 +113,41 @@ class AetherVpnService : VpnService() {
         val n: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.notif_vpn))
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        startForeground(NOTIF_ID, n)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIF_ID, n)
+        }
     }
 
-    override fun onDestroy() {
-        alive.set(false)
+    private fun stopTunnel() {
+        if (hevStarted) {
+            try {
+                TProxyStopService()
+            } catch (e: Exception) {
+                Log.w(TAG, "hev stop: ${e.message}")
+            }
+            hevStarted = false
+        }
         try {
             tun?.close()
         } catch (_: Exception) {
         }
         tun = null
+    }
+
+    override fun onRevoke() {
+        stopTunnel()
+        stopSelf()
+        super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        stopTunnel()
         super.onDestroy()
     }
 
@@ -124,5 +155,26 @@ class AetherVpnService : VpnService() {
         private const val TAG = "AetherVpn"
         private const val CHANNEL = "aether_vpn"
         private const val NOTIF_ID = 43
+        private const val MTU = 1280
+        const val EXTRA_SOCKS_PORT = "socks_port"
+        const val ACTION_STOP = "app.aethernext.VPN_STOP"
+
+        init {
+            try {
+                System.loadLibrary("hev-socks5-tunnel")
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e(TAG, "failed to load libhev-socks5-tunnel: ${e.message}")
+            }
+        }
+
+        /** hev JNI (registered in hev-jni.c for AetherVpnService). */
+        @JvmStatic
+        private external fun TProxyStartService(configPath: String, fd: Int)
+
+        @JvmStatic
+        private external fun TProxyStopService()
+
+        @JvmStatic
+        private external fun TProxyGetStats(): LongArray
     }
 }

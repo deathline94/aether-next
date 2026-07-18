@@ -33,7 +33,7 @@ class AetherBridge(
                     when {
                         err == "VPN_PERMISSION_REQUIRED" -> {
                             activity.requestVpnPermission()
-                            // Permission pending â€” not a hard failure
+                            // Permission pending - not a hard failure
                             JSONObject.NULL
                         }
                         err != null -> throw IllegalStateException(err)

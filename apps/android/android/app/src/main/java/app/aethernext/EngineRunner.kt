@@ -70,7 +70,8 @@ class EngineRunner(
                     put("AETHER_HTTP", "127.0.0.1:${settings.httpPort}")
                     put("AETHER_CONFIG", configPath)
                     put("AETHER_MASQUE_HTTP2", if (settings.transport == "h2") "1" else "0")
-                    put("AETHER_TUN", if (settings.routingMode == "tun") "1" else "0")
+                    // Android full-device routing uses hev tun2socks + VpnService, not engine TUN.
+                    put("AETHER_TUN", "0")
                     put("AETHER_WG_NO_PROFILE_RETRY", "1")
                     put("RUST_LOG", "info")
                     put("HOME", homeDir)

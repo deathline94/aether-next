@@ -33,7 +33,7 @@ const defaults: Settings = {
   scanMode: "balanced",
   ipVersion: "v4",
   noize: "firewall",
-  routingMode: "proxy-only",
+  routingMode: "tun",
   socksPort: 1819,
   httpPort: 1820,
   startMinimized: false,
