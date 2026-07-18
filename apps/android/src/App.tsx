@@ -94,20 +94,20 @@ const speedProfiles: {
   {
     id: "speed",
     label: "Speed",
-    hint: "MASQUE h2 - firewall - balanced - full VPN",
+    hint: "MASQUE h2 - firewall - balanced - local proxy only",
     patch: {
       protocol: "masque",
       transport: "h2",
       noize: "firewall",
       scanMode: "balanced",
       ipVersion: "v4",
-      routingMode: "tun",
+      routingMode: "proxy-only",
     },
   },
   {
     id: "max-tun",
     label: "Max (VPN)",
-    hint: "Same as Speed + full-device VpnService tunnel",
+    hint: "MASQUE h2 - firewall - balanced - full device VPN",
     patch: {
       protocol: "masque",
       transport: "h2",

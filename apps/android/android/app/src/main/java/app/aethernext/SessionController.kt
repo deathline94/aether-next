@@ -176,6 +176,7 @@ class SessionController(
             line.contains("quic handshake established")
         ) {
             tunnelSeen.set(true)
+            maybeStartVpn()
         }
         parseEndpoint(line)?.let {
             runtime.endpoint = it
@@ -193,6 +194,9 @@ class SessionController(
     private fun maybeStartVpn() {
         if (settings.routingMode != "tun") return
         if (!socksSeen.get()) return
+        // Wait until the tunnel path is actually up so early SOCKS accepts
+        // do not blackhole the first wave of DNS/TCP from other apps.
+        if (settings.protocol == "masque" && !tunnelSeen.get()) return
         if (!vpnStarted.compareAndSet(false, true)) return
         try {
             val vpn = Intent(context, AetherVpnService::class.java).apply {

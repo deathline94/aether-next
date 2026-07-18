@@ -20,6 +20,9 @@ import java.io.FileOutputStream
  * App traffic is routed into a TUN interface. hev forwards TCP/UDP through the
  * local aether SOCKS5 proxy (127.0.0.1:socksPort). Our own package is excluded
  * so the engine's outbound CF connections are not looped back into the TUN.
+ *
+ * DNS uses hev mapdns (fake resolver at 198.18.0.2) so name lookups go through
+ * SOCKS rather than raw UDP to public resolvers.
  */
 class AetherVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
@@ -50,9 +53,9 @@ class AetherVpnService : VpnService() {
             .setSession("Aether Next")
             .setMtu(MTU)
             .setBlocking(false)
-            .addAddress("10.0.0.2", 32)
-            .addDnsServer("1.1.1.1")
-            .addDnsServer("1.0.0.1")
+            // Same address scheme as SocksTun / hev defaults.
+            .addAddress(TUN_ADDR, 32)
+            .addDnsServer(MAPPED_DNS)
             .addRoute("0.0.0.0", 0)
 
         // Keep engine + hev sockets off the TUN (otherwise infinite loop).
@@ -76,18 +79,25 @@ class AetherVpnService : VpnService() {
 
     private fun writeHevConfig(socksPort: Int): String {
         val conf = File(cacheDir, "hev-socks5-tunnel.yml")
-        // udp:tcp — relay UDP over SOCKS TCP (works with aether SOCKS without UDP ASSOCIATE).
+        // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
+        // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
         val yaml = """
             |tunnel:
             |  mtu: $MTU
-            |  ipv4: 10.0.0.2
+            |  ipv4: $TUN_ADDR
             |  icmp: 'reply'
             |socks5:
             |  port: $socksPort
             |  address: 127.0.0.1
-            |  udp: 'tcp'
+            |  udp: 'udp'
+            |mapdns:
+            |  address: $MAPPED_DNS
+            |  port: 53
+            |  network: 240.0.0.0
+            |  netmask: 240.0.0.0
+            |  cache-size: 10000
             |misc:
-            |  task-stack-size: 86016
+            |  task-stack-size: 81920
             |  connect-timeout: 10000
             |  log-level: warn
             |""".trimMargin()
@@ -156,6 +166,8 @@ class AetherVpnService : VpnService() {
         private const val CHANNEL = "aether_vpn"
         private const val NOTIF_ID = 43
         private const val MTU = 1280
+        private const val TUN_ADDR = "198.18.0.1"
+        private const val MAPPED_DNS = "198.18.0.2"
         const val EXTRA_SOCKS_PORT = "socks_port"
         const val ACTION_STOP = "app.aethernext.VPN_STOP"
 
