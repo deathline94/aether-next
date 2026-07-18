@@ -8,8 +8,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# One build per branch/tag. A new push cancels the older in-flight job (not a real failure).
 concurrency:
-  group: build-apps-${{ github.ref }}
+  group: build-apps-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

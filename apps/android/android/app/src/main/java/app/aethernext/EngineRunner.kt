@@ -2,15 +2,20 @@ package app.aethernext
 
 import android.content.Context
 import android.os.Build
+import android.system.Os
 import android.util.Log
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Spawns the packaged `aether` engine binary with the same env contract as desktop.
+ * Spawns the packaged engine binary.
+ *
+ * On modern Android (W^X), executables under filesDir are not runnable (EACCES/13).
+ * Prefer [nativeLibraryDir]/libaether.so which is already executable.
  */
 class EngineRunner(
     private val context: Context,
@@ -24,7 +29,6 @@ class EngineRunner(
 
     fun pid(): Int? {
         val p = processRef.get() ?: return null
-        // Process.pid() is API 33+; use reflection for older devices.
         return try {
             val m = p.javaClass.getMethod("pid")
             (m.invoke(p) as? Int)
@@ -39,36 +43,55 @@ class EngineRunner(
         }
         return try {
             val binary = resolveEngine(settings.enginePath)
-                ?: return "aether engine binary not found. Build for Android and place in jniLibs or assets."
+                ?: return "Engine binary not found in the APK (libaether.so / assets)."
+            Log.i(TAG, "starting engine: ${binary.absolutePath} exists=${binary.exists()} canExec=${binary.canExecute()} len=${binary.length()}")
+
             val configDir = File(context.filesDir, "config").apply { mkdirs() }
             val configPath = File(configDir, "aether.toml").absolutePath
+            val homeDir = context.filesDir.absolutePath
+
+            // Map UI protocol names to engine env values.
+            val protocolEnv = when (settings.protocol.lowercase()) {
+                "wireguard", "wg" -> "wg"
+                "gool", "wiw", "warp-in-warp" -> "gool"
+                else -> "masque"
+            }
 
             val pb = ProcessBuilder(binary.absolutePath).apply {
-                directory(binary.parentFile)
+                // Work from a writable app dir (config/logs), not the lib folder.
+                directory(context.filesDir)
                 redirectErrorStream(true)
                 environment().apply {
-                    put("AETHER_PROTOCOL", settings.protocol)
+                    put("AETHER_PROTOCOL", protocolEnv)
                     put("AETHER_SCAN", settings.scanMode)
                     put("AETHER_IP", settings.ipVersion)
                     put("AETHER_NOIZE", settings.noize)
                     put("AETHER_SOCKS", "127.0.0.1:${settings.socksPort}")
                     put("AETHER_HTTP", "127.0.0.1:${settings.httpPort}")
                     put("AETHER_CONFIG", configPath)
-                    put(
-                        "AETHER_MASQUE_HTTP2",
-                        if (settings.transport == "h2") "1" else "0",
-                    )
-                    put(
-                        "AETHER_TUN",
-                        if (settings.routingMode == "tun") "1" else "0",
-                    )
+                    put("AETHER_MASQUE_HTTP2", if (settings.transport == "h2") "1" else "0")
+                    put("AETHER_TUN", if (settings.routingMode == "tun") "1" else "0")
                     put("AETHER_WG_NO_PROFILE_RETRY", "1")
                     put("RUST_LOG", "info")
-                    put("HOME", context.filesDir.absolutePath)
+                    put("HOME", homeDir)
+                    put("TMPDIR", context.cacheDir.absolutePath)
                 }
             }
 
-            val proc = pb.start()
+            val proc = try {
+                pb.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "ProcessBuilder failed for ${binary.absolutePath}: ${e.message}", e)
+                // Last resort: try sh -c with explicit path
+                ProcessBuilder("sh", "-c", binary.absolutePath)
+                    .directory(context.filesDir)
+                    .redirectErrorStream(true)
+                    .also { b ->
+                        b.environment().putAll(pb.environment())
+                    }
+                    .start()
+            }
+
             processRef.set(proc)
             Thread({
                 try {
@@ -95,6 +118,7 @@ class EngineRunner(
         } catch (e: Exception) {
             running.set(false)
             processRef.set(null)
+            Log.e(TAG, "start failed", e)
             "Could not start engine: ${e.message}"
         }
     }
@@ -103,7 +127,6 @@ class EngineRunner(
         val p = processRef.getAndSet(null) ?: return
         try {
             p.destroy()
-            // Give graceful exit a moment, then force.
             Thread {
                 try {
                     Thread.sleep(1500)
@@ -119,48 +142,75 @@ class EngineRunner(
     private fun resolveEngine(configured: String): File? {
         if (configured.isNotBlank()) {
             val f = File(configured)
-            if (f.exists() && f.canExecute()) return f
+            if (f.exists()) return f
         }
-        // Extracted copy in files dir (preferred for execute bit).
-        val extracted = File(context.filesDir, "engine/aether")
-        if (extracted.exists()) {
-            extracted.setExecutable(true, false)
-            if (extracted.canExecute()) return extracted
-        }
-        // Native library dir (if shipped as libaether.so renamed usage)
+
+        // 1) APK native lib dir — only place Android allows executing our payload on API 29+.
         val libDir = File(context.applicationInfo.nativeLibraryDir)
-        listOf("aether", "libaether.so").forEach { name ->
+        listOf("libaether.so", "aether").forEach { name ->
             val f = File(libDir, name)
             if (f.exists()) {
-                // Copy to filesDir so we can chmod +x consistently
-                return extractFromFile(f, extracted)
+                Log.i(TAG, "engine from nativeLibraryDir: ${f.absolutePath}")
+                return f
             }
         }
-        // assets/engine/aether
+        Log.w(TAG, "nativeLibraryDir has no engine: $libDir contents=${libDir.list()?.joinToString()}")
+
+        // 2) Already extracted under filesDir (may fail exec on API 29+).
+        val extracted = File(context.filesDir, "engine/aether")
+        if (extracted.exists() && extracted.length() > 0) {
+            ensureExecutable(extracted)
+            if (canTryExec(extracted)) return extracted
+        }
+
+        // 3) Copy from assets into native-like name under codeCacheDir (sometimes executable).
+        val fromAssets = extractAssetEngine()
+        if (fromAssets != null) return fromAssets
+
+        return null
+    }
+
+    private fun extractAssetEngine(): File? {
         return try {
+            // Prefer codeCacheDir; still may be non-exec on some devices.
+            val destDir = File(context.codeCacheDir, "engine").apply { mkdirs() }
+            val dest = File(destDir, "libaether.so")
             context.assets.open("engine/aether").use { input ->
-                extracted.parentFile?.mkdirs()
-                extracted.outputStream().use { output -> input.copyTo(output) }
-                extracted.setExecutable(true, false)
-                if (extracted.exists()) extracted else null
+                FileOutputStream(dest).use { output -> input.copyTo(output) }
             }
-        } catch (_: Exception) {
+            ensureExecutable(dest)
+            Log.i(TAG, "extracted assets engine → ${dest.absolutePath} exec=${dest.canExecute()}")
+            if (dest.exists() && dest.length() > 0) dest else null
+        } catch (e: Exception) {
+            Log.e(TAG, "asset extract failed: ${e.message}")
             null
         }
     }
 
-    private fun extractFromFile(src: File, dest: File): File? {
-        return try {
-            dest.parentFile?.mkdirs()
-            src.inputStream().use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
+    private fun ensureExecutable(f: File) {
+        try {
+            f.setReadable(true, false)
+            f.setExecutable(true, false)
+            if (Build.VERSION.SDK_INT >= 21) {
+                try {
+                    Os.chmod(f.absolutePath, 493) // 0755
+                } catch (_: Exception) {
+                }
             }
-            dest.setExecutable(true, false)
-            dest
-        } catch (e: Exception) {
-            Log.e(TAG, "extract failed: ${e.message}")
-            null
+        } catch (_: Exception) {
         }
+    }
+
+    private fun canTryExec(f: File): Boolean {
+        // Android 10+ blocks exec from app data dirs even if chmod succeeds.
+        if (Build.VERSION.SDK_INT >= 29) {
+            val path = f.absolutePath
+            if (path.contains("/files/") || path.contains("/cache/")) {
+                Log.w(TAG, "skip exec candidate under data dir on API ${Build.VERSION.SDK_INT}: $path")
+                return false
+            }
+        }
+        return f.canExecute() || f.exists()
     }
 
     companion object {

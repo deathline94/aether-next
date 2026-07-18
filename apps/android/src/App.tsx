@@ -361,7 +361,7 @@ function App() {
             </div>
           </div>
           <div className="version">
-            AETHER NEXT <span>v1.0.0</span>
+            AETHER NEXT <span>v1.0.1</span>
           </div>
         </div>
       </aside>
@@ -597,7 +597,7 @@ function App() {
                   Built by <strong>deathline94</strong> · full rework, not a fork
                 </span>
               </div>
-              <code>v1.0.0</code>
+              <code>v1.0.1</code>
             </section>
           </div>
         )}
@@ -717,8 +717,8 @@ function App() {
             <section className="settings-section">
               <div className="section-heading">
                 <div>
-                  <p>WINDOWS</p>
-                  <h3>Routing and startup</h3>
+                  <p>ANDROID</p>
+                  <h3>Routing</h3>
                 </div>
                 <Settings2 size={20} />
               </div>
@@ -728,7 +728,7 @@ function App() {
                   <span>
                     {settings.routingMode === "tun"
                       ? admin
-                        ? "VPN permission granted â€” full device tunnel"
+                        ? "VPN permission granted - full device tunnel"
                         : "Will request Android VPN permission"
                       : "Local SOCKS5/HTTP for apps that support a proxy"}
                   </span>
@@ -743,31 +743,8 @@ function App() {
                   }
                 >
                   <option value="proxy-only">Proxy only</option>
-                  <option value="system-proxy">App proxy hint</option>
                   <option value="tun">Full VPN (VpnService)</option>
                 </select>
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>Launch at login</strong>
-                  <span>Open Aether Next after device boot (when allowed)</span>
-                </div>
-                <Toggle
-                  checked={settings.launchAtLogin}
-                  disabled={settingsLocked}
-                  onChange={(launchAtLogin) => patchSettings({ launchAtLogin })}
-                />
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>Start minimized</strong>
-                  <span>Prefer background session after connect</span>
-                </div>
-                <Toggle
-                  checked={settings.startMinimized}
-                  disabled={settingsLocked}
-                  onChange={(startMinimized) => patchSettings({ startMinimized })}
-                />
               </div>
             </section>
 
@@ -775,13 +752,13 @@ function App() {
               <div className="section-heading">
                 <div>
                   <p>ADVANCED</p>
-                  <h3>Local services</h3>
+                  <h3>Local ports</h3>
                 </div>
                 <ChevronRight size={20} />
               </div>
               <div className="setting-row input-row">
                 <label>
-                  <span>HTTP port (1024â€“65535)</span>
+                  <span>HTTP port (1024-65535)</span>
                   <input
                     type="number"
                     min={1024}
@@ -794,7 +771,7 @@ function App() {
                   />
                 </label>
                 <label>
-                  <span>SOCKS5 port (1024â€“65535)</span>
+                  <span>SOCKS5 port (1024-65535)</span>
                   <input
                     type="number"
                     min={1024}
@@ -806,18 +783,6 @@ function App() {
                     }
                   />
                 </label>
-              </div>
-              <div className="setting-row path-row">
-                <div>
-                  <strong>Engine path</strong>
-                  <span>Optional path to aether.exe</span>
-                </div>
-                <input
-                  disabled={settingsLocked}
-                  placeholder="Auto-detect"
-                  value={settings.enginePath}
-                  onChange={(event) => patchSettings({ enginePath: event.target.value })}
-                />
               </div>
             </section>
 

@@ -206,31 +206,34 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
 .endpoint-row button { width: 32px; height: 32px; border: 1px solid #313c41; border-radius: 5px; background: #192125; color: #7d8b91; display: grid; place-items: center; cursor: pointer; }
 .endpoint-row button:hover { color: var(--green); border-color: #39634f; }
 
-.settings-view { display: grid; gap: 14px; }
+.settings-view { display: grid; gap: 12px; }
 .settings-section { margin: 0; }
 .setting-row {
-  min-height: 75px;
-  padding: 14px 20px;
+  min-height: 0;
+  padding: 12px 16px;
   border-bottom: 1px solid #232c30;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 12px;
   flex-wrap: wrap;
 }
 .setting-row:last-child { border-bottom: 0; }
-.setting-row > div:first-child { min-width: 0; flex: 1 1 180px; }
+/* Do not flex-grow the label block — on mobile that created huge empty gaps. */
+.setting-row > div:first-child { min-width: 0; flex: 0 1 auto; max-width: 100%; }
 .setting-row strong, .setting-row > div > span { display: block; }
 .setting-row strong { font-size: 12px; font-weight: 600; }
-.setting-row > div > span { margin-top: 4px; color: #748187; font-size: 10px; }
+.setting-row > div > span { margin-top: 3px; color: #748187; font-size: 10px; line-height: 1.35; }
 .segmented {
   padding: 3px;
   border: 1px solid #303a3f;
   border-radius: 6px;
   background: #0f1416;
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
+  flex: 0 0 auto;
   max-width: 100%;
+  align-self: flex-start;
 }
 .segmented button {
   min-width: 64px;
@@ -244,13 +247,13 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
   cursor: pointer;
 }
 .segmented button.active { color: #e5ebed; background: #2a3539; box-shadow: 0 1px 4px rgba(0,0,0,.22); }
-select, input { height: 36px; border: 1px solid #303b40; border-radius: 5px; outline: 0; background: #101517; color: #cbd3d6; font-size: 11px; }
-select { min-width: 150px; padding: 0 30px 0 10px; } input { padding: 0 10px; }
+select, input { height: 36px; border: 1px solid #303b40; border-radius: 5px; outline: 0; background: #101517; color: #cbd3d6; font-size: 11px; flex: 0 0 auto; }
+select { min-width: 140px; padding: 0 30px 0 10px; } input { padding: 0 10px; }
 select:focus, input:focus { border-color: #47705d; }
-.toggle { width: 38px; height: 22px; padding: 2px; border: 1px solid #3b474c; border-radius: 11px; background: #242d31; cursor: pointer; transition: background .18s; }.toggle span { display: block; width: 16px; height: 16px; border-radius: 50%; background: #839096; transition: transform .18s; }.toggle.on { background: #24533c; border-color: #397357; }.toggle.on span { transform: translateX(16px); background: var(--green); }
-.input-row { justify-content: flex-start; gap: 16px; }
-.input-row label { display: grid; gap: 7px; color: #748187; font-size: 10px; }
-.input-row input { width: 130px; max-width: 100%; }
+.toggle { width: 38px; height: 22px; padding: 2px; border: 1px solid #3b474c; border-radius: 11px; background: #242d31; cursor: pointer; transition: background .18s; flex: 0 0 auto; }.toggle span { display: block; width: 16px; height: 16px; border-radius: 50%; background: #839096; transition: transform .18s; }.toggle.on { background: #24533c; border-color: #397357; }.toggle.on span { transform: translateX(16px); background: var(--green); }
+.input-row { justify-content: flex-start; gap: 12px; align-items: flex-end; }
+.input-row label { display: grid; gap: 6px; color: #748187; font-size: 10px; flex: 1 1 120px; }
+.input-row input { width: 100%; max-width: 160px; }
 .path-row { align-items: flex-start; }
 .path-row input { width: min(48%, 400px); min-width: 180px; max-width: 100%; flex: 1 1 220px; }
 .save-bar { position: sticky; bottom: 0; min-height: 62px; padding: 10px 16px; border: 1px solid #303a3f; border-radius: 7px; background: rgba(20, 26, 29, .96); display: flex; align-items: center; justify-content: space-between; backdrop-filter: blur(16px); }.save-bar span { color: #748187; font-size: 10px; }.save-bar button { height: 36px; padding: 0 16px; border: 1px solid #4f8067; border-radius: 5px; background: #21533a; color: #dff9eb; display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; cursor: pointer; }
@@ -327,8 +330,36 @@ select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
   .endpoint-row { grid-template-columns: 1fr 34px; gap: 10px; }
   .endpoint-row code { grid-column: 1; grid-row: 2; max-width: 100%; min-width: 0; }
   .endpoint-row button { grid-column: 2; grid-row: 2; }
-  .setting-row { align-items: flex-start; flex-direction: column; }
-  .path-row input, .input-row input { width: 100%; }
+  .setting-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 11px 14px;
+    min-height: 0;
+  }
+  .setting-row > div:first-child {
+    flex: 0 0 auto;
+    width: 100%;
+  }
+  .segmented, select {
+    width: 100%;
+    max-width: 100%;
+  }
+  .segmented {
+    display: flex;
+  }
+  .segmented button {
+    flex: 1 1 auto;
+  }
+  .path-row input, .input-row input { width: 100%; max-width: 100%; }
+  .input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .section-heading {
+    min-height: 0;
+    padding: 12px 14px;
+  }
   .test-row { flex-direction: column; align-items: stretch; }
   .logs-view { height: calc(100vh - 134px); }
   .save-bar { flex-direction: column; gap: 8px; align-items: stretch; }
