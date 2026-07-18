@@ -362,7 +362,7 @@ function App() {
             </div>
           </div>
           <div className="version">
-            AETHER NEXT <span>v1.0.0</span>
+            AETHER NEXT <span>v1.0.1</span>
           </div>
         </div>
       </aside>
@@ -598,7 +598,7 @@ function App() {
                   Built by <strong>deathline94</strong> · full rework, not a fork
                 </span>
               </div>
-              <code>v1.0.0</code>
+              <code>v1.0.1</code>
             </section>
           </div>
         )}
