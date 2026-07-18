@@ -153,7 +153,7 @@ export async function invoke<T = unknown>(
     case "app_info":
       return {
         name: "Aether Next",
-        version: "1.0.1",
+        version: "1.0.4",
         author: "deathline94",
         engine: "deathline94/aether-next",
         platform: "android",

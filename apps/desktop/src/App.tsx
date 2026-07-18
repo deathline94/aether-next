@@ -219,6 +219,7 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState("1.0.4");
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
@@ -235,12 +236,13 @@ function App() {
       invoke<Settings>("get_settings"),
       invoke<RuntimeState>("get_state"),
       invoke<boolean>("is_admin").catch(() => false),
+      invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.4" })),
       listen<RuntimeState>("session://state", (event) => setRuntime(event.payload)),
       listen<{ level: LogEntry["level"]; message: string }>("session://log", (event) =>
         appendLog(event.payload),
       ),
     ])
-      .then(([loadedSettings, state, isAdmin, unlistenState, unlistenLog]) => {
+      .then(([loadedSettings, state, isAdmin, info, unlistenState, unlistenLog]) => {
         if (disposed) {
           unlistenState();
           unlistenLog();
@@ -249,6 +251,7 @@ function App() {
         setSettings(loadedSettings);
         setRuntime(state);
         setAdmin(isAdmin);
+        if (info?.version) setAppVersion(String(info.version));
         cleanup.push(unlistenState, unlistenLog);
       })
       .catch((error) => appendLog({ level: "warn", message: String(error) }));
@@ -362,7 +365,7 @@ function App() {
             </div>
           </div>
           <div className="version">
-            AETHER NEXT <span>v1.0.1</span>
+            AETHER NEXT <span>v{appVersion}</span>
           </div>
         </div>
       </aside>
@@ -598,7 +601,7 @@ function App() {
                   Built by <strong>deathline94</strong> · full rework, not a fork
                 </span>
               </div>
-              <code>v1.0.1</code>
+              <code>v{appVersion}</code>
             </section>
           </div>
         )}

@@ -152,17 +152,51 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
     } else {
         "masque-h3"
     };
-    if let Some(warm) = crate::endpoint_cache::load(cache_kind) {
-        if (warm.is_ipv4() && effective_ip.want_v4())
-            || (warm.is_ipv6() && effective_ip.want_v6())
-        {
-            log::info!("[*] trying warm MASQUE endpoint {warm}");
-            if let Some(pr) = verify_one(probe, warm.ip(), warm.port(), timeout).await {
-                crate::endpoint_cache::save(cache_kind, SocketAddr::new(pr.ip, pr.port));
-                return Ok(pr);
+
+    // Phase 0: probe all cached warm endpoints in parallel (high priority).
+    let warm_list: Vec<SocketAddr> = crate::endpoint_cache::load_ranked(cache_kind)
+        .into_iter()
+        .filter(|w| {
+            (w.is_ipv4() && effective_ip.want_v4()) || (w.is_ipv6() && effective_ip.want_v6())
+        })
+        .collect();
+    if !warm_list.is_empty() {
+        let warm_timeout = timeout.min(Duration::from_secs(4));
+        log::info!(
+            "[*] probing {} warm MASQUE endpoint(s) first (concurrency up to {})",
+            warm_list.len(),
+            warm_list.len().min(st.concurrency.max(8))
+        );
+        let warm_conc = warm_list.len().min(st.concurrency.max(8));
+        let mut warm_stream = futures::stream::iter(warm_list.clone().into_iter().map(|w| {
+            async move { verify_one(probe, w.ip(), w.port(), warm_timeout).await }
+        }))
+        .buffer_unordered(warm_conc);
+        let mut warm_hits: Vec<ProbeResult> = Vec::new();
+        while let Some(item) = warm_stream.next().await {
+            if let Some(pr) = item {
+                log::info!("[+] warm hit {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                warm_hits.push(pr);
             }
-            log::info!("[-] warm endpoint missed; full scan");
         }
+        if !warm_hits.is_empty() {
+            warm_hits.sort_by_key(|p| p.rtt);
+            let best = warm_hits[0];
+            let ranked: Vec<(SocketAddr, Duration)> = warm_hits
+                .iter()
+                .map(|p| (SocketAddr::new(p.ip, p.port), p.rtt))
+                .collect();
+            crate::endpoint_cache::save_ranked(cache_kind, &ranked);
+            log::info!(
+                "[+] using best warm gateway {}:{} rtt={:?} ({} warm hit(s))",
+                best.ip,
+                best.port,
+                best.rtt,
+                warm_hits.len()
+            );
+            return Ok(best);
+        }
+        log::info!("[-] warm cache missed; full scan (cached IPs still tried first)");
     }
 
     let dns_seeds = resolve_discovery_seeds(effective_ip).await;
@@ -172,7 +206,30 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
             dns_seeds.len()
         );
     }
-    let candidates = build_candidates(&st, &probe.ports, effective_ip, &dns_seeds);
+    let mut candidates = build_candidates(&st, &probe.ports, effective_ip, &dns_seeds);
+    // Re-prioritize: any remaining warm IPs go to the front of the full scan.
+    if !warm_list.is_empty() {
+        let primary = probe.ports.first().copied().unwrap_or(443);
+        let mut front: Vec<(IpAddr, u16)> = Vec::new();
+        let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+        for w in &warm_list {
+            let key = (w.ip(), w.port());
+            if seen.insert(key) {
+                front.push(key);
+            }
+            // Also try primary MASQUE port if cache had something else.
+            let key2 = (w.ip(), primary);
+            if seen.insert(key2) {
+                front.push(key2);
+            }
+        }
+        for c in candidates {
+            if seen.insert(c) {
+                front.push(c);
+            }
+        }
+        candidates = front;
+    }
 
     log::info!(
         "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?} transport={}",
@@ -198,6 +255,7 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut quiet_until: Option<Instant> = None;
+    let mut session_hits: Vec<(SocketAddr, Duration)> = Vec::new();
 
     loop {
         let effective = match quiet_until {
@@ -230,8 +288,12 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
                     Some(None) => continue,
                     Some(Some(pr)) => {
                         log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        session_hits.push((SocketAddr::new(pr.ip, pr.port), pr.rtt));
                         if st.early_exit_first {
-                            crate::endpoint_cache::save(cache_kind, SocketAddr::new(pr.ip, pr.port));
+                            crate::endpoint_cache::save_ranked(
+                                cache_kind,
+                                &[(SocketAddr::new(pr.ip, pr.port), pr.rtt)],
+                            );
                             return Ok(pr);
                         }
                         best = Some(match best {
@@ -257,7 +319,11 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
     match best {
         Some(pr) => {
             log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::endpoint_cache::save(cache_kind, SocketAddr::new(pr.ip, pr.port));
+            if session_hits.is_empty() {
+                crate::endpoint_cache::save(cache_kind, SocketAddr::new(pr.ip, pr.port));
+            } else {
+                crate::endpoint_cache::save_ranked(cache_kind, &session_hits);
+            }
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),

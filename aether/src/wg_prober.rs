@@ -63,21 +63,67 @@ async fn hunt_best_wg_endpoint_inner(probe: &WgProbe, mode: ScanMode) -> Result<
         }
     }
 
-    // Warm path first.
-    if let Some(warm) = crate::endpoint_cache::load("wg") {
-        if (warm.is_ipv4() && effective_ip.want_v4())
-            || (warm.is_ipv6() && effective_ip.want_v6())
-        {
-            log::info!("[*] trying warm WireGuard endpoint {warm}");
-            if let Some(pr) = verify_one_wg(probe, warm.ip(), warm.port(), timeout).await {
-                crate::endpoint_cache::save("wg", SocketAddr::new(pr.ip, pr.port));
-                return Ok(pr);
+    // Phase 0: probe all cached warm endpoints in parallel.
+    let warm_list: Vec<SocketAddr> = crate::endpoint_cache::load_ranked("wg")
+        .into_iter()
+        .filter(|w| {
+            (w.is_ipv4() && effective_ip.want_v4()) || (w.is_ipv6() && effective_ip.want_v6())
+        })
+        .collect();
+    if !warm_list.is_empty() {
+        let warm_timeout = timeout.min(Duration::from_millis(2500));
+        log::info!(
+            "[*] probing {} warm WireGuard endpoint(s) first",
+            warm_list.len()
+        );
+        let warm_conc = warm_list.len().min(st.concurrency.max(8));
+        let mut warm_stream = futures::stream::iter(warm_list.clone().into_iter().map(|w| {
+            async move { verify_one_wg(probe, w.ip(), w.port(), warm_timeout).await }
+        }))
+        .buffer_unordered(warm_conc);
+        let mut warm_hits: Vec<WgProbeResult> = Vec::new();
+        while let Some(item) = warm_stream.next().await {
+            if let Some(pr) = item {
+                log::info!("[+] warm wg hit {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                warm_hits.push(pr);
             }
-            log::info!("[-] warm endpoint missed; full scan");
         }
+        if !warm_hits.is_empty() {
+            warm_hits.sort_by_key(|p| p.rtt);
+            let best = warm_hits[0];
+            let ranked: Vec<(SocketAddr, Duration)> = warm_hits
+                .iter()
+                .map(|p| (SocketAddr::new(p.ip, p.port), p.rtt))
+                .collect();
+            crate::endpoint_cache::save_ranked("wg", &ranked);
+            log::info!(
+                "[+] using best warm WireGuard endpoint {}:{} rtt={:?}",
+                best.ip,
+                best.port,
+                best.rtt
+            );
+            return Ok(best);
+        }
+        log::info!("[-] warm wg cache missed; full scan");
     }
 
-    let candidates = build_wg_candidates(&st, &probe.ports, effective_ip, mode);
+    let mut candidates = build_wg_candidates(&st, &probe.ports, effective_ip, mode);
+    if !warm_list.is_empty() {
+        let mut front: Vec<(IpAddr, u16)> = Vec::new();
+        let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+        for w in &warm_list {
+            let key = (w.ip(), w.port());
+            if seen.insert(key) {
+                front.push(key);
+            }
+        }
+        for c in candidates {
+            if seen.insert(c) {
+                front.push(c);
+            }
+        }
+        candidates = front;
+    }
 
     log::info!(
         "[*] wireguard scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
@@ -102,6 +148,7 @@ async fn hunt_best_wg_endpoint_inner(probe: &WgProbe, mode: ScanMode) -> Result<
     let mut best: Option<WgProbeResult> = None;
     let mut found = 0usize;
     let mut quiet_until: Option<Instant> = None;
+    let mut session_hits: Vec<(SocketAddr, Duration)> = Vec::new();
 
     loop {
         let effective = match quiet_until {
@@ -134,8 +181,12 @@ async fn hunt_best_wg_endpoint_inner(probe: &WgProbe, mode: ScanMode) -> Result<
                     Some(None) => continue,
                     Some(Some(pr)) => {
                         log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        session_hits.push((SocketAddr::new(pr.ip, pr.port), pr.rtt));
                         if st.early_exit_first {
-                            crate::endpoint_cache::save("wg", SocketAddr::new(pr.ip, pr.port));
+                            crate::endpoint_cache::save_ranked(
+                                "wg",
+                                &[(SocketAddr::new(pr.ip, pr.port), pr.rtt)],
+                            );
                             return Ok(pr);
                         }
                         best = Some(match best {
@@ -161,7 +212,11 @@ async fn hunt_best_wg_endpoint_inner(probe: &WgProbe, mode: ScanMode) -> Result<
     match best {
         Some(pr) => {
             log::info!("[+] best wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::endpoint_cache::save("wg", SocketAddr::new(pr.ip, pr.port));
+            if session_hits.is_empty() {
+                crate::endpoint_cache::save("wg", SocketAddr::new(pr.ip, pr.port));
+            } else {
+                crate::endpoint_cache::save_ranked("wg", &session_hits);
+            }
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),

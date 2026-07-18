@@ -32,60 +32,57 @@ impl ScanMode {
     /// Strategy tuned for MASQUE (TCP/QUIC probes).
     pub fn masque_strategy(&self) -> HuntStrategy {
         match self {
-            // Turbo: still fast, but sample a few successes and pick lowest RTT
-            // (early_exit_first often locks a high-latency edge and kills speed).
+            // High concurrency + short quiet window for snappy connects.
             ScanMode::Turbo => HuntStrategy {
-                concurrency: 24,
-                // H3 handshakes often need >5s on high-RTT links.
-                per_probe_timeout: Duration::from_millis(8000),
-                overall_deadline: Duration::from_secs(50),
-                quiet_after_first: Duration::from_secs(5),
-                target_successes: 4,
+                concurrency: 48,
+                per_probe_timeout: Duration::from_millis(6000),
+                overall_deadline: Duration::from_secs(40),
+                quiet_after_first: Duration::from_secs(3),
+                target_successes: 3,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 96,
+                sample_per_cidr: 80,
             },
             ScanMode::Balanced => HuntStrategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(6000),
-                overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(15),
-                target_successes: 8,
+                concurrency: 40,
+                per_probe_timeout: Duration::from_millis(5500),
+                overall_deadline: Duration::from_secs(90),
+                quiet_after_first: Duration::from_secs(8),
+                target_successes: 6,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 180,
+                sample_per_cidr: 160,
             },
             ScanMode::Thorough => HuntStrategy {
-                concurrency: 24,
-                per_probe_timeout: Duration::from_millis(10000),
-                overall_deadline: Duration::from_secs(300),
-                quiet_after_first: Duration::from_secs(30),
+                concurrency: 36,
+                per_probe_timeout: Duration::from_millis(9000),
+                overall_deadline: Duration::from_secs(240),
+                quiet_after_first: Duration::from_secs(20),
                 target_successes: 0,
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
             ScanMode::Stealth => HuntStrategy {
-                concurrency: 4,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(25),
+                concurrency: 6,
+                per_probe_timeout: Duration::from_millis(10000),
+                overall_deadline: Duration::from_secs(160),
+                quiet_after_first: Duration::from_secs(20),
                 target_successes: 4,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 80,
+                sample_per_cidr: 64,
             },
         }
     }
 
     /// Strategy tuned for WireGuard (UDP handshake probes).
-    /// Turbo must finish fast and always return — hung hunts are worse than a clean fail.
     pub fn wg_strategy(&self) -> HuntStrategy {
         match self {
             ScanMode::Turbo => HuntStrategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(3500),
-                overall_deadline: Duration::from_secs(28),
+                concurrency: 40,
+                per_probe_timeout: Duration::from_millis(3000),
+                overall_deadline: Duration::from_secs(24),
                 quiet_after_first: Duration::from_secs(0),
                 target_successes: 1,
                 early_exit_first: true,
@@ -93,30 +90,30 @@ impl ScanMode {
                 sample_per_cidr: 24,
             },
             ScanMode::Balanced => HuntStrategy {
-                concurrency: 14,
-                per_probe_timeout: Duration::from_millis(5000),
-                overall_deadline: Duration::from_secs(55),
-                quiet_after_first: Duration::from_secs(6),
+                concurrency: 28,
+                per_probe_timeout: Duration::from_millis(4500),
+                overall_deadline: Duration::from_secs(48),
+                quiet_after_first: Duration::from_secs(4),
                 target_successes: 4,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 64,
             },
             ScanMode::Thorough => HuntStrategy {
-                concurrency: 12,
-                per_probe_timeout: Duration::from_millis(7000),
-                overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(15),
+                concurrency: 24,
+                per_probe_timeout: Duration::from_millis(6500),
+                overall_deadline: Duration::from_secs(110),
+                quiet_after_first: Duration::from_secs(12),
                 target_successes: 0,
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
             ScanMode::Stealth => HuntStrategy {
-                concurrency: 3,
-                per_probe_timeout: Duration::from_millis(8000),
-                overall_deadline: Duration::from_secs(90),
-                quiet_after_first: Duration::from_secs(12),
+                concurrency: 4,
+                per_probe_timeout: Duration::from_millis(7500),
+                overall_deadline: Duration::from_secs(80),
+                quiet_after_first: Duration::from_secs(10),
                 target_successes: 3,
                 early_exit_first: false,
                 full_subnet: false,
@@ -154,5 +151,11 @@ mod tests {
     fn strategies_differ_by_transport() {
         let m = ScanMode::Balanced;
         assert_ne!(m.masque_strategy().concurrency, m.wg_strategy().concurrency);
+    }
+
+    #[test]
+    fn turbo_is_highly_concurrent() {
+        assert!(ScanMode::Turbo.masque_strategy().concurrency >= 40);
+        assert!(ScanMode::Balanced.masque_strategy().concurrency >= 32);
     }
 }
