@@ -22,7 +22,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen, platformLabel } from "./bridge";
 import "./App.css";
 
@@ -223,9 +223,9 @@ function App() {
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running;
 
-  const appendLog = useEffectEvent((entry: Omit<LogEntry, "time">) => {
+  const appendLog = useCallback((entry: Omit<LogEntry, "time">) => {
     setLogs((current) => [...current.slice(-499), { ...entry, time: now() }]);
-  });
+  }, []);
 
   useEffect(() => {
     let disposed = false;

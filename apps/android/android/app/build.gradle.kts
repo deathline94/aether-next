@@ -62,3 +62,14 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
+
+// Fail the build early if the React UI was not synced into assets/www.
+tasks.register("checkWwwAssets") {
+    doLast {
+        val index = file("src/main/assets/www/index.html")
+        check(index.exists()) {
+            "Missing assets/www/index.html — run: cd apps/android && npm run sync-www"
+        }
+    }
+}
+tasks.named("preBuild").configure { dependsOn("checkWwwAssets") }
