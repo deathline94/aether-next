@@ -15,7 +15,7 @@ use crate::scan::HuntStrategy;
 pub use crate::scan::ScanMode;
 
 // MASQUE CONNECT-IP edges live in 162.159.19x — NOT general CF CDN / WG anycast
-// (188.114.x accepts TLS but returns connect-ip 400).
+// (188.114.x accepts TLS but returns connect-ip 400). Keep MASQUE CIDRs focused.
 pub const MASQUE_CIDRS_V4: &[&str] = &[
     "162.159.192.0/24",
     "162.159.193.0/24",
@@ -40,7 +40,10 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.197.1",
 ];
 
-pub const MASQUE_PORTS: &[u16] = &[443];
+// MASQUE is primarily 443; include shared engage ports used by some edges.
+pub const MASQUE_PORTS: &[u16] = &[
+    443, 8443, 2408, 500, 4500, 1701, 854, 878, 880, 890,
+];
 
 /// Only hosts that resolve into WARP client / MASQUE ranges. General CDN names
 /// pollute the pool with edges that TLS-handshake but reject CONNECT-IP.

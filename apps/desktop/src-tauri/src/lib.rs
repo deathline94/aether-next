@@ -244,7 +244,9 @@ fn handle_engine_line(
     settings: &Settings,
     socks_seen: &AtomicBool,
     tunnel_seen: &AtomicBool,
+    tun_seen: &AtomicBool,
 ) {
+    let want_tun = settings.routing_mode == "tun";
     if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
             let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -262,10 +264,17 @@ fn handle_engine_line(
                 "proxy_ready" => {
                     socks_seen.store(true, Ordering::SeqCst);
                 }
-                "tunnel_ready" | "tun_ready" => {
+                "tunnel_ready" => {
+                    tunnel_seen.store(true, Ordering::SeqCst);
+                }
+                "tun_ready" => {
+                    tun_seen.store(true, Ordering::SeqCst);
+                    // Full-system path: TUN up implies kernel bridge is usable.
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
                 "connected" => {
+                    // Crypto + proxies only. Never treat as TUN-ready (false "connected"
+                    // when WinTUN routes are still missing).
                     socks_seen.store(true, Ordering::SeqCst);
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
@@ -283,11 +292,15 @@ fn handle_engine_line(
     if line.contains("socks5 server listening") || line.contains("http proxy listening") {
         socks_seen.store(true, Ordering::SeqCst);
     }
-    // Do NOT treat connect-ip 200 / quic handshake as tunnel ready (control plane only).
-    if line.contains("[tun] bridge active")
-        || line.contains("data-plane verified")
-        || line.contains("handshake successful")
-    {
+    if line.contains("data-plane verified") {
+        tunnel_seen.store(true, Ordering::SeqCst);
+    }
+    // Handshake alone is NOT enough for TUN mode (WG handshake fires before WinTUN).
+    if !want_tun && line.contains("handshake successful") {
+        tunnel_seen.store(true, Ordering::SeqCst);
+    }
+    if line.contains("[tun] bridge active") || line.contains("TUN mode enabled") {
+        tun_seen.store(true, Ordering::SeqCst);
         tunnel_seen.store(true, Ordering::SeqCst);
     }
     if let Some(endpoint) = parse_endpoint(line) {
@@ -299,8 +312,10 @@ fn handle_engine_line(
         let _ = app.emit("session://state", snap);
     }
 
-    // All protocols: require both proxy + tunnel signals (prevents system-proxy leak).
-    let ready = socks_seen.load(Ordering::SeqCst) && tunnel_seen.load(Ordering::SeqCst);
+    // Proxy + tunnel always. TUN mode also requires tun_ready / bridge active.
+    let ready = socks_seen.load(Ordering::SeqCst)
+        && tunnel_seen.load(Ordering::SeqCst)
+        && (!want_tun || tun_seen.load(Ordering::SeqCst));
     if ready {
         let state = app.state::<AppState>();
         mark_connected(app, &state, settings);
@@ -546,6 +561,7 @@ fn stream_output<R: std::io::Read + Send + 'static>(
     settings: Settings,
     socks_seen: Arc<AtomicBool>,
     tunnel_seen: Arc<AtomicBool>,
+    tun_seen: Arc<AtomicBool>,
     generation: u64,
 ) {
     std::thread::spawn(move || {
@@ -557,7 +573,14 @@ fn stream_output<R: std::io::Read + Send + 'static>(
                 if state.generation.load(Ordering::SeqCst) != generation {
                     break;
                 }
-                handle_engine_line(&app, &line, &settings, &socks_seen, &tunnel_seen);
+                handle_engine_line(
+                    &app,
+                    &line,
+                    &settings,
+                    &socks_seen,
+                    &tunnel_seen,
+                    &tun_seen,
+                );
             }
             emit_log(&app, line);
         }
@@ -760,6 +783,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let socks_seen = Arc::new(AtomicBool::new(false));
         let tunnel_seen = Arc::new(AtomicBool::new(false));
+        let tun_seen = Arc::new(AtomicBool::new(false));
         state.connected_once.store(false, Ordering::SeqCst);
 
         let stdout = child.stdout.take();
@@ -769,7 +793,11 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             &app,
             &state,
             "connecting",
-            "Scanning reachable routes",
+            if settings.routing_mode == "tun" {
+                "Starting tunnel + full-system routing"
+            } else {
+                "Scanning reachable routes"
+            },
             Some(pid),
             None,
         );
@@ -780,11 +808,20 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                 settings.clone(),
                 socks_seen.clone(),
                 tunnel_seen.clone(),
+                tun_seen.clone(),
                 generation,
             );
         }
         if let Some(stderr) = stderr {
-            stream_output(app, stderr, settings, socks_seen, tunnel_seen, generation);
+            stream_output(
+                app,
+                stderr,
+                settings,
+                socks_seen,
+                tunnel_seen,
+                tun_seen,
+                generation,
+            );
         }
         Ok(())
     })();

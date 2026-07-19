@@ -81,6 +81,7 @@ async fn spawn_with_tun(
     let stack = netstack::spawn(ipv4, ipv6, mtu, app_in_rx, app_out_tx)?;
     let tun = crate::tun_win::spawn(ipv4, peer, tun_in_rx, tun_out_tx).await?;
     log::info!("[+] TUN mode enabled (WinTUN full-system routing)");
+    // Emit only after WinTUN session + routes are installed (spawn fails closed otherwise).
     session_event::emit(SessionEvent::TunReady);
     Ok((stack, Some(TunGuard::Windows(tun))))
 }

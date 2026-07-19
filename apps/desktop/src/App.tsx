@@ -219,7 +219,7 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.5");
+  const [appVersion, setAppVersion] = useState("1.0.6");
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
@@ -259,7 +259,7 @@ function App() {
           invoke<Settings>("get_settings"),
           invoke<RuntimeState>("get_state"),
           invoke<boolean>("is_admin").catch(() => false),
-          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.5" })),
+          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.6" })),
         ]);
         if (disposed) {
           return;
