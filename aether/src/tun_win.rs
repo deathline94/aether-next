@@ -85,6 +85,7 @@ fn default_gateway() -> Result<(String, Ipv4Addr)> {
 }
 
 fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
+    // Point-to-point /32; gateway=none so Windows treats it as a tunnel NIC.
     run_cmd(
         "netsh",
         &[
@@ -96,6 +97,7 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             "static",
             &ipv4.to_string(),
             "255.255.255.255",
+            "none",
         ],
     )?;
     // Point DNS at the tunnel so name lookups leave via TUN (not physical NIC).
@@ -143,6 +145,15 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
         "netsh",
         &["interface", "ip", "set", "interface", name, "metric=1"],
     )?;
+    // Ensure adapter is up (orphaned adapters can sit Disabled).
+    let _ = run_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            &format!("Enable-NetAdapter -Name '{name}' -Confirm:$false -ErrorAction SilentlyContinue"),
+        ],
+    );
     log::info!("[tun] adapter {name} mtu={mtu} metric=1 (OS/kernel TCP stack)");
     Ok(())
 }
@@ -195,11 +206,14 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
         ],
     )?;
 
-    // Split default via TUN interface index (on-link). Using TUN IP as gateway alone
-    // often leaves routes installed but unusable on Windows without IF index.
+    // Split default via TUN: next-hop MUST be the TUN interface IP (not 0.0.0.0).
+    // On-link 0.0.0.0 next-hop often installs but never carries traffic on WinTUN.
     let ifs = if_index.to_string();
+    let via = ipv4.to_string();
     for dest in ["0.0.0.0", "128.0.0.0"] {
         let mask = "128.0.0.0";
+        // Prefer delete-then-add so restarts don't leave stale/conflicting routes.
+        let _ = run_cmd("route", &["delete", dest, "mask", mask]);
         if let Err(error) = run_cmd(
             "route",
             &[
@@ -207,7 +221,7 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
                 dest,
                 "mask",
                 mask,
-                "0.0.0.0",
+                &via,
                 "metric",
                 "1",
                 "IF",
@@ -219,13 +233,12 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
         }
     }
     log::info!(
-        "[tun] routes installed: peer exclude via {gw_s}, split-default IF={if_index} ({ipv4})"
+        "[tun] routes installed: peer exclude via {gw_s}, split-default {via} IF={if_index}"
     );
     Ok(gw)
 }
 
 fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
-    let _ = ipv4;
     if let IpAddr::V4(v4) = peer.ip() {
         let gateway = gateway.to_string();
         let _ = run_cmd(
@@ -239,7 +252,10 @@ fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
             ],
         );
     }
-    // Delete split-default by destination; IF-bound routes match without via.
+    let via = ipv4.to_string();
+    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0", &via]);
+    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0", &via]);
+    // Fallback if Windows stored route without matching via string.
     let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0"]);
     let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0"]);
 }
@@ -366,10 +382,17 @@ pub async fn spawn(
     let wintun = unsafe { wintun_bindings::load_from_path(&dll) }
         .map_err(|e| AetherError::Other(format!("load wintun: {e}")))?;
 
+    // Prefer existing adapter; create if missing. Orphaned "Aether 1" names are cleaned by WinTun.
     let adapter = match Adapter::open(&wintun, ADAPTER_NAME) {
-        Ok(a) => a,
-        Err(_) => Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
-            .map_err(|e| AetherError::Other(format!("create adapter: {e}")))?,
+        Ok(a) => {
+            log::info!("[tun] opened existing adapter {ADAPTER_NAME}");
+            a
+        }
+        Err(e) => {
+            log::info!("[tun] open {ADAPTER_NAME}: {e}; creating");
+            Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
+                .map_err(|e| AetherError::Other(format!("create adapter: {e}")))?
+        }
     };
 
     let ipv4 = parse_v4(ipv4_cidr)?;
@@ -408,17 +431,25 @@ pub async fn spawn(
     std::thread::Builder::new()
         .name("aether-tun-rx".into())
         .spawn(move || {
+            let mut n: u64 = 0;
             while let Ok(pkt) = session_r.receive_blocking() {
                 let data = pkt.bytes().to_vec();
+                if data.is_empty() {
+                    continue;
+                }
+                n += 1;
+                if n == 1 || n % 5000 == 0 {
+                    log::info!("[tun] rx from kernel packets={n} last_len={}", data.len());
+                }
                 if out_tx.blocking_send(data).is_err() {
                     break;
                 }
             }
+            log::info!("[tun] rx thread exit after {n} packets");
         })
         .map_err(|e| AetherError::Other(format!("tun rx thread: {e}")))?;
 
-    // Kernel TX path: dedicated thread drains inbound packets without
-    // per-packet spawn_blocking overhead (was a major TUN speed limit).
+    // Kernel TX path: write decrypted tunnel packets into WinTUN for the OS stack.
     let session_w = session;
     std::thread::Builder::new()
         .name("aether-tun-tx".into())
@@ -429,6 +460,7 @@ pub async fn spawn(
             let Ok(rt) = rt else { return };
             rt.block_on(async move {
                 let mut inbound_rx = inbound_rx;
+                let mut n: u64 = 0;
                 while let Some(first) = inbound_rx.recv().await {
                     let mut batch = vec![first];
                     while batch.len() < 64 {
@@ -438,7 +470,9 @@ pub async fn spawn(
                         }
                     }
                     let session = session_w.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let batch_len = batch.len();
+                    let wrote = tokio::task::spawn_blocking(move || {
+                        let mut ok = 0u32;
                         for pkt in batch {
                             if pkt.is_empty() || pkt.len() > u16::MAX as usize {
                                 continue;
@@ -446,11 +480,19 @@ pub async fn spawn(
                             if let Ok(mut packet) = session.allocate_send_packet(pkt.len() as u16) {
                                 packet.bytes_mut()[..pkt.len()].copy_from_slice(&pkt);
                                 session.send_packet(packet);
+                                ok += 1;
                             }
                         }
+                        ok
                     })
-                    .await;
+                    .await
+                    .unwrap_or(0);
+                    n += wrote as u64;
+                    if n <= batch_len as u64 || n % 5000 == 0 {
+                        log::info!("[tun] tx to kernel packets={n} batch={batch_len}");
+                    }
                 }
+                log::info!("[tun] tx thread exit after {n} packets");
             });
         })
         .map_err(|e| AetherError::Other(format!("tun tx thread: {e}")))?;
