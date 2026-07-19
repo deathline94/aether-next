@@ -18,7 +18,11 @@ struct DnsCache {
 
 fn dns_cache() -> &'static Mutex<DnsCache> {
     static CACHE: OnceLock<Mutex<DnsCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(DnsCache { map: HashMap::new() }))
+    CACHE.get_or_init(|| {
+        Mutex::new(DnsCache {
+            map: HashMap::new(),
+        })
+    })
 }
 
 const VER: u8 = 0x05;
@@ -37,7 +41,15 @@ enum Target {
 }
 
 pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
+    serve_listener(bind(listen).await?, stack).await
+}
+
+pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
+    Ok(TcpListener::bind(listen).await?)
+}
+
+pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result<()> {
+    let listen = listener.local_addr()?;
     log::info!("socks5 listening on {listen}");
 
     loop {
@@ -84,8 +96,22 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[VER, 0x00]).await?;
+    let method = select_auth_method(&methods);
+    sock.write_all(&[VER, method]).await?;
+    if method == 0xff {
+        return Err(AetherError::Other(
+            "no supported socks authentication method".into(),
+        ));
+    }
     Ok(())
+}
+
+fn select_auth_method(methods: &[u8]) -> u8 {
+    if methods.contains(&0x00) {
+        0x00
+    } else {
+        0xff
+    }
 }
 
 async fn read_target(sock: &mut TcpStream, atyp: u8) -> Result<(Target, u16)> {
@@ -150,6 +176,20 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
     }
 }
 
+fn dns_prefer_order() -> Vec<u16> {
+    // 1=A, 28=AAAA. Respect AETHER_IP when set.
+    match std::env::var("AETHER_IP")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "4" | "v4" | "ipv4" => vec![1],
+        "6" | "v6" | "ipv6" => vec![28, 1],
+        _ => vec![1, 28],
+    }
+}
+
 async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let key = name.to_ascii_lowercase();
     if let Ok(guard) = dns_cache().lock() {
@@ -162,25 +202,38 @@ async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
 
     let udp = stack.open_udp().await?;
     let server: SocketAddr = "1.1.1.1:53".parse().unwrap();
+    let (sender, mut from_stack) = udp.into_split();
 
-    let query = build_dns_query(name, 1);
-    udp.send_to(server, query).await?;
-
-    let (_sender, mut from_stack) = udp.into_split();
-
-    let resp = tokio::time::timeout(Duration::from_secs(5), from_stack.recv())
-        .await
-        .map_err(|_| AetherError::Other("dns timeout".into()))?
-        .ok_or_else(|| AetherError::Other("dns channel closed".into()))?;
-
-    let ip = parse_dns_a(&resp.1).ok_or_else(|| AetherError::Other(format!("no A record for {name}")))?;
-    if let Ok(mut guard) = dns_cache().lock() {
-        guard.map.insert(key, (ip, Instant::now()));
-        if guard.map.len() > 2048 {
-            guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
+    let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
+    for qtype in dns_prefer_order() {
+        let query = build_dns_query(name, qtype);
+        if let Err(e) = sender.send_to(server, query).await {
+            last_err = e;
+            continue;
         }
+        let resp = match tokio::time::timeout(Duration::from_secs(3), from_stack.recv()).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                last_err = AetherError::Other("dns channel closed".into());
+                continue;
+            }
+            Err(_) => {
+                last_err = AetherError::Other("dns timeout".into());
+                continue;
+            }
+        };
+        if let Some(ip) = parse_dns_answer(&resp.1, qtype) {
+            if let Ok(mut guard) = dns_cache().lock() {
+                guard.map.insert(key, (ip, Instant::now()));
+                if guard.map.len() > 2048 {
+                    guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
+                }
+            }
+            return Ok(ip);
+        }
+        last_err = AetherError::Other(format!("no type-{qtype} record for {name}"));
     }
-    Ok(ip)
+    Err(last_err)
 }
 
 pub async fn resolve_host(stack: &StackHandle, name: &str) -> Result<IpAddr> {
@@ -207,7 +260,7 @@ fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
     q
 }
 
-fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
+fn parse_dns_answer(resp: &[u8], want_type: u16) -> Option<IpAddr> {
     if resp.len() < 12 {
         return None;
     }
@@ -231,13 +284,18 @@ fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {
         if pos + rdlen > resp.len() {
             return None;
         }
-        if rtype == 1 && rdlen == 4 {
+        if rtype == want_type && want_type == 1 && rdlen == 4 {
             return Some(IpAddr::V4(Ipv4Addr::new(
                 resp[pos],
                 resp[pos + 1],
                 resp[pos + 2],
                 resp[pos + 3],
             )));
+        }
+        if rtype == want_type && want_type == 28 && rdlen == 16 {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&resp[pos..pos + 16]);
+            return Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
         }
         pos += rdlen;
     }
@@ -446,4 +504,36 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&src.port().to_be_bytes());
     pkt.extend_from_slice(data);
     pkt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_dns_answer, select_auth_method};
+
+    #[test]
+    fn rejects_clients_without_no_auth_method() {
+        assert_eq!(select_auth_method(&[0x02]), 0xff);
+        assert_eq!(select_auth_method(&[0x02, 0x00]), 0x00);
+    }
+
+    #[test]
+    fn parses_a_and_aaaa_answers() {
+        // Minimal synthetic DNS response with one A answer (not full wire-valid; parser only walks answers).
+        // Header: id=1, flags=0x8180, qd=1, an=1
+        let mut resp = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        // Question: a.com
+        resp.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
+        // Answer: pointer to name + type A + class IN + ttl + rdlen 4 + 1.2.3.4
+        resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        let ip = parse_dns_answer(&resp, 1).expect("A");
+        assert_eq!(ip.to_string(), "1.2.3.4");
+
+        let mut resp6 = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        resp6.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 28, 0, 1]);
+        let mut ans = vec![0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16];
+        ans.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        resp6.extend_from_slice(&ans);
+        let ip6 = parse_dns_answer(&resp6, 28).expect("AAAA");
+        assert_eq!(ip6.to_string(), "2001:db8::1");
+    }
 }

@@ -25,6 +25,18 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystore = System.getenv("AETHER_ANDROID_KEYSTORE")
+            if (keystore != null) {
+                storeFile = file(keystore)
+                storePassword = System.getenv("AETHER_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("AETHER_ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("AETHER_ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -32,8 +44,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            // Sideload-ready: no Play Store keystore in CI yet.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -72,4 +83,32 @@ tasks.register("checkWwwAssets") {
         }
     }
 }
-tasks.named("preBuild").configure { dependsOn("checkWwwAssets") }
+
+tasks.register("checkReleasePayloads") {
+    doLast {
+        val requiredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        val requiredLibraries = listOf("libaether.so", "libhev-socks5-tunnel.so")
+        requiredAbis.forEach { abi ->
+            requiredLibraries.forEach { library ->
+                check(file("src/main/jniLibs/$abi/$library").length() > 0) {
+                    "Missing $abi/$library - build and stage every advertised ABI"
+                }
+            }
+        }
+        val signingInputs = listOf(
+            "AETHER_ANDROID_KEYSTORE",
+            "AETHER_ANDROID_KEYSTORE_PASSWORD",
+            "AETHER_ANDROID_KEY_ALIAS",
+            "AETHER_ANDROID_KEY_PASSWORD",
+        )
+        check(signingInputs.none { System.getenv(it).isNullOrBlank() }) {
+            "Release signing missing: set ${signingInputs.joinToString()}"
+        }
+        check(file(System.getenv("AETHER_ANDROID_KEYSTORE")).isFile) {
+            "Release keystore file is missing"
+        }
+    }
+}
+tasks.named("preReleaseBuild").configure {
+    dependsOn("checkWwwAssets", "checkReleasePayloads")
+}

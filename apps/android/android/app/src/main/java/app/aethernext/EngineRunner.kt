@@ -24,6 +24,7 @@ class EngineRunner(
 ) {
     private val processRef = AtomicReference<Process?>(null)
     private val running = AtomicBoolean(false)
+    private val generation = java.util.concurrent.atomic.AtomicLong(0)
 
     fun isRunning(): Boolean = running.get()
 
@@ -38,12 +39,13 @@ class EngineRunner(
     }
 
     fun start(settings: Settings): String? {
+        val binary = resolveEngine(settings.enginePath)
+            ?: return "Engine binary not found in the APK (libaether.so / assets)."
         if (!running.compareAndSet(false, true)) {
             return "Aether is already running"
         }
+        val currentGeneration = generation.incrementAndGet()
         return try {
-            val binary = resolveEngine(settings.enginePath)
-                ?: return "Engine binary not found in the APK (libaether.so / assets)."
             Log.i(TAG, "starting engine: ${binary.absolutePath} exists=${binary.exists()} canExec=${binary.canExecute()} len=${binary.length()}")
 
             val configDir = File(context.filesDir, "config").apply { mkdirs() }
@@ -110,9 +112,11 @@ class EngineRunner(
                     } catch (_: Exception) {
                         null
                     }
-                    running.set(false)
-                    processRef.set(null)
-                    onExit(code)
+                    if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
+                        running.set(false)
+                        processRef.compareAndSet(proc, null)
+                        onExit(code)
+                    }
                 }
             }, "aether-engine-io").start()
             null
@@ -125,6 +129,7 @@ class EngineRunner(
     }
 
     fun stop() {
+        generation.incrementAndGet()
         val p = processRef.getAndSet(null) ?: return
         try {
             p.destroy()

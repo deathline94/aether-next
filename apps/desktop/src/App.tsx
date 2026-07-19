@@ -231,30 +231,48 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
+    let receivedRuntimeEvent = { current: false };
     const cleanup: Array<() => void> = [];
-    Promise.all([
-      invoke<Settings>("get_settings"),
-      invoke<RuntimeState>("get_state"),
-      invoke<boolean>("is_admin").catch(() => false),
-      invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.4" })),
-      listen<RuntimeState>("session://state", (event) => setRuntime(event.payload)),
-      listen<{ level: LogEntry["level"]; message: string }>("session://log", (event) =>
-        appendLog(event.payload),
-      ),
-    ])
-      .then(([loadedSettings, state, isAdmin, info, unlistenState, unlistenLog]) => {
+    async function initialize() {
+      try {
+        const unlistenState = await listen<RuntimeState>("session://state", (event) =>
+          {
+            receivedRuntimeEvent.current = true;
+            setRuntime(event.payload);
+          },
+        );
         if (disposed) {
           unlistenState();
+          return;
+        }
+        cleanup.push(unlistenState);
+        const unlistenLog = await listen<{
+          level: LogEntry["level"];
+          message: string;
+        }>("session://log", (event) => appendLog(event.payload));
+        if (disposed) {
           unlistenLog();
           return;
         }
+        cleanup.push(unlistenLog);
+        const [loadedSettings, state, isAdmin, info] = await Promise.all([
+          invoke<Settings>("get_settings"),
+          invoke<RuntimeState>("get_state"),
+          invoke<boolean>("is_admin").catch(() => false),
+          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.4" })),
+        ]);
+        if (disposed) {
+          return;
+        }
         setSettings(loadedSettings);
-        setRuntime(state);
+        if (!receivedRuntimeEvent.current) setRuntime(state);
         setAdmin(isAdmin);
         if (info?.version) setAppVersion(String(info.version));
-        cleanup.push(unlistenState, unlistenLog);
-      })
-      .catch((error) => appendLog({ level: "warn", message: String(error) }));
+      } catch (error) {
+        appendLog({ level: "warn", message: String(error) });
+      }
+    }
+    void initialize();
     return () => {
       disposed = true;
       cleanup.forEach((fn) => fn());

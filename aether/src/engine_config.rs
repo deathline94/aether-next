@@ -66,6 +66,13 @@ impl EngineConfig {
         }
         cfg.socks = parse_listen("AETHER_SOCKS", "127.0.0.1:1819")?;
         cfg.http = parse_listen("AETHER_HTTP", "127.0.0.1:1820")?;
+        if !env_truthy("AETHER_ALLOW_REMOTE_PROXY")
+            && (!cfg.socks.ip().is_loopback() || !cfg.http.ip().is_loopback())
+        {
+            return Err(AetherError::Other(
+                "proxy listeners must use loopback unless AETHER_ALLOW_REMOTE_PROXY=1".into(),
+            ));
+        }
         if cfg.socks.port() == cfg.http.port() {
             return Err(AetherError::Other(
                 "AETHER_SOCKS and AETHER_HTTP ports must differ".into(),

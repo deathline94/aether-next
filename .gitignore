@@ -76,6 +76,7 @@ temp/
 .kotlin/
 
 # ── Secrets / local env ───────────────────────────────────────
+.release-signing/
 .env
 .env.*
 !.env.example

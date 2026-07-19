@@ -10,7 +10,6 @@ import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.webkit.WebResourceErrorCompat
@@ -18,6 +17,7 @@ import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
@@ -29,7 +29,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         // Helpful when diagnosing UI blanks on emulators / LDPlayer.
-        WebView.setWebContentsDebuggingEnabled(true)
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
         webView = WebView(this).apply {
             setBackgroundColor(Color.parseColor("#0D1113"))
@@ -49,19 +49,13 @@ class MainActivity : AppCompatActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            databaseEnabled = true
-            allowFileAccess = true
-            allowContentAccess = true
-            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            cacheMode = WebSettings.LOAD_DEFAULT
+            databaseEnabled = false
+            allowFileAccess = false
+            allowContentAccess = false
             mediaPlaybackRequiresUserGesture = false
             // Needed so relative module imports resolve correctly.
             useWideViewPort = true
             loadWithOverviewMode = true
-            @Suppress("DEPRECATION")
-            allowFileAccessFromFileURLs = true
-            @Suppress("DEPRECATION")
-            allowUniversalAccessFromFileURLs = true
         }
 
         webView.webChromeClient = object : WebChromeClient() {
@@ -78,11 +72,22 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.webViewClient = object : WebViewClientCompat() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                return request.url.scheme != "https" || request.url.host != APP_HOST
+            }
+
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest,
             ): android.webkit.WebResourceResponse? {
-                return assetLoader.shouldInterceptRequest(request.url)
+                if (request.url.scheme == "https" && request.url.host == APP_HOST) {
+                    return assetLoader.shouldInterceptRequest(request.url)
+                }
+                return android.webkit.WebResourceResponse(
+                    "text/plain",
+                    "UTF-8",
+                    ByteArrayInputStream(ByteArray(0)),
+                )
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -202,7 +207,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        session.setEmitter { _, _ -> }
         if (::webView.isInitialized) {
+            webView.removeJavascriptInterface("AetherAndroid")
             webView.destroy()
         }
         super.onDestroy()
@@ -211,5 +218,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "AetherMain"
         private const val REQ_VPN = 1001
+        private const val APP_HOST = "appassets.androidplatform.net"
     }
 }

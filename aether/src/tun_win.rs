@@ -85,7 +85,7 @@ fn default_gateway() -> Result<(String, Ipv4Addr)> {
 }
 
 fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
-    let _ = run_cmd(
+    run_cmd(
         "netsh",
         &[
             "interface",
@@ -97,8 +97,8 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             &ipv4.to_string(),
             "255.255.255.255",
         ],
-    );
-    let _ = run_cmd(
+    )?;
+    run_cmd(
         "netsh",
         &[
             "interface",
@@ -110,10 +110,10 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             "1.1.1.1",
             "primary",
         ],
-    );
+    )?;
     // Kernel TCP path: raise adapter MTU to match tunnel MTU (default 1280, up to 1400).
     let mtu = crate::mtu::current().clamp(1280, 1400);
-    let _ = run_cmd(
+    run_cmd(
         "netsh",
         &[
             "interface",
@@ -124,25 +124,17 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             &format!("mtu={mtu}"),
             "store=active",
         ],
-    );
+    )?;
     // Prefer TUN for default traffic (lower metric wins on Windows).
-    let _ = run_cmd(
+    run_cmd(
         "netsh",
-        &[
-            "interface",
-            "ip",
-            "set",
-            "interface",
-            name,
-            "metric=1",
-        ],
-    );
+        &["interface", "ip", "set", "interface", name, "metric=1"],
+    )?;
     log::info!("[tun] adapter {name} mtu={mtu} metric=1 (OS/kernel TCP stack)");
     Ok(())
 }
 
-fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Vec<String>> {
-    let mut installed = Vec::new();
+fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
     let peer_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => {
@@ -158,40 +150,126 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Vec<String>> {
     let gw_s = gw.to_string();
     run_cmd(
         "route",
-        &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "5"],
+        &[
+            "add",
+            &peer_s,
+            "mask",
+            "255.255.255.255",
+            &gw_s,
+            "metric",
+            "5",
+        ],
     )?;
-    installed.push(peer_s);
 
     // Split default route via TUN IP (avoids replacing system default entirely).
     for dest in ["0.0.0.0", "128.0.0.0"] {
         let mask = "128.0.0.0";
         let via = ipv4.to_string();
-        let _ = run_cmd(
-            "route",
-            &["add", dest, "mask", mask, &via, "metric", "5"],
-        );
-        installed.push(format!("{dest}/{mask}"));
+        if let Err(error) = run_cmd("route", &["add", dest, "mask", mask, &via, "metric", "5"]) {
+            remove_routes(peer, ipv4, gw);
+            return Err(error);
+        }
     }
-    Ok(installed)
+    Ok(gw)
 }
 
-fn remove_routes(peer: SocketAddr) {
+fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
     if let IpAddr::V4(v4) = peer.ip() {
-        let _ = run_cmd("route", &["delete", &v4.to_string()]);
+        let gateway = gateway.to_string();
+        let _ = run_cmd(
+            "route",
+            &[
+                "delete",
+                &v4.to_string(),
+                "mask",
+                "255.255.255.255",
+                &gateway,
+            ],
+        );
     }
-    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0"]);
-    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0"]);
+    let via = ipv4.to_string();
+    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0", &via]);
+    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0", &via]);
+}
+
+fn route_state_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
+    Some(dir.join("AetherNext").join("tun-routes.json"))
+}
+
+fn persist_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
+    let Some(path) = route_state_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = format!(
+        "{{\"peer\":\"{}\",\"ipv4\":\"{}\",\"gateway\":\"{}\"}}\n",
+        peer.ip(),
+        ipv4,
+        gateway
+    );
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+fn clear_persisted_routes() {
+    if let Some(path) = route_state_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove routes left by a crashed previous engine process.
+pub fn recover_stale_routes() {
+    let Some(path) = route_state_path() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let peer = text
+        .split("\"peer\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse::<IpAddr>().ok());
+    let ipv4 = text
+        .split("\"ipv4\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    let gateway = text
+        .split("\"gateway\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .and_then(|s| s.parse::<Ipv4Addr>().ok());
+    if let (Some(IpAddr::V4(peer_ip)), Some(ipv4), Some(gateway)) = (peer, ipv4, gateway) {
+        log::warn!("[tun] recovering stale routes from previous session");
+        remove_routes(
+            SocketAddr::new(IpAddr::V4(peer_ip), 0),
+            ipv4,
+            gateway,
+        );
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 pub struct TunHandle {
     _adapter: Arc<Adapter>,
     session: Arc<Session>,
     peer: SocketAddr,
+    ipv4: Ipv4Addr,
+    gateway: Ipv4Addr,
 }
 
 impl Drop for TunHandle {
     fn drop(&mut self) {
-        remove_routes(self.peer);
+        remove_routes(self.peer, self.ipv4, self.gateway);
+        clear_persisted_routes();
         let _ = self.session.shutdown();
         log::info!("[tun] cleaned routes and session");
     }
@@ -218,12 +296,30 @@ pub async fn spawn(
     // Wait briefly for adapter to appear in Windows.
     tokio::time::sleep(Duration::from_millis(300)).await;
     configure_adapter_ip(ADAPTER_NAME, ipv4)?;
-    let _ = install_routes(peer, ipv4)?;
-    log::info!("[tun] adapter {ADAPTER_NAME} up {ipv4}/32 peer exclude {}", peer.ip());
 
     let session = adapter
         .start_session(MAX_RING_CAPACITY)
         .map_err(|e| AetherError::Other(format!("start session: {e}")))?;
+    recover_stale_routes();
+    let gateway = match install_routes(peer, ipv4) {
+        Ok(gateway) => {
+            persist_routes(peer, ipv4, gateway);
+            gateway
+        }
+        Err(error) => {
+            let _ = session.shutdown();
+            return Err(error);
+        }
+    };
+
+    // Build handle first so Drop cleans routes/session if thread spawn fails.
+    let handle = TunHandle {
+        _adapter: adapter,
+        session: session.clone(),
+        peer,
+        ipv4,
+        gateway,
+    };
 
     // High-throughput path: dedicated OS thread reads WinTUN ring (kernel packets)
     // and feeds the userspace tunnel encryptor. App TCP lives in the Windows stack.
@@ -231,24 +327,22 @@ pub async fn spawn(
     let out_tx = outbound_tx;
     std::thread::Builder::new()
         .name("aether-tun-rx".into())
-        .spawn(move || {
-            loop {
-                match session_r.receive_blocking() {
-                    Ok(pkt) => {
-                        let data = pkt.bytes().to_vec();
-                        if out_tx.blocking_send(data).is_err() {
-                            break;
-                        }
+        .spawn(move || loop {
+            match session_r.receive_blocking() {
+                Ok(pkt) => {
+                    let data = pkt.bytes().to_vec();
+                    if out_tx.blocking_send(data).is_err() {
+                        break;
                     }
-                    Err(_) => break,
                 }
+                Err(_) => break,
             }
         })
         .map_err(|e| AetherError::Other(format!("tun rx thread: {e}")))?;
 
     // Kernel TX path: dedicated thread drains inbound packets without
     // per-packet spawn_blocking overhead (was a major TUN speed limit).
-    let session_w = session.clone();
+    let session_w = session;
     std::thread::Builder::new()
         .name("aether-tun-tx".into())
         .spawn(move || {
@@ -284,10 +378,10 @@ pub async fn spawn(
         })
         .map_err(|e| AetherError::Other(format!("tun tx thread: {e}")))?;
 
+    log::info!(
+        "[tun] adapter {ADAPTER_NAME} up {ipv4}/32 peer exclude {}",
+        peer.ip()
+    );
     log::info!("[tun] bridge active (kernel TCP / WinTUN high-throughput path)");
-    Ok(TunHandle {
-        _adapter: adapter,
-        session,
-        peer,
-    })
+    Ok(handle)
 }

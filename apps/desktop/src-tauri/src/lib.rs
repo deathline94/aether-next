@@ -3,11 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -76,6 +76,9 @@ struct AppState {
     #[cfg(windows)]
     proxy_snapshot: Mutex<Option<windows_proxy::ProxySnapshot>>,
     connected_once: AtomicBool,
+    connecting: AtomicBool,
+    generation: AtomicU64,
+    operation: Mutex<()>,
 }
 
 impl Default for AppState {
@@ -92,6 +95,9 @@ impl Default for AppState {
             #[cfg(windows)]
             proxy_snapshot: Mutex::new(None),
             connected_once: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            operation: Mutex::new(()),
         }
     }
 }
@@ -102,6 +108,11 @@ fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(config_dir(app)?.join("settings.json"))
+}
+
+#[cfg(windows)]
+fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(config_dir(app)?.join("proxy-recovery.json"))
 }
 
 fn load_settings_file(app: &AppHandle) -> Settings {
@@ -116,7 +127,9 @@ fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), String
     let path = settings_path(app)?;
     fs::create_dir_all(path.parent().ok_or("invalid config path")?).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 fn emit_state(
@@ -159,7 +172,10 @@ fn parse_endpoint(line: &str) -> Option<String> {
 }
 
 fn validate_settings(settings: &Settings) -> Result<(), String> {
-    for (name, port) in [("HTTP", settings.http_port), ("SOCKS5", settings.socks_port)] {
+    for (name, port) in [
+        ("HTTP", settings.http_port),
+        ("SOCKS5", settings.socks_port),
+    ] {
         if port < 1024 {
             return Err(format!("{name} port must be 1024–65535 (got {port})"));
         }
@@ -265,21 +281,62 @@ fn resolve_resource(app: &AppHandle, name: &str) -> Option<PathBuf> {
     app.path()
         .resolve(name, BaseDirectory::Resource)
         .ok()
-        .filter(|p| p.exists())
+        .filter(|p| p.is_file())
+}
+
+/// TUN runs elevated: only load regular files under the app install / portable root.
+fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| format!("{label}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{label} is not a regular file"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("{label} must not be a reparse point/symlink"));
+        }
+    }
+    let app_root = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if let Some(root) = app_root {
+        let root = root.canonicalize().unwrap_or(root);
+        if canon.starts_with(&root) {
+            return Ok(());
+        }
+    }
+    // Packaged Tauri resources often live under a sibling resources/ directory.
+    if let Some(parent) = path.parent() {
+        let name = parent.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.eq_ignore_ascii_case("resources") || name.eq_ignore_ascii_case("engine") {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "{label} rejected: must live under the app install directory (got {})",
+        path.display()
+    ))
 }
 
 fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> {
-    if !settings.engine_path.trim().is_empty() {
+    // TUN elevates process: reject user/custom overrides that can be planted.
+    // Still allow installer resource + portable app-dir layout.
+    if settings.routing_mode != "tun" && !settings.engine_path.trim().is_empty() {
         let path = PathBuf::from(settings.engine_path.trim());
         return path
             .exists()
             .then_some(path)
             .ok_or("Configured aether.exe was not found".into());
     }
-    if let Ok(path) = std::env::var("AETHER_ENGINE") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Ok(path);
+    if settings.routing_mode != "tun" {
+        if let Ok(path) = std::env::var("AETHER_ENGINE") {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Ok(path);
+            }
         }
     }
     if let Some(path) = resolve_resource(app, "aether.exe") {
@@ -301,20 +358,18 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> 
             }
         }
     }
-    let repo_build = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../aether/target/release/aether.exe");
-    repo_build.exists().then_some(repo_build).ok_or(
-        "aether.exe not found. Build engine or choose it in Settings > Advanced.".into(),
-    )
+    if settings.routing_mode == "tun" {
+        return Err("aether.exe not found next to app; reinstall or use portable package".into());
+    }
+    let repo_build =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../aether/target/release/aether.exe");
+    repo_build
+        .exists()
+        .then_some(repo_build)
+        .ok_or("aether.exe not found. Build engine or choose it in Settings > Advanced.".into())
 }
 
 fn wintun_path(app: &AppHandle) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("AETHER_WINTUN") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
     if let Some(path) = resolve_resource(app, "wintun.dll") {
         return Some(path);
     }
@@ -331,11 +386,46 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
     let endpoint = state.runtime.lock().unwrap().endpoint.clone();
     if settings.routing_mode == "system-proxy" {
         #[cfg(windows)]
-        match windows_proxy::enable(settings.http_port, endpoint.as_deref()) {
-            Ok(snapshot) => *state.proxy_snapshot.lock().unwrap() = Some(snapshot),
-            Err(error) => emit_log(app, format!("System proxy failed: {error}")),
+        {
+            let recovery_path = proxy_recovery_path(app).ok();
+            match windows_proxy::enable(
+                settings.http_port,
+                endpoint.as_deref(),
+                recovery_path.as_deref(),
+            ) {
+                Ok(snapshot) => {
+                    *state.proxy_snapshot.lock().unwrap() = Some(snapshot);
+                    state.proxy_enabled.store(true, Ordering::SeqCst);
+                }
+                Err((error, snapshot)) => {
+                    if let Some(snapshot) = snapshot {
+                        *state.proxy_snapshot.lock().unwrap() = Some(snapshot);
+                        state.proxy_enabled.store(true, Ordering::SeqCst);
+                    }
+                    emit_log(app, format!("System proxy failed: {error}"));
+                    // Stop engine so UI is not stuck with orphan child.
+                    if let Some(mut child) = state.child.lock().unwrap().take() {
+                        state.generation.fetch_add(1, Ordering::SeqCst);
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(b"shutdown\n");
+                            let _ = stdin.flush();
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    cleanup_routing(app, state);
+                    emit_state(
+                        app,
+                        state,
+                        "error",
+                        "System proxy setup failed",
+                        None,
+                        endpoint,
+                    );
+                    return;
+                }
+            }
         }
-        state.proxy_enabled.store(true, Ordering::SeqCst);
     }
     let pid = state.runtime.lock().unwrap().pid;
     let detail = match settings.routing_mode.as_str() {
@@ -352,20 +442,36 @@ fn stream_output<R: std::io::Read + Send + 'static>(
     settings: Settings,
     socks_seen: Arc<AtomicBool>,
     tunnel_seen: Arc<AtomicBool>,
+    generation: u64,
 ) {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            handle_engine_line(&app, &line, &settings, &socks_seen, &tunnel_seen);
+            let state = app.state::<AppState>();
+            // Hold operation only for generation check + dispatch, not forever.
+            {
+                let _operation = state.operation.lock().unwrap();
+                if state.generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
+                handle_engine_line(&app, &line, &settings, &socks_seen, &tunnel_seen);
+            }
             emit_log(&app, line);
         }
     });
 }
 
-fn cleanup_routing(state: &AppState) {
+fn cleanup_routing(app: &AppHandle, state: &AppState) {
     #[cfg(windows)]
     if state.proxy_enabled.swap(false, Ordering::SeqCst) {
-        if let Some(snapshot) = state.proxy_snapshot.lock().unwrap().take() {
-            let _ = windows_proxy::restore(snapshot);
+        let mut snapshot = state.proxy_snapshot.lock().unwrap();
+        if let Some(saved) = snapshot.take() {
+            if let Err(error) = windows_proxy::restore(saved.clone()) {
+                *snapshot = Some(saved);
+                state.proxy_enabled.store(true, Ordering::SeqCst);
+                eprintln!("system proxy restore failed: {error}");
+            } else if let Ok(path) = proxy_recovery_path(app) {
+                let _ = fs::remove_file(path);
+            }
         }
     }
     state.connected_once.store(false, Ordering::SeqCst);
@@ -375,6 +481,7 @@ fn watch_child(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let state = app.state::<AppState>();
+        let _operation = state.operation.lock().unwrap();
         let mut child_slot = state.child.lock().unwrap();
         let Some(child) = child_slot.as_mut() else {
             continue;
@@ -383,7 +490,9 @@ fn watch_child(app: AppHandle) {
             Ok(Some(status)) => {
                 *child_slot = None;
                 drop(child_slot);
-                cleanup_routing(&state);
+                state.connecting.store(false, Ordering::SeqCst);
+                state.generation.fetch_add(1, Ordering::SeqCst);
+                cleanup_routing(&app, &state);
                 let detail = if status.success() {
                     "Engine stopped".into()
                 } else {
@@ -395,7 +504,9 @@ fn watch_child(app: AppHandle) {
             Err(_) => {
                 *child_slot = None;
                 drop(child_slot);
-                cleanup_routing(&state);
+                state.connecting.store(false, Ordering::SeqCst);
+                state.generation.fetch_add(1, Ordering::SeqCst);
+                cleanup_routing(&app, &state);
                 emit_state(&app, &state, "disconnected", "Engine lost", None, None);
             }
         }
@@ -435,113 +546,169 @@ fn is_admin() -> bool {
 
 #[tauri::command]
 fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    if state.child.lock().unwrap().is_some() {
+    let _operation = state.operation.lock().unwrap();
+    if state
+        .connecting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err("Aether is already running".into());
     }
-    validate_settings(&settings)?;
-    save_settings_file(&app, &settings)?;
-    #[cfg(windows)]
-    autostart::set(settings.launch_at_login)?;
+    let result = (|| -> Result<(), String> {
+        if state.child.lock().unwrap().is_some() {
+            return Err("Aether is already running".into());
+        }
+        validate_settings(&settings)?;
+        save_settings_file(&app, &settings)?;
+        #[cfg(windows)]
+        autostart::set(settings.launch_at_login)?;
 
-    if settings.routing_mode == "tun" {
+        if settings.routing_mode == "tun" {
+            #[cfg(windows)]
+            {
+                // Keep GUI unelevated. TUN requires an already-elevated process
+                // (right-click Run as administrator). Whole-GUI UAC relaunch removed.
+                if !elevation::is_elevated() {
+                    return Err(
+                        "Full-device TUN needs Administrator. Close Aether, right-click the app, Run as administrator, then Connect."
+                            .into(),
+                    );
+                }
+                if wintun_path(&app).is_none() {
+                    return Err("wintun.dll not found. Reinstall Aether or place wintun.dll next to the app.".into());
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                return Err("TUN mode is Windows-only".into());
+            }
+        }
+
+        let executable = engine_path(&app, &settings)?;
+        let dir = config_dir(&app)?;
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        if settings.routing_mode == "tun" {
+            validate_trusted_binary(&executable, "aether.exe")?;
+            if let Some(wintun) = wintun_path(&app) {
+                validate_trusted_binary(&wintun, "wintun.dll")?;
+            }
+        }
+
+        let mut command = Command::new(&executable);
+        command
+            .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+            .env("AETHER_PROTOCOL", &settings.protocol)
+            .env("AETHER_SCAN", &settings.scan_mode)
+            .env("AETHER_IP", &settings.ip_version)
+            .env("AETHER_NOIZE", &settings.noize)
+            .env("AETHER_SOCKS", format!("127.0.0.1:{}", settings.socks_port))
+            .env("AETHER_HTTP", format!("127.0.0.1:{}", settings.http_port))
+            .env("AETHER_CONFIG", dir.join("aether.toml"))
+            .env(
+                "AETHER_MASQUE_HTTP2",
+                if settings.transport == "h2" { "1" } else { "0" },
+            )
+            .env(
+                "AETHER_TUN",
+                if settings.routing_mode == "tun" {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
+            // Prefer auto MTU (engine probes 1400 vs 1280) unless user set AETHER_MTU outside.
+            .env("AETHER_WG_NO_PROFILE_RETRY", "1")
+            .env("AETHER_CONTROL_STDIN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(wintun) = wintun_path(&app) {
+            // Only pass Wintun path we already validated for TUN; never env override.
+            command.env("AETHER_WINTUN", wintun);
+        }
+
         #[cfg(windows)]
         {
-            if !elevation::is_elevated() {
-                elevation::relaunch_elevated()?;
-                app.exit(0);
-                return Ok(());
-            }
-            if wintun_path(&app).is_none() {
-                return Err("wintun.dll not found. Reinstall Aether or place wintun.dll next to the app.".into());
-            }
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
         }
-        #[cfg(not(windows))]
-        {
-            return Err("TUN mode is Windows-only".into());
-        }
-    }
 
-    let executable = engine_path(&app, &settings)?;
-    let dir = config_dir(&app)?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Could not start aether.exe: {e}"))?;
+        let pid = child.id();
+        let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let socks_seen = Arc::new(AtomicBool::new(false));
+        let tunnel_seen = Arc::new(AtomicBool::new(false));
+        state.connected_once.store(false, Ordering::SeqCst);
 
-    let mut command = Command::new(&executable);
-    command
-        .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
-        .env("AETHER_PROTOCOL", &settings.protocol)
-        .env("AETHER_SCAN", &settings.scan_mode)
-        .env("AETHER_IP", &settings.ip_version)
-        .env("AETHER_NOIZE", &settings.noize)
-        .env("AETHER_SOCKS", format!("127.0.0.1:{}", settings.socks_port))
-        .env("AETHER_HTTP", format!("127.0.0.1:{}", settings.http_port))
-        .env("AETHER_CONFIG", dir.join("aether.toml"))
-        .env(
-            "AETHER_MASQUE_HTTP2",
-            if settings.transport == "h2" { "1" } else { "0" },
-        )
-        .env(
-            "AETHER_TUN",
-            if settings.routing_mode == "tun" {
-                "1"
-            } else {
-                "0"
-            },
-        )
-        // Prefer auto MTU (engine probes 1400 vs 1280) unless user set AETHER_MTU outside.
-        .env("AETHER_WG_NO_PROFILE_RETRY", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(wintun) = wintun_path(&app) {
-        command.env("AETHER_WINTUN", wintun);
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Could not start aether.exe: {e}"))?;
-    let pid = child.id();
-    let socks_seen = Arc::new(AtomicBool::new(false));
-    let tunnel_seen = Arc::new(AtomicBool::new(false));
-    state.connected_once.store(false, Ordering::SeqCst);
-
-    if let Some(stdout) = child.stdout.take() {
-        stream_output(
-            app.clone(),
-            stdout,
-            settings.clone(),
-            socks_seen.clone(),
-            tunnel_seen.clone(),
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        *state.child.lock().unwrap() = Some(child);
+        emit_state(
+            &app,
+            &state,
+            "connecting",
+            "Scanning reachable routes",
+            Some(pid),
+            None,
         );
-    }
-    if let Some(stderr) = child.stderr.take() {
-        stream_output(app.clone(), stderr, settings, socks_seen, tunnel_seen);
-    }
-    *state.child.lock().unwrap() = Some(child);
-    emit_state(
-        &app,
-        &state,
-        "connecting",
-        "Scanning reachable routes",
-        Some(pid),
-        None,
-    );
-    Ok(())
+        if let Some(stdout) = stdout {
+            stream_output(
+                app.clone(),
+                stdout,
+                settings.clone(),
+                socks_seen.clone(),
+                tunnel_seen.clone(),
+                generation,
+            );
+        }
+        if let Some(stderr) = stderr {
+            stream_output(app, stderr, settings, socks_seen, tunnel_seen, generation);
+        }
+        Ok(())
+    })();
+    state.connecting.store(false, Ordering::SeqCst);
+    result
 }
 
 #[tauri::command]
 fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(mut child) = state.child.lock().unwrap().take() {
-        child.kill().map_err(|e| e.to_string())?;
-        let _ = child.wait();
+    // Invalidate readers first under lock, then wait outside lock so stdout can drain.
+    let mut child = {
+        let _operation = state.operation.lock().unwrap();
+        state.generation.fetch_add(1, Ordering::SeqCst);
+        state.connecting.store(false, Ordering::SeqCst);
+        state.child.lock().unwrap().take()
+    };
+    if let Some(child) = child.as_mut() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"shutdown\n");
+            let _ = stdin.flush();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
     }
-    cleanup_routing(&state);
+    let _operation = state.operation.lock().unwrap();
+    cleanup_routing(&app, &state);
     emit_state(&app, &state, "disconnected", "Ready", None, None);
     Ok(())
 }
@@ -584,14 +751,11 @@ fn test_connection(settings: Settings) -> Result<String, String> {
 
 #[cfg(windows)]
 mod elevation {
-    use std::env;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     pub fn is_elevated() -> bool {
         unsafe {
@@ -611,30 +775,6 @@ mod elevation {
             CloseHandle(token);
             ok != 0 && elevation.TokenIsElevated != 0
         }
-    }
-
-    fn wide(s: &str) -> Vec<u16> {
-        OsStr::new(s).encode_wide().chain(Some(0)).collect()
-    }
-
-    pub fn relaunch_elevated() -> Result<(), String> {
-        let exe = env::current_exe().map_err(|e| e.to_string())?;
-        let exe_w = wide(&exe.to_string_lossy());
-        let op = wide("runas");
-        let ret = unsafe {
-            ShellExecuteW(
-                std::ptr::null_mut(),
-                op.as_ptr(),
-                exe_w.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        } as isize;
-        if ret <= 32 {
-            return Err(format!("UAC elevation failed (code {ret}). Run Aether as Administrator for TUN."));
-        }
-        Ok(())
     }
 }
 
@@ -665,12 +805,15 @@ mod autostart {
 
 #[cfg(windows)]
 mod windows_proxy {
+    use serde::{Deserialize, Serialize};
     use std::io;
+    use std::path::Path;
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
+    #[derive(Clone, Serialize, Deserialize)]
     pub struct ProxySnapshot {
         enabled: u32,
         server: Option<String>,
@@ -701,39 +844,74 @@ mod windows_proxy {
         }
     }
 
-    pub fn enable(port: u16, endpoint: Option<&str>) -> Result<ProxySnapshot, String> {
-        let key = key().map_err(|e| e.to_string())?;
+    pub fn enable(
+        port: u16,
+        endpoint: Option<&str>,
+        recovery_path: Option<&Path>,
+    ) -> Result<ProxySnapshot, (String, Option<ProxySnapshot>)> {
+        let key = key().map_err(|e| (e.to_string(), None))?;
         let snapshot = ProxySnapshot {
             enabled: key.get_value("ProxyEnable").unwrap_or(0),
             server: key.get_value("ProxyServer").ok(),
             bypass: key.get_value("ProxyOverride").ok(),
         };
-        key.set_value(
-            "ProxyServer",
-            &format!("http=127.0.0.1:{port};https=127.0.0.1:{port}"),
-        )
-        .map_err(|e| e.to_string())?;
-        let mut bypass = String::from("localhost;127.*;<local>");
-        if let Some(ep) = endpoint {
-            let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
-            if !host.is_empty() {
-                bypass.push(';');
-                bypass.push_str(host.trim_matches(['[', ']']));
+        if let Some(path) = recovery_path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| (format!("proxy recovery directory: {e}"), None))?;
             }
+            let json = serde_json::to_vec_pretty(&snapshot)
+                .map_err(|e| (format!("proxy recovery encode: {e}"), None))?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, json)
+                .map_err(|e| (format!("proxy recovery write: {e}"), None))?;
+            std::fs::rename(&tmp, path)
+                .map_err(|e| (format!("proxy recovery commit: {e}"), None))?;
         }
-        key.set_value("ProxyOverride", &bypass)
+        let result = (|| -> Result<(), String> {
+            key.set_value(
+                "ProxyServer",
+                &format!("http=127.0.0.1:{port};https=127.0.0.1:{port}"),
+            )
             .map_err(|e| e.to_string())?;
-        key.set_value("ProxyEnable", &1u32).map_err(|e| e.to_string())?;
+            let mut bypass = String::from("localhost;127.*;<local>");
+            if let Some(ep) = endpoint {
+                let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
+                if !host.is_empty() {
+                    bypass.push(';');
+                    bypass.push_str(host.trim_matches(['[', ']']));
+                }
+            }
+            key.set_value("ProxyOverride", &bypass)
+                .map_err(|e| e.to_string())?;
+            key.set_value("ProxyEnable", &1u32)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return match restore(snapshot.clone()) {
+                Ok(()) => {
+                    if let Some(path) = recovery_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    Err((error, None))
+                }
+                Err(rollback) => Err((
+                    format!("{error}; rollback failed: {rollback}"),
+                    Some(snapshot),
+                )),
+            };
+        }
         refresh();
         Ok(snapshot)
     }
 
     pub fn restore(snapshot: ProxySnapshot) -> Result<(), String> {
         let key = key().map_err(|e| e.to_string())?;
-        key.set_value("ProxyEnable", &snapshot.enabled)
-            .map_err(|e| e.to_string())?;
         match snapshot.server {
-            Some(value) => key.set_value("ProxyServer", &value).map_err(|e| e.to_string())?,
+            Some(value) => key
+                .set_value("ProxyServer", &value)
+                .map_err(|e| e.to_string())?,
             None => {
                 let _ = key.delete_value("ProxyServer");
             }
@@ -746,8 +924,21 @@ mod windows_proxy {
                 let _ = key.delete_value("ProxyOverride");
             }
         }
+        key.set_value("ProxyEnable", &snapshot.enabled)
+            .map_err(|e| e.to_string())?;
         refresh();
         Ok(())
+    }
+
+    pub fn recover(path: &Path) -> Result<bool, String> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let data = std::fs::read(path).map_err(|e| e.to_string())?;
+        let snapshot: ProxySnapshot = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+        restore(snapshot)?;
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        Ok(true)
     }
 }
 
@@ -764,6 +955,20 @@ pub fn run() {
         }))
         .manage(AppState::default())
         .setup(|app| {
+            #[cfg(windows)]
+            if let Ok(path) = proxy_recovery_path(app.handle()) {
+                match windows_proxy::recover(&path) {
+                    Ok(true) => emit_log(
+                        app.handle(),
+                        "Recovered Windows proxy after interrupted session".into(),
+                    ),
+                    Ok(false) => {}
+                    Err(error) => emit_log(
+                        app.handle(),
+                        format!("Windows proxy recovery failed: {error}"),
+                    ),
+                }
+            }
             watch_child(app.handle().clone());
             let settings = load_settings_file(app.handle());
             if settings.start_minimized {

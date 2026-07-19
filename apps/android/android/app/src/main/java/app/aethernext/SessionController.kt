@@ -27,6 +27,7 @@ class SessionController(
     private val socksSeen = AtomicBoolean(false)
     private val tunnelSeen = AtomicBoolean(false)
     private val vpnStarted = AtomicBoolean(false)
+    private val vpnEstablished = AtomicBoolean(false)
     private var settings = store.load()
 
     private val runner = EngineRunner(
@@ -37,6 +38,7 @@ class SessionController(
             socksSeen.set(false)
             tunnelSeen.set(false)
             vpnStarted.set(false)
+            vpnEstablished.set(false)
             setRuntime(
                 "disconnected",
                 if (code == 0 || code == null) "Engine stopped" else "Engine exited ($code)",
@@ -71,6 +73,7 @@ class SessionController(
         socksSeen.set(false)
         tunnelSeen.set(false)
         vpnStarted.set(false)
+        vpnEstablished.set(false)
 
         if (s.routingMode == "tun") {
             val prep = VpnService.prepare(context)
@@ -102,6 +105,7 @@ class SessionController(
         socksSeen.set(false)
         tunnelSeen.set(false)
         vpnStarted.set(false)
+        vpnEstablished.set(false)
         setRuntime("disconnected", "Ready", null, null)
     }
 
@@ -132,7 +136,7 @@ class SessionController(
     }
 
     private fun validate(s: Settings) {
-        if (s.socksPort < 1024 || s.httpPort < 1024) {
+        if (s.socksPort !in 1024..65535 || s.httpPort !in 1024..65535) {
             throw IllegalArgumentException("Ports must be 1024-65535")
         }
         if (s.socksPort == s.httpPort) {
@@ -188,7 +192,7 @@ class SessionController(
         } else {
             socksSeen.get() || tunnelSeen.get()
         }
-        if (ready) markConnected()
+        if (ready && (settings.routingMode != "tun" || vpnEstablished.get())) markConnected()
     }
 
     private fun maybeStartVpn() {
@@ -208,7 +212,9 @@ class SessionController(
         } catch (e: Exception) {
             vpnStarted.set(false)
             Log.e(TAG, "VPN start failed: ${e.message}", e)
-            emitLog("VPN start failed: ${e.message}")
+            runner.stop()
+            context.stopService(Intent(context, EngineService::class.java))
+            setRuntime("error", "VPN start failed: ${e.message}", null, runtime.endpoint)
         }
     }
 
@@ -221,6 +227,21 @@ class SessionController(
         } catch (_: Exception) {
         }
         context.stopService(Intent(context, AetherVpnService::class.java))
+    }
+
+    fun onVpnEstablished() {
+        vpnEstablished.set(true)
+        emitLog("VPN: tun2socks established")
+        val ready = socksSeen.get() && (settings.protocol != "masque" || tunnelSeen.get())
+        if (ready) markConnected()
+    }
+
+    fun onVpnFailed(message: String) {
+        vpnStarted.set(false)
+        vpnEstablished.set(false)
+        runner.stop()
+        context.stopService(Intent(context, EngineService::class.java))
+        setRuntime("error", "VPN failed: $message", null, runtime.endpoint)
     }
 
     private fun parseEndpoint(line: String): String? {

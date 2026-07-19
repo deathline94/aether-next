@@ -10,7 +10,15 @@ use crate::socks;
 const MAX_HEADER: usize = 64 * 1024;
 
 pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    let listener = TcpListener::bind(listen).await?;
+    serve_listener(bind(listen).await?, stack).await
+}
+
+pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
+    Ok(TcpListener::bind(listen).await?)
+}
+
+pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result<()> {
+    let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -26,9 +34,14 @@ pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
 
 async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     let header = read_header(&mut client).await?;
-    let text = std::str::from_utf8(&header)
+    let header_end =
+        find_header_end(&header).ok_or_else(|| AetherError::Other("invalid HTTP header".into()))?;
+    let text = std::str::from_utf8(&header[..header_end])
         .map_err(|_| AetherError::Other("invalid HTTP header".into()))?;
-    let first = text.lines().next().ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
+    let first = text
+        .lines()
+        .next()
+        .ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
     let mut request = first.split_whitespace();
     let method = request.next().unwrap_or("");
     let target = request.next().unwrap_or("");
@@ -40,7 +53,10 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     } else {
         let host = text
             .lines()
-            .find_map(|line| line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")))
+            .find_map(|line| {
+                line.strip_prefix("Host:")
+                    .or_else(|| line.strip_prefix("host:"))
+            })
             .map(str::trim)
             .ok_or_else(|| AetherError::Other("HTTP Host header missing".into()))?;
         parse_authority(host, 80)?
@@ -51,17 +67,31 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     let upstream = match upstream {
         Ok(value) => value,
         Err(error) => {
-            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n").await;
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await;
             return Err(error);
         }
     };
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        if header_end < header.len() {
+            upstream.send(header[header_end..].to_vec()).await?;
+        }
     } else {
         upstream.send(rewrite_absolute_uri(header)?).await?;
     }
     relay(client, upstream).await
+}
+
+fn find_header_end(header: &[u8]) -> Option<usize> {
+    header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
 }
 
 async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -70,7 +100,9 @@ async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
     loop {
         let count = stream.read(&mut buf).await?;
         if count == 0 {
-            return Err(AetherError::Other("client closed before HTTP header".into()));
+            return Err(AetherError::Other(
+                "client closed before HTTP header".into(),
+            ));
         }
         header.extend_from_slice(&buf[..count]);
         if header.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -88,7 +120,11 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
     }
     if let Some((host, port)) = value.rsplit_once(':') {
         if !host.contains(':') {
-            return Ok((host.to_string(), port.parse().map_err(|_| AetherError::Other("invalid proxy port".into()))?));
+            return Ok((
+                host.to_string(),
+                port.parse()
+                    .map_err(|_| AetherError::Other("invalid proxy port".into()))?,
+            ));
         }
     }
     let host = value.trim_matches(['[', ']']);
@@ -99,9 +135,12 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
 }
 
 fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
-    let end = header.windows(2).position(|window| window == b"\r\n")
+    let end = header
+        .windows(2)
+        .position(|window| window == b"\r\n")
         .ok_or_else(|| AetherError::Other("invalid HTTP request line".into()))?;
-    let first = std::str::from_utf8(&header[..end]).map_err(|_| AetherError::Other("invalid HTTP request line".into()))?;
+    let first = std::str::from_utf8(&header[..end])
+        .map_err(|_| AetherError::Other("invalid HTTP request line".into()))?;
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -146,4 +185,16 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
     let _ = writer.shutdown().await;
     upload.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_header_end;
+
+    #[test]
+    fn separates_pipelined_connect_payload() {
+        let request = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLS";
+        let end = find_header_end(request).unwrap();
+        assert_eq!(&request[end..], b"TLS");
+    }
 }

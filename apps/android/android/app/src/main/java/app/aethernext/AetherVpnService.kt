@@ -27,25 +27,36 @@ import java.io.FileOutputStream
 class AetherVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var hevStarted = false
+    private var stopRequested = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            stopRequested = true
             stopTunnel()
             stopSelf()
             return START_NOT_STICKY
         }
         startForegroundNotification()
         if (tun == null) {
-            val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, 1819) ?: 1819
+            val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, -1) ?: -1
             try {
+                check(socksPort in 1024..65535) { "VPN start missing valid SOCKS port" }
+                check(nativeLoaded) { "hev-socks5-tunnel native library unavailable" }
                 establishTun(socksPort)
+                SessionController.getOrNull()?.onVpnEstablished()
             } catch (e: Exception) {
                 Log.e(TAG, "VPN establish failed: ${e.message}", e)
                 stopTunnel()
+                SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
+                stopSelf()
+            } catch (e: UnsatisfiedLinkError) {
+                Log.e(TAG, "VPN native call failed: ${e.message}", e)
+                stopTunnel()
+                SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
                 stopSelf()
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun establishTun(socksPort: Int) {
@@ -57,6 +68,9 @@ class AetherVpnService : VpnService() {
             .addAddress(TUN_ADDR, 32)
             .addDnsServer(MAPPED_DNS)
             .addRoute("0.0.0.0", 0)
+            // IPv6 tunnel not implemented: block IPv6 so traffic cannot bypass full VPN.
+            .addAddress(TUN_ADDR_V6, 128)
+            .addRoute("::", 0)
 
         // Keep engine + hev sockets off the TUN (otherwise infinite loop).
         try {
@@ -151,13 +165,19 @@ class AetherVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        stopRequested = true
         stopTunnel()
+        SessionController.getOrNull()?.onVpnFailed("VPN permission revoked")
         stopSelf()
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        val unexpected = !stopRequested && hevStarted
         stopTunnel()
+        if (unexpected) {
+            SessionController.getOrNull()?.onVpnFailed("VPN service stopped by system")
+        }
         super.onDestroy()
     }
 
@@ -167,13 +187,17 @@ class AetherVpnService : VpnService() {
         private const val NOTIF_ID = 43
         private const val MTU = 1280
         private const val TUN_ADDR = "198.18.0.1"
+        // Unique local address for blackhole IPv6 route (no real IPv6 tunnel yet).
+        private const val TUN_ADDR_V6 = "fd00:aether::1"
         private const val MAPPED_DNS = "198.18.0.2"
+        private var nativeLoaded = false
         const val EXTRA_SOCKS_PORT = "socks_port"
         const val ACTION_STOP = "app.aethernext.VPN_STOP"
 
         init {
             try {
                 System.loadLibrary("hev-socks5-tunnel")
+                nativeLoaded = true
             } catch (e: UnsatisfiedLinkError) {
                 Log.e(TAG, "failed to load libhev-socks5-tunnel: ${e.message}")
             }

@@ -142,12 +142,30 @@ jobs:
           npm run sync-www
       - name: APKs
         working-directory: apps/android/android
+        env:
+          AETHER_ANDROID_KEYSTORE: ${{ github.workspace }}/apps/android/android/release.keystore
+          AETHER_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AETHER_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          AETHER_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          test -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" || { echo "ANDROID_KEYSTORE_BASE64 secret missing"; exit 1; }
+          printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > release.keystore
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           echo "ndk.dir=${{ steps.ndk.outputs.ndk-path }}" >> local.properties
           chmod +x ./gradlew
           ./gradlew assembleRelease --stacktrace
           ls -la app/build/outputs/apk/release/
+      - name: Verify APK signature
+        working-directory: apps/android/android
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          test -n "$APKSIGNER"
+          for apk in app/build/outputs/apk/release/*.apk; do
+            "$APKSIGNER" verify --verbose --print-certs "$apk"
+            digest=$($APKSIGNER verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')
+            test "$digest" = "1396DD16D8F2954E7D9A213AD0BF2BA8B96E4A5B5F0A71C3CA88A133744794AC"
+          done
       - name: Collect
         run: |
           set -euo pipefail

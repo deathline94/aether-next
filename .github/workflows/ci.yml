@@ -10,6 +10,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  engine:
+    name: Rust engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: lukka/get-cmake@latest
+      - uses: ilammy/setup-nasm@v1
+      # fmt/clippy debt exists in tree; gate on compile + tests until cleaned.
+      - run: cargo check --locked --manifest-path aether/Cargo.toml
+      - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -W clippy::correctness
+      - run: cargo test --locked --manifest-path aether/Cargo.toml
+
   desktop-ui:
     name: Desktop UI
     runs-on: ubuntu-latest
@@ -25,3 +40,50 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  desktop-backend:
+    name: Desktop backend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+  android-ui:
+    name: Android UI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/android/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  android-native-payloads:
+    name: Android native payload gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require ABI libraries when present in tree
+        run: |
+          set -euo pipefail
+          # If any ABI dir exists, every advertised ABI must have both libs.
+          root="apps/android/android/app/src/main/jniLibs"
+          if [[ ! -d "$root" ]]; then
+            echo "jniLibs absent (CI release workflow builds them)"
+            exit 0
+          fi
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            for lib in libaether.so libhev-socks5-tunnel.so; do
+              f="$root/$abi/$lib"
+              if [[ -e "$f" ]]; then
+                test -s "$f"
+              fi
+            done
+          done

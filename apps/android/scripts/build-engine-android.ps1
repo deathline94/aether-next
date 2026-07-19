@@ -1,10 +1,10 @@
-# Cross-compile aether for Android and stage into the APK.
+# Cross-compile aether for all advertised Android ABIs and stage into the APK.
 # Requires: Rust, Android NDK, CMake, Ninja, Go, Git.
 # Set $env:ANDROID_NDK_HOME (e.g. C:\Android\android-sdk\ndk\27.3.13750724)
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..\..")
 $Engine = Join-Path $Root "aether"
-$OutArm64 = Join-Path $Root "apps\android\android\app\src\main\jniLibs\arm64-v8a"
+$JniRoot = Join-Path $Root "apps\android\android\app\src\main\jniLibs"
 $Assets = Join-Path $Root "apps\android\android\app\src\main\assets\engine"
 
 if (-not $env:ANDROID_NDK_HOME) {
@@ -17,48 +17,85 @@ if (-not (Test-Path $prebuilt)) {
 }
 $env:Path = "$prebuilt;$env:Path"
 $api = 26
-$linker = "aarch64-linux-android$api-clang.cmd"
-if (-not (Test-Path (Join-Path $prebuilt $linker))) {
-  $linker = "aarch64-linux-android$api-clang"
+
+$targets = @(
+  @{ Triple = "aarch64-linux-android"; Abi = "arm64-v8a"; Linker = "aarch64-linux-android$api-clang" },
+  @{ Triple = "armv7-linux-androideabi"; Abi = "armeabi-v7a"; Linker = "armv7a-linux-androideabi$api-clang" },
+  @{ Triple = "x86_64-linux-android"; Abi = "x86_64"; Linker = "x86_64-linux-android$api-clang" }
+)
+
+function Resolve-Linker([string]$base) {
+  $cmd = Join-Path $prebuilt "$base.cmd"
+  if (Test-Path $cmd) { return "$base.cmd" }
+  $plain = Join-Path $prebuilt $base
+  if (Test-Path $plain) { return $base }
+  throw "Linker not found: $base"
 }
-$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $linker
 
-# BoringSSL / cmake-rs on Windows: use Ninja + skip broken host try-compile links.
 if (-not $env:CMAKE_GENERATOR) { $env:CMAKE_GENERATOR = "Ninja" }
-$env:ANDROID_ABI = "arm64-v8a"
-$env:ANDROID_PLATFORM = "android-$api"
-$env:ANDROID_NATIVE_API_LEVEL = "$api"
-
-# Project-local cargo config for the Android target
 $cargoDir = Join-Path $Engine ".cargo"
 New-Item -ItemType Directory -Force -Path $cargoDir | Out-Null
 $ndkEsc = $env:ANDROID_NDK_HOME -replace '\\', '\\'
-@"
-[target.aarch64-linux-android]
+
+$cargoConfig = @()
+foreach ($t in $targets) {
+  $linker = Resolve-Linker $t.Linker
+  $envName = ("CARGO_TARGET_{0}_LINKER" -f ($t.Triple.ToUpper().Replace('-', '_')))
+  Set-Item -Path "Env:$envName" -Value $linker
+  rustup target add $t.Triple | Out-Null
+  $cargoConfig += @"
+[target.$($t.Triple)]
 linker = "$linker"
 ar = "llvm-ar.exe"
+"@
+}
+$cargoConfig += @"
 
 [env]
 ANDROID_NDK_HOME = { value = "$ndkEsc", force = true }
 CMAKE_GENERATOR = { value = "Ninja", force = true }
-ANDROID_ABI = { value = "arm64-v8a", force = true }
 ANDROID_PLATFORM = { value = "android-$api", force = true }
 ANDROID_NATIVE_API_LEVEL = { value = "$api", force = true }
-"@ | Set-Content (Join-Path $cargoDir "config.toml") -Encoding UTF8
+"@
+$cargoConfig -join "`n" | Set-Content (Join-Path $cargoDir "config.toml") -Encoding UTF8
 
-rustup target add aarch64-linux-android | Out-Null
-Push-Location $Engine
-cargo build --release --target aarch64-linux-android
-Pop-Location
+New-Item -ItemType Directory -Force -Path $Assets | Out-Null
+$primary = $null
+foreach ($t in $targets) {
+  $env:ANDROID_ABI = $t.Abi
+  Write-Host "==> building $($t.Triple) ($($t.Abi))"
+  Push-Location $Engine
+  cargo build --release --target $t.Triple
+  if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    throw "Build failed for $($t.Triple)"
+  }
+  Pop-Location
 
-New-Item -ItemType Directory -Force -Path $OutArm64, $Assets | Out-Null
-$bin = Join-Path $Engine "target\aarch64-linux-android\release\aether"
-if (-not (Test-Path $bin)) { $bin = "$bin.exe" }
-if (-not (Test-Path $bin)) {
-  Write-Error "Built binary not found under $Engine\target\aarch64-linux-android\release\"
+  $bin = Join-Path $Engine "target\$($t.Triple)\release\aether"
+  if (-not (Test-Path $bin)) { $bin = "$bin.exe" }
+  if (-not (Test-Path $bin)) {
+    throw "Built binary missing for $($t.Triple)"
+  }
+  $outDir = Join-Path $JniRoot $t.Abi
+  New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+  Copy-Item -Force $bin (Join-Path $outDir "libaether.so")
+  if ($t.Abi -eq "arm64-v8a") {
+    Copy-Item -Force $bin (Join-Path $Assets "aether")
+    $primary = Join-Path $outDir "libaether.so"
+  }
+  Write-Host "Staged $($t.Abi)/libaether.so"
 }
-# jniLibs only packages lib*.so — ship as libaether.so and also as assets/engine/aether.
-Copy-Item -Force $bin (Join-Path $OutArm64 "libaether.so")
-Copy-Item -Force $bin (Join-Path $Assets "aether")
-Write-Host "Staged: $OutArm64\libaether.so and $Assets\aether"
-Get-Item (Join-Path $OutArm64 "libaether.so"), (Join-Path $Assets "aether") | Format-Table Name, Length
+
+# Fail closed if any advertised ABI payload is missing.
+foreach ($t in $targets) {
+  $so = Join-Path $JniRoot "$($t.Abi)\libaether.so"
+  if (-not (Test-Path $so) -or (Get-Item $so).Length -le 0) {
+    throw "Missing payload: $so"
+  }
+}
+if (-not $primary -or -not (Test-Path $primary)) {
+  throw "arm64 primary engine missing"
+}
+Write-Host "All Android engine ABIs staged."
+Get-ChildItem -Recurse $JniRoot -Filter libaether.so | Format-Table FullName, Length

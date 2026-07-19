@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 mod account;
+mod aethernoize;
 mod config;
 mod consts;
 mod dns;
 mod endpoint_cache;
+mod engine_config;
 mod error;
 mod http_proxy;
 mod masque;
@@ -11,21 +13,19 @@ mod masque_h2;
 mod mtu;
 mod netstack;
 mod noize;
+mod obfuscation;
 mod prober;
 mod quic;
+mod routing_plane;
+mod scan;
+mod session_event;
 mod socks;
 mod tls;
-mod aethernoize;
-mod wireguard;
-mod wg_prober;
-mod session_event;
-mod engine_config;
-mod scan;
-mod obfuscation;
-mod routing_plane;
-mod tunnel;
 #[cfg(windows)]
 mod tun_win;
+mod tunnel;
+mod wg_prober;
+mod wireguard;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -47,7 +47,29 @@ async fn main() -> Result<()> {
         .init();
 
     install_netstack_panic_guard();
-    run_session(EngineConfig::from_env()?).await
+    let session = run_session(EngineConfig::from_env()?);
+    if std::env::var("AETHER_CONTROL_STDIN").as_deref() == Ok("1") {
+        tokio::select! {
+            result = session => result,
+            _ = shutdown_request() => {
+                log::info!("[+] graceful shutdown requested");
+                Ok(())
+            }
+        }
+    } else {
+        session.await
+    }
+}
+
+async fn shutdown_request() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().eq_ignore_ascii_case("shutdown") {
+            return;
+        }
+    }
 }
 
 /// Product session entry — CLI is a thin adapter; GUI spawns this binary.
@@ -121,7 +143,10 @@ async fn run_session(cfg: EngineConfig) -> Result<()> {
             let secondary = load_or_provision_warp(&secondary_path).await?;
             log::info!(
                 "[+] outer device={} ipv4={} | inner device={} ipv4={}",
-                primary.device_id, primary.ipv4, secondary.device_id, secondary.ipv4
+                primary.device_id,
+                primary.ipv4,
+                secondary.device_id,
+                secondary.ipv4
             );
             let peer = select_peer(&primary, Protocol::WireGuard).await?;
             log::info!("[+] using cloudflare edge {peer} (outer)");
@@ -172,7 +197,10 @@ fn masque_config_path(base: &str) -> String {
 }
 
 fn derive_sibling_path(base: &str, suffix: &str) -> String {
-    let dir_end = base.rfind(|c| c == '/' || c == '\\').map(|i| i + 1).unwrap_or(0);
+    let dir_end = base
+        .rfind(|c| c == '/' || c == '\\')
+        .map(|i| i + 1)
+        .unwrap_or(0);
     match base[dir_end..].rfind('.') {
         Some(rel) => {
             let dot = dir_end + rel;
@@ -189,7 +217,8 @@ async fn load_or_provision_warp(config_path: &str) -> Result<account::Identity> 
     }
 
     log::info!("[+] no warp identity found; provisioning dedicated wireguard account");
-    let identity = account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
+    let identity =
+        account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
     config::save(config_path, &identity)?;
     log::info!("[+] provisioned and saved new warp identity to {config_path}");
     Ok(identity)
@@ -206,15 +235,24 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
         }
         log::info!("[+] masque identity missing credentials; enrolling masque key");
         let (cert_pem, key_pem) = account::ensure_masque_enrolled(&identity).await?;
-        let identity = account::Identity { cert_pem, key_pem, ..identity };
+        let identity = account::Identity {
+            cert_pem,
+            key_pem,
+            ..identity
+        };
         config::save(config_path, &identity)?;
         return Ok(identity);
     }
 
     log::info!("[+] no masque identity found; provisioning dedicated masque account");
-    let identity = account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
+    let identity =
+        account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
     let (cert_pem, key_pem) = account::ensure_masque_enrolled(&identity).await?;
-    let identity = account::Identity { cert_pem, key_pem, ..identity };
+    let identity = account::Identity {
+        cert_pem,
+        key_pem,
+        ..identity
+    };
     config::save(config_path, &identity)?;
     log::info!("[+] provisioned and saved new masque identity to {config_path}");
     Ok(identity)
@@ -227,7 +265,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
             .ok()
             .or_else(|| std::env::var("AETHER_PEER").ok()),
     };
-    
+
     if let Some(p) = force_peer {
         let peer: SocketAddr = p
             .parse()
@@ -237,7 +275,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
     }
 
     log::info!("[+] selected protocol: {}", protocol.label());
-    
+
     let mode_str = select_scan_mode_str().await;
     let ip = select_ip_version().await;
 
@@ -258,28 +296,41 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
             };
 
             let best = prober::hunt_best_gateway(&probe, mode).await?;
-            log::info!("[+] selected MASQUE gateway {}:{} (rtt {:?})", best.ip, best.port, best.rtt);
+            log::info!(
+                "[+] selected MASQUE gateway {}:{} (rtt {:?})",
+                best.ip,
+                best.port,
+                best.rtt
+            );
             Ok(SocketAddr::new(best.ip, best.port))
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
             log::info!("[*] hunting for a working WireGuard endpoint (handshake + data-plane verification)");
             let mode = scan::ScanMode::parse(&mode_str);
-            
+
             let private_key = identity.private_key_bytes()?;
             let peer_public = identity.peer_public_key_bytes()?;
-            
+
             let probe = wg_prober::WgProbe {
                 private_key: std::sync::Arc::new(private_key),
                 peer_public_key: std::sync::Arc::new(peer_public),
                 client_id: identity.client_id.clone(),
-                local_ipv4: identity.ipv4.parse().map_err(|_| AetherError::Other("invalid ipv4".into()))?,
+                local_ipv4: identity
+                    .ipv4
+                    .parse()
+                    .map_err(|_| AetherError::Other("invalid ipv4".into()))?,
                 aethernoize: aethernoize_config(),
                 ports: wireguard::WG_PORTS.to_vec(),
                 ip,
             };
 
             let best = wg_prober::hunt_best_wg_endpoint(&probe, mode).await?;
-            log::info!("[+] selected WireGuard endpoint {}:{} (rtt {:?})", best.ip, best.port, best.rtt);
+            log::info!(
+                "[+] selected WireGuard endpoint {}:{} (rtt {:?})",
+                best.ip,
+                best.port,
+                best.rtt
+            );
             Ok(SocketAddr::new(best.ip, best.port))
         }
     }
@@ -289,7 +340,10 @@ async fn resolve_ech() -> Option<Vec<u8>> {
     match std::env::var("AETHER_ECH") {
         Ok(v) if v.eq_ignore_ascii_case("auto") => match dns::fetch_ech_config().await {
             Ok(raw) => {
-                log::info!("[+] fetched ECHConfigList automatically ({} bytes)", raw.len());
+                log::info!(
+                    "[+] fetched ECHConfigList automatically ({} bytes)",
+                    raw.len()
+                );
                 Some(raw)
             }
             Err(e) => {
@@ -341,9 +395,14 @@ async fn run_masque_tunnel(
         ctrl_tx,
     } = chans;
 
-    let (stack, _tun) =
-        spawn_stack_and_optional_tun(&identity.ipv4, &identity.ipv6, peer, inbound_rx, outbound_tx)
-            .await?;
+    let (stack, _tun) = spawn_stack_and_optional_tun(
+        &identity.ipv4,
+        &identity.ipv6,
+        peer,
+        inbound_rx,
+        outbound_tx,
+    )
+    .await?;
     let _ctrl = ctrl_tx;
 
     let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(8);
@@ -360,12 +419,14 @@ async fn run_masque_tunnel(
         }
     });
 
+    let socks_listener = socks::bind(listen).await?;
+    let http_listener = http_proxy::bind(http_listen).await?;
     let socks_stack = stack.clone();
     let socks_task = tokio::spawn(async move {
         log::info!("[+] socks5 server listening on {listen}");
-        socks::serve(listen, socks_stack).await
+        socks::serve_listener(socks_listener, socks_stack).await
     });
-    let http_task = tokio::spawn(http_proxy::serve(http_listen, stack.clone()));
+    let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack.clone()));
     session_event::emit(SessionEvent::ProxyReady {
         socks: listen.to_string(),
         http: http_listen.to_string(),
@@ -444,7 +505,11 @@ async fn hunt_wg_peer_with_profile(
     Ok(SocketAddr::new(best.ip, best.port))
 }
 
-async fn run_wireguard(identity: account::Identity, listen: SocketAddr, http_listen: SocketAddr) -> Result<()> {
+async fn run_wireguard(
+    identity: account::Identity,
+    listen: SocketAddr,
+    http_listen: SocketAddr,
+) -> Result<()> {
     let candidates = wg_profile_candidates();
     let _multi = candidates.len() > 1;
 
@@ -480,7 +545,11 @@ async fn run_wireguard(identity: account::Identity, listen: SocketAddr, http_lis
             .await
             {
                 Ok(rtt) => {
-                    log::info!("[+] profile '{}' passed handshake + data-plane (rtt {:?})", name, rtt);
+                    log::info!(
+                        "[+] profile '{}' passed handshake + data-plane (rtt {:?})",
+                        name,
+                        rtt
+                    );
                     chosen = Some((peer, profile.clone()));
                     break;
                 }
@@ -495,8 +564,7 @@ async fn run_wireguard(identity: account::Identity, listen: SocketAddr, http_lis
         let ip = select_ip_version().await;
         let mode = scan::ScanMode::parse(&mode_str);
         // Cap all profile retries under one wall clock so turbo never hangs the process.
-        let hunt_budget = mode.wg_strategy().overall_deadline
-            * candidates.len().max(1) as u32
+        let hunt_budget = mode.wg_strategy().overall_deadline * candidates.len().max(1) as u32
             + std::time::Duration::from_secs(8);
         log::info!(
             "[*] wireguard hunt wall-clock budget {:?} (mode={} profiles={})",
@@ -516,8 +584,13 @@ async fn run_wireguard(identity: account::Identity, listen: SocketAddr, http_lis
                 log::info!(
                     "[*] hunting for a working WireGuard endpoint (handshake + data-plane verification, aethernoize='{name}')"
                 );
-                match hunt_wg_peer_with_profile(&id_for_hunt, &mode_str_for_hunt, ip, profile.clone())
-                    .await
+                match hunt_wg_peer_with_profile(
+                    &id_for_hunt,
+                    &mode_str_for_hunt,
+                    ip,
+                    profile.clone(),
+                )
+                .await
                 {
                     Ok(peer) => {
                         log::info!(
@@ -611,7 +684,9 @@ async fn run_wireguard_tunnel(
             session_event::emit(SessionEvent::Error {
                 message: format!("WireGuard handshake failed: {e}"),
             });
-            return Err(AetherError::Other(format!("WireGuard handshake failed: {e}")));
+            return Err(AetherError::Other(format!(
+                "WireGuard handshake failed: {e}"
+            )));
         }
     }
 
@@ -630,12 +705,14 @@ async fn run_wireguard_tunnel(
     // spawn already used tunnel_mtu(); ensure env was set by resolve_mtu.
     let _ = mtu;
 
+    let socks_listener = socks::bind(listen).await?;
+    let http_listener = http_proxy::bind(http_listen).await?;
     let socks_stack = stack.clone();
     let socks_task = tokio::spawn(async move {
         log::info!("[+] socks5 server listening on {listen}");
-        socks::serve(listen, socks_stack).await
+        socks::serve_listener(socks_listener, socks_stack).await
     });
-    let http_task = tokio::spawn(http_proxy::serve(http_listen, stack.clone()));
+    let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack.clone()));
     session_event::emit(SessionEvent::ProxyReady {
         socks: listen.to_string(),
         http: http_listen.to_string(),
@@ -790,8 +867,13 @@ async fn run_warp_in_warp(
     log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
     let inner_stack = establish_wg(&secondary, forwarder, inner_mtu(), false, 20, "inner").await?;
 
+    let socks_listener = socks::bind(listen).await?;
+    let http_listener = http_proxy::bind(http_listen).await?;
     log::info!("[+] socks5 server listening on {listen}");
-    let http_task = tokio::spawn(http_proxy::serve(http_listen, inner_stack.clone()));
+    let http_task = tokio::spawn(http_proxy::serve_listener(
+        http_listener,
+        inner_stack.clone(),
+    ));
     session_event::emit(SessionEvent::ProxyReady {
         socks: listen.to_string(),
         http: http_listen.to_string(),
@@ -802,7 +884,7 @@ async fn run_warp_in_warp(
     session_event::emit(SessionEvent::Connected {
         detail: "warp-in-warp ready".into(),
     });
-    let result = socks::serve(listen, inner_stack).await;
+    let result = socks::serve_listener(socks_listener, inner_stack).await;
     http_task.abort();
     result
 }
