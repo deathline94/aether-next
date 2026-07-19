@@ -206,7 +206,7 @@ async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
 
     let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
     for qtype in dns_prefer_order() {
-        let query = build_dns_query(name, qtype);
+        let (qid, query) = build_dns_query(name, qtype);
         if let Err(e) = sender.send_to(server, query).await {
             last_err = e;
             continue;
@@ -222,7 +222,7 @@ async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
                 continue;
             }
         };
-        if let Some(ip) = parse_dns_answer(&resp.1, qtype) {
+        if let Some(ip) = parse_dns_answer_id(&resp.1, qtype, Some(qid)) {
             if let Ok(mut guard) = dns_cache().lock() {
                 guard.map.insert(key, (ip, Instant::now()));
                 if guard.map.len() > 2048 {
@@ -243,7 +243,7 @@ pub async fn resolve_host(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     }
 }
 
-fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
+fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     let mut q = Vec::with_capacity(32 + name.len());
     let id: u16 = rand::random();
     q.extend_from_slice(&id.to_be_bytes());
@@ -251,17 +251,34 @@ fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
     q.extend_from_slice(&[0x00, 0x01]);
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            continue;
+        }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
     }
     q.push(0x00);
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]);
-    q
+    (id, q)
 }
 
 fn parse_dns_answer(resp: &[u8], want_type: u16) -> Option<IpAddr> {
+    parse_dns_answer_id(resp, want_type, None)
+}
+
+fn parse_dns_answer_id(resp: &[u8], want_type: u16, expect_id: Option<u16>) -> Option<IpAddr> {
     if resp.len() < 12 {
+        return None;
+    }
+    if let Some(id) = expect_id {
+        let got = u16::from_be_bytes([resp[0], resp[1]]);
+        if got != id {
+            return None;
+        }
+    }
+    // Truncated (TC bit) — refuse; caller may retry or fail.
+    if resp[2] & 0x02 != 0 {
         return None;
     }
     let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
@@ -403,6 +420,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
 
+    // First UDP packet pins the authorized client; later packets from others are dropped.
     let mut client: Option<SocketAddr> = None;
     let mut cbuf = vec![0u8; 65535];
     let mut ctrl = [0u8; 256];
@@ -411,7 +429,15 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
         tokio::select! {
             r = relay.recv_from(&mut cbuf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => break };
-                client = Some(from);
+                match client {
+                    None => client = Some(from),
+                    Some(allowed) if allowed.ip() == from.ip() && allowed.port() == from.port() => {}
+                    Some(allowed) if allowed.ip() == from.ip() => {
+                        // Same host, new ephemeral port (common for multi-socket clients).
+                        client = Some(from);
+                    }
+                    Some(_) => continue, // reject hijack from different local process IP
+                }
                 if let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) {
                     let dst = match dst {
                         Target::Ip(ip) => SocketAddr::new(ip, payload.0),

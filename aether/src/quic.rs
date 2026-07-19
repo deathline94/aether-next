@@ -138,8 +138,21 @@ pub async fn run(
     cfg: TunnelConfig,
     mut internals: Internals,
     addr_tx: Option<mpsc::Sender<AssignedAddr>>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
     let peer = cfg.peer;
+    let mut ready_tx = Some(ready_tx);
+    let mut h3_ready = false;
+    let mut dataplane_ok = false;
+    let mut probe_deadline: Option<Instant> = None;
+    let mut last_probe = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    // Prefer assigned edge address when known; else identity-style fallback.
+    let probe_src = std::env::var("AETHER_PROBE_SRC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
 
     let init_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
     let local = init_sock.local_addr()?;
@@ -276,10 +289,60 @@ pub async fn run(
         }
 
         if let (Some(h3c), Some(sid)) = (h3_conn.as_mut(), req_stream) {
-            poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx)?;
+            poll_h3(
+                &mut conn,
+                h3c,
+                sid,
+                &mut capsules,
+                &addr_tx,
+                &mut h3_ready,
+            )?;
         }
 
-        drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf).await;
+        // After CONNECT-IP 200, prove data-plane with a DNS probe before ready signal.
+        if h3_ready && !dataplane_ok {
+            if probe_deadline.is_none() {
+                probe_deadline = Some(Instant::now() + Duration::from_secs(8));
+            }
+            if last_probe.elapsed() >= Duration::from_millis(700) {
+                if let Some(sid) = req_stream {
+                    let probe = build_h3_dns_probe(probe_src);
+                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe) {
+                        let _ = conn.dgram_send(&framed);
+                    }
+                }
+                last_probe = Instant::now();
+            }
+            if let Some(deadline) = probe_deadline {
+                if Instant::now() >= deadline {
+                    return Err(AetherError::Other(
+                        "h3 data-plane verify timeout (CONNECT ok, no traffic)".into(),
+                    ));
+                }
+            }
+        }
+
+        // Any inbound datagram after CONNECT-IP 200 counts as data-plane proof.
+        if h3_ready && !dataplane_ok {
+            // drain_datagrams below will deliver; also check capsule parser side effects via inbound
+        }
+
+        drain_datagrams(
+            &mut conn,
+            req_stream,
+            &internals.inbound_tx,
+            &mut out_buf,
+            h3_ready && !dataplane_ok,
+            &mut dataplane_ok,
+        )
+        .await;
+
+        if h3_ready && dataplane_ok {
+            if let Some(tx) = ready_tx.take() {
+                log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h3\"}}");
+                let _ = tx.send(());
+            }
+        }
 
         flush(&mut conn, &sockets).await?;
 
@@ -337,25 +400,26 @@ async fn sleep_opt(timeout: Option<Duration>) {
     }
 }
 
+/// Returns true when CONNECT-IP response status is 200.
 fn poll_h3(
     conn: &mut quiche::Connection,
     h3c: &mut h3::Connection,
     req_stream: u64,
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
+    h3_ready: &mut bool,
 ) -> Result<()> {
     let mut body = vec![0u8; 65535];
 
     loop {
         match h3c.poll(conn) {
-                    Ok((_stream_id, h3::Event::Headers { list, .. })) => {
+            Ok((_stream_id, h3::Event::Headers { list, .. })) => {
                 for h in &list {
                     if h.name() == b":status" {
                         let status = String::from_utf8_lossy(h.value());
                         log::info!("connect-ip status: {status}");
                         if h.value() == b"200" {
-                            log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h3\"}}");
-                            log::info!("AETHER_EVENT {{\"type\":\"connected\",\"detail\":\"masque h3 ready\"}}");
+                            *h3_ready = true;
                         }
                     }
                 }
@@ -384,6 +448,50 @@ fn poll_h3(
     }
 
     Ok(())
+}
+
+fn build_h3_dns_probe(src: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut dns = Vec::with_capacity(64);
+    let id: u16 = rand::random();
+    dns.extend_from_slice(&id.to_be_bytes());
+    dns.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for label in ["cloudflare", "com"] {
+        dns.push(label.len() as u8);
+        dns.extend_from_slice(label.as_bytes());
+    }
+    dns.push(0);
+    dns.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    let udp_len = 8 + dns.len();
+    let total = 20 + udp_len;
+    let mut pkt = Vec::with_capacity(total);
+    pkt.push(0x45);
+    pkt.push(0x00);
+    pkt.extend_from_slice(&(total as u16).to_be_bytes());
+    pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00, 64, 17, 0x00, 0x00]);
+    pkt.extend_from_slice(&src.octets());
+    pkt.extend_from_slice(&[1, 1, 1, 1]);
+    // checksum zeroed then filled
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < 20 {
+        if i != 10 {
+            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+        }
+        i += 2;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let csum = !(sum as u16);
+    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    let sport: u16 = 40000 + (rand::random::<u16>() % 20000);
+    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&53u16.to_be_bytes());
+    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00]);
+    pkt.extend_from_slice(&dns);
+    pkt
 }
 
 fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>) {
@@ -434,6 +542,8 @@ async fn drain_datagrams(
     req_stream: Option<u64>,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     buf: &mut [u8],
+    watch_dataplane: bool,
+    dataplane_ok: &mut bool,
 ) {
     let sid = match req_stream {
         Some(s) => s,
@@ -444,6 +554,9 @@ async fn drain_datagrams(
         match conn.dgram_recv(buf) {
             Ok(n) => match masque::decode_ip_datagram(&buf[..n], sid) {
                 Ok(Some(ip_packet)) => {
+                    if watch_dataplane && ip_packet.len() >= 20 {
+                        *dataplane_ok = true;
+                    }
                     // Prefer try_send so QUIC recv keeps moving; await only under backpressure.
                     match inbound_tx.try_send(ip_packet) {
                         Ok(()) => {}
@@ -500,6 +613,7 @@ async fn do_migrate(
         return Err(AetherError::Other("no spare dcids for migration".into()));
     }
 
+    let old_locals: Vec<SocketAddr> = sockets.keys().copied().collect();
     let new_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
     let new_local = new_sock.local_addr()?;
     let new_sock = Arc::new(new_sock);
@@ -510,6 +624,12 @@ async fn do_migrate(
     conn.probe_path(new_local, peer)?;
     let seq = conn.migrate_source(new_local)?;
     log::info!("migrated to local {new_local} (path seq {seq})");
+    // Drop old sockets so their readers exit on next recv error (no unbounded leak).
+    for old in old_locals {
+        if old != new_local {
+            sockets.remove(&old);
+        }
+    }
 
     Ok(())
 }

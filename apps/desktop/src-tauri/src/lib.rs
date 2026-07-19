@@ -116,11 +116,26 @@ fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn load_settings_file(app: &AppHandle) -> Settings {
-    settings_path(app)
-        .ok()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    let Ok(path) = settings_path(app) else {
+        return Settings::default();
+    };
+    if !path.exists() {
+        return Settings::default();
+    }
+    match fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<Settings>(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                // Corrupt settings: keep file, use defaults, surface in log via stderr.
+                eprintln!("settings.json invalid ({e}); using defaults");
+                Settings::default()
+            }
+        },
+        Err(e) => {
+            eprintln!("settings.json unreadable ({e}); using defaults");
+            Settings::default()
+        }
+    }
 }
 
 fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), String> {
@@ -176,13 +191,49 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
         ("HTTP", settings.http_port),
         ("SOCKS5", settings.socks_port),
     ] {
-        if port < 1024 {
+        if !(1024..=65535).contains(&port) {
             return Err(format!("{name} port must be 1024–65535 (got {port})"));
         }
     }
     if settings.http_port == settings.socks_port {
         return Err("HTTP and SOCKS5 ports must differ".into());
     }
+    let allow = |field: &str, val: &str, opts: &[&str]| {
+        if opts.iter().any(|o| o.eq_ignore_ascii_case(val.trim())) {
+            Ok(())
+        } else {
+            Err(format!("{field} must be one of: {}", opts.join(", ")))
+        }
+    };
+    allow(
+        "protocol",
+        &settings.protocol,
+        &["masque", "wireguard", "warp", "gool"],
+    )?;
+    allow("transport", &settings.transport, &["h3", "h2", "auto"])?;
+    allow(
+        "scan_mode",
+        &settings.scan_mode,
+        &["fast", "balanced", "deep", "turbo", "auto"],
+    )?;
+    allow(
+        "ip_version",
+        &settings.ip_version,
+        &["auto", "4", "6", "v4", "v6", "ipv4", "ipv6", "dual"],
+    )?;
+    allow(
+        "noize",
+        &settings.noize,
+        &[
+            "off", "none", "default", "firewall", "gfw", "light", "balanced", "aggressive",
+            "heavy",
+        ],
+    )?;
+    allow(
+        "routing_mode",
+        &settings.routing_mode,
+        &["proxy-only", "system-proxy", "tun"],
+    )?;
     Ok(())
 }
 
@@ -228,14 +279,14 @@ fn handle_engine_line(
         }
     }
 
-    // Legacy log markers (engine without events / partial paths)
+    // Legacy log markers — only strong readiness signals (not CONNECT/handshake alone).
     if line.contains("socks5 server listening") || line.contains("http proxy listening") {
         socks_seen.store(true, Ordering::SeqCst);
     }
-    if line.contains("connect-ip status: 200")
+    // Do NOT treat connect-ip 200 / quic handshake as tunnel ready (control plane only).
+    if line.contains("[tun] bridge active")
+        || line.contains("data-plane verified")
         || line.contains("handshake successful")
-        || line.contains("[tun] bridge active")
-        || line.contains("quic handshake established")
     {
         tunnel_seen.store(true, Ordering::SeqCst);
     }
@@ -248,11 +299,8 @@ fn handle_engine_line(
         let _ = app.emit("session://state", snap);
     }
 
-    let ready = if settings.protocol == "masque" {
-        socks_seen.load(Ordering::SeqCst) && tunnel_seen.load(Ordering::SeqCst)
-    } else {
-        socks_seen.load(Ordering::SeqCst) || tunnel_seen.load(Ordering::SeqCst)
-    };
+    // All protocols: require both proxy + tunnel signals (prevents system-proxy leak).
+    let ready = socks_seen.load(Ordering::SeqCst) && tunnel_seen.load(Ordering::SeqCst);
     if ready {
         let state = app.state::<AppState>();
         mark_connected(app, &state, settings);
@@ -290,12 +338,24 @@ fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
     if !meta.is_file() {
         return Err(format!("{label} is not a regular file"));
     }
+    if meta.len() == 0 {
+        return Err(format!("{label} is empty"));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(format!("{label} must not be a reparse point/symlink"));
+        }
+        // PE header check (MZ) — fail closed if unreadable or not PE.
+        let mut hdr = [0u8; 2];
+        let mut f = fs::File::open(path).map_err(|e| format!("{label}: cannot open: {e}"))?;
+        use std::io::Read;
+        f.read_exact(&mut hdr)
+            .map_err(|e| format!("{label}: cannot read PE header: {e}"))?;
+        if hdr != *b"MZ" {
+            return Err(format!("{label} is not a Windows PE binary"));
         }
     }
     let app_root = std::env::current_exe()
@@ -321,20 +381,64 @@ fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
     ))
 }
 
+/// Only allow safe host tokens into Windows ProxyOverride (no `;` injection).
+fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
+    let host = endpoint
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(endpoint)
+        .trim_matches(['[', ']', ' ', '\t']);
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    // IPv4 / hostname / simple IPv6 without zone or separators that break registry lists.
+    let ok = host.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_')
+    }) && !host.contains(';')
+        && !host.contains('<')
+        && !host.contains('>');
+    ok.then(|| host.to_string())
+}
+
+fn file_sha256_hex(path: &PathBuf) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let out = Command::new("certutil")
+            .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let t = line.trim().replace(' ', "").to_ascii_lowercase();
+            if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(t);
+            }
+        }
+        Err("could not parse certutil SHA256 output".into())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("hash check unsupported on this platform".into())
+    }
+}
+
 fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> {
-    // TUN elevates process: reject user/custom overrides that can be planted.
-    // Still allow installer resource + portable app-dir layout.
+    // TUN: never honor custom overrides (elevated risk).
+    // Non-TUN: custom paths allowed only after full trust checks.
     if settings.routing_mode != "tun" && !settings.engine_path.trim().is_empty() {
         let path = PathBuf::from(settings.engine_path.trim());
-        return path
-            .exists()
-            .then_some(path)
-            .ok_or("Configured aether.exe was not found".into());
+        if !path.exists() {
+            return Err("Configured aether.exe was not found".into());
+        }
+        validate_trusted_binary(&path, "aether.exe")?;
+        return Ok(path);
     }
     if settings.routing_mode != "tun" {
         if let Ok(path) = std::env::var("AETHER_ENGINE") {
             let path = PathBuf::from(path);
             if path.exists() {
+                validate_trusted_binary(&path, "aether.exe")?;
                 return Ok(path);
             }
         }
@@ -566,16 +670,19 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         if settings.routing_mode == "tun" {
             #[cfg(windows)]
             {
-                // Keep GUI unelevated. TUN requires an already-elevated process
-                // (right-click Run as administrator). Whole-GUI UAC relaunch removed.
+                // Prefer Admin session for TUN (Wintun + routes). No whole-GUI auto-relaunch.
+                // Run Aether as Administrator once, or accept UAC when engine elevates via helper later.
                 if !elevation::is_elevated() {
                     return Err(
-                        "Full-device TUN needs Administrator. Close Aether, right-click the app, Run as administrator, then Connect."
+                        "Full-device TUN needs Administrator. Right-click Aether → Run as administrator, then Connect."
                             .into(),
                     );
                 }
                 if wintun_path(&app).is_none() {
-                    return Err("wintun.dll not found. Reinstall Aether or place wintun.dll next to the app.".into());
+                    return Err(
+                        "wintun.dll not found. Reinstall Aether or place wintun.dll next to the app."
+                            .into(),
+                    );
                 }
             }
             #[cfg(not(windows))]
@@ -591,6 +698,18 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             validate_trusted_binary(&executable, "aether.exe")?;
             if let Some(wintun) = wintun_path(&app) {
                 validate_trusted_binary(&wintun, "wintun.dll")?;
+                // Optional pin: set AETHER_WINTUN_SHA256 to require exact file hash.
+                if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
+                    let expected = expected.trim().to_ascii_lowercase();
+                    if !expected.is_empty() {
+                        let actual = file_sha256_hex(&wintun)?;
+                        if actual != expected {
+                            return Err(format!(
+                                "wintun.dll hash mismatch (got {actual}, want {expected})"
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -876,10 +995,9 @@ mod windows_proxy {
             .map_err(|e| e.to_string())?;
             let mut bypass = String::from("localhost;127.*;<local>");
             if let Some(ep) = endpoint {
-                let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
-                if !host.is_empty() {
+                if let Some(host) = super::sanitize_proxy_bypass_host(ep) {
                     bypass.push(';');
-                    bypass.push_str(host.trim_matches(['[', ']']));
+                    bypass.push_str(&host);
                 }
             }
             key.set_value("ProxyOverride", &bypass)
@@ -994,20 +1112,29 @@ pub fn run() {
                         }
                     }
                     "connect" => {
-                        let settings = load_settings_file(app);
-                        let state = app.state::<AppState>();
-                        if let Err(e) = connect(app.clone(), state, settings) {
-                            emit_log(app, format!("tray connect: {e}"));
-                        }
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let settings = load_settings_file(&app);
+                            let state = app.state::<AppState>();
+                            if let Err(e) = connect(app.clone(), state, settings) {
+                                emit_log(&app, format!("tray connect: {e}"));
+                            }
+                        });
                     }
                     "disconnect" => {
-                        let state = app.state::<AppState>();
-                        let _ = disconnect(app.clone(), state);
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let state = app.state::<AppState>();
+                            let _ = disconnect(app.clone(), state);
+                        });
                     }
                     "quit" => {
-                        let state = app.state::<AppState>();
-                        let _ = disconnect(app.clone(), state);
-                        app.exit(0);
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let state = app.state::<AppState>();
+                            let _ = disconnect(app.clone(), state);
+                            app.exit(0);
+                        });
                     }
                     _ => {}
                 })

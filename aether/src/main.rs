@@ -90,9 +90,7 @@ async fn run_session(cfg: EngineConfig) -> Result<()> {
     let http_listen = cfg.http;
     let base_config = cfg.config_path.clone();
 
-    let protocol = if cfg.has_forced_peer() {
-        Protocol::parse(&cfg.protocol)
-    } else if std::env::var("AETHER_PROTOCOL").is_ok() {
+    let protocol = if cfg.has_forced_peer() || std::env::var("AETHER_PROTOCOL").is_ok() {
         Protocol::parse(&cfg.protocol)
     } else {
         select_protocol().await
@@ -197,10 +195,7 @@ fn masque_config_path(base: &str) -> String {
 }
 
 fn derive_sibling_path(base: &str, suffix: &str) -> String {
-    let dir_end = base
-        .rfind(|c| c == '/' || c == '\\')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let dir_end = base.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
     match base[dir_end..].rfind('.') {
         Some(rel) => {
             let dot = dir_end + rel;
@@ -314,7 +309,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
             let probe = wg_prober::WgProbe {
                 private_key: std::sync::Arc::new(private_key),
                 peer_public_key: std::sync::Arc::new(peer_public),
-                client_id: identity.client_id.clone(),
+                client_id: identity.client_id,
                 local_ipv4: identity
                     .ipv4
                     .parse()
@@ -419,6 +414,8 @@ async fn run_masque_tunnel(
         }
     });
 
+    // Bind early so port conflicts fail fast, but do not advertise ProxyReady until
+    // the tunnel data-plane is proven (H2/H3).
     let socks_listener = socks::bind(listen).await?;
     let http_listener = http_proxy::bind(http_listen).await?;
     let socks_stack = stack.clone();
@@ -427,12 +424,15 @@ async fn run_masque_tunnel(
         socks::serve_listener(socks_listener, socks_stack).await
     });
     let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack.clone()));
-    session_event::emit(SessionEvent::ProxyReady {
-        socks: listen.to_string(),
-        http: http_listen.to_string(),
-    });
 
-    let tunnel_result = if masque_h2::enabled() {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let probe_src: Option<std::net::Ipv4Addr> = identity.ipv4.parse().ok();
+    if let Some(src) = probe_src {
+        // H3 path reads this for data-plane probe source (matches H2 identity IPv4).
+        std::env::set_var("AETHER_PROBE_SRC", src.to_string());
+    }
+
+    let tunnel_handle = if masque_h2::enabled() {
         let h2cfg = masque_h2::H2TunnelConfig {
             peer: masque_h2::h2_peer(peer),
             sni: consts::CONNECT_SNI.to_string(),
@@ -440,14 +440,47 @@ async fn run_masque_tunnel(
             path: quic::default_path().to_string(),
             cert_pem: identity.cert_pem.clone(),
             key_pem: identity.key_pem.clone(),
+            probe_src,
         };
         log::info!("[+] MASQUE transport: HTTP/2 (TCP) to {}", h2cfg.peer);
         let _ = &cfg;
-        masque_h2::run(h2cfg, internals, Some(addr_tx)).await
+        tokio::spawn(async move { masque_h2::run(h2cfg, internals, Some(addr_tx), ready_tx).await })
     } else {
         log::info!("[+] MASQUE transport: HTTP/3 (QUIC) to {}", peer);
-        quic::run(cfg, internals, Some(addr_tx)).await
+        tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
     };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(45), ready_rx).await {
+        Ok(Ok(())) => {
+            session_event::emit(SessionEvent::ProxyReady {
+                socks: listen.to_string(),
+                http: http_listen.to_string(),
+            });
+            session_event::emit(SessionEvent::Connected {
+                detail: "masque ready".into(),
+            });
+        }
+        Ok(Err(_)) => {
+            tunnel_handle.abort();
+            socks_task.abort();
+            http_task.abort();
+            return Err(AetherError::Other(
+                "tunnel closed before data-plane ready".into(),
+            ));
+        }
+        Err(_) => {
+            tunnel_handle.abort();
+            socks_task.abort();
+            http_task.abort();
+            return Err(AetherError::Other(
+                "timeout waiting for MASQUE data-plane".into(),
+            ));
+        }
+    }
+
+    let tunnel_result = tunnel_handle
+        .await
+        .map_err(|e| AetherError::Other(format!("tunnel task: {e}")))?;
     socks_task.abort();
     http_task.abort();
 
@@ -821,15 +854,10 @@ async fn spawn_udp_forwarder(
     let up_peer = inner_peer.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
-        loop {
-            match up_sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
-                    *up_peer.lock().await = Some(from);
-                    if udp_tx.send_to(remote, buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((n, from)) = up_sock.recv_from(&mut buf).await {
+            *up_peer.lock().await = Some(from);
+            if udp_tx.send_to(remote, buf[..n].to_vec()).await.is_err() {
+                break;
             }
         }
     });

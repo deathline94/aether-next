@@ -344,6 +344,7 @@ async fn verify_one(
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
+            probe_src: None,
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
             Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
@@ -419,10 +420,10 @@ async fn resolve_discovery_seeds(ip: IpScan) -> Vec<IpAddr> {
                         log::debug!("discovery skip non-masque {addr} from {host}");
                         continue;
                     }
-                    if (addr.is_ipv4() && ip.want_v4()) || (addr.is_ipv6() && ip.want_v6()) {
-                        if seen.insert(addr) {
-                            out.push(addr);
-                        }
+                    if ((addr.is_ipv4() && ip.want_v4()) || (addr.is_ipv6() && ip.want_v6()))
+                        && seen.insert(addr)
+                    {
+                        out.push(addr);
                     }
                 }
             }

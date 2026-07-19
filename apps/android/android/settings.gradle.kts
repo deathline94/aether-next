@@ -3,6 +3,8 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
+        // Some networks / caches flake on google() — direct path as fallback.
+        maven(url = "https://maven.google.com/")
     }
 }
 dependencyResolutionManagement {
@@ -10,6 +12,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven(url = "https://maven.google.com/")
     }
 }
 rootProject.name = "AetherNext"

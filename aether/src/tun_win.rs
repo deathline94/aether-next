@@ -199,6 +199,15 @@ fn route_state_path() -> Option<PathBuf> {
     Some(dir.join("AetherNext").join("tun-routes.json"))
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RouteState {
+    peer: String,
+    ipv4: String,
+    gateway: String,
+    /// Process id that installed routes (stale if dead).
+    pid: u32,
+}
+
 fn persist_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
     let Some(path) = route_state_path() else {
         return;
@@ -206,15 +215,17 @@ fn persist_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body = format!(
-        "{{\"peer\":\"{}\",\"ipv4\":\"{}\",\"gateway\":\"{}\"}}\n",
-        peer.ip(),
-        ipv4,
-        gateway
-    );
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(tmp, path);
+    let state = RouteState {
+        peer: peer.ip().to_string(),
+        ipv4: ipv4.to_string(),
+        gateway: gateway.to_string(),
+        pid: std::process::id(),
+    };
+    if let Ok(body) = serde_json::to_vec_pretty(&state) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
     }
 }
 
@@ -229,33 +240,50 @@ pub fn recover_stale_routes() {
     let Some(path) = route_state_path() else {
         return;
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    let peer = text
-        .split("\"peer\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .and_then(|s| s.parse::<IpAddr>().ok());
-    let ipv4 = text
-        .split("\"ipv4\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .and_then(|s| s.parse::<Ipv4Addr>().ok());
-    let gateway = text
-        .split("\"gateway\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .and_then(|s| s.parse::<Ipv4Addr>().ok());
-    if let (Some(IpAddr::V4(peer_ip)), Some(ipv4), Some(gateway)) = (peer, ipv4, gateway) {
+    let Ok(state) = serde_json::from_slice::<RouteState>(&bytes) else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    // If installer process still lives, leave routes alone (another instance).
+    if state.pid != 0 && process_alive(state.pid) {
+        return;
+    }
+    let peer_ip = state.peer.parse::<IpAddr>().ok();
+    let ipv4 = state.ipv4.parse::<Ipv4Addr>().ok();
+    let gateway = state.gateway.parse::<Ipv4Addr>().ok();
+    if let (Some(IpAddr::V4(peer_ip)), Some(ipv4), Some(gateway)) = (peer_ip, ipv4, gateway) {
         log::warn!("[tun] recovering stale routes from previous session");
-        remove_routes(
-            SocketAddr::new(IpAddr::V4(peer_ip), 0),
-            ipv4,
-            gateway,
-        );
+        remove_routes(SocketAddr::new(IpAddr::V4(peer_ip), 0), ipv4, gateway);
     }
     let _ = std::fs::remove_file(path);
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // tasklist is slow; use OpenProcess via wmic-less approach: try kill with signal 0 equivalent.
+        // On Windows, OpenProcess + GetExitCodeProcess would need FFI; use `tasklist /FI PID eq`.
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .creation_flags(0x08000000)
+            .output();
+        match out {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.contains(&pid.to_string())
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 pub struct TunHandle {
@@ -327,15 +355,12 @@ pub async fn spawn(
     let out_tx = outbound_tx;
     std::thread::Builder::new()
         .name("aether-tun-rx".into())
-        .spawn(move || loop {
-            match session_r.receive_blocking() {
-                Ok(pkt) => {
-                    let data = pkt.bytes().to_vec();
-                    if out_tx.blocking_send(data).is_err() {
-                        break;
-                    }
+        .spawn(move || {
+            while let Ok(pkt) = session_r.receive_blocking() {
+                let data = pkt.bytes().to_vec();
+                if out_tx.blocking_send(data).is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
         })
         .map_err(|e| AetherError::Other(format!("tun rx thread: {e}")))?;

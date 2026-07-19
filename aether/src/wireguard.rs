@@ -59,15 +59,10 @@ fn strip_client_id(pkt: &mut [u8]) {
 /// until Done after every WriteToNetwork — otherwise handshake/data stalls.
 fn drain_to_network(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> Vec<Vec<u8>> {
     let mut wire = Vec::new();
-    loop {
-        match tunn.decapsulate(None, &[], out_buf) {
-            TunnResult::WriteToNetwork(pkt) => {
-                let mut pkt_vec = pkt.to_vec();
-                inject_client_id(&mut pkt_vec, client_id);
-                wire.push(pkt_vec);
-            }
-            _ => break,
-        }
+    while let TunnResult::WriteToNetwork(pkt) = tunn.decapsulate(None, &[], out_buf) {
+        let mut pkt_vec = pkt.to_vec();
+        inject_client_id(&mut pkt_vec, client_id);
+        wire.push(pkt_vec);
     }
     wire
 }
@@ -85,15 +80,10 @@ fn encapsulate_all(
             inject_client_id(&mut pkt_vec, client_id);
             wire.push(pkt_vec);
             // Flush any follow-up (handshake continuation, etc.)
-            loop {
-                match tunn.encapsulate(&[], out_buf) {
-                    TunnResult::WriteToNetwork(pkt) => {
-                        let mut pkt_vec = pkt.to_vec();
-                        inject_client_id(&mut pkt_vec, client_id);
-                        wire.push(pkt_vec);
-                    }
-                    _ => break,
-                }
+            while let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], out_buf) {
+                let mut pkt_vec = pkt.to_vec();
+                inject_client_id(&mut pkt_vec, client_id);
+                wire.push(pkt_vec);
             }
         }
         TunnResult::Done => {}
@@ -300,7 +290,7 @@ impl WgTunnel {
         let established = self.established.clone();
         let established_notify = self.established_notify.clone();
 
-        let recv_task = tokio::spawn(async move {
+        let mut recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
             let mut tmp = vec![0u8; MAX_PACKET];
             loop {
@@ -363,7 +353,7 @@ impl WgTunnel {
 
         let post_hs_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let post_hs_flag = post_hs_done.clone();
-        let send_task = tokio::spawn(async move {
+        let mut send_task = tokio::spawn(async move {
             let mut out_buf = vec![0u8; MAX_PACKET];
             while let Some(first) = outbound_rx.recv().await {
                 let mut batch = Vec::with_capacity(32);
@@ -414,33 +404,36 @@ impl WgTunnel {
             }
         });
 
-        let timer_task = tokio::spawn(async move {
+        let mut timer_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TIMER_TICK);
             loop {
                 interval.tick().await;
                 let mut tunn = tunn_t.lock().await;
                 let mut tmp = vec![0u8; MAX_PACKET];
-                match tunn.update_timers(&mut tmp) {
-                    TunnResult::WriteToNetwork(pkt) => {
-                        let mut pkt_vec = pkt.to_vec();
-                        inject_client_id(&mut pkt_vec, &client_id);
-                        let more = drain_to_network(&mut tunn, &mut tmp, &client_id);
-                        drop(tunn);
-                        let _ = sock_t.send(&pkt_vec).await;
-                        for pkt in more {
-                            let _ = sock_t.send(&pkt).await;
-                        }
+                if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
+                    let mut pkt_vec = pkt.to_vec();
+                    inject_client_id(&mut pkt_vec, &client_id);
+                    let more = drain_to_network(&mut tunn, &mut tmp, &client_id);
+                    drop(tunn);
+                    let _ = sock_t.send(&pkt_vec).await;
+                    for pkt in more {
+                        let _ = sock_t.send(&pkt).await;
                     }
-                    _ => {}
                 }
             }
         });
 
         tokio::select! {
-            _ = recv_task => log::info!("wireguard recv task ended"),
-            _ = send_task => log::info!("wireguard send task ended"),
-            _ = timer_task => log::info!("wireguard timer task ended"),
+            _ = &mut recv_task => log::info!("wireguard recv task ended"),
+            _ = &mut send_task => log::info!("wireguard send task ended"),
+            _ = &mut timer_task => log::info!("wireguard timer task ended"),
         }
+        recv_task.abort();
+        send_task.abort();
+        timer_task.abort();
+        let _ = recv_task.await;
+        let _ = send_task.await;
+        let _ = timer_task.await;
 
         Ok(())
     }

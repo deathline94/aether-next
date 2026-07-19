@@ -85,14 +85,8 @@ class EngineRunner(
                 pb.start()
             } catch (e: Exception) {
                 Log.e(TAG, "ProcessBuilder failed for ${binary.absolutePath}: ${e.message}", e)
-                // Last resort: try sh -c with explicit path
-                ProcessBuilder("sh", "-c", binary.absolutePath)
-                    .directory(context.filesDir)
-                    .redirectErrorStream(true)
-                    .also { b ->
-                        b.environment().putAll(pb.environment())
-                    }
-                    .start()
+                // No sh -c fallback: data dirs are noexec on modern Android and hide real errors.
+                throw e
             }
 
             processRef.set(proc)
@@ -146,9 +140,9 @@ class EngineRunner(
     }
 
     private fun resolveEngine(configured: String): File? {
+        // Never run arbitrary user paths (bridge can set enginePath). Only APK natives / staged assets.
         if (configured.isNotBlank()) {
-            val f = File(configured)
-            if (f.exists()) return f
+            Log.w(TAG, "ignoring custom enginePath for security: $configured")
         }
 
         // 1) APK native lib dir — only place Android allows executing our payload on API 29+.

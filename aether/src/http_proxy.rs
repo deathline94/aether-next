@@ -98,7 +98,9 @@ async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut header = Vec::with_capacity(2048);
     let mut buf = [0u8; 2048];
     loop {
-        let count = stream.read(&mut buf).await?;
+        let count = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut buf))
+            .await
+            .map_err(|_| AetherError::Other("HTTP header read timeout".into()))??;
         if count == 0 {
             return Err(AetherError::Other(
                 "client closed before HTTP header".into(),
@@ -115,8 +117,25 @@ async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
 }
 
 fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
+    let value = value.trim();
+    // Strip userinfo if present: user:pass@host:port
+    let value = value.rsplit_once('@').map(|(_, h)| h).unwrap_or(value);
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok((addr.ip().to_string(), addr.port()));
+    }
+    if value.starts_with('[') {
+        if let Some(end) = value.find(']') {
+            let host = &value[1..end];
+            let rest = &value[end + 1..];
+            if let Some(port) = rest.strip_prefix(':') {
+                return Ok((
+                    host.to_string(),
+                    port.parse()
+                        .map_err(|_| AetherError::Other("invalid proxy port".into()))?,
+                ));
+            }
+            return Ok((host.to_string(), default_port));
+        }
     }
     if let Some((host, port)) = value.rsplit_once(':') {
         if !host.contains(':') {
@@ -127,11 +146,10 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
             ));
         }
     }
-    let host = value.trim_matches(['[', ']']);
-    if host.is_empty() {
+    if value.is_empty() {
         return Err(AetherError::Other("proxy target missing".into()));
     }
-    Ok((host.to_string(), default_port))
+    Ok((value.to_string(), default_port))
 }
 
 fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {

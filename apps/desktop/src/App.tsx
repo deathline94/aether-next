@@ -24,7 +24,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 
 type View = "home" | "settings" | "logs";
@@ -219,15 +219,15 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.4");
+  const [appVersion, setAppVersion] = useState("1.0.5");
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running;
 
-  const appendLog = useEffectEvent((entry: Omit<LogEntry, "time">) => {
+  const appendLog = useCallback((entry: Omit<LogEntry, "time">) => {
     setLogs((current) => [...current.slice(-499), { ...entry, time: now() }]);
-  });
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -259,7 +259,7 @@ function App() {
           invoke<Settings>("get_settings"),
           invoke<RuntimeState>("get_state"),
           invoke<boolean>("is_admin").catch(() => false),
-          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.4" })),
+          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.5" })),
         ]);
         if (disposed) {
           return;
@@ -337,18 +337,27 @@ function App() {
     }
   }
 
-  async function copyEndpoint(value: string) {
+  async function copyEndpoint(value: string, quiet = false) {
     try {
       await navigator.clipboard.writeText(value);
-      appendLog({ level: "info", message: `Copied ${value}` });
+      if (!quiet) appendLog({ level: "info", message: `Copied ${value}` });
     } catch {
-      appendLog({ level: "warn", message: "Clipboard copy failed" });
+      if (!quiet) appendLog({ level: "warn", message: "Clipboard copy failed" });
     }
   }
 
   function exportLogs() {
     const text = logs.map((l) => `${l.time}\t${l.level}\t${l.message}`).join("\n");
-    void copyEndpoint(text || "(no logs)");
+    void copyEndpoint(text || "(no logs)", true);
+  }
+
+  async function dismissError() {
+    try {
+      await invoke("disconnect");
+    } catch {
+      /* already stopped */
+    }
+    setRuntime(initialRuntime);
   }
 
   return (
@@ -453,7 +462,7 @@ function App() {
               <div className="error-banner">
                 <CircleAlert size={18} />
                 <span>{runtime.detail}</span>
-                <button onClick={() => setRuntime(initialRuntime)} aria-label="Dismiss">
+                <button type="button" onClick={() => void dismissError()} aria-label="Dismiss">
                   <X size={17} />
                 </button>
               </div>

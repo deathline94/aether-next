@@ -26,6 +26,8 @@ pub struct H2TunnelConfig {
     pub path: String,
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+    /// Preferred IPv4 source for data-plane DNS probe (edge-assigned / identity).
+    pub probe_src: Option<std::net::Ipv4Addr>,
 }
 
 pub fn enabled() -> bool {
@@ -84,13 +86,21 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder.set_verify(SslVerifyMode::NONE);
+    if std::env::var("AETHER_TLS_VERIFY")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        builder.set_verify(SslVerifyMode::PEER);
+    } else {
+        // WARP/MASQUE private PKI — public CA verify is not applicable by default.
+        builder.set_verify(SslVerifyMode::NONE);
+    }
 
     let connector = builder.build();
     let mut config = connector
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
-    config.set_verify_hostname(false);
+    config.set_verify_hostname(std::env::var("AETHER_TLS_VERIFY").is_ok());
     config.set_use_server_name_indication(true);
 
     Ok(config)
@@ -157,6 +167,7 @@ pub async fn run(
     cfg: H2TunnelConfig,
     internals: Internals,
     addr_tx: Option<mpsc::Sender<AssignedAddr>>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
     let (mut outbound_rx, inbound_tx, mut ctrl_rx) = internals.into_parts();
 
@@ -217,26 +228,42 @@ pub async fn run(
     let mut capsules = CapsuleParser::new();
 
     // Prove data plane before advertising readiness (CONNECT 200 alone is insufficient).
-    verify_dataplane(&mut send_stream, &mut recv_body, &mut capsules).await?;
+    let probe_src = cfg
+        .probe_src
+        .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
+    verify_dataplane(&mut send_stream, &mut recv_body, &mut capsules, probe_src).await?;
     log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h2\"}}");
-    log::info!("AETHER_EVENT {{\"type\":\"connected\",\"detail\":\"masque h2 ready\"}}");
+    let _ = ready_tx.send(());
+
+    // Shared last traffic timestamp for stall detection (send OR recv activity resets).
+    let last_traffic = std::sync::Arc::new(tokio::sync::Mutex::new(Instant::now()));
+    let last_send = last_traffic.clone();
+    let last_recv = last_traffic.clone();
+    let probe_src_ka = probe_src;
 
     // CRITICAL: send and recv must not share one select. Waiting on H2 send capacity
     // used to block DATA recv + window updates → download collapsed under load.
     let send_task = tokio::spawn(async move {
-        let mut idle = tokio::time::interval(Duration::from_secs(15));
+        let mut idle = tokio::time::interval(Duration::from_secs(20));
         idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_activity = Instant::now();
         loop {
             tokio::select! {
                 _ = idle.tick() => {
-                    if last_activity.elapsed() > Duration::from_secs(90) {
+                    let last = *last_send.lock().await;
+                    if last.elapsed() > Duration::from_secs(90) {
                         return Err(AetherError::Masque(
-                            "h2 stall: no send activity for 90s".into(),
+                            "h2 stall: no traffic for 90s".into(),
                         ));
                     }
-                    // Lightweight keep-alive: empty DATA not allowed mid-stream; reserve capacity.
-                    send_stream.reserve_capacity(1);
+                    // Keep-alive: small DNS probe so half-open links fail fast.
+                    if last.elapsed() > Duration::from_secs(25) {
+                        let probe = build_dns_probe_packet(probe_src_ka);
+                        if let Err(e) = send_ip_batch(&mut send_stream, vec![probe]).await {
+                            log::debug!("[h2] keepalive: {e}");
+                            return Err(e);
+                        }
+                        *last_send.lock().await = Instant::now();
+                    }
                 }
                 ctrl = ctrl_rx.recv() => {
                     match ctrl {
@@ -251,7 +278,7 @@ pub async fn run(
                 pkt = outbound_rx.recv() => {
                     match pkt {
                         Some(ip_packet) => {
-                            last_activity = Instant::now();
+                            *last_send.lock().await = Instant::now();
                             let mut batch = Vec::with_capacity(64);
                             batch.push(ip_packet);
                             while batch.len() < 128 {
@@ -276,16 +303,15 @@ pub async fn run(
     });
 
     let recv_task = tokio::spawn(async move {
-        let mut last_data = Instant::now();
         loop {
             match tokio::time::timeout(
-                Duration::from_secs(90),
+                Duration::from_secs(45),
                 futures::future::poll_fn(|cx| recv_body.poll_data(cx)),
             )
             .await
             {
                 Ok(Some(Ok(chunk))) => {
-                    last_data = Instant::now();
+                    *last_recv.lock().await = Instant::now();
                     let _ = recv_body.flow_control().release_capacity(chunk.len());
                     capsules.push(&chunk);
                     drain_capsules(&mut capsules, &inbound_tx, &addr_tx).await;
@@ -299,7 +325,8 @@ pub async fn run(
                     return Ok::<(), AetherError>(());
                 }
                 Err(_) => {
-                    if last_data.elapsed() > Duration::from_secs(90) {
+                    let last = *last_recv.lock().await;
+                    if last.elapsed() > Duration::from_secs(90) {
                         return Err(AetherError::Masque(
                             "h2 stall: no data from edge for 90s".into(),
                         ));
@@ -327,8 +354,8 @@ pub async fn run(
     }
 }
 
-fn build_dns_probe_packet() -> Vec<u8> {
-    // Minimal IPv4 UDP DNS query: source 198.18.0.1 → 1.1.1.1:53 A for cloudflare.com
+fn build_dns_probe_packet(src: std::net::Ipv4Addr) -> Vec<u8> {
+    // Minimal IPv4 UDP DNS query: src → 1.1.1.1:53 A for cloudflare.com
     let mut dns = Vec::with_capacity(64);
     let id: u16 = rand::random();
     dns.extend_from_slice(&id.to_be_bytes());
@@ -348,7 +375,7 @@ fn build_dns_probe_packet() -> Vec<u8> {
     pkt.extend_from_slice(&(total as u16).to_be_bytes());
     pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes());
     pkt.extend_from_slice(&[0x00, 0x00, 64, 17, 0x00, 0x00]);
-    pkt.extend_from_slice(&[198, 18, 0, 1]);
+    pkt.extend_from_slice(&src.octets());
     pkt.extend_from_slice(&[1, 1, 1, 1]);
     let csum = ipv4_header_checksum(&pkt[0..20]);
     pkt[10..12].copy_from_slice(&csum.to_be_bytes());
@@ -382,13 +409,14 @@ async fn verify_dataplane(
     send: &mut h2::SendStream<Bytes>,
     recv_body: &mut h2::RecvStream,
     capsules: &mut CapsuleParser,
+    probe_src: std::net::Ipv4Addr,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut confirms = 0u8;
     let mut resend_at = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= resend_at {
-            let probe = build_dns_probe_packet();
+            let probe = build_dns_probe_packet(probe_src);
             send_ip_batch(send, vec![probe]).await?;
             resend_at = Instant::now() + Duration::from_millis(700);
         }
@@ -535,5 +563,49 @@ fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
             Some(IpAddr::V6(b.into()))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::masque::CapsuleParser;
+
+    #[test]
+    fn dns_probe_is_ipv4_udp_to_1111() {
+        let src = std::net::Ipv4Addr::new(198, 18, 0, 1);
+        let pkt = build_dns_probe_packet(src);
+        assert!(pkt.len() >= 28, "header+udp min");
+        assert_eq!(pkt[0] >> 4, 4, "IPv4");
+        assert_eq!(pkt[9], 17, "UDP");
+        assert_eq!(&pkt[12..16], &src.octets());
+        assert_eq!(&pkt[16..20], &[1, 1, 1, 1]);
+        assert_eq!(u16::from_be_bytes([pkt[22], pkt[23]]), 53);
+    }
+
+    #[test]
+    fn ipv4_checksum_field_zeroed_in_sum() {
+        let pkt = build_dns_probe_packet(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        // Recompute: with stored checksum, ones-complement sum of header should be 0xffff.
+        let mut sum = 0u32;
+        for i in (0..20).step_by(2) {
+            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xffff);
+    }
+
+    #[test]
+    fn datagram_capsule_roundtrip_for_probe() {
+        let pkt = build_dns_probe_packet(std::net::Ipv4Addr::new(198, 18, 0, 1));
+        let framed = masque::encode_datagram_capsule(&pkt);
+        let mut parser = CapsuleParser::new();
+        parser.push(&framed);
+        match parser.next().expect("parse") {
+            Some(Capsule::Datagram(got)) => assert_eq!(got, pkt),
+            other => panic!("expected datagram, got {other:?}"),
+        }
     }
 }

@@ -11,8 +11,8 @@ android {
         applicationId = "app.aethernext"
         minSdk = 26
         targetSdk = 34
-        versionCode = 104
-        versionName = "1.0.4"
+        versionCode = 105
+        versionName = "1.0.5"
     }
 
     // Per-ABI APKs + one fat universal (all engines inside).
@@ -24,7 +24,6 @@ android {
             isUniversalApk = true
         }
     }
-
     signingConfigs {
         create("release") {
             val keystore = System.getenv("AETHER_ANDROID_KEYSTORE")
@@ -104,11 +103,20 @@ tasks.register("checkReleasePayloads") {
         check(signingInputs.none { System.getenv(it).isNullOrBlank() }) {
             "Release signing missing: set ${signingInputs.joinToString()}"
         }
-        check(file(System.getenv("AETHER_ANDROID_KEYSTORE")).isFile) {
+        check(file(System.getenv("AETHER_ANDROID_KEYSTORE")!!).isFile) {
             "Release keystore file is missing"
         }
     }
 }
-tasks.named("preReleaseBuild").configure {
-    dependsOn("checkWwwAssets", "checkReleasePayloads")
+
+// AGP creates pre*Build tasks after project evaluation — never call named() at top level.
+afterEvaluate {
+    tasks.named("preBuild").configure {
+        dependsOn("checkWwwAssets")
+    }
+    // Cover base release + any ABI-split pre*ReleaseBuild variants.
+    tasks.matching { it.name.startsWith("pre") && it.name.contains("Release") && it.name.endsWith("Build") }
+        .configureEach {
+            dependsOn("checkWwwAssets", "checkReleasePayloads")
+        }
 }

@@ -10,14 +10,14 @@ pub enum Transport {
 
 /// Canonical profile name after alias resolution.
 pub fn normalize(name: &str) -> &str {
-    match name.trim().to_lowercase().as_str() {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "" => "default",
         "off" | "none" => "off",
         "gfw" => "gfw",
         "firewall" => "firewall",
         "light" => "light",
         "aggressive" | "heavy" => "aggressive",
         "balanced" => "balanced",
-        other if other.is_empty() => "default",
         _ => "default",
     }
 }
@@ -47,11 +47,10 @@ pub fn wg_from_env() -> AetherNoizeConfig {
 pub fn noize_from_name(name: &str) -> NoizeConfig {
     match normalize(name) {
         "off" => NoizeConfig::off(),
-        "gfw" => NoizeConfig::gfw(),
-        // WG-only names map sensibly onto MASQUE
-        "light" => NoizeConfig::firewall(),
-        "aggressive" => NoizeConfig::gfw(),
-        "balanced" | "firewall" | "default" | _ => NoizeConfig::firewall(),
+        "gfw" | "aggressive" => NoizeConfig::gfw(),
+        // WG-only / default names map onto MASQUE firewall profile
+        "light" | "balanced" | "firewall" | "default" => NoizeConfig::firewall(),
+        _ => NoizeConfig::firewall(),
     }
 }
 
@@ -60,9 +59,9 @@ pub fn aethernoize_from_name(name: &str) -> AetherNoizeConfig {
         "off" => AetherNoizeConfig::off(),
         "light" => AetherNoizeConfig::light(),
         "aggressive" => AetherNoizeConfig::aggressive(),
-        // MASQUE-only names map onto WG
-        "gfw" | "firewall" => AetherNoizeConfig::balanced(),
-        "balanced" | "default" | _ => AetherNoizeConfig::balanced(),
+        // MASQUE-only / default names map onto WG balanced
+        "gfw" | "firewall" | "balanced" | "default" => AetherNoizeConfig::balanced(),
+        _ => AetherNoizeConfig::balanced(),
     }
 }
 

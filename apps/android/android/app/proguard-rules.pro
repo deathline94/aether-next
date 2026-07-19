@@ -1,4 +1,4 @@
-# Keep bridge entry points
--keepclassmembers class studio.cluvex.aether.AetherBridge {
+# Keep bridge entry points (must match package app.aethernext)
+-keepclassmembers class app.aethernext.AetherBridge {
     @android.webkit.JavascriptInterface <methods>;
 }

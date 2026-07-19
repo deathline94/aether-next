@@ -20,9 +20,8 @@ jobs:
           components: rustfmt, clippy
       - uses: lukka/get-cmake@latest
       - uses: ilammy/setup-nasm@v1
-      # fmt/clippy debt exists in tree; gate on compile + tests until cleaned.
       - run: cargo check --locked --manifest-path aether/Cargo.toml
-      - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -W clippy::correctness
+      - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --locked --manifest-path aether/Cargo.toml
 
   desktop-ui:

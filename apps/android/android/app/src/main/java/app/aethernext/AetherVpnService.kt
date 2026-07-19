@@ -8,11 +8,15 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import java.io.File
 import java.io.FileOutputStream
+import java.util.concurrent.Executors
 
 /**
  * Full-device VPN via Android [VpnService] + hev-socks5-tunnel (tun2socks).
@@ -32,28 +36,46 @@ class AetherVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopRequested = true
-            stopTunnel()
+            // Do not call startForeground on STOP — just tear down.
+            worker.execute {
+                stopTunnel()
+                mainHandler.post { stopSelf() }
+            }
+            return START_NOT_STICKY
+        }
+        try {
+            startForegroundNotification()
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed: ${e.message}", e)
+            SessionController.getOrNull()?.onVpnFailed("VPN foreground start blocked: ${e.message}")
             stopSelf()
             return START_NOT_STICKY
         }
-        startForegroundNotification()
         if (tun == null) {
             val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, -1) ?: -1
-            try {
-                check(socksPort in 1024..65535) { "VPN start missing valid SOCKS port" }
-                check(nativeLoaded) { "hev-socks5-tunnel native library unavailable" }
-                establishTun(socksPort)
-                SessionController.getOrNull()?.onVpnEstablished()
-            } catch (e: Exception) {
-                Log.e(TAG, "VPN establish failed: ${e.message}", e)
-                stopTunnel()
-                SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
-                stopSelf()
-            } catch (e: UnsatisfiedLinkError) {
-                Log.e(TAG, "VPN native call failed: ${e.message}", e)
-                stopTunnel()
-                SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
-                stopSelf()
+            worker.execute {
+                try {
+                    check(socksPort in 1024..65535) { "VPN start missing valid SOCKS port" }
+                    check(nativeLoaded) { "hev-socks5-tunnel native library unavailable" }
+                    establishTun(socksPort)
+                    mainHandler.post {
+                        SessionController.getOrNull()?.onVpnEstablished()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "VPN establish failed: ${e.message}", e)
+                    stopTunnel()
+                    mainHandler.post {
+                        SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
+                        stopSelf()
+                    }
+                } catch (e: UnsatisfiedLinkError) {
+                    Log.e(TAG, "VPN native call failed: ${e.message}", e)
+                    stopTunnel()
+                    mainHandler.post {
+                        SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
+                        stopSelf()
+                    }
+                }
             }
         }
         return START_NOT_STICKY
@@ -68,7 +90,8 @@ class AetherVpnService : VpnService() {
             .addAddress(TUN_ADDR, 32)
             .addDnsServer(MAPPED_DNS)
             .addRoute("0.0.0.0", 0)
-            // IPv6 tunnel not implemented: block IPv6 so traffic cannot bypass full VPN.
+            // IPv6 tunnel not implemented: blackhole IPv6 so traffic cannot bypass full VPN.
+            // Apps needing real IPv6 fail closed (no silent leak).
             .addAddress(TUN_ADDR_V6, 128)
             .addRoute("::", 0)
 
@@ -92,14 +115,15 @@ class AetherVpnService : VpnService() {
     }
 
     private fun writeHevConfig(socksPort: Int): String {
-        val conf = File(cacheDir, "hev-socks5-tunnel.yml")
+        val conf = File(noBackupFilesDir, "hev-socks5-tunnel.yml")
         // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
         // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
+        // icmp drop — avoid NTP/oracle side-channels from reply mode.
         val yaml = """
             |tunnel:
             |  mtu: $MTU
             |  ipv4: $TUN_ADDR
-            |  icmp: 'reply'
+            |  icmp: 'drop'
             |socks5:
             |  port: $socksPort
             |  address: 127.0.0.1
@@ -116,6 +140,11 @@ class AetherVpnService : VpnService() {
             |  log-level: warn
             |""".trimMargin()
         FileOutputStream(conf, false).use { it.write(yaml.toByteArray(Charsets.UTF_8)) }
+        try {
+            conf.setReadable(true, true)
+            conf.setWritable(true, true)
+        } catch (_: Exception) {
+        }
         return conf.absolutePath
     }
 
@@ -142,7 +171,12 @@ class AetherVpnService : VpnService() {
             .setOngoing(true)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            ServiceCompat.startForeground(
+                this,
+                NOTIF_ID,
+                n,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
         } else {
             startForeground(NOTIF_ID, n)
         }
@@ -154,8 +188,15 @@ class AetherVpnService : VpnService() {
                 TProxyStopService()
             } catch (e: Exception) {
                 Log.w(TAG, "hev stop: ${e.message}")
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(TAG, "hev stop native: ${e.message}")
             }
             hevStarted = false
+            // Give hev threads a beat to release the TUN fd before close (avoids SIGSEGV).
+            try {
+                Thread.sleep(150)
+            } catch (_: InterruptedException) {
+            }
         }
         try {
             tun?.close()
@@ -190,7 +231,12 @@ class AetherVpnService : VpnService() {
         // Unique local address for blackhole IPv6 route (no real IPv6 tunnel yet).
         private const val TUN_ADDR_V6 = "fd00:aether::1"
         private const val MAPPED_DNS = "198.18.0.2"
+        @Volatile
         private var nativeLoaded = false
+        private val worker = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "aether-vpn-worker").apply { isDaemon = true }
+        }
+        private val mainHandler = Handler(Looper.getMainLooper())
         const val EXTRA_SOCKS_PORT = "socks_port"
         const val ACTION_STOP = "app.aethernext.VPN_STOP"
 

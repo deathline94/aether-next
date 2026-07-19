@@ -67,7 +67,18 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder.set_verify(SslVerifyMode::NONE);
+    // Cloudflare WARP/MASQUE uses client mTLS to a private PKI; public CA verify
+    // fails against the edge. Optional pin/enforce via env for stricter deployments.
+    if std::env::var("AETHER_TLS_VERIFY")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        builder.set_verify(SslVerifyMode::PEER);
+        log::info!("[tls] peer certificate verification ENABLED (AETHER_TLS_VERIFY)");
+    } else {
+        builder.set_verify(SslVerifyMode::NONE);
+        log::debug!("[tls] peer certificate verification disabled (WARP mTLS mode)");
+    }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(AetherError::Quic)?;

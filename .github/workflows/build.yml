@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +23,8 @@ jobs:
   windows-app:
     name: Windows x64
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +42,7 @@ jobs:
 
       - name: Build engine
         working-directory: aether
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Stage engine
         shell: pwsh
@@ -49,6 +51,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $res | Out-Null
           Copy-Item -Force "aether/target/release/aether.exe" "$res/aether.exe"
           Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
+          # Provenance pin for packaged Wintun (update if you replace packaging/wintun.dll).
+          $want = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+          $got = (Get-FileHash "packaging/wintun.dll" -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $want) { throw "wintun.dll hash mismatch: $got" }
+          Write-Host "wintun.dll sha256 ok"
 
       - name: Build app
         working-directory: apps/desktop
@@ -127,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            cargo ndk -t "$abi" --platform 26 build --release
+            cargo ndk -t "$abi" --platform 26 build --locked --release
           done
           mkdir -p ../apps/android/android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
           mkdir -p ../apps/android/android/app/src/main/assets/engine
@@ -140,6 +147,17 @@ jobs:
         run: |
           npm ci
           npm run sync-www
+      - name: Verify staged native payloads
+        working-directory: apps/android/android
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            for lib in libaether.so libhev-socks5-tunnel.so; do
+              f="app/src/main/jniLibs/$abi/$lib"
+              test -s "$f"
+              echo "ok $f $(stat -c%s "$f" 2>/dev/null || wc -c < "$f")"
+            done
+          done
       - name: APKs
         working-directory: apps/android/android
         env:
@@ -190,6 +208,8 @@ jobs:
     needs: [windows-app, android-apk]
     if: ${{ always() && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

@@ -267,8 +267,8 @@ fn strip_cidr(s: &str) -> &str {
 
 fn to_ip_address(ip: IpAddr) -> IpAddress {
     match ip {
-        IpAddr::V4(v4) => IpAddress::Ipv4(Ipv4Address::from(v4)),
-        IpAddr::V6(v6) => IpAddress::Ipv6(Ipv6Address::from(v6)),
+        IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+        IpAddr::V6(v6) => IpAddress::Ipv6(v6),
     }
 }
 
@@ -321,29 +321,35 @@ fn apply_addrs(
     v4: Option<(Ipv4Addr, u8)>,
     v6: Option<(Ipv6Addr, u8)>,
 ) {
+    // Merge: when only one family is provided, keep the other family's current addrs.
+    let mut keep_v4: Option<(Ipv4Addr, u8)> = None;
+    let mut keep_v6: Option<(Ipv6Addr, u8)> = None;
+    for cidr in iface.ip_addrs() {
+        match cidr.address() {
+            IpAddress::Ipv4(a) => keep_v4 = Some((a, cidr.prefix_len())),
+            IpAddress::Ipv6(a) => keep_v6 = Some((a, cidr.prefix_len())),
+        }
+    }
+    let next_v4 = v4.or(keep_v4);
+    let next_v6 = v6.or(keep_v6);
+
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
-        if let Some((ip, p)) = v4 {
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address::from(ip)),
-                routable_prefix_v4(p),
-            ));
+        if let Some((ip, p)) = next_v4 {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(ip), routable_prefix_v4(p)));
         }
-        if let Some((ip, p)) = v6 {
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv6(Ipv6Address::from(ip)),
-                routable_prefix_v6(p),
-            ));
+        if let Some((ip, p)) = next_v6 {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(ip), routable_prefix_v6(p)));
         }
     });
 
-    if let Some((ip, _)) = v4 {
+    if let Some((ip, _)) = next_v4 {
         let o = ip.octets();
         let host = if o[3] == 1 { 2 } else { 1 };
         let gw = Ipv4Address::new(o[0], o[1], o[2], host);
         let _ = iface.routes_mut().add_default_ipv4_route(gw);
     }
-    if let Some((ip, _)) = v6 {
+    if let Some((ip, _)) = next_v6 {
         let mut o = ip.octets();
         o[15] = if o[15] == 1 { 2 } else { 1 };
         let _ = iface
@@ -354,8 +360,8 @@ fn apply_addrs(
 
 fn endpoint_to_socketaddr(ep: IpEndpoint) -> SocketAddr {
     let ip = match ep.addr {
-        IpAddress::Ipv4(v4) => IpAddr::V4(v4.into()),
-        IpAddress::Ipv6(v6) => IpAddr::V6(v6.into()),
+        IpAddress::Ipv4(v4) => IpAddr::V4(v4),
+        IpAddress::Ipv6(v6) => IpAddr::V6(v6),
     };
     SocketAddr::new(ip, ep.port)
 }
@@ -608,13 +614,14 @@ async fn service_tcp(s: &mut NetStack) {
         }
 
         {
-            let socket = s.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.can_send() {
-                let st = s.tcp_conns.get_mut(&id).unwrap();
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
                 if !st.pending.is_empty() {
-                    let sent = socket.send_slice(&st.pending).unwrap_or(0);
-                    if sent > 0 {
-                        st.pending.drain(0..sent);
+                    let socket = s.sockets.get_mut::<tcp::Socket>(handle);
+                    if socket.can_send() {
+                        let sent = socket.send_slice(&st.pending).unwrap_or(0);
+                        if sent > 0 {
+                            st.pending.drain(0..sent);
+                        }
                     }
                 }
             }

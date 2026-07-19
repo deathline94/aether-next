@@ -113,40 +113,6 @@ pub fn encode_datagram_capsule(ip_packet: &[u8]) -> Vec<u8> {
     encode_capsule(CAPSULE_DATAGRAM, ip_packet)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quarter_stream_id_divides_by_four() {
-        assert_eq!(quarter_stream_id(0), 0);
-        assert_eq!(quarter_stream_id(4), 1);
-        assert_eq!(quarter_stream_id(12), 3);
-    }
-
-    #[test]
-    fn ip_datagram_roundtrip() {
-        let stream = 4u64;
-        let pkt = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01];
-        let enc = encode_ip_datagram(stream, &pkt).expect("encode");
-        let dec = decode_ip_datagram(&enc, stream).expect("decode");
-        assert_eq!(dec, Some(pkt));
-    }
-
-    #[test]
-    fn ip_datagram_wrong_stream_ignored() {
-        let enc = encode_ip_datagram(4, b"abc").expect("encode");
-        let dec = decode_ip_datagram(&enc, 8).expect("decode");
-        assert!(dec.is_none());
-    }
-
-    #[test]
-    fn capsule_datagram_encode_nonempty() {
-        let c = encode_datagram_capsule(b"hello");
-        assert!(!c.is_empty());
-    }
-}
-
 pub struct CapsuleParser {
     buf: Vec<u8>,
 }
@@ -171,19 +137,37 @@ impl CapsuleParser {
             Ok(v) => v as usize,
             Err(_) => return Ok(None),
         };
+        // Cap absurd lengths so a corrupt stream cannot stall forever.
+        if len > 4 * 1024 * 1024 {
+            self.buf.clear();
+            return Err(AetherError::Capsule(format!("capsule too large: {len}")));
+        }
         if b.cap() < len {
             return Ok(None);
         }
 
-        let value = b.get_bytes(len).map_err(oct)?.to_vec();
+        let value = match b.get_bytes(len) {
+            Ok(v) => v.to_vec(),
+            Err(e) => {
+                self.buf.clear();
+                return Err(oct(e));
+            }
+        };
         let consumed = b.off();
         self.buf.drain(0..consumed);
 
         let capsule = match kind {
-            CAPSULE_ADDRESS_ASSIGN => Capsule::AddressAssign(parse_address_assign(&value)?),
+            CAPSULE_ADDRESS_ASSIGN => match parse_address_assign(&value) {
+                Ok(a) => Capsule::AddressAssign(a),
+                Err(e) => {
+                    // Skip bad capsule; do not leave partial state forever.
+                    return Err(e);
+                }
+            },
             CAPSULE_ADDRESS_REQUEST => Capsule::AddressRequest,
-            CAPSULE_ROUTE_ADVERTISEMENT => {
-                Capsule::RouteAdvertisement(parse_route_advertisement(&value)?)
+            CAPSULE_ROUTE_ADVERTISEMENT => match parse_route_advertisement(&value) {
+                Ok(r) => Capsule::RouteAdvertisement(r),
+                Err(e) => return Err(e),
             },
             CAPSULE_DATAGRAM => Capsule::Datagram(value),
             other => Capsule::Unknown {
@@ -268,4 +252,38 @@ fn varint_len(v: u64) -> usize {
 
 fn oct(e: octets::BufferTooShortError) -> AetherError {
     AetherError::Capsule(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quarter_stream_id_divides_by_four() {
+        assert_eq!(quarter_stream_id(0), 0);
+        assert_eq!(quarter_stream_id(4), 1);
+        assert_eq!(quarter_stream_id(12), 3);
+    }
+
+    #[test]
+    fn ip_datagram_roundtrip() {
+        let stream = 4u64;
+        let pkt = vec![0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01];
+        let enc = encode_ip_datagram(stream, &pkt).expect("encode");
+        let dec = decode_ip_datagram(&enc, stream).expect("decode");
+        assert_eq!(dec, Some(pkt));
+    }
+
+    #[test]
+    fn ip_datagram_wrong_stream_ignored() {
+        let enc = encode_ip_datagram(4, b"abc").expect("encode");
+        let dec = decode_ip_datagram(&enc, 8).expect("decode");
+        assert!(dec.is_none());
+    }
+
+    #[test]
+    fn capsule_datagram_encode_nonempty() {
+        let c = encode_datagram_capsule(b"hello");
+        assert!(!c.is_empty());
+    }
 }

@@ -73,6 +73,9 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClientCompat() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                if (!request.isForMainFrame) {
+                    return false
+                }
                 return request.url.scheme != "https" || request.url.host != APP_HOST
             }
 
@@ -83,11 +86,8 @@ class MainActivity : AppCompatActivity() {
                 if (request.url.scheme == "https" && request.url.host == APP_HOST) {
                     return assetLoader.shouldInterceptRequest(request.url)
                 }
-                return android.webkit.WebResourceResponse(
-                    "text/plain",
-                    "UTF-8",
-                    ByteArrayInputStream(ByteArray(0)),
-                )
+                // null = let system handle (or block); empty 200 half-renders pages.
+                return null
             }
 
             override fun onPageFinished(view: WebView, url: String) {
@@ -125,13 +125,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Maps to assets/www/index.html → relative ./assets/*.js load correctly.
+        val entry = "https://appassets.androidplatform.net/assets/www/index.html"
+        // Only expose bridge after client is locked to appassets host.
         webView.addJavascriptInterface(
             AetherBridge(this, session),
             "AetherAndroid",
         )
-
-        // Maps to assets/www/index.html → relative ./assets/*.js load correctly.
-        val entry = "https://appassets.androidplatform.net/assets/www/index.html"
         Log.i(TAG, "loading $entry")
         webView.loadUrl(entry)
     }
