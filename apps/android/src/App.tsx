@@ -35,6 +35,10 @@ type Settings = {
   scanMode: "turbo" | "balanced" | "thorough" | "stealth";
   ipVersion: "v4" | "v6" | "both";
   noize: string;
+  noizeJc: number;
+  noizeJmin: number;
+  noizeJmax: number;
+  noizeIntervalMs: number;
   routingMode: "system-proxy" | "proxy-only" | "tun";
   socksPort: number;
   httpPort: number;
@@ -61,7 +65,11 @@ const defaults: Settings = {
   transport: "h2",
   scanMode: "balanced",
   ipVersion: "v4",
-  noize: "firewall",
+  noize: "medium",
+  noizeJc: 4,
+  noizeJmin: 48,
+  noizeJmax: 190,
+  noizeIntervalMs: 4,
   // Android default: full-device VPN (VpnService + hev tun2socks).
   routingMode: "tun",
   socksPort: 1819,
@@ -94,11 +102,11 @@ const speedProfiles: {
   {
     id: "speed",
     label: "Speed",
-    hint: "MASQUE h2 - firewall - balanced - local proxy only",
+    hint: "MASQUE h2 - medium - balanced - local proxy only",
     patch: {
       protocol: "masque",
       transport: "h2",
-      noize: "firewall",
+      noize: "medium",
       scanMode: "balanced",
       ipVersion: "v4",
       routingMode: "proxy-only",
@@ -107,11 +115,11 @@ const speedProfiles: {
   {
     id: "max-tun",
     label: "Max (VPN)",
-    hint: "MASQUE h2 - firewall - balanced - full device VPN",
+    hint: "MASQUE h2 - medium - balanced - full device VPN",
     patch: {
       protocol: "masque",
       transport: "h2",
-      noize: "firewall",
+      noize: "medium",
       scanMode: "balanced",
       ipVersion: "v4",
       routingMode: "tun",
@@ -120,11 +128,11 @@ const speedProfiles: {
   {
     id: "wireguard",
     label: "WireGuard",
-    hint: "UDP path - aggressive - turbo hunt - full VPN",
+    hint: "UDP path - max - turbo hunt - full VPN",
     patch: {
       protocol: "wireguard",
       transport: "h2",
-      noize: "aggressive",
+      noize: "max",
       scanMode: "turbo",
       ipVersion: "v4",
       routingMode: "tun",
@@ -656,21 +664,110 @@ function App() {
               <div className="setting-row">
                 <div>
                   <strong>Obfuscation</strong>
-                  <span>Pre-handshake traffic profile</span>
+                  <span>Noise before handshake (low → high)</span>
                 </div>
                 <select
                   disabled={settingsLocked}
-                  value={settings.noize}
+                  value={
+                    ["off", "light", "medium", "high", "max", "custom"].includes(settings.noize)
+                      ? settings.noize
+                      : settings.noize === "firewall" || settings.noize === "balanced"
+                        ? "medium"
+                        : settings.noize === "gfw"
+                          ? "high"
+                          : settings.noize === "aggressive" || settings.noize === "heavy"
+                            ? "max"
+                            : "medium"
+                  }
                   onChange={(event) => patchSettings({ noize: event.target.value })}
                 >
-                  <option value="firewall">Firewall</option>
-                  <option value="gfw">GFW</option>
-                  <option value="balanced">Balanced</option>
-                  <option value="aggressive">Aggressive</option>
-                  <option value="light">Light</option>
-                  <option value="off">Off</option>
+                  <option value="off">Off — no noise</option>
+                  <option value="light">Light — low noise</option>
+                  <option value="medium">Medium — default</option>
+                  <option value="high">High — stronger</option>
+                  <option value="max">Max — highest noise</option>
+                  <option value="custom">Custom — manual values</option>
                 </select>
               </div>
+              {settings.noize === "custom" && (
+                <div className="setting-stack" style={{ gap: 10, marginTop: 8 }}>
+                  <div className="setting-row">
+                    <div>
+                      <strong>Junk count</strong>
+                      <span>Packets before handshake (0–64)</span>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={64}
+                      disabled={settingsLocked}
+                      value={settings.noizeJc}
+                      onChange={(e) =>
+                        patchSettings({
+                          noizeJc: Math.max(0, Math.min(64, Number(e.target.value) || 0)),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="setting-row">
+                    <div>
+                      <strong>Min size</strong>
+                      <span>Bytes</span>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={2048}
+                      disabled={settingsLocked}
+                      value={settings.noizeJmin}
+                      onChange={(e) =>
+                        patchSettings({
+                          noizeJmin: Math.max(0, Math.min(2048, Number(e.target.value) || 0)),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="setting-row">
+                    <div>
+                      <strong>Max size</strong>
+                      <span>Bytes (≥ min)</span>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={2048}
+                      disabled={settingsLocked}
+                      value={settings.noizeJmax}
+                      onChange={(e) =>
+                        patchSettings({
+                          noizeJmax: Math.max(0, Math.min(2048, Number(e.target.value) || 0)),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="setting-row">
+                    <div>
+                      <strong>Interval</strong>
+                      <span>Milliseconds between junk</span>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={5000}
+                      disabled={settingsLocked}
+                      value={settings.noizeIntervalMs}
+                      onChange={(e) =>
+                        patchSettings({
+                          noizeIntervalMs: Math.max(
+                            0,
+                            Math.min(5000, Number(e.target.value) || 0),
+                          ),
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              )}
             </section>
 
             <section className="settings-section">

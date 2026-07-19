@@ -8,7 +8,11 @@ data class Settings(
     var transport: String = "h2",
     var scanMode: String = "balanced",
     var ipVersion: String = "v4",
-    var noize: String = "firewall",
+    var noize: String = "medium",
+    var noizeJc: Int = 4,
+    var noizeJmin: Int = 48,
+    var noizeJmax: Int = 190,
+    var noizeIntervalMs: Int = 4,
     var routingMode: String = "tun",
     var socksPort: Int = 1819,
     var httpPort: Int = 1820,
@@ -22,6 +26,10 @@ data class Settings(
         put("scanMode", scanMode)
         put("ipVersion", ipVersion)
         put("noize", noize)
+        put("noizeJc", noizeJc)
+        put("noizeJmin", noizeJmin)
+        put("noizeJmax", noizeJmax)
+        put("noizeIntervalMs", noizeIntervalMs)
         put("routingMode", routingMode)
         put("socksPort", socksPort)
         put("httpPort", httpPort)
@@ -36,7 +44,11 @@ data class Settings(
             transport = o.optString("transport", "h2"),
             scanMode = o.optString("scanMode", "balanced"),
             ipVersion = o.optString("ipVersion", "v4"),
-            noize = o.optString("noize", "firewall"),
+            noize = o.optString("noize", "medium"),
+            noizeJc = o.optInt("noizeJc", 4),
+            noizeJmin = o.optInt("noizeJmin", 48),
+            noizeJmax = o.optInt("noizeJmax", 190),
+            noizeIntervalMs = o.optInt("noizeIntervalMs", 4),
             routingMode = o.optString("routingMode", "tun"),
             socksPort = o.optInt("socksPort", 1819),
             httpPort = o.optInt("httpPort", 1820),

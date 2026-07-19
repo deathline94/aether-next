@@ -98,6 +98,7 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             "255.255.255.255",
         ],
     )?;
+    // Point DNS at the tunnel so name lookups leave via TUN (not physical NIC).
     run_cmd(
         "netsh",
         &[
@@ -111,6 +112,18 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
             "primary",
         ],
     )?;
+    let _ = run_cmd(
+        "netsh",
+        &[
+            "interface",
+            "ip",
+            "add",
+            "dns",
+            &format!("name={name}"),
+            "1.0.0.1",
+            "index=2",
+        ],
+    );
     // Kernel TCP path: raise adapter MTU to match tunnel MTU (default 1280, up to 1400).
     let mtu = crate::mtu::current().clamp(1280, 1400);
     run_cmd(
@@ -134,6 +147,26 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
     Ok(())
 }
 
+fn interface_index(name: &str) -> Result<u32> {
+    let out = run_cmd(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ifIndex)"
+            ),
+        ],
+    )?;
+    let idx = out
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.parse::<u32>().ok())
+        .ok_or_else(|| AetherError::Other(format!("could not resolve ifIndex for {name}")))?;
+    Ok(idx)
+}
+
 fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
     let peer_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
@@ -144,8 +177,9 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
         }
     };
     let (_iface, gw) = default_gateway()?;
+    let if_index = interface_index(ADAPTER_NAME)?;
 
-    // Keep path to edge peer on physical gateway.
+    // Keep path to edge peer on physical gateway (not via TUN).
     let peer_s = peer_ip.to_string();
     let gw_s = gw.to_string();
     run_cmd(
@@ -157,23 +191,41 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
             "255.255.255.255",
             &gw_s,
             "metric",
-            "5",
+            "1",
         ],
     )?;
 
-    // Split default route via TUN IP (avoids replacing system default entirely).
+    // Split default via TUN interface index (on-link). Using TUN IP as gateway alone
+    // often leaves routes installed but unusable on Windows without IF index.
+    let ifs = if_index.to_string();
     for dest in ["0.0.0.0", "128.0.0.0"] {
         let mask = "128.0.0.0";
-        let via = ipv4.to_string();
-        if let Err(error) = run_cmd("route", &["add", dest, "mask", mask, &via, "metric", "5"]) {
+        if let Err(error) = run_cmd(
+            "route",
+            &[
+                "add",
+                dest,
+                "mask",
+                mask,
+                "0.0.0.0",
+                "metric",
+                "1",
+                "IF",
+                &ifs,
+            ],
+        ) {
             remove_routes(peer, ipv4, gw);
             return Err(error);
         }
     }
+    log::info!(
+        "[tun] routes installed: peer exclude via {gw_s}, split-default IF={if_index} ({ipv4})"
+    );
     Ok(gw)
 }
 
 fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
+    let _ = ipv4;
     if let IpAddr::V4(v4) = peer.ip() {
         let gateway = gateway.to_string();
         let _ = run_cmd(
@@ -187,9 +239,9 @@ fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
             ],
         );
     }
-    let via = ipv4.to_string();
-    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0", &via]);
-    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0", &via]);
+    // Delete split-default by destination; IF-bound routes match without via.
+    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0"]);
+    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0"]);
 }
 
 fn route_state_path() -> Option<PathBuf> {

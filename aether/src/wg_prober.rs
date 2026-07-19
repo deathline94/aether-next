@@ -250,8 +250,8 @@ async fn verify_one_wg(
     }
 }
 
-/// Priority WARP ports first — 2408 is the classic engage port.
-const WG_PRIORITY_PORTS: &[u16] = &[2408, 500, 4500, 1701, 878, 880, 890, 854, 864];
+/// Priority WARP/MASQUE ports first — 2408 is classic engage; 443 for HTTPS edges.
+const WG_PRIORITY_PORTS: &[u16] = crate::scan_pool::EDGE_PRIORITY_PORTS;
 
 fn build_wg_candidates(
     st: &HuntStrategy,

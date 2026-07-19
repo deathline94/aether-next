@@ -10,6 +10,10 @@ export type Settings = {
   scanMode: string;
   ipVersion: string;
   noize: string;
+  noizeJc: number;
+  noizeJmin: number;
+  noizeJmax: number;
+  noizeIntervalMs: number;
   routingMode: string;
   socksPort: number;
   httpPort: number;
@@ -32,7 +36,11 @@ const defaults: Settings = {
   transport: "h2",
   scanMode: "balanced",
   ipVersion: "v4",
-  noize: "firewall",
+  noize: "medium",
+  noizeJc: 4,
+  noizeJmin: 48,
+  noizeJmax: 190,
+  noizeIntervalMs: 4,
   routingMode: "tun",
   socksPort: 1819,
   httpPort: 1820,

@@ -14,52 +14,15 @@ use crate::scan::HuntStrategy;
 // Re-export unified ScanMode for existing call sites.
 pub use crate::scan::ScanMode;
 
-// MASQUE CONNECT-IP edges live in 162.159.19x — NOT general CF CDN / WG anycast
-// (188.114.x accepts TLS but returns connect-ip 400). Keep MASQUE CIDRs focused.
-pub const MASQUE_CIDRS_V4: &[&str] = &[
-    "162.159.192.0/24",
-    "162.159.193.0/24",
-    "162.159.195.0/24",
-    "162.159.196.0/24",
-    "162.159.197.0/24",
-    "162.159.198.0/24",
-];
-
-// Prefer diverse / known-good edges first; DNS discovery appends live A records.
-pub const MASQUE_SEEDS: &[&str] = &[
-    "162.159.198.1",
-    "162.159.198.2",
-    "162.159.192.1",
-    "162.159.192.2",
-    "162.159.193.1",
-    "162.159.193.2",
-    "162.159.195.1",
-    "162.159.195.2",
-    "162.159.196.1",
-    "162.159.196.2",
-    "162.159.197.1",
-];
-
-// MASQUE is primarily 443; include shared engage ports used by some edges.
-pub const MASQUE_PORTS: &[u16] = &[
-    443, 8443, 2408, 500, 4500, 1701, 854, 878, 880, 890,
-];
+// Shared edge pool (same CIDRs/ports for MASQUE + WG). Bad edges simply fail probe.
+pub use crate::scan_pool::{
+    EDGE_CIDRS_V4 as MASQUE_CIDRS_V4, EDGE_CIDRS_V6 as MASQUE_CIDRS_V6, EDGE_PORTS as MASQUE_PORTS,
+    EDGE_SEEDS_V4 as MASQUE_SEEDS, EDGE_SEEDS_V6 as MASQUE_SEEDS_V6,
+};
 
 /// Only hosts that resolve into WARP client / MASQUE ranges. General CDN names
 /// pollute the pool with edges that TLS-handshake but reject CONNECT-IP.
-pub const MASQUE_DISCOVERY_HOSTS: &[&str] = &[
-    "engage.cloudflareclient.com",
-];
-
-pub const MASQUE_CIDRS_V6: &[&str] = &["2606:4700:d0::/48", "2606:4700:d1::/48"];
-
-pub const MASQUE_SEEDS_V6: &[&str] = &[
-    "2606:4700:d0::a29f:c602",
-    "2606:4700:d1::a29f:c602",
-    "2606:4700:d0::a29f:c601",
-    "2606:4700:d0::a29f:c001",
-    "2606:4700:d0::a29f:c001",
-];
+pub const MASQUE_DISCOVERY_HOSTS: &[&str] = &["engage.cloudflareclient.com"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeResult {

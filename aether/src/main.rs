@@ -18,6 +18,7 @@ mod prober;
 mod quic;
 mod routing_plane;
 mod scan;
+mod scan_pool;
 mod session_event;
 mod socks;
 mod tls;

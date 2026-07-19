@@ -26,6 +26,14 @@ struct Settings {
     scan_mode: String,
     ip_version: String,
     noize: String,
+    /// Custom obfuscation: junk packet count (when noize == custom).
+    noize_jc: u32,
+    /// Custom obfuscation: min junk size.
+    noize_jmin: u32,
+    /// Custom obfuscation: max junk size.
+    noize_jmax: u32,
+    /// Custom obfuscation: interval between junk packets (ms).
+    noize_interval_ms: u32,
     routing_mode: String,
     socks_port: u16,
     http_port: u16,
@@ -42,7 +50,11 @@ impl Default for Settings {
             // Prefer balanced over turbo: better edge RTT → higher throughput.
             scan_mode: "balanced".into(),
             ip_version: "v4".into(),
-            noize: "firewall".into(),
+            noize: "medium".into(),
+            noize_jc: 4,
+            noize_jmin: 48,
+            noize_jmax: 190,
+            noize_interval_ms: 4,
             routing_mode: "system-proxy".into(),
             socks_port: 1819,
             http_port: 1820,
@@ -225,10 +237,31 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
         "noize",
         &settings.noize,
         &[
-            "off", "none", "default", "firewall", "gfw", "light", "balanced", "aggressive",
+            "off",
+            "none",
+            "light",
+            "low",
+            "medium",
+            "balanced",
+            "firewall",
+            "default",
+            "high",
+            "gfw",
+            "max",
+            "aggressive",
             "heavy",
+            "custom",
         ],
     )?;
+    if settings.noize.eq_ignore_ascii_case("custom") {
+        if settings.noize_jmax < settings.noize_jmin {
+            return Err("custom obfuscation: max size must be >= min size".into());
+        }
+        if settings.noize_jc > 64 || settings.noize_jmax > 2048 || settings.noize_interval_ms > 5000
+        {
+            return Err("custom obfuscation values out of range".into());
+        }
+    }
     allow(
         "routing_mode",
         &settings.routing_mode,
@@ -764,6 +797,17 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        if settings.noize.eq_ignore_ascii_case("custom") {
+            command
+                .env("AETHER_NOIZE_JC", settings.noize_jc.to_string())
+                .env("AETHER_NOIZE_JMIN", settings.noize_jmin.to_string())
+                .env("AETHER_NOIZE_JMAX", settings.noize_jmax.to_string())
+                .env(
+                    "AETHER_NOIZE_INTERVAL_MS",
+                    settings.noize_interval_ms.to_string(),
+                );
+        }
 
         if let Some(wintun) = wintun_path(&app) {
             // Only pass Wintun path we already validated for TUN; never env override.

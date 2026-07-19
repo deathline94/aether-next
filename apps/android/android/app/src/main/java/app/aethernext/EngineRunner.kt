@@ -78,6 +78,12 @@ class EngineRunner(
                     put("RUST_LOG", "info")
                     put("HOME", homeDir)
                     put("TMPDIR", context.cacheDir.absolutePath)
+                    if (settings.noize.equals("custom", ignoreCase = true)) {
+                        put("AETHER_NOIZE_JC", settings.noizeJc.toString())
+                        put("AETHER_NOIZE_JMIN", settings.noizeJmin.toString())
+                        put("AETHER_NOIZE_JMAX", settings.noizeJmax.toString())
+                        put("AETHER_NOIZE_INTERVAL_MS", settings.noizeIntervalMs.toString())
+                    }
                 }
             }
 
