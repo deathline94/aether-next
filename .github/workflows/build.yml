@@ -177,12 +177,21 @@ jobs:
         working-directory: apps/android/android
         run: |
           set -euo pipefail
+          WANT="1396DD16D8F2954E7D9A213AD0BF2BA8B96E4A5B5F0A71C3CA88A133744794AC"
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
           test -n "$APKSIGNER"
           for apk in app/build/outputs/apk/release/*.apk; do
-            "$APKSIGNER" verify --verbose --print-certs "$apk"
-            digest=$($APKSIGNER verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')
-            test "$digest" = "1396DD16D8F2954E7D9A213AD0BF2BA8B96E4A5B5F0A71C3CA88A133744794AC"
+            echo "=== verify $apk ==="
+            out=$("$APKSIGNER" verify --verbose --print-certs "$apk" 2>&1) || {
+              echo "$out"
+              exit 1
+            }
+            echo "$out"
+            # apksigner formats vary: "Signer #1 certificate SHA-256 digest:" or "V2 Signer: certificate SHA-256 digest:"
+            digest=$(printf '%s\n' "$out" | grep -iE 'certificate SHA-256 digest:' | head -1 | sed -E 's/.*SHA-256 digest:[[:space:]]*//' | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+            echo "signer digest=$digest"
+            test -n "$digest"
+            test "$digest" = "$WANT"
           done
       - name: Collect
         run: |
