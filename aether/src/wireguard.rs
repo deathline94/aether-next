@@ -703,5 +703,5 @@ pub async fn verify_endpoint(
 // Shared edge pool with MASQUE (see scan_pool.rs).
 pub use crate::scan_pool::{
     EDGE_CIDRS_V4 as WG_PREFIXES_V4, EDGE_CIDRS_V6 as WG_PREFIXES_V6, EDGE_PORTS as WG_PORTS,
-    EDGE_SEEDS_V4 as WG_SEEDS_V4, EDGE_SEEDS_V6 as WG_SEEDS_V6,
+    EDGE_SEEDS_V4 as WG_SEEDS_V4,
 };

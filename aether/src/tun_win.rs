@@ -13,12 +13,12 @@ const ADAPTER_NAME: &str = "Aether";
 const TUNNEL_TYPE: &str = "Aether";
 
 pub fn enabled() -> bool {
-    match std::env::var("AETHER_TUN") {
-        Ok(v) => {
+    match crate::runtime_env::var("AETHER_TUN") {
+        Some(v) => {
             let v = v.trim().to_lowercase();
             v == "1" || v == "true" || v == "yes" || v == "on"
         }
-        Err(_) => false,
+        None => false,
     }
 }
 
@@ -62,26 +62,45 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
+/// Defense-in-depth: reject any interpolated value that could break out of a
+/// single-quoted PowerShell string literal (L1 fix). Inputs here are typed IPs
+/// and a constant adapter name, so this should never fire in practice; it guards
+/// against future call sites passing attacker-influenced strings into scripts.
+fn ps_literal_is_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | ':'))
+}
+
 fn parse_v4(s: &str) -> Result<Ipv4Addr> {
     let ip = s.split('/').next().unwrap_or(s);
     ip.parse()
         .map_err(|_| AetherError::Other(format!("bad ipv4 {s}")))
 }
 
-fn default_gateway() -> Result<(String, Ipv4Addr)> {
-    let out = run_cmd("route", &["print", "0.0.0.0"])?;
-    for line in out.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 5 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
-            let gw: Ipv4Addr = cols[2]
-                .parse()
-                .map_err(|_| AetherError::Other("bad default gateway".into()))?;
-            if !gw.is_unspecified() {
-                return Ok((cols[3].to_string(), gw));
-            }
-        }
-    }
-    Err(AetherError::Other("default gateway not found".into()))
+fn default_gateway() -> Result<(u32, Ipv4Addr)> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$best = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' |
+  Where-Object { $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -ne 'Aether' } |
+  ForEach-Object {
+    $ifm = (Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $_.InterfaceIndex).InterfaceMetric
+    [PSCustomObject]@{ InterfaceIndex=$_.InterfaceIndex; NextHop=$_.NextHop; TotalMetric=($_.RouteMetric + $ifm) }
+  } | Sort-Object TotalMetric | Select-Object -First 1
+if (-not $best) { throw 'physical default gateway not found' }
+Write-Output ($best.InterfaceIndex.ToString() + '|' + $best.NextHop)
+"#;
+    let out = ps(script)?;
+    let line = out.lines().map(str::trim).find(|line| line.contains('|'))
+        .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
+    let (idx, gateway) = line.split_once('|')
+        .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
+    let idx = idx.trim().parse::<u32>()
+        .map_err(|_| AetherError::Other("bad default interface index".into()))?;
+    let gateway = gateway.trim().parse::<Ipv4Addr>()
+        .map_err(|_| AetherError::Other("bad default gateway".into()))?;
+    Ok((idx, gateway))
 }
 
 fn ps(cmd: &str) -> Result<String> {
@@ -92,6 +111,9 @@ fn ps(cmd: &str) -> Result<String> {
 }
 
 fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
+    if !ps_literal_is_safe(name) {
+        return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
+    }
     // WireGuard-style: /32 on tunnel NIC, no gateway, low metric, DNS via tunnel.
     let mtu = crate::mtu::current().clamp(1280, 1400);
     let ip = ipv4.to_string();
@@ -169,6 +191,9 @@ Write-Output 'ok'
 }
 
 fn interface_index(name: &str) -> Result<u32> {
+    if !ps_literal_is_safe(name) {
+        return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
+    }
     let out = ps(&format!(
         "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ifIndex)"
     ))?;
@@ -190,7 +215,7 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
             ))
         }
     };
-    let (_iface, gw) = default_gateway()?;
+    let (physical_if_index, gw) = default_gateway()?;
     let if_index = interface_index(ADAPTER_NAME)?;
     let peer_s = peer_ip.to_string();
     let gw_s = gw.to_string();
@@ -200,11 +225,12 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
     // plus host route for edge peer via physical gateway. Prefer New-NetRoute.
     let script = format!(
         r#"
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 $tunIf = {if_index}
 $peer = '{peer_s}/32'
 $gw = '{gw_s}'
 $via = '{via}'
+$physIf = {physical_if_index}
 # Drop stale split defaults
 foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')) {{
   Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
@@ -213,17 +239,11 @@ foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')) {{
 # Peer exclude: force edge traffic out physical gateway
 Get-NetRoute -DestinationPrefix $peer -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-# Find physical interface that has the default gateway
-$phys = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.NextHop -eq $gw }} | Select-Object -First 1
-if ($phys) {{
-  New-NetRoute -DestinationPrefix $peer -InterfaceIndex $phys.InterfaceIndex -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-}} else {{
-  route add {peer_s} mask 255.255.255.255 {gw_s} metric 1 | Out-Null
-}}
+# Pin the outer transport to the selected physical interface.
+New-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 # Split default ON-LINK on WinTUN (this is what WireGuard uses)
 foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
-  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -NextHop '0.0.0.0' -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -NextHop '0.0.0.0' -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
   if (-not (Get-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -ErrorAction SilentlyContinue)) {{
     # Fallback: next-hop = tunnel IP + IF
     $dest = $p.Split('/')[0]
@@ -231,16 +251,14 @@ foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
     route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
   }}
 }}
-# Blackhole IPv6 to prevent dual-stack bypass.
-# We route it into the IPv4 TUN where it is dropped, preventing silent leaks.
-foreach ($p in @('::/1','8000::/1')) {{
-  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-}}
+# IPv6 stays disabled until this TUN path supports it.
 # Verify
 $v = @(Get-NetRoute -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
   Where-Object {{ $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') }} |
   Select-Object -ExpandProperty DestinationPrefix)
-if ($v.Count -lt 2) {{ Write-Output 'WARN:missing-split-routes' }} else {{ Write-Output ('ok if=' + $tunIf + ' routes=' + ($v -join ',')) }}
+$peerOk = Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue
+if ($v.Count -lt 2 -or -not $peerOk) {{ throw 'route verification failed' }}
+Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -join ','))
 "#
     );
     match ps(&script) {

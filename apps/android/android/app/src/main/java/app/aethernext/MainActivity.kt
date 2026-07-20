@@ -73,9 +73,6 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClientCompat() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                if (!request.isForMainFrame) {
-                    return false
-                }
                 return request.url.scheme != "https" || request.url.host != APP_HOST
             }
 
@@ -86,8 +83,10 @@ class MainActivity : AppCompatActivity() {
                 if (request.url.scheme == "https" && request.url.host == APP_HOST) {
                     return assetLoader.shouldInterceptRequest(request.url)
                 }
-                // null = let system handle (or block); empty 200 half-renders pages.
-                return null
+                Log.w(TAG, "blocked untrusted WebView resource: ${request.url}")
+                return android.webkit.WebResourceResponse(
+                    "text/plain", "UTF-8", 403, "Forbidden", emptyMap(), ByteArrayInputStream(ByteArray(0)),
+                )
             }
 
             override fun onPageFinished(view: WebView, url: String) {

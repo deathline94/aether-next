@@ -26,6 +26,16 @@ pub fn normalize(name: &str) -> &str {
     }
 }
 
+/// True if `name` (after trimming/lowercasing) is a recognized profile token.
+/// Unknown names fall back to the transport default; callers warn when this happens.
+pub fn is_recognized(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "" | "off" | "none" | "light" | "low" | "medium" | "balanced" | "firewall"
+            | "default" | "high" | "gfw" | "max" | "aggressive" | "heavy" | "custom"
+    )
+}
+
 /// Default profile for a transport when env is unset.
 pub fn default_profile(transport: Transport) -> &'static str {
     match transport {
@@ -76,9 +86,15 @@ fn apply_custom_aethernoize(mut cfg: AetherNoizeConfig) -> AetherNoizeConfig {
 }
 
 pub fn masque_from_env() -> NoizeConfig {
-    let raw =
-        std::env::var("AETHER_NOIZE").unwrap_or_else(|_| default_profile(Transport::Masque).into());
+    let raw = crate::runtime_env::var("AETHER_NOIZE")
+        .unwrap_or_else(|| default_profile(Transport::Masque).into());
     let name = normalize(&raw);
+    if !is_recognized(&raw) {
+        log::warn!("[!] unknown obfuscation profile {raw:?}; falling back to '{name}'");
+    }
+    if name == "max" {
+        log::info!("[i] MASQUE obfuscation 'max' is equivalent to 'high' (only two profiles exist)");
+    }
     log::info!("[+] obfuscation profile (masque): {name}");
     let mut cfg = noize_from_name(name);
     if name == "custom" {
@@ -88,9 +104,12 @@ pub fn masque_from_env() -> NoizeConfig {
 }
 
 pub fn wg_from_env() -> AetherNoizeConfig {
-    let raw = std::env::var("AETHER_NOIZE")
-        .unwrap_or_else(|_| default_profile(Transport::WireGuard).into());
+    let raw = crate::runtime_env::var("AETHER_NOIZE")
+        .unwrap_or_else(|| default_profile(Transport::WireGuard).into());
     let name = normalize(&raw);
+    if !is_recognized(&raw) {
+        log::warn!("[!] unknown obfuscation profile {raw:?}; falling back to '{name}'");
+    }
     log::info!("[+] obfuscation profile (wireguard): {name}");
     let mut cfg = aethernoize_from_name(name);
     if name == "custom" {

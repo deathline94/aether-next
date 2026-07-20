@@ -17,7 +17,7 @@ pub use crate::scan::ScanMode;
 // Shared edge pool (same CIDRs/ports for MASQUE + WG). Bad edges simply fail probe.
 pub use crate::scan_pool::{
     EDGE_CIDRS_V4 as MASQUE_CIDRS_V4, EDGE_CIDRS_V6 as MASQUE_CIDRS_V6, EDGE_PORTS as MASQUE_PORTS,
-    EDGE_SEEDS_V4 as MASQUE_SEEDS, EDGE_SEEDS_V6 as MASQUE_SEEDS_V6,
+    EDGE_SEEDS_V4 as MASQUE_SEEDS,
 };
 
 /// Only hosts that resolve into WARP client / MASQUE ranges. General CDN names
@@ -321,10 +321,9 @@ async fn verify_one(
         };
     }
 
-    // Try with configured noize first; if that fails, retry clean (noize off).
-    // Many paths accept plain QUIC while junk-before-handshake breaks Initial.
+    // Try clean first; obfuscation on every candidate wastes time and can trigger rate limits.
     let attempts: Vec<crate::noize::NoizeConfig> = if probe.noize.is_enabled() {
-        vec![probe.noize.clone(), crate::noize::NoizeConfig::off()]
+        vec![crate::noize::NoizeConfig::off(), probe.noize.clone()]
     } else {
         vec![crate::noize::NoizeConfig::off()]
     };
@@ -345,7 +344,7 @@ async fn verify_one(
             Ok(rtt) => {
                 if i > 0 {
                     log::info!(
-                        "[+] h3 probe {ip}:{port} succeeded without noize (rtt {:?})",
+                        "[+] h3 probe {ip}:{port} required noize (rtt {:?})",
                         rtt
                     );
                 }

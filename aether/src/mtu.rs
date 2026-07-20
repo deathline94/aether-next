@@ -16,7 +16,7 @@ static CHOSEN: OnceLock<usize> = OnceLock::new();
 
 /// Resolve MTU: env `AETHER_MTU` wins; otherwise auto-probe (cached).
 pub async fn resolve_mtu(protocol: &str) -> usize {
-    if let Ok(v) = std::env::var("AETHER_MTU") {
+    if let Some(v) = crate::runtime_env::var("AETHER_MTU") {
         if let Ok(n) = v.trim().parse::<usize>() {
             if (576..=1500).contains(&n) {
                 log::info!("[+] MTU from AETHER_MTU={n}");
@@ -33,7 +33,7 @@ pub async fn resolve_mtu(protocol: &str) -> usize {
     let n = auto_probe(protocol).await;
     let _ = CHOSEN.set(n);
     // So routing_plane::tunnel_mtu() and other readers see the same value.
-    std::env::set_var("AETHER_MTU", n.to_string());
+    crate::runtime_env::set("AETHER_MTU", &n.to_string());
     log::info!("[+] auto MTU selected: {n} (protocol={protocol})");
     n
 }
@@ -42,7 +42,7 @@ async fn auto_probe(protocol: &str) -> usize {
     // WireGuard outer packets add ~60B; stay conservative unless probe says OK.
     // MASQUE h2 is TCP to :443 — slightly more tolerant of larger inner MTU.
     let prefer_large = protocol.eq_ignore_ascii_case("masque")
-        || std::env::var("AETHER_MASQUE_HTTP2")
+        || crate::runtime_env::var("AETHER_MASQUE_HTTP2")
             .map(|v| {
                 let v = v.to_ascii_lowercase();
                 v == "1" || v == "true" || v == "h2" || v == "on"
@@ -96,7 +96,7 @@ async fn probe_udp_size(payload: usize) -> bool {
 
 /// Current MTU (env or last resolve). Safe default if never resolved.
 pub fn current() -> usize {
-    if let Ok(v) = std::env::var("AETHER_MTU") {
+    if let Some(v) = crate::runtime_env::var("AETHER_MTU") {
         if let Ok(n) = v.trim().parse::<usize>() {
             if (576..=1500).contains(&n) {
                 return n;

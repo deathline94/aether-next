@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +11,9 @@ use crate::netstack::StackHandle;
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 const RELAY_BUF: usize = 256 * 1024;
+const MAX_CLIENTS: usize = 256;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
 
 struct DnsCache {
     map: HashMap<String, (IpAddr, Instant)>,
@@ -45,6 +48,9 @@ pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
 }
 
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
+    if !listen.ip().is_loopback() && std::env::var_os("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
+        return Err(AetherError::Other("refusing non-loopback SOCKS bind".into()));
+    }
     Ok(TcpListener::bind(listen).await?)
 }
 
@@ -52,12 +58,17 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     let listen = listener.local_addr()?;
     log::info!("socks5 listening on {listen}");
 
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
         let (sock, peer) = listener.accept().await?;
+        let permit = match permits.clone().try_acquire_owned() { Ok(p) => p, Err(_) => continue };
         let _ = sock.set_nodelay(true);
         let stack = stack.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(sock, stack).await {
+            let _permit = permit;
+            if let Err(e) = tokio::time::timeout(MAX_SESSION, handle_client(sock, stack)).await
+                .map_err(|_| AetherError::Other("SOCKS maximum session duration reached".into()))
+                .and_then(|r| r) {
                 log::debug!("socks client {peer} ended: {e}");
             }
         });
@@ -65,17 +76,14 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
 }
 
 async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
-    handshake(&mut sock).await?;
-
-    let mut head = [0u8; 4];
-    sock.read_exact(&mut head).await?;
-    if head[0] != VER {
-        return Err(AetherError::Other("bad socks version".into()));
-    }
-
-    let cmd = head[1];
-    let atyp = head[3];
-    let (target, port) = read_target(&mut sock, atyp).await?;
+    let (cmd, target, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        handshake(&mut sock).await?;
+        let mut head = [0u8; 4];
+        sock.read_exact(&mut head).await?;
+        if head[0] != VER { return Err(AetherError::Other("bad socks version".into())); }
+        let (target, port) = read_target(&mut sock, head[3]).await?;
+        Ok::<_, AetherError>((head[1], target, port))
+    }).await.map_err(|_| AetherError::Other("SOCKS handshake timeout".into()))??;
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
@@ -178,7 +186,7 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 
 fn dns_prefer_order() -> Vec<u16> {
     // 1=A, 28=AAAA. Respect AETHER_IP when set.
-    match std::env::var("AETHER_IP")
+    match crate::runtime_env::var("AETHER_IP")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -431,12 +439,17 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                 let (n, from) = match r { Ok(v) => v, Err(_) => break };
                 match client {
                     None => client = Some(from),
-                    Some(allowed) if allowed.ip() == from.ip() && allowed.port() == from.port() => {}
-                    Some(allowed) if allowed.ip() == from.ip() => {
-                        // Same host, new ephemeral port (common for multi-socket clients).
+                    Some(allowed) if allowed == from => {}
+                    Some(allowed)
+                        if allowed.ip() == from.ip() && from.ip().is_loopback() =>
+                    {
+                        // Same loopback host, new ephemeral port (common for
+                        // multi-socket clients). Restricted to loopback so a
+                        // non-loopback source can never rebind the session (L2 fix).
+                        log::debug!("socks udp client rebind {allowed} -> {from}");
                         client = Some(from);
                     }
-                    Some(_) => continue, // reject hijack from different local process IP
+                    Some(_) => continue, // reject any other source
                 }
                 if let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) {
                     let dst = match dst {

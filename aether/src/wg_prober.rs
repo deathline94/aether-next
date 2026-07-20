@@ -231,18 +231,24 @@ async fn verify_one_wg(
 ) -> Option<WgProbeResult> {
     let peer = SocketAddr::new(ip, port);
 
+    let clean = crate::aethernoize::from_profile("off");
     match wireguard::verify_endpoint(
-        peer,
-        *probe.private_key,
-        *probe.peer_public_key,
-        probe.client_id,
-        probe.local_ipv4,
-        &probe.aethernoize,
-        timeout,
-    )
-    .await
-    {
+        peer, *probe.private_key, *probe.peer_public_key, probe.client_id,
+        probe.local_ipv4, &clean, timeout,
+    ).await {
         Ok(rtt) => Some(WgProbeResult { ip, port, rtt }),
+        Err(clean_err) if probe.aethernoize.is_enabled() => {
+            match wireguard::verify_endpoint(
+                peer, *probe.private_key, *probe.peer_public_key, probe.client_id,
+                probe.local_ipv4, &probe.aethernoize, timeout,
+            ).await {
+                Ok(rtt) => Some(WgProbeResult { ip, port, rtt }),
+                Err(e) => {
+                    log::debug!("wg probe {ip}:{port} clean={clean_err}; obfuscated={e}");
+                    None
+                }
+            }
+        }
         Err(e) => {
             log::debug!("wg probe {ip}:{port} -> {e}");
             None
@@ -282,14 +288,14 @@ fn build_wg_candidates(
             .iter()
             .filter_map(|c| parse_cidr_v4(c))
             .collect();
-        
-        // Seeds go first, with a random port
+        // Pair each trusted seed with the five highest-priority protocol ports.
         for s in wireguard::WG_SEEDS_V4 {
             if let Ok(a) = s.parse::<Ipv4Addr>() {
-                let port = use_ports[rng.gen_range(0..use_ports.len())];
-                let key = (IpAddr::V4(a), port);
-                if seen.insert(key) {
-                    out.push(key);
+                for &port in use_ports.iter().take(5) {
+                    let key = (IpAddr::V4(a), port);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
                 }
             }
         }

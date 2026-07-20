@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 110
-        versionName = "1.0.10"
+        versionName = "1.0.11"
     }
 
     // Per-ABI APKs + one fat universal (all engines inside).
@@ -38,7 +38,7 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

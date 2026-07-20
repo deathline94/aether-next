@@ -1,12 +1,15 @@
 use std::path::Path;
 
 use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::account::Identity;
 use crate::error::{AetherError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PersistedIdentity {
     pub device_id: String,
     pub access_token: String,
@@ -88,6 +91,51 @@ impl TryFrom<PersistedIdentity> for Identity {
 }
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAGIC: &[u8] = b"AETHERCFG1\n";
+
+fn key() -> Result<Option<[u8; 32]>> {
+    let Some(v) = std::env::var_os("AETHER_CONFIG_KEY") else { return Ok(None) };
+    let b = base64::engine::general_purpose::STANDARD.decode(v.to_string_lossy().trim())
+        .map_err(|_| AetherError::Other("invalid config key".into()))?;
+    if b.len() != 32 { return Err(AetherError::Other("config key must be 32 bytes".into())); }
+    let mut k=[0u8;32]; k.copy_from_slice(&b); Ok(Some(k))
+}
+fn encode(plain: &[u8]) -> Result<Vec<u8>> {
+    let Some(mut k)=key()? else { return Ok(plain.to_vec()) };
+    let cipher=ChaCha20Poly1305::new((&k).into());
+    let mut nonce=[0u8;12]; rand::thread_rng().fill_bytes(&mut nonce);
+    let ct=cipher.encrypt(Nonce::from_slice(&nonce), plain)
+        .map_err(|_| AetherError::Other("config encryption failed".into()))?;
+    k.fill(0); let mut out=MAGIC.to_vec(); out.extend_from_slice(&nonce); out.extend_from_slice(&ct); Ok(out)
+}
+fn read_text(path: &str) -> Result<String> {
+    let raw=std::fs::read(path)?;
+    let plain=if let Some(body)=raw.strip_prefix(MAGIC) {
+        if body.len()<12 { return Err(AetherError::Other("truncated encrypted config".into())); }
+        let Some(mut k)=key()? else { return Err(AetherError::Other("encrypted config key unavailable".into())); };
+        let cipher=ChaCha20Poly1305::new((&k).into());
+        let p=cipher.decrypt(Nonce::from_slice(&body[..12]), &body[12..])
+            .map_err(|_| AetherError::Other("config authentication failed".into()))?;
+        k.fill(0); p
+    } else { raw };
+    String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))
+}
+fn private_atomic_write(path: &str, data: &[u8]) -> Result<()> {
+    if let Some(parent)=Path::new(path).parent() { std::fs::create_dir_all(parent)?; }
+    let tmp=format!("{path}.tmp");
+    #[cfg(unix)] {
+        use std::fs::OpenOptions; use std::io::Write; use std::os::unix::fs::OpenOptionsExt;
+        let mut f=OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        f.write_all(data)?; f.sync_all()?;
+    }
+    #[cfg(not(unix))] std::fs::write(&tmp,data)?;
+    if Path::new(path).exists() { std::fs::remove_file(path)?; }
+    std::fs::rename(&tmp,path)?;
+    #[cfg(windows)] if let Ok(user)=std::env::var("USERNAME") {
+        let _=std::process::Command::new("icacls").args([path,"/inheritance:r","/grant:r",&format!("{user}:F")]).output();
+    }
+    Ok(())
+}
 
 pub fn load(path: &str) -> Result<Option<Identity>> {
     if !Path::new(path).exists() {
@@ -100,7 +148,7 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
             meta.len()
         )));
     }
-    let text = std::fs::read_to_string(path)?;
+    let text = read_text(path)?;
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
     Ok(Some(Identity::try_from(persisted)?))
@@ -110,31 +158,21 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
     let text = toml::to_string_pretty(&persisted)
         .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    if let Some(parent) = Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    let data=encode(text.as_bytes())?;
+    private_atomic_write(path, &data)
 }
 
 pub fn save_masque_creds(path: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
     if !Path::new(path).exists() {
         return Ok(());
     }
-    let text = std::fs::read_to_string(path)?;
+    let text = read_text(path)?;
     let mut persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
     persisted.cert_pem = String::from_utf8_lossy(cert_pem).to_string();
     persisted.key_pem = String::from_utf8_lossy(key_pem).to_string();
     let updated = toml::to_string_pretty(&persisted)
         .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    std::fs::write(path, updated)?;
-    Ok(())
+    let data=encode(updated.as_bytes())?;
+    private_atomic_write(path, &data)
 }

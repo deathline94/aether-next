@@ -17,6 +17,7 @@ mod obfuscation;
 mod prober;
 mod quic;
 mod routing_plane;
+mod runtime_env;
 mod scan;
 mod scan_pool;
 mod session_event;
@@ -88,16 +89,18 @@ async fn shutdown_request() {
 
 /// Product session entry — CLI is a thin adapter; GUI spawns this binary.
 async fn run_session(cfg: EngineConfig) -> Result<()> {
-    // Apply config into process env so existing helpers keep working.
-    // Next deepening step: pass cfg by value into helpers instead of env.
-    std::env::set_var("AETHER_NOIZE", &cfg.noize);
-    std::env::set_var("AETHER_SCAN", &cfg.scan);
-    std::env::set_var("AETHER_IP", &cfg.ip);
+    // Apply resolved config into a thread-safe, in-process store (S3 fix).
+    // Downstream helpers read these via runtime_env::var, which falls back to
+    // the real process environment. This avoids std::env::set_var, which is a
+    // data race once the async runtime's worker threads are running.
+    runtime_env::set("AETHER_NOIZE", &cfg.noize);
+    runtime_env::set("AETHER_SCAN", &cfg.scan);
+    runtime_env::set("AETHER_IP", &cfg.ip);
     if cfg.masque_http2 {
-        std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+        runtime_env::set("AETHER_MASQUE_HTTP2", "1");
     }
     if cfg.tun {
-        std::env::set_var("AETHER_TUN", "1");
+        runtime_env::set("AETHER_TUN", "1");
     }
 
     let listen = cfg.socks;
@@ -404,10 +407,15 @@ async fn run_masque_tunnel(
         ctrl_tx,
     } = chans;
 
+    let route_peer = if masque_h2::enabled() {
+        masque_h2::h2_peer(peer)
+    } else {
+        peer
+    };
     let (stack, _tun) = spawn_stack_and_optional_tun(
         &identity.ipv4,
         &identity.ipv6,
-        peer,
+        route_peer,
         inbound_rx,
         outbound_tx,
     )
@@ -415,35 +423,45 @@ async fn run_masque_tunnel(
     let _ctrl = ctrl_tx;
 
     let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(8);
-    let bridge_stack = stack.clone();
-    tokio::spawn(async move {
-        while let Some(a) = addr_rx.recv().await {
-            let res = match a.ip {
-                IpAddr::V4(v4) => bridge_stack.set_addrs(Some((v4, a.prefix)), None).await,
-                IpAddr::V6(v6) => bridge_stack.set_addrs(None, Some((v6, a.prefix))).await,
-            };
-            if let Err(e) = res {
-                log::warn!("[-] failed to sync edge address into netstack: {e}");
+    if let Some(bridge_stack) = stack.clone() {
+        tokio::spawn(async move {
+            while let Some(a) = addr_rx.recv().await {
+                let res = match a.ip {
+                    IpAddr::V4(v4) => bridge_stack.set_addrs(Some((v4, a.prefix)), None).await,
+                    IpAddr::V6(v6) => bridge_stack.set_addrs(None, Some((v6, a.prefix))).await,
+                };
+                if let Err(e) = res {
+                    log::warn!("[-] failed to sync edge address into netstack: {e}");
+                }
             }
-        }
-    });
+        });
+    } else {
+        // CONNECT-IP may send repeated address capsules. Drain them in TUN mode
+        // so the bounded control channel can never stall the transport task.
+        tokio::spawn(async move { while addr_rx.recv().await.is_some() {} });
+    }
 
-    // Bind early so port conflicts fail fast, but do not advertise ProxyReady until
-    // the tunnel data-plane is proven (H2/H3).
-    let socks_listener = socks::bind(listen).await?;
-    let http_listener = http_proxy::bind(http_listen).await?;
-    let socks_stack = stack.clone();
-    let socks_task = tokio::spawn(async move {
-        log::info!("[+] socks5 server listening on {listen}");
-        socks::serve_listener(socks_listener, socks_stack).await
-    });
-    let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack.clone()));
+    // Proxy services are intentionally disabled in full-device TUN mode: sharing
+    // one tunnel identity between Windows TCP/IP and smoltcp corrupts flow ownership.
+    let (socks_task, http_task) = if let Some(stack) = stack.clone() {
+        let socks_listener = socks::bind(listen).await?;
+        let http_listener = http_proxy::bind(http_listen).await?;
+        let socks_stack = stack.clone();
+        let socks_task = tokio::spawn(async move {
+            log::info!("[+] socks5 server listening on {listen}");
+            socks::serve_listener(socks_listener, socks_stack).await
+        });
+        let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack));
+        (Some(socks_task), Some(http_task))
+    } else {
+        (None, None)
+    };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let probe_src: Option<std::net::Ipv4Addr> = identity.ipv4.parse().ok();
     if let Some(src) = probe_src {
         // H3 path reads this for data-plane probe source (matches H2 identity IPv4).
-        std::env::set_var("AETHER_PROBE_SRC", src.to_string());
+        runtime_env::set("AETHER_PROBE_SRC", &src.to_string());
     }
 
     let tunnel_handle = if masque_h2::enabled() {
@@ -466,26 +484,40 @@ async fn run_masque_tunnel(
 
     match tokio::time::timeout(std::time::Duration::from_secs(45), ready_rx).await {
         Ok(Ok(())) => {
-            session_event::emit(SessionEvent::ProxyReady {
-                socks: listen.to_string(),
-                http: http_listen.to_string(),
-            });
+            if stack.is_some() {
+                session_event::emit(SessionEvent::ProxyReady {
+                    socks: listen.to_string(),
+                    http: http_listen.to_string(),
+                });
+            }
             session_event::emit(SessionEvent::Connected {
-                detail: "masque ready".into(),
+                detail: if stack.is_some() {
+                    "masque proxies ready".into()
+                } else {
+                    "masque full-device tunnel ready".into()
+                },
             });
         }
         Ok(Err(_)) => {
             tunnel_handle.abort();
-            socks_task.abort();
-            http_task.abort();
+            if let Some(task) = &socks_task {
+                task.abort();
+            }
+            if let Some(task) = &http_task {
+                task.abort();
+            }
             return Err(AetherError::Other(
                 "tunnel closed before data-plane ready".into(),
             ));
         }
         Err(_) => {
             tunnel_handle.abort();
-            socks_task.abort();
-            http_task.abort();
+            if let Some(task) = &socks_task {
+                task.abort();
+            }
+            if let Some(task) = &http_task {
+                task.abort();
+            }
             return Err(AetherError::Other(
                 "timeout waiting for MASQUE data-plane".into(),
             ));
@@ -495,8 +527,12 @@ async fn run_masque_tunnel(
     let tunnel_result = tunnel_handle
         .await
         .map_err(|e| AetherError::Other(format!("tunnel task: {e}")))?;
-    socks_task.abort();
-    http_task.abort();
+    if let Some(task) = &socks_task {
+        task.abort();
+    }
+    if let Some(task) = &http_task {
+        task.abort();
+    }
 
     match tunnel_result {
         Ok(()) => Ok(()),
@@ -513,7 +549,7 @@ fn wg_keepalive_secs() -> u16 {
 }
 
 fn wg_profile_candidates() -> Vec<(String, aethernoize::AetherNoizeConfig)> {
-    let primary = std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "balanced".to_string());
+    let primary = runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| "balanced".to_string());
     log::info!("[+] aethernoize primary profile: {primary}");
 
     obfuscation::wg_profile_retry_names(&primary)
@@ -752,25 +788,38 @@ async fn run_wireguard_tunnel(
     // spawn already used tunnel_mtu(); ensure env was set by resolve_mtu.
     let _ = mtu;
 
-    let socks_listener = socks::bind(listen).await?;
-    let http_listener = http_proxy::bind(http_listen).await?;
-    let socks_stack = stack.clone();
-    let socks_task = tokio::spawn(async move {
-        log::info!("[+] socks5 server listening on {listen}");
-        socks::serve_listener(socks_listener, socks_stack).await
-    });
-    let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack.clone()));
-    session_event::emit(SessionEvent::ProxyReady {
-        socks: listen.to_string(),
-        http: http_listen.to_string(),
-    });
+    let (socks_task, http_task) = if let Some(stack) = stack {
+        let socks_listener = socks::bind(listen).await?;
+        let http_listener = http_proxy::bind(http_listen).await?;
+        let socks_stack = stack.clone();
+        let socks_task = tokio::spawn(async move {
+            log::info!("[+] socks5 server listening on {listen}");
+            socks::serve_listener(socks_listener, socks_stack).await
+        });
+        let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack));
+        session_event::emit(SessionEvent::ProxyReady {
+            socks: listen.to_string(),
+            http: http_listen.to_string(),
+        });
+        (Some(socks_task), Some(http_task))
+    } else {
+        (None, None)
+    };
     session_event::emit(SessionEvent::Connected {
-        detail: "wireguard proxies up".into(),
+        detail: if socks_task.is_some() {
+            "wireguard proxies up".into()
+        } else {
+            "wireguard full-device tunnel ready".into()
+        },
     });
 
     let tunnel_result = tunnel.run(tints.outbound_rx).await;
-    socks_task.abort();
-    http_task.abort();
+    if let Some(task) = &socks_task {
+        task.abort();
+    }
+    if let Some(task) = &http_task {
+        task.abort();
+    }
 
     match tunnel_result {
         Ok(()) => Ok(()),
@@ -784,7 +833,7 @@ async fn spawn_stack_and_optional_tun(
     peer: SocketAddr,
     inbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-) -> Result<(netstack::StackHandle, Option<routing_plane::TunGuard>)> {
+) -> Result<(Option<netstack::StackHandle>, Option<routing_plane::TunGuard>)> {
     routing_plane::spawn(ipv4, ipv6, peer, inbound_rx, outbound_tx).await
 }
 
@@ -826,8 +875,8 @@ async fn establish_wg(
         aethernoize: std::sync::Arc::new(profile),
     };
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(16384);
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(16384);
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(2048);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(2048);
 
     let tunnel = wireguard::WgTunnel::new(cfg, inbound_tx).await?;
     // Handshake on the same tunnel before netstack traffic starts.
@@ -952,7 +1001,7 @@ async fn prompt_line(prompt: &str) -> Option<String> {
 }
 
 async fn select_scan_mode() -> scan::ScanMode {
-    if let Ok(v) = std::env::var("AETHER_SCAN") {
+    if let Some(v) = runtime_env::var("AETHER_SCAN") {
         return scan::ScanMode::parse(&v);
     }
 
@@ -970,7 +1019,7 @@ async fn select_scan_mode() -> scan::ScanMode {
 }
 
 async fn select_scan_mode_str() -> String {
-    if let Ok(v) = std::env::var("AETHER_SCAN") {
+    if let Some(v) = runtime_env::var("AETHER_SCAN") {
         return v;
     }
 
@@ -1030,7 +1079,7 @@ impl Protocol {
 }
 
 async fn select_ip_version() -> prober::IpScan {
-    if let Ok(v) = std::env::var("AETHER_IP") {
+    if let Some(v) = runtime_env::var("AETHER_IP") {
         return prober::IpScan::parse(&v);
     }
 

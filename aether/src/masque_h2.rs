@@ -31,12 +31,12 @@ pub struct H2TunnelConfig {
 }
 
 pub fn enabled() -> bool {
-    match std::env::var("AETHER_MASQUE_HTTP2") {
-        Ok(v) => {
+    match crate::runtime_env::var("AETHER_MASQUE_HTTP2") {
+        Some(v) => {
             let v = v.trim().to_lowercase();
             v == "1" || v == "true" || v == "h2" || v == "yes" || v == "on"
         }
-        Err(_) => false,
+        None => false,
     }
 }
 
@@ -86,21 +86,26 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    if std::env::var("AETHER_TLS_VERIFY")
+    let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-    {
-        builder.set_verify(SslVerifyMode::PEER);
-    } else {
-        // WARP/MASQUE private PKI — public CA verify is not applicable by default.
+        .unwrap_or(false);
+    if dangerous {
         builder.set_verify(SslVerifyMode::NONE);
+        log::warn!("[tls] DANGER: H2 server authentication explicitly disabled");
+    } else {
+        if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
+            builder.set_ca_file(path.trim()).map_err(|e| AetherError::Tls(format!("load TLS CA file: {e}")))?;
+        } else {
+            builder.set_default_verify_paths().map_err(|e| AetherError::Tls(format!("load system TLS roots: {e}")))?;
+        }
+        builder.set_verify(SslVerifyMode::PEER);
     }
 
     let connector = builder.build();
     let mut config = connector
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
-    config.set_verify_hostname(std::env::var("AETHER_TLS_VERIFY").is_ok());
+    config.set_verify_hostname(!dangerous);
     config.set_use_server_name_indication(true);
 
     Ok(config)
@@ -185,11 +190,19 @@ pub async fn run(
         String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
     );
 
-    // Large windows — default h2 crate limits throttle a single CONNECT-IP stream hard.
+    // Flow-control windows sized to unblock a single CONNECT-IP stream without
+    // over-allocating per tunnel (S6 fix). Defaults are modest; AETHER_H2_WINDOW_MB
+    // can raise the stream window up to a hard cap of 32 MiB for high-BDP links.
+    let win_mb = crate::runtime_env::var("AETHER_H2_WINDOW_MB")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(4)
+        .clamp(1, 32);
+    let stream_window = win_mb * 1024 * 1024;
+    let conn_window = stream_window.saturating_mul(2);
     let mut h2_builder = h2::client::Builder::new();
-    h2_builder.initial_window_size(16 * 1024 * 1024);
-    h2_builder.initial_connection_window_size(32 * 1024 * 1024);
-    h2_builder.max_frame_size(1024 * 1024);
+    h2_builder.initial_window_size(stream_window);
+    h2_builder.initial_connection_window_size(conn_window);
+    h2_builder.max_frame_size(256 * 1024);
     let (h2, connection) = h2_builder
         .handshake(tls)
         .await
@@ -355,7 +368,10 @@ pub async fn run(
 }
 
 fn build_dns_probe_packet(src: std::net::Ipv4Addr) -> Vec<u8> {
-    // Minimal IPv4 UDP DNS query: src → 1.1.1.1:53 A for cloudflare.com
+    // Minimal IPv4 UDP DNS query: src → 1.1.1.1:53 A for cloudflare.com.
+    // NOTE (L3): this query travels inside the encrypted tunnel purely to prove
+    // the data plane works. It is not the user's system resolver and does not leak
+    // DNS outside the tunnel.
     let mut dns = Vec::with_capacity(64);
     let id: u16 = rand::random();
     dns.extend_from_slice(&id.to_be_bytes());
@@ -386,6 +402,23 @@ fn build_dns_probe_packet(src: std::net::Ipv4Addr) -> Vec<u8> {
     pkt.extend_from_slice(&[0x00, 0x00]);
     pkt.extend_from_slice(&dns);
     pkt
+}
+
+/// Strictly validate that an inbound IPv4 datagram is a UDP DNS reply from
+/// 1.1.1.1:53 (the resolver our probe targets). Prevents an unrelated or stray
+/// datagram from being treated as data-plane proof (S4 fix).
+fn is_dns_reply_from_resolver(pkt: &[u8]) -> bool {
+    if pkt.len() < 28 || pkt[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 17 {
+        return false;
+    }
+    if pkt[12..16] != [1, 1, 1, 1] {
+        return false;
+    }
+    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
 }
 
 fn ipv4_header_checksum(header: &[u8]) -> u16 {
@@ -432,13 +465,16 @@ async fn verify_dataplane(
                 loop {
                     match capsules.next() {
                         Ok(Some(Capsule::Datagram(pkt))) if pkt.len() >= 28 => {
-                            // UDP reply from 1.1.1.1 is enough to prove data plane.
-                            if pkt[9] == 17 {
+                            // S4 fix: require a genuine UDP DNS reply from 1.1.1.1:53
+                            // rather than accepting any inbound datagram as proof.
+                            if is_dns_reply_from_resolver(&pkt) {
                                 confirms += 1;
                                 if confirms >= 1 {
-                                    log::info!("[h2] data-plane verified");
+                                    log::info!("[h2] data-plane verified (dns reply from 1.1.1.1:53)");
                                     return Ok(());
                                 }
+                            } else {
+                                log::debug!("[h2] ignoring unrelated inbound datagram during verify");
                             }
                         }
                         Ok(Some(_)) => {}
@@ -595,6 +631,21 @@ mod tests {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         assert_eq!(sum as u16, 0xffff);
+    }
+
+    #[test]
+    fn dataplane_accepts_only_dns_reply_from_resolver() {
+        // Outbound probe is a query (src != 1.1.1.1) and must NOT count as a reply.
+        let probe = build_dns_probe_packet(std::net::Ipv4Addr::new(198, 18, 0, 1));
+        assert!(!is_dns_reply_from_resolver(&probe));
+
+        // Minimal IPv4/UDP datagram from 1.1.1.1:53 must be accepted.
+        let mut reply = vec![0u8; 28];
+        reply[0] = 0x45; // IPv4, IHL=5
+        reply[9] = 17; // UDP
+        reply[12..16].copy_from_slice(&[1, 1, 1, 1]); // src = 1.1.1.1
+        reply[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port 53
+        assert!(is_dns_reply_from_resolver(&reply));
     }
 
     #[test]

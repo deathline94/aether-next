@@ -11,13 +11,17 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AetherError, Result};
 
-// Large windows matter: with ~400ms RTT, 1MB caps ~20Mbps (BDP). 8MB → ~160Mbps ceiling.
-const TCP_BUF: usize = 8 * 1024 * 1024;
-const UDP_BUF: usize = 512 * 1024;
-const UDP_META: usize = 512;
-const APP_QUEUE: usize = 16384;
-const MAX_INGEST_PER_TICK: usize = 2048;
-const MAX_RECV_CHUNKS: usize = 512;
+// Keep per-flow memory bounded. Large fixed buffers multiplied by browser connection
+// counts caused multi-gigabyte growth and allocator aborts on desktop.
+const TCP_BUF: usize = 512 * 1024;
+const UDP_BUF: usize = 128 * 1024;
+const UDP_META: usize = 128;
+const APP_QUEUE: usize = 256;
+const MAX_INGEST_PER_TICK: usize = 256;
+const MAX_RECV_CHUNKS: usize = 64;
+const MAX_TCP_CONNECTIONS: usize = 512;
+const MAX_UDP_CONNECTIONS: usize = 128;
+const MAX_PENDING_PER_CONN: usize = 512 * 1024;
 
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
 type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
@@ -420,6 +424,11 @@ async fn run(
             s.iface.poll(now, &mut s.device, &mut s.sockets);
         }));
         if poll_outcome.is_err() {
+            // L4 fix: don't silently swallow a smoltcp poll panic; surface it so the
+            // recovery (dropping the in-flight rx/tx buffers) is visible in logs.
+            log::error!(
+                "[netstack] smoltcp poll panicked; dropping in-flight rx/tx buffers and continuing"
+            );
             s.device.rx.clear();
             s.device.tx.clear();
         }
@@ -482,6 +491,10 @@ async fn sleep_opt(delay: Option<std::time::Duration>) {
 fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     match cmd {
         Cmd::OpenTcp { dst, resp } => {
+            if s.tcp_conns.len() >= MAX_TCP_CONNECTIONS {
+                let _ = resp.send(Err("too many TCP connections".into()));
+                return;
+            }
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -515,6 +528,10 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             );
         }
         Cmd::OpenUdp { resp } => {
+            if s.udp_conns.len() >= MAX_UDP_CONNECTIONS {
+                let _ = resp.send(Err("too many UDP associations".into()));
+                return;
+            }
             let rx_meta = vec![udp::PacketMetadata::EMPTY; UDP_META];
             let tx_meta = vec![udp::PacketMetadata::EMPTY; UDP_META];
             let rx_buf = udp::PacketBuffer::new(rx_meta, vec![0u8; UDP_BUF]);
@@ -552,7 +569,12 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
     match d {
         DataIn::Tcp(id, data) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
-                st.pending.extend_from_slice(&data);
+                if st.pending.len().saturating_add(data.len()) > MAX_PENDING_PER_CONN {
+                    log::warn!("netstack TCP {id} exceeded pending-data limit; closing");
+                    st.half_closed = true;
+                } else {
+                    st.pending.extend_from_slice(&data);
+                }
             }
         }
         DataIn::TcpClose(id) => {

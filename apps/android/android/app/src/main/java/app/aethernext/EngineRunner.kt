@@ -1,12 +1,9 @@
 package app.aethernext
 
 import android.content.Context
-import android.os.Build
-import android.system.Os
 import android.util.Log
 import java.io.BufferedReader
 import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -71,6 +68,7 @@ class EngineRunner(
                     put("AETHER_SOCKS", "127.0.0.1:${settings.socksPort}")
                     put("AETHER_HTTP", "127.0.0.1:${settings.httpPort}")
                     put("AETHER_CONFIG", configPath)
+                    put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
                     put("AETHER_MASQUE_HTTP2", if (settings.transport == "h2") "1" else "0")
                     // Android full-device routing uses hev tun2socks + VpnService, not engine TUN.
                     put("AETHER_TUN", "0")
@@ -162,61 +160,9 @@ class EngineRunner(
         }
         Log.w(TAG, "nativeLibraryDir has no engine: $libDir contents=${libDir.list()?.joinToString()}")
 
-        // 2) Already extracted under filesDir (may fail exec on API 29+).
-        val extracted = File(context.filesDir, "engine/aether")
-        if (extracted.exists() && extracted.length() > 0) {
-            ensureExecutable(extracted)
-            if (canTryExec(extracted)) return extracted
-        }
-
-        // 3) Copy from assets into native-like name under codeCacheDir (sometimes executable).
-        val fromAssets = extractAssetEngine()
-        if (fromAssets != null) return fromAssets
+        // Refuse extracted executables; only APK-signed native libraries are trusted.
 
         return null
-    }
-
-    private fun extractAssetEngine(): File? {
-        return try {
-            // Prefer codeCacheDir; still may be non-exec on some devices.
-            val destDir = File(context.codeCacheDir, "engine").apply { mkdirs() }
-            val dest = File(destDir, "libaether.so")
-            context.assets.open("engine/aether").use { input ->
-                FileOutputStream(dest).use { output -> input.copyTo(output) }
-            }
-            ensureExecutable(dest)
-            Log.i(TAG, "extracted assets engine → ${dest.absolutePath} exec=${dest.canExecute()}")
-            if (dest.exists() && dest.length() > 0) dest else null
-        } catch (e: Exception) {
-            Log.e(TAG, "asset extract failed: ${e.message}")
-            null
-        }
-    }
-
-    private fun ensureExecutable(f: File) {
-        try {
-            f.setReadable(true, false)
-            f.setExecutable(true, false)
-            if (Build.VERSION.SDK_INT >= 21) {
-                try {
-                    Os.chmod(f.absolutePath, 493) // 0755
-                } catch (_: Exception) {
-                }
-            }
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun canTryExec(f: File): Boolean {
-        // Android 10+ blocks exec from app data dirs even if chmod succeeds.
-        if (Build.VERSION.SDK_INT >= 29) {
-            val path = f.absolutePath
-            if (path.contains("/files/") || path.contains("/cache/")) {
-                Log.w(TAG, "skip exec candidate under data dir on API ${Build.VERSION.SDK_INT}: $path")
-                return false
-            }
-        }
-        return f.canExecute() || f.exists()
     }
 
     companion object {

@@ -7,25 +7,35 @@ use crate::error::{AetherError, Result};
 use crate::netstack::{StackHandle, TcpConn};
 use crate::socks;
 
-const MAX_HEADER: usize = 64 * 1024;
+const MAX_HEADER: usize = 16 * 1024;
+const MAX_CLIENTS: usize = 256;
+const MAX_REQUEST_LINE: usize = 4096;
+const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
 pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
     serve_listener(bind(listen).await?, stack).await
 }
 
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
+    if !listen.ip().is_loopback() && std::env::var_os("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
+        return Err(AetherError::Other("refusing non-loopback HTTP proxy bind".into()));
+    }
     Ok(TcpListener::bind(listen).await?)
 }
 
 pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result<()> {
     let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
         let (socket, peer) = listener.accept().await?;
+        let permit = match permits.clone().try_acquire_owned() { Ok(p) => p, Err(_) => continue };
         let _ = socket.set_nodelay(true);
         let stack = stack.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle(socket, stack).await {
+            let _permit = permit;
+            if let Err(error) = tokio::time::timeout(MAX_SESSION, handle(socket, stack)).await
+                .map_err(|_| AetherError::Other("HTTP maximum session duration reached".into())).and_then(|r| r) {
                 log::debug!("http proxy client {peer} ended: {error}");
             }
         });
@@ -42,6 +52,7 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
         .lines()
         .next()
         .ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
+    if first.len() > MAX_REQUEST_LINE { return Err(AetherError::Other("HTTP request line too long".into())); }
     let mut request = first.split_whitespace();
     let method = request.next().unwrap_or("");
     let target = request.next().unwrap_or("");
@@ -98,7 +109,7 @@ async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut header = Vec::with_capacity(2048);
     let mut buf = [0u8; 2048];
     loop {
-        let count = tokio::time::timeout(std::time::Duration::from_secs(30), stream.read(&mut buf))
+        let count = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
             .await
             .map_err(|_| AetherError::Other("HTTP header read timeout".into()))??;
         if count == 0 {

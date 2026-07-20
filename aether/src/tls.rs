@@ -29,7 +29,6 @@ const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
     pub key_pem: &'a [u8],
-    pub pin_endpoint: bool,
 }
 
 pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
@@ -67,17 +66,21 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    // Cloudflare WARP/MASQUE uses client mTLS to a private PKI; public CA verify
-    // fails against the edge. Optional pin/enforce via env for stricter deployments.
-    if std::env::var("AETHER_TLS_VERIFY")
+    let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-    {
-        builder.set_verify(SslVerifyMode::PEER);
-        log::info!("[tls] peer certificate verification ENABLED (AETHER_TLS_VERIFY)");
-    } else {
+        .unwrap_or(false);
+    if dangerous {
         builder.set_verify(SslVerifyMode::NONE);
-        log::debug!("[tls] peer certificate verification disabled (WARP mTLS mode)");
+        log::warn!("[tls] DANGER: server authentication explicitly disabled");
+    } else {
+        if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
+            builder.set_ca_file(path.trim())
+                .map_err(|e| AetherError::Tls(format!("load TLS CA file: {e}")))?;
+        } else {
+            builder.set_default_verify_paths()
+                .map_err(|e| AetherError::Tls(format!("load system TLS roots: {e}")))?;
+        }
+        builder.set_verify(SslVerifyMode::PEER);
     }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
@@ -102,8 +105,6 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     config.set_disable_active_migration(true);
     // Larger dgram queues so bulk IP traffic is not dropped under load.
     config.enable_dgram(true, 256_000, 256_000);
-
-    let _ = params.pin_endpoint;
 
     Ok(config)
 }

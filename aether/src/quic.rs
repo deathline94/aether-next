@@ -15,7 +15,7 @@ use crate::tls::{self, TlsParams};
 use crate::{consts, error::AetherError, error::Result};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const NET_QUEUE: usize = 32768;
+const NET_QUEUE: usize = 2048;
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     use socket2::{Socket, Domain, Type};
@@ -149,8 +149,7 @@ pub async fn run(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     // Prefer assigned edge address when known; else identity-style fallback.
-    let probe_src = std::env::var("AETHER_PROBE_SRC")
-        .ok()
+    let probe_src = crate::runtime_env::var("AETHER_PROBE_SRC")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
 
@@ -167,7 +166,6 @@ pub async fn run(
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &cfg.cert_pem,
         key_pem: &cfg.key_pem,
-        pin_endpoint: false,
     })?;
 
     let mut current_ech = cfg.ech_config_list.clone();
@@ -450,7 +448,26 @@ fn poll_h3(
     Ok(())
 }
 
+/// Strictly validate that an inbound IPv4 datagram is a UDP DNS reply from
+/// 1.1.1.1:53 (the resolver the probe targets). Prevents a stray datagram from
+/// being accepted as data-plane proof (S4 fix).
+fn is_dns_reply_from_resolver(pkt: &[u8]) -> bool {
+    if pkt.len() < 28 || pkt[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 17 {
+        return false;
+    }
+    if pkt[12..16] != [1, 1, 1, 1] {
+        return false;
+    }
+    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
+}
+
 fn build_h3_dns_probe(src: std::net::Ipv4Addr) -> Vec<u8> {
+    // NOTE (L3): sent inside the encrypted tunnel to prove the data plane; this
+    // is not the user's system resolver and does not leak DNS outside the tunnel.
     let mut dns = Vec::with_capacity(64);
     let id: u16 = rand::random();
     dns.extend_from_slice(&id.to_be_bytes());
@@ -554,7 +571,9 @@ async fn drain_datagrams(
         match conn.dgram_recv(buf) {
             Ok(n) => match masque::decode_ip_datagram(&buf[..n], sid) {
                 Ok(Some(ip_packet)) => {
-                    if watch_dataplane && ip_packet.len() >= 20 {
+                    // S4 fix: only treat a genuine UDP DNS reply from 1.1.1.1:53 as
+                    // data-plane proof, not any inbound datagram.
+                    if watch_dataplane && is_dns_reply_from_resolver(&ip_packet) {
                         *dataplane_ok = true;
                     }
                     // Prefer try_send so QUIC recv keeps moving; await only under backpressure.
@@ -677,7 +696,6 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &p.cert_pem,
         key_pem: &p.key_pem,
-        pin_endpoint: false,
     })?;
 
     let scid_bytes = random_scid();

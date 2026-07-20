@@ -73,7 +73,8 @@ pub struct Addresses {
     pub v6: String,
 }
 
-#[derive(Debug, Clone)]
+// Contains bearer tokens and private keys; never derive Debug.
+#[derive(Clone)]
 pub struct Identity {
     pub device_id: String,
     pub access_token: String,
@@ -117,7 +118,9 @@ pub fn generate_masque_keypair() -> Result<MasqueKeyPair> {
         .set_version(2)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let serial = BigNum::from_u32(0)
+    // L5 fix: use a random positive serial instead of a fixed 0, which is an
+    // unusual value that makes the client certificate trivially fingerprintable.
+    let serial = BigNum::from_slice(&(rand::random::<u64>() | 1).to_be_bytes())
         .and_then(|bn| bn.to_asn1_integer())
         .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
@@ -135,7 +138,9 @@ pub fn generate_masque_keypair() -> Result<MasqueKeyPair> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     let not_before = Asn1Time::days_from_now(0).map_err(|e| AetherError::Tls(e.to_string()))?;
-    let not_after = Asn1Time::days_from_now(1).map_err(|e| AetherError::Tls(e.to_string()))?;
+    // L5 fix: widen the 1-day validity slightly for clock-skew tolerance while
+    // keeping the client certificate short-lived.
+    let not_after = Asn1Time::days_from_now(7).map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
         .set_not_before(&not_before)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -269,11 +274,10 @@ async fn parse_account(resp: reqwest::Response) -> Result<AccountData> {
     let text = resp.text().await.map_err(|e| AetherError::Api(e.to_string()))?;
 
     if !status.is_success() {
-        return Err(AetherError::Api(format!("status {status}: {text}")));
+        return Err(AetherError::Api(format!("upstream account API returned {status}")));
     }
-
     serde_json::from_str::<AccountData>(&text)
-        .map_err(|e| AetherError::Api(format!("decode: {e}; body={text}")))
+        .map_err(|e| AetherError::Api(format!("invalid account API response: {e}")))
 }
 
 fn extract_wg_peer(reg: &AccountData) -> Result<[u8; 32]> {
@@ -301,7 +305,7 @@ pub async fn provision_wg(model: &str, locale: &str, jwt: Option<&str>) -> Resul
 
     let mut client_id_arr = [0u8; 3];
     if !reg.config.client_id.is_empty() {
-        log::debug!("[account] received client_id from API: {:?}", reg.config.client_id);
+        log::debug!("[account] received client_id from API");
         if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &reg.config.client_id) {
             if decoded.len() == 3 {
                 client_id_arr.copy_from_slice(&decoded);

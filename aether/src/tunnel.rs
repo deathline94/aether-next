@@ -4,7 +4,7 @@
 //! app/netstack ──outbound──► tunnel ──inbound──► app/netstack
 use tokio::sync::mpsc;
 
-const NET_QUEUE: usize = 32768;
+const NET_QUEUE: usize = 2048;
 
 /// App-facing half: write outbound IP packets, read inbound.
 pub struct Channels {

@@ -35,14 +35,14 @@ impl ScanMode {
             // High concurrency + short quiet window for snappy connects.
             ScanMode::Turbo => HuntStrategy {
                 concurrency: 64,
-                per_probe_timeout: Duration::from_millis(1500),
+                per_probe_timeout: Duration::from_millis(3500),
                 overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(0),
-                target_successes: 1,
-                early_exit_first: true, // Connect to absolute first one that works
+                quiet_after_first: Duration::from_millis(500),
+                target_successes: 3,
+                early_exit_first: false, // Connect to absolute first one that works
                 full_subnet: false,
                 sample_per_cidr: 64,
-                candidate_cap: 4500,
+                candidate_cap: 768,
             },
             ScanMode::Balanced => HuntStrategy {
                 concurrency: 40,
@@ -53,7 +53,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 160,
-                candidate_cap: 3000,
+                candidate_cap: 1200,
             },
             ScanMode::Thorough => HuntStrategy {
                 concurrency: 36,
@@ -64,7 +64,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
-                candidate_cap: 10000,
+                candidate_cap: 5000,
             },
             ScanMode::Stealth => HuntStrategy {
                 concurrency: 6,
@@ -75,7 +75,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 64,
-                candidate_cap: 800,
+                candidate_cap: 400,
             },
         }
     }
@@ -85,14 +85,14 @@ impl ScanMode {
         match self {
             ScanMode::Turbo => HuntStrategy {
                 concurrency: 64,
-                per_probe_timeout: Duration::from_millis(1500),
+                per_probe_timeout: Duration::from_millis(3500),
                 overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(0),
-                target_successes: 1,
-                early_exit_first: true, // Connect to absolute first one that works
+                quiet_after_first: Duration::from_millis(500),
+                target_successes: 3,
+                early_exit_first: false, // Connect to absolute first one that works
                 full_subnet: false,
                 sample_per_cidr: 64,
-                candidate_cap: 4500,
+                candidate_cap: 768,
             },
             ScanMode::Balanced => HuntStrategy {
                 concurrency: 64,
@@ -103,7 +103,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 160,
-                candidate_cap: 4500,
+                candidate_cap: 768,
             },
             ScanMode::Thorough => HuntStrategy {
                 concurrency: 40,
@@ -114,7 +114,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
-                candidate_cap: 10000,
+                candidate_cap: 5000,
             },
             ScanMode::Stealth => HuntStrategy {
                 concurrency: 8,
@@ -125,7 +125,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 64,
-                candidate_cap: 1500,
+                candidate_cap: 500,
             },
         }
     }
