@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
 
     install_netstack_panic_guard();
     let session = run_session(EngineConfig::from_env()?);
-    if std::env::var("AETHER_CONTROL_STDIN").as_deref() == Ok("1") {
+    let result = if std::env::var("AETHER_CONTROL_STDIN").as_deref() == Ok("1") {
         tokio::select! {
             result = session => result,
             _ = shutdown_request() => {
@@ -59,7 +59,20 @@ async fn main() -> Result<()> {
         }
     } else {
         session.await
+    };
+    if let Err(ref e) = result {
+        let message = match e {
+            AetherError::NoCleanEndpoint => {
+                "No working gateway found. Try HTTP/2, another scan mode, or a different network."
+                    .to_string()
+            }
+            other => other.to_string(),
+        };
+        log::error!("[-] session failed: {message}");
+        session_event::emit(SessionEvent::Error { message });
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
+    result
 }
 
 async fn shutdown_request() {

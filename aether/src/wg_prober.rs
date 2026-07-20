@@ -257,118 +257,82 @@ fn build_wg_candidates(
     st: &HuntStrategy,
     ports: &[u16],
     ip: IpScan,
-    mode: ScanMode,
+    _mode: ScanMode,
 ) -> Vec<(IpAddr, u16)> {
-    // Turbo: only high-value ports to finish quickly.
-    let ports: Vec<u16> = if matches!(mode, ScanMode::Turbo) {
-        let mut out = WG_PRIORITY_PORTS.to_vec();
-        for p in ports {
-            if !out.contains(p) && out.len() < 16 {
-                out.push(*p);
-            }
-        }
-        out
-    } else {
-        let mut seen_port: HashSet<u16> = HashSet::new();
-        let mut deduped: Vec<u16> = WG_PRIORITY_PORTS
-            .iter()
-            .copied()
-            .chain(ports.iter().copied())
-            .filter(|p| seen_port.insert(*p))
-            .collect();
-        if deduped.is_empty() {
-            deduped = vec![2408];
-        }
-        deduped
-    };
+    let mut out: Vec<(IpAddr, u16)> = Vec::new();
+    let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+    let mut rng = rand::thread_rng();
+    let cap = st.candidate_cap;
 
-    let mut anchors: Vec<IpAddr> = Vec::new();
-    let mut pool: Vec<IpAddr> = Vec::new();
+    // Build the list of ports to use
+    let mut use_ports = Vec::new();
+    let mut seen_port = HashSet::new();
+    for &p in WG_PRIORITY_PORTS.iter().chain(ports.iter()) {
+        if seen_port.insert(p) {
+            use_ports.push(p);
+        }
+    }
+    if use_ports.is_empty() {
+        use_ports = vec![2408, 500, 4500, 1701, 1010];
+    }
 
     if ip.want_v4() {
+        // Parse the v4 CIDRs
+        let prefixes: Vec<(u32, u8)> = wireguard::WG_PREFIXES_V4
+            .iter()
+            .filter_map(|c| parse_cidr_v4(c))
+            .collect();
+        
+        // Seeds go first, with a random port
         for s in wireguard::WG_SEEDS_V4 {
             if let Ok(a) = s.parse::<Ipv4Addr>() {
-                anchors.push(IpAddr::V4(a));
+                let port = use_ports[rng.gen_range(0..use_ports.len())];
+                let key = (IpAddr::V4(a), port);
+                if seen.insert(key) {
+                    out.push(key);
+                }
             }
         }
-        // DNS warm seeds for engage-style edges.
-        // (lookup is sync-free; call sites can also cache via endpoint_cache)
-        let sample = if matches!(mode, ScanMode::Turbo) {
-            st.sample_per_cidr.min(16)
-        } else {
-            st.sample_per_cidr
-        };
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = wireguard::WG_PREFIXES_V4
-            .iter()
-            .map(|c| {
-                if st.full_subnet {
-                    enumerate_cidr_v4(c)
-                } else {
-                    sample_cidr_v4(c, sample)
-                }
-            })
-            .collect();
-        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max_len {
-            for hosts in &cidr_hosts {
-                if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V4(*a));
-                }
+
+        // Randomly select from CIDRs
+        let mut guard = 0;
+        while out.len() < cap && !prefixes.is_empty() && guard < cap * 10 {
+            guard += 1;
+            let (base, prefix) = prefixes[rng.gen_range(0..prefixes.len())];
+            let host_bits = 32u32.saturating_sub(prefix as u32);
+            // Careful with sizes to prevent overflow
+            let off = if host_bits == 0 {
+                0
+            } else if host_bits >= 32 {
+                rng.gen::<u32>()
+            } else {
+                let usable = (1u32 << host_bits).saturating_sub(2).max(1);
+                1 + rng.gen_range(0..usable)
+            };
+            let a = IpAddr::V4(Ipv4Addr::from(base.wrapping_add(off)));
+            let port = use_ports[rng.gen_range(0..use_ports.len())];
+            let key = (a, port);
+            if seen.insert(key) {
+                out.push(key);
             }
         }
     }
 
     if ip.want_v6() {
-        for s in wireguard::WG_SEEDS_V6 {
-            if let Ok(a) = s.parse::<Ipv6Addr>() {
-                anchors.push(IpAddr::V6(a));
-            }
-        }
-        let per = if st.sample_per_cidr == 0 { 80 } else { st.sample_per_cidr };
-        let cidr6: Vec<Vec<Ipv6Addr>> = wireguard::WG_PREFIXES_V6
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, wireguard::WG_PREFIXES_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V6(*a));
+        // We'll add some basic V6 generation logic here, 
+        // up to the cap if we haven't reached it.
+        let per_cidr = if st.sample_per_cidr == 0 { 40 } else { st.sample_per_cidr.min(40) };
+        for c in wireguard::WG_PREFIXES_V6 {
+            for a in sample_cidr_v6(c, per_cidr, wireguard::WG_PREFIXES_V4) {
+                if out.len() >= cap {
+                    break;
+                }
+                let port = use_ports[rng.gen_range(0..use_ports.len())];
+                let key = (IpAddr::V6(a), port);
+                if seen.insert(key) {
+                    out.push(key);
                 }
             }
-        }
-    }
-
-    let mut ips: Vec<IpAddr> = Vec::with_capacity(anchors.len() + pool.len());
-    ips.extend(anchors.iter().copied());
-    ips.extend(pool.iter().copied());
-
-    let mut out: Vec<(IpAddr, u16)> = Vec::new();
-    let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
-
-    // Phase 1: every anchor × priority ports (highest hit rate).
-    for a in &anchors {
-        for &port in &ports {
-            if seen.insert((*a, port)) {
-                out.push((*a, port));
-            }
-        }
-    }
-    // Phase 2: pool IPs with round-robin ports (capped hard for turbo so hunts always end).
-    let cap = if matches!(mode, ScanMode::Turbo) {
-        48
-    } else if matches!(mode, ScanMode::Balanced) {
-        280
-    } else {
-        800
-    };
-    for (idx, a) in ips.iter().enumerate() {
-        if out.len() >= cap {
-            break;
-        }
-        let port = ports[idx % ports.len()];
-        if seen.insert((*a, port)) {
-            out.push((*a, port));
         }
     }
 

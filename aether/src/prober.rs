@@ -405,85 +405,94 @@ fn build_candidates(
     ip: IpScan,
     dns_seeds: &[IpAddr],
 ) -> Vec<(IpAddr, u16)> {
-    let primary = ports.first().copied().unwrap_or(443);
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+    let mut rng = rand::thread_rng();
+    let cap = st.candidate_cap;
 
-    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
+    let mut use_ports = Vec::new();
+    let mut seen_port = HashSet::new();
+    // For MASQUE, we heavily prioritize 443.
+    if seen_port.insert(443) {
+        use_ports.push(443);
+    }
+    for &p in ports {
+        if seen_port.insert(p) {
+            use_ports.push(p);
+        }
+    }
 
-    // Live DNS first — often lowest-latency anycast for this network.
+    // Live DNS first
     for a in dns_seeds {
-        if seen.insert((*a, primary)) {
-            out.push((*a, primary));
+        let key = (*a, 443);
+        if seen.insert(key) {
+            out.push(key);
         }
     }
 
     if ip.want_v4() {
-        for a in &seeds {
-            if seen.insert((IpAddr::V4(*a), primary)) {
-                out.push((IpAddr::V4(*a), primary));
+        let prefixes: Vec<(u32, u8)> = MASQUE_CIDRS_V4
+            .iter()
+            .filter_map(|c| parse_cidr_v4(c))
+            .collect();
+
+        // Seeds
+        for s in MASQUE_SEEDS {
+            if let Ok(a) = s.parse::<Ipv4Addr>() {
+                for &p in &use_ports {
+                    let key = (IpAddr::V4(a), p);
+                    if seen.insert(key) {
+                        out.push(key);
+                    }
+                }
             }
         }
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = MASQUE_CIDRS_V4
-            .iter()
-            .map(|c| {
-                if st.full_subnet {
-                    enumerate_cidr_v4(c)
+
+        // Randomly select from CIDRs
+        let mut guard = 0;
+        while out.len() < cap && !prefixes.is_empty() && guard < cap * 10 {
+            guard += 1;
+            let (base, prefix) = prefixes[rng.gen_range(0..prefixes.len())];
+            let host_bits = 32u32.saturating_sub(prefix as u32);
+            let off = if host_bits == 0 {
+                0
+            } else if host_bits >= 32 {
+                rng.gen::<u32>()
+            } else {
+                let usable = (1u32 << host_bits).saturating_sub(2).max(1);
+                1 + rng.gen_range(0..usable)
+            };
+            let a = IpAddr::V4(Ipv4Addr::from(base.wrapping_add(off)));
+            
+            // Bias towards 443 for random IP samples in MASQUE
+            let port = if rng.gen_bool(0.8) || use_ports.is_empty() {
+                443
+            } else {
+                use_ports[rng.gen_range(0..use_ports.len())]
+            };
+            
+            let key = (a, port);
+            if seen.insert(key) {
+                out.push(key);
+            }
+        }
+    }
+
+    if ip.want_v6() {
+        let per_cidr = if st.sample_per_cidr == 0 { 40 } else { st.sample_per_cidr.min(40) };
+        for c in MASQUE_CIDRS_V6 {
+            for a in sample_cidr_v6(c, per_cidr, MASQUE_CIDRS_V4) {
+                if out.len() >= cap {
+                    break;
+                }
+                let port = if rng.gen_bool(0.8) || use_ports.is_empty() {
+                    443
                 } else {
-                    sample_cidr_v4(c, st.sample_per_cidr)
-                }
-            })
-            .collect();
-        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max_len {
-            for hosts in &cidr_hosts {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V4(*a), primary)) {
-                        out.push((IpAddr::V4(*a), primary));
-                    }
-                }
-            }
-        }
-    }
-
-    if ip.want_v6() {
-        for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
-        }
-        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
-        let cidr6: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
-                    }
-                }
-            }
-        }
-    }
-
-    if ip.want_v4() {
-        for a in &seeds {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
-                    out.push((IpAddr::V4(*a), port));
-                }
-            }
-        }
-    }
-    if ip.want_v6() {
-        for a in &seeds6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
+                    use_ports[rng.gen_range(0..use_ports.len())]
+                };
+                let key = (IpAddr::V6(a), port);
+                if seen.insert(key) {
+                    out.push(key);
                 }
             }
         }

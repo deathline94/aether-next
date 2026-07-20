@@ -96,11 +96,13 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
     let mtu = crate::mtu::current().clamp(1280, 1400);
     let ip = ipv4.to_string();
     // Enable + purge old IPv4 config, then set address/DNS/MTU/metric in one shot.
+    // Also disable IPv6 on the adapter to prevent router advertisements from overriding.
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
 $n = '{name}'
 Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+Disable-NetAdapterBinding -Name $n -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Out-Null
 Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
 Get-NetRoute -InterfaceAlias $n -ErrorAction SilentlyContinue |
@@ -203,8 +205,8 @@ $tunIf = {if_index}
 $peer = '{peer_s}/32'
 $gw = '{gw_s}'
 $via = '{via}'
-# Drop stale split defaults (any interface)
-foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
+# Drop stale split defaults
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')) {{
   Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
     Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 }}
@@ -228,6 +230,11 @@ foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
     $mask = if ($p -like '0.0.0.0/*') {{ '128.0.0.0' }} else {{ '128.0.0.0' }}
     route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
   }}
+}}
+# Blackhole IPv6 to prevent dual-stack bypass.
+# We route it into the IPv4 TUN where it is dropped, preventing silent leaks.
+foreach ($p in @('::/1','8000::/1')) {{
+  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
 }}
 # Verify
 $v = @(Get-NetRoute -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
@@ -276,7 +283,7 @@ fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
     let gw_s = gateway.to_string();
     let script = format!(
         r#"
-foreach ($p in @('0.0.0.0/1','128.0.0.0/1','{peer_s}/32')) {{
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','{peer_s}/32')) {{
   Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
     Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 }}
@@ -460,6 +467,7 @@ pub async fn spawn(
         .name("aether-tun-rx".into())
         .spawn(move || {
             let mut n: u64 = 0;
+            // Never block kernel packet reading: use try_send, drop on backpressure.
             while let Ok(pkt) = session_r.receive_blocking() {
                 let data = pkt.bytes().to_vec();
                 if data.is_empty() {
@@ -469,8 +477,10 @@ pub async fn spawn(
                 if n == 1 || n % 5000 == 0 {
                     log::info!("[tun] rx from kernel packets={n} last_len={}", data.len());
                 }
-                if out_tx.blocking_send(data).is_err() {
-                    break;
+                match out_tx.try_send(data) {
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {} // drop to keep WinTUN ring moving
                 }
             }
             log::info!("[tun] rx thread exit after {n} packets");
@@ -505,10 +515,25 @@ pub async fn spawn(
                             if pkt.is_empty() || pkt.len() > u16::MAX as usize {
                                 continue;
                             }
-                            if let Ok(mut packet) = session.allocate_send_packet(pkt.len() as u16) {
-                                packet.bytes_mut()[..pkt.len()].copy_from_slice(&pkt);
-                                session.send_packet(packet);
-                                ok += 1;
+                            // WinTUN expects raw IP packets. Ensure version is 4 (no ethernet header).
+                            if pkt[0] >> 4 == 4 {
+                                if let Ok(mut packet) = session.allocate_send_packet(pkt.len() as u16) {
+                                    packet.bytes_mut()[..pkt.len()].copy_from_slice(&pkt);
+                                    session.send_packet(packet);
+                                    ok += 1;
+                                }
+                            } else if pkt[0] >> 4 == 6 {
+                                // Drop IPv6 — tunnel is currently IPv4 only.
+                            } else {
+                                // Sometimes Netstack adds ethernet header? Strip it if so.
+                                if pkt.len() > 14 && pkt[14] >> 4 == 4 {
+                                    let ip_len = pkt.len() - 14;
+                                    if let Ok(mut packet) = session.allocate_send_packet(ip_len as u16) {
+                                        packet.bytes_mut()[..ip_len].copy_from_slice(&pkt[14..]);
+                                        session.send_packet(packet);
+                                        ok += 1;
+                                    }
+                                }
                             }
                         }
                         ok
