@@ -198,7 +198,7 @@ fn dns_prefer_order() -> Vec<u16> {
     }
 }
 
-async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
+pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let key = name.to_ascii_lowercase();
     if let Ok(guard) = dns_cache().lock() {
         if let Some((ip, at)) = guard.map.get(&key) {

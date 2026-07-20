@@ -9,20 +9,52 @@ use rand::Rng;
 use crate::error::{AetherError, Result};
 use crate::noize::NoizeConfig;
 use crate::quic;
-use crate::scan::HuntStrategy;
 
-// Re-export unified ScanMode for existing call sites.
-pub use crate::scan::ScanMode;
+pub const MASQUE_CIDRS_V4: &[&str] = &[
+    "162.159.36.0/24",
+    "162.159.46.0/24",
+    "162.159.192.0/24",
+    "162.159.193.0/24",
+    "162.159.195.0/24",
+    "162.159.196.0/24",
+    "162.159.197.0/24",
+    "162.159.198.0/24",
+    "162.159.204.0/24",
+    "172.65.251.0/24",
+    "188.114.96.0/24",
+    "188.114.97.0/24",
+    "188.114.98.0/24",
+    "188.114.99.0/24",
+    "8.34.146.0/24",
+    "8.39.214.0/24",
+    "8.39.204.0/24",
+    "8.6.112.0/24",
+    "8.35.211.0/24",
+    "8.39.125.0/24",
+    "8.47.69.0/24",
+];
 
-// Shared edge pool (same CIDRs/ports for MASQUE + WG). Bad edges simply fail probe.
-pub use crate::scan_pool::{
-    EDGE_CIDRS_V4 as MASQUE_CIDRS_V4, EDGE_CIDRS_V6 as MASQUE_CIDRS_V6, EDGE_PORTS as MASQUE_PORTS,
-    EDGE_SEEDS_V4 as MASQUE_SEEDS,
-};
+pub const MASQUE_SEEDS: &[&str] = &[
+    "162.159.198.2",
+    "162.159.198.1",
+    "162.159.192.1",
+    "162.159.193.1",
+    "162.159.195.1",
+    "162.159.196.1",
+    "8.34.146.1",
+    "8.39.214.1",
+    "8.6.112.1",
+];
 
-/// Only hosts that resolve into WARP client / MASQUE ranges. General CDN names
-/// pollute the pool with edges that TLS-handshake but reject CONNECT-IP.
-pub const MASQUE_DISCOVERY_HOSTS: &[&str] = &["engage.cloudflareclient.com"];
+pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4443, 8443, 8095];
+
+pub const MASQUE_CIDRS_V6: &[&str] = &[
+    "2606:4700:d0::/48",
+    "2606:4700:d1::/48",
+    "2606:4700:102::/48",
+];
+
+pub const MASQUE_SEEDS_V6: &[&str] = &["2606:4700:d0::a29f:c602", "2606:4700:d1::a29f:c602", "2606:4700:d0::a29f:c601", "2606:4700:d0::a29f:c001"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeResult {
@@ -64,6 +96,105 @@ impl IpScan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    Turbo,
+    Balanced,
+    Thorough,
+    Stealth,
+    Ironclad,
+}
+
+impl ScanMode {
+    pub fn parse(s: &str) -> ScanMode {
+        match s.trim().to_lowercase().as_str() {
+            "turbo" | "fast" => ScanMode::Turbo,
+            "thorough" | "deep" | "pro" => ScanMode::Thorough,
+            "stealth" | "quiet" => ScanMode::Stealth,
+            "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
+            _ => ScanMode::Balanced,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScanMode::Turbo => "turbo",
+            ScanMode::Balanced => "balanced",
+            ScanMode::Thorough => "thorough",
+            ScanMode::Stealth => "stealth",
+            ScanMode::Ironclad => "ironclad",
+        }
+    }
+
+    fn strategy(&self) -> Strategy {
+        match self {
+            ScanMode::Turbo => Strategy {
+                concurrency: 20,
+                per_probe_timeout: Duration::from_millis(6000),
+                overall_deadline: Duration::from_secs(45),
+                quiet_after_first: Duration::from_secs(0),
+                target_successes: 1,
+                early_exit_first: true,
+                full_subnet: false,
+                sample_per_cidr: 64,
+            },
+            ScanMode::Balanced => Strategy {
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(6000),
+                overall_deadline: Duration::from_secs(120),
+                quiet_after_first: Duration::from_secs(20),
+                target_successes: 6,
+                early_exit_first: false,
+                full_subnet: false,
+                sample_per_cidr: 140,
+            },
+            ScanMode::Thorough => Strategy {
+                concurrency: 20,
+                per_probe_timeout: Duration::from_millis(10000),
+                overall_deadline: Duration::from_secs(300),
+                quiet_after_first: Duration::from_secs(30),
+                target_successes: 0,
+                early_exit_first: false,
+                full_subnet: true,
+                sample_per_cidr: 0,
+            },
+            ScanMode::Stealth => Strategy {
+                concurrency: 3,
+                per_probe_timeout: Duration::from_millis(12000),
+                overall_deadline: Duration::from_secs(180),
+                quiet_after_first: Duration::from_secs(25),
+                target_successes: 4,
+                early_exit_first: false,
+                full_subnet: false,
+                sample_per_cidr: 64,
+            },
+            ScanMode::Ironclad => Strategy {
+                concurrency: 4,
+                per_probe_timeout: Duration::from_millis(15000),
+                overall_deadline: Duration::from_secs(180),
+                quiet_after_first: Duration::from_secs(15),
+                target_successes: 3,
+                early_exit_first: false,
+                full_subnet: false,
+                sample_per_cidr: 140,
+            },
+        }
+    }
+}
+
+const IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct Strategy {
+    concurrency: usize,
+    per_probe_timeout: Duration,
+    overall_deadline: Duration,
+    quiet_after_first: Duration,
+    target_successes: usize,
+    early_exit_first: bool,
+    full_subnet: bool,
+    sample_per_cidr: usize,
+}
+
 #[derive(Clone)]
 pub struct MasqueProbe {
     pub sni: String,
@@ -75,6 +206,7 @@ pub struct MasqueProbe {
     pub noize: NoizeConfig,
     pub ports: Vec<u16>,
     pub ip: IpScan,
+    pub local_ipv4: Ipv4Addr,
 }
 
 pub async fn host_has_ipv6() -> bool {
@@ -85,22 +217,7 @@ pub async fn host_has_ipv6() -> bool {
 }
 
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
-    let st = mode.masque_strategy();
-    let hard = st.overall_deadline + Duration::from_secs(5);
-    match tokio::time::timeout(hard, hunt_best_gateway_inner(probe, mode)).await {
-        Ok(r) => r,
-        Err(_) => {
-            log::warn!(
-                "[-] masque scan hard-timeout after {:?} — giving up cleanly",
-                hard
-            );
-            Err(AetherError::NoCleanEndpoint)
-        }
-    }
-}
-
-async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
-    let st = mode.masque_strategy();
+    let st = mode.strategy();
     let timeout = st.per_probe_timeout;
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
@@ -112,93 +229,10 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
             return Err(AetherError::NoCleanEndpoint);
         }
     }
-
-    let cache_kind = if crate::masque_h2::enabled() {
-        "masque-h2"
-    } else {
-        "masque-h3"
-    };
-
-    // Phase 0: probe all cached warm endpoints in parallel (high priority).
-    let warm_list: Vec<SocketAddr> = crate::endpoint_cache::load_ranked(cache_kind)
-        .into_iter()
-        .filter(|w| {
-            (w.is_ipv4() && effective_ip.want_v4()) || (w.is_ipv6() && effective_ip.want_v6())
-        })
-        .collect();
-    if !warm_list.is_empty() {
-        let warm_timeout = timeout.min(Duration::from_secs(4));
-        log::info!(
-            "[*] probing {} warm MASQUE endpoint(s) first (concurrency up to {})",
-            warm_list.len(),
-            warm_list.len().min(st.concurrency.max(8))
-        );
-        let warm_conc = warm_list.len().min(st.concurrency.max(8));
-        let mut warm_stream = futures::stream::iter(warm_list.clone().into_iter().map(|w| {
-            async move { verify_one(probe, w.ip(), w.port(), warm_timeout).await }
-        }))
-        .buffer_unordered(warm_conc);
-        let mut warm_hits: Vec<ProbeResult> = Vec::new();
-        while let Some(item) = warm_stream.next().await {
-            if let Some(pr) = item {
-                log::info!("[+] warm hit {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                warm_hits.push(pr);
-            }
-        }
-        if !warm_hits.is_empty() {
-            warm_hits.sort_by_key(|p| p.rtt);
-            let best = warm_hits[0];
-            let ranked: Vec<(SocketAddr, Duration)> = warm_hits
-                .iter()
-                .map(|p| (SocketAddr::new(p.ip, p.port), p.rtt))
-                .collect();
-            crate::endpoint_cache::save_ranked(cache_kind, &ranked);
-            log::info!(
-                "[+] using best warm gateway {}:{} rtt={:?} ({} warm hit(s))",
-                best.ip,
-                best.port,
-                best.rtt,
-                warm_hits.len()
-            );
-            return Ok(best);
-        }
-        log::info!("[-] warm cache missed; full scan (cached IPs still tried first)");
-    }
-
-    let dns_seeds = resolve_discovery_seeds(effective_ip).await;
-    if !dns_seeds.is_empty() {
-        log::info!(
-            "[+] discovery DNS added {} extra edge IP(s)",
-            dns_seeds.len()
-        );
-    }
-    let mut candidates = build_candidates(&st, &probe.ports, effective_ip, &dns_seeds);
-    // Re-prioritize: any remaining warm IPs go to the front of the full scan.
-    if !warm_list.is_empty() {
-        let primary = probe.ports.first().copied().unwrap_or(443);
-        let mut front: Vec<(IpAddr, u16)> = Vec::new();
-        let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
-        for w in &warm_list {
-            let key = (w.ip(), w.port());
-            if seen.insert(key) {
-                front.push(key);
-            }
-            // Also try primary MASQUE port if cache had something else.
-            let key2 = (w.ip(), primary);
-            if seen.insert(key2) {
-                front.push(key2);
-            }
-        }
-        for c in candidates {
-            if seen.insert(c) {
-                front.push(c);
-            }
-        }
-        candidates = front;
-    }
+    let candidates = build_candidates(&st, &probe.ports, effective_ip);
 
     log::info!(
-        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?} transport={}",
+        "[*] scan mode={} ip={} candidates={} ports={:?} concurrency={} per_probe={:?} budget={:?}",
         mode.label(),
         effective_ip.label(),
         candidates.len(),
@@ -206,13 +240,14 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
         st.concurrency,
         st.per_probe_timeout,
         st.overall_deadline,
-        if crate::masque_h2::enabled() { "h2" } else { "h3" },
     );
+
+    let ironclad = mode == ScanMode::Ironclad;
 
     let stream = futures::stream::iter(
         candidates
             .into_iter()
-            .map(|(ip, port)| verify_one(probe, ip, port, timeout)),
+            .map(|(ip, port)| verify_one(probe, ip, port, timeout, ironclad)),
     )
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
@@ -221,7 +256,6 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut quiet_until: Option<Instant> = None;
-    let mut session_hits: Vec<(SocketAddr, Duration)> = Vec::new();
 
     loop {
         let effective = match quiet_until {
@@ -231,7 +265,11 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
         let remaining = effective.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             if best.is_some() {
-                log::info!("[+] masque scan budget exhausted; using best so far");
+                if quiet_until.is_some() {
+                    log::info!("[+] no new gateways recently, finalizing selection");
+                } else {
+                    log::warn!("[-] scan deadline reached");
+                }
             } else {
                 log::warn!("[-] scan deadline reached with no gateway");
             }
@@ -239,27 +277,13 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
         }
 
         tokio::select! {
-            biased;
-            _ = tokio::time::sleep(remaining) => {
-                if best.is_some() {
-                    log::info!("[+] masque scan budget exhausted; using best so far");
-                } else {
-                    log::warn!("[-] scan deadline reached with no gateway");
-                }
-                break;
-            }
             item = stream.next() => {
                 match item {
                     None => break,
                     Some(None) => continue,
                     Some(Some(pr)) => {
                         log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                        session_hits.push((SocketAddr::new(pr.ip, pr.port), pr.rtt));
                         if st.early_exit_first {
-                            crate::endpoint_cache::save_ranked(
-                                cache_kind,
-                                &[(SocketAddr::new(pr.ip, pr.port), pr.rtt)],
-                            );
                             return Ok(pr);
                         }
                         best = Some(match best {
@@ -267,8 +291,8 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
                             _ => pr,
                         });
                         found += 1;
-
-                        if st.target_successes > 0 && found >= st.target_successes {
+                        
+                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
                             log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
                             if !st.quiet_after_first.is_zero() {
                                 quiet_until = Some(Instant::now() + st.quiet_after_first);
@@ -279,17 +303,24 @@ async fn hunt_best_gateway_inner(probe: &MasqueProbe, mode: ScanMode) -> Result<
                     }
                 }
             }
+            _ = tokio::time::sleep(remaining) => {
+                if best.is_some() {
+                    if quiet_until.is_some() {
+                        log::info!("[+] no new gateways recently, finalizing selection");
+                    } else {
+                        log::warn!("[-] scan deadline reached");
+                    }
+                } else {
+                    log::warn!("[-] scan deadline reached with no gateway");
+                }
+                break;
+            }
         }
     }
 
     match best {
         Some(pr) => {
             log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            if session_hits.is_empty() {
-                crate::endpoint_cache::save(cache_kind, SocketAddr::new(pr.ip, pr.port));
-            } else {
-                crate::endpoint_cache::save_ranked(cache_kind, &session_hits);
-            }
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),
@@ -301,7 +332,33 @@ async fn verify_one(
     ip: IpAddr,
     port: u16,
     timeout: Duration,
+    ironclad: bool,
 ) -> Option<ProbeResult> {
+    if ironclad {
+        let params = crate::tunnelping::MasquePingParams {
+            peer: SocketAddr::new(ip, port),
+            sni: probe.sni.clone(),
+            authority: probe.authority.clone(),
+            path: probe.path.clone(),
+            cert_pem: probe.cert_pem.to_vec(),
+            key_pem: probe.key_pem.to_vec(),
+            noize: probe.noize.clone(),
+            local_ipv4: probe.local_ipv4,
+            local_ipv4_str: probe.local_ipv4.to_string(),
+            local_ipv6_str: String::new(),
+        };
+        return match crate::tunnelping::masque_http_ping(&params, IRONCLAD_TCPING_TIMEOUT).await {
+            Ok(rtt) => {
+                log::info!("[+] ironclad verified {ip}:{port} real http round trip rtt={:?}", rtt);
+                Some(ProbeResult { ip, port, rtt })
+            }
+            Err(e) => {
+                log::debug!("[-] ironclad {ip}:{port} failed real http check: {e}");
+                None
+            }
+        };
+    }
+
     if crate::masque_h2::enabled() {
         let cfg = crate::masque_h2::H2TunnelConfig {
             peer: SocketAddr::new(ip, port),
@@ -310,7 +367,7 @@ async fn verify_one(
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
-            probe_src: None,
+            probe_src: Some(probe.local_ipv4),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
             Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
@@ -321,177 +378,100 @@ async fn verify_one(
         };
     }
 
-    // Try clean first; obfuscation on every candidate wastes time and can trigger rate limits.
-    let attempts: Vec<crate::noize::NoizeConfig> = if probe.noize.is_enabled() {
-        vec![crate::noize::NoizeConfig::off(), probe.noize.clone()]
-    } else {
-        vec![crate::noize::NoizeConfig::off()]
+    let vp = quic::VerifyParams {
+        peer: SocketAddr::new(ip, port),
+        sni: probe.sni.clone(),
+        authority: probe.authority.clone(),
+        path: probe.path.clone(),
+        cert_pem: probe.cert_pem.to_vec(),
+        key_pem: probe.key_pem.to_vec(),
+        ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
+        noize: probe.noize.clone(),
+        timeout,
     };
 
-    for (i, noize) in attempts.into_iter().enumerate() {
-        let vp = quic::VerifyParams {
-            peer: SocketAddr::new(ip, port),
-            sni: probe.sni.clone(),
-            authority: probe.authority.clone(),
-            path: probe.path.clone(),
-            cert_pem: probe.cert_pem.to_vec(),
-            key_pem: probe.key_pem.to_vec(),
-            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
-            noize,
-            timeout,
-        };
-        match quic::verify_masque(&vp).await {
-            Ok(rtt) => {
-                if i > 0 {
-                    log::info!(
-                        "[+] h3 probe {ip}:{port} required noize (rtt {:?})",
-                        rtt
-                    );
-                }
-                return Some(ProbeResult { ip, port, rtt });
-            }
-            Err(e) => {
-                log::debug!("h3 probe {ip}:{port} attempt{} -> {e}", i + 1);
-            }
-        }
-    }
-    None
-}
-
-fn is_masque_range(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // 162.159.192-198.x
-            o[0] == 162 && o[1] == 159 && (192..=198).contains(&o[2])
-        }
-        IpAddr::V6(v6) => {
-            // 2606:4700:d0::/44-ish WARP MASQUE
-            let s = v6.segments();
-            s[0] == 0x2606 && s[1] == 0x4700 && (s[2] == 0xd0 || s[2] == 0xd1)
+    match quic::verify_masque(&vp).await {
+        Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
+        Err(e) => {
+            log::debug!("probe {ip}:{port} -> {e}");
+            None
         }
     }
 }
 
-async fn resolve_discovery_seeds(ip: IpScan) -> Vec<IpAddr> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for host in MASQUE_DISCOVERY_HOSTS {
-        match tokio::net::lookup_host((*host, 443)).await {
-            Ok(iter) => {
-                for sa in iter {
-                    let addr = sa.ip();
-                    if !is_masque_range(addr) {
-                        log::debug!("discovery skip non-masque {addr} from {host}");
-                        continue;
-                    }
-                    if ((addr.is_ipv4() && ip.want_v4()) || (addr.is_ipv6() && ip.want_v6()))
-                        && seen.insert(addr)
-                    {
-                        out.push(addr);
-                    }
-                }
-            }
-            Err(e) => log::debug!("discovery DNS {host}: {e}"),
-        }
-    }
-    out
-}
-
-fn build_candidates(
-    st: &HuntStrategy,
-    ports: &[u16],
-    ip: IpScan,
-    dns_seeds: &[IpAddr],
-) -> Vec<(IpAddr, u16)> {
+fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
+    let primary = ports.first().copied().unwrap_or(443);
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
-    let mut rng = rand::thread_rng();
-    let cap = st.candidate_cap;
 
-    let mut use_ports = Vec::new();
-    let mut seen_port = HashSet::new();
-    // For MASQUE, we heavily prioritize 443.
-    if seen_port.insert(443) {
-        use_ports.push(443);
-    }
-    for &p in ports {
-        if seen_port.insert(p) {
-            use_ports.push(p);
-        }
-    }
-
-    // Live DNS first
-    for a in dns_seeds {
-        let key = (*a, 443);
-        if seen.insert(key) {
-            out.push(key);
-        }
-    }
+    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
+    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
     if ip.want_v4() {
-        let prefixes: Vec<(u32, u8)> = MASQUE_CIDRS_V4
-            .iter()
-            .filter_map(|c| parse_cidr_v4(c))
-            .collect();
-
-        // Seeds
-        for s in MASQUE_SEEDS {
-            if let Ok(a) = s.parse::<Ipv4Addr>() {
-                for &p in &use_ports {
-                    let key = (IpAddr::V4(a), p);
-                    if seen.insert(key) {
-                        out.push(key);
-                    }
-                }
+        for a in &seeds {
+            if seen.insert((IpAddr::V4(*a), primary)) {
+                out.push((IpAddr::V4(*a), primary));
             }
         }
-
-        // Randomly select from CIDRs
-        let mut guard = 0;
-        while out.len() < cap && !prefixes.is_empty() && guard < cap * 10 {
-            guard += 1;
-            let (base, prefix) = prefixes[rng.gen_range(0..prefixes.len())];
-            let host_bits = 32u32.saturating_sub(prefix as u32);
-            let off = if host_bits == 0 {
-                0
-            } else if host_bits >= 32 {
-                rng.gen::<u32>()
-            } else {
-                let usable = (1u32 << host_bits).saturating_sub(2).max(1);
-                1 + rng.gen_range(0..usable)
-            };
-            let a = IpAddr::V4(Ipv4Addr::from(base.wrapping_add(off)));
-            
-            // Bias towards 443 for random IP samples in MASQUE
-            let port = if rng.gen_bool(0.8) || use_ports.is_empty() {
-                443
-            } else {
-                use_ports[rng.gen_range(0..use_ports.len())]
-            };
-            
-            let key = (a, port);
-            if seen.insert(key) {
-                out.push(key);
+        let cidr_hosts: Vec<Vec<Ipv4Addr>> = MASQUE_CIDRS_V4
+            .iter()
+            .map(|c| {
+                if st.full_subnet {
+                    enumerate_cidr_v4(c)
+                } else {
+                    sample_cidr_v4(c, st.sample_per_cidr)
+                }
+            })
+            .collect();
+        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
+        for i in 0..max_len {
+            for hosts in &cidr_hosts {
+                if let Some(a) = hosts.get(i) {
+                    if seen.insert((IpAddr::V4(*a), primary)) {
+                        out.push((IpAddr::V4(*a), primary));
+                    }
+                }
             }
         }
     }
 
     if ip.want_v6() {
-        let per_cidr = if st.sample_per_cidr == 0 { 40 } else { st.sample_per_cidr.min(40) };
-        for c in MASQUE_CIDRS_V6 {
-            for a in sample_cidr_v6(c, per_cidr, MASQUE_CIDRS_V4) {
-                if out.len() >= cap {
-                    break;
+        for a in &seeds6 {
+            if seen.insert((IpAddr::V6(*a), primary)) {
+                out.push((IpAddr::V6(*a), primary));
+            }
+        }
+        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
+        let cidr6: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
+            .iter()
+            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
+            .collect();
+        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
+        for i in 0..max6 {
+            for hosts in &cidr6 {
+                if let Some(a) = hosts.get(i) {
+                    if seen.insert((IpAddr::V6(*a), primary)) {
+                        out.push((IpAddr::V6(*a), primary));
+                    }
                 }
-                let port = if rng.gen_bool(0.8) || use_ports.is_empty() {
-                    443
-                } else {
-                    use_ports[rng.gen_range(0..use_ports.len())]
-                };
-                let key = (IpAddr::V6(a), port);
-                if seen.insert(key) {
-                    out.push(key);
+            }
+        }
+    }
+
+    if ip.want_v4() {
+        for a in &seeds {
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
+                    out.push((IpAddr::V4(*a), port));
+                }
+            }
+        }
+    }
+    if ip.want_v6() {
+        for a in &seeds6 {
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
+                    out.push((IpAddr::V6(*a), port));
                 }
             }
         }
