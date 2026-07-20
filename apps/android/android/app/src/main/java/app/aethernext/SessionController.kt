@@ -165,7 +165,6 @@ class SessionController(
                         maybeStartVpn()
                     }
                     "tunnel_ready", "tun_ready", "connected" -> {
-                        socksSeen.set(true)
                         tunnelSeen.set(true)
                         maybeStartVpn()
                     }

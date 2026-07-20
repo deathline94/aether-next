@@ -576,9 +576,9 @@ async fn drain_datagrams(
         match conn.dgram_recv(buf) {
             Ok(n) => match masque::decode_ip_datagram(&buf[..n], sid) {
                 Ok(Some(ip_packet)) => {
-                    // S4 fix: only treat a genuine UDP DNS reply from 1.1.1.1:53 as
-                    // data-plane proof, not any inbound datagram.
-                    if watch_dataplane && is_dns_reply_from_resolver(&ip_packet) {
+                    // S4 fix rollback: accept any datagram (even ICMP errors) as proof 
+                    // the tunnel isn't a zombie.
+                    if watch_dataplane {
                         *dataplane_ok = true;
                     }
                     // Prefer try_send so QUIC recv keeps moving; await only under backpressure.

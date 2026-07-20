@@ -464,17 +464,12 @@ async fn verify_dataplane(
                 capsules.push(&chunk);
                 loop {
                     match capsules.next() {
-                        Ok(Some(Capsule::Datagram(pkt))) if pkt.len() >= 28 => {
-                            // S4 fix: require a genuine UDP DNS reply from 1.1.1.1:53
-                            // rather than accepting any inbound datagram as proof.
-                            if is_dns_reply_from_resolver(&pkt) {
-                                confirms += 1;
-                                if confirms >= 1 {
-                                    log::info!("[h2] data-plane verified (dns reply from 1.1.1.1:53)");
-                                    return Ok(());
-                                }
-                            } else {
-                                log::debug!("[h2] ignoring unrelated inbound datagram during verify");
+                        Ok(Some(Capsule::Datagram(_pkt))) => {
+                            // S4 fix rollback: accept any datagram as proof.
+                            confirms += 1;
+                            if confirms >= 1 {
+                                log::info!("[h2] data-plane verified (datagram received)");
+                                return Ok(());
                             }
                         }
                         Ok(Some(Capsule::AddressAssign(addrs))) => {

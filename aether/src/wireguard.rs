@@ -142,13 +142,29 @@ impl WgTunnel {
                             TunnResult::WriteToNetwork(pkt) => {
                                 let mut pkt_vec = pkt.to_vec();
                                 inject_client_id(&mut pkt_vec, &client_id);
+                                let mut extra = drain_to_network(&mut tunn, &mut tmp, &client_id);
+                                let mut extra_tun = drain_to_tun(&mut tunn, &mut tmp);
                                 drop(tunn);
                                 let _ = sock_r.send(&pkt_vec).await;
+                                for p in extra {
+                                    let _ = sock_r.send(&p).await;
+                                }
+                                for p in extra_tun {
+                                    let _ = inbound_tx.send(p).await;
+                                }
                             }
                             TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
                                 let pkt_vec = pkt.to_vec();
+                                let mut extra = drain_to_network(&mut tunn, &mut tmp, &client_id);
+                                let mut extra_tun = drain_to_tun(&mut tunn, &mut tmp);
                                 drop(tunn);
                                 let _ = inbound_tx.send(pkt_vec).await;
+                                for p in extra {
+                                    let _ = sock_r.send(&p).await;
+                                }
+                                for p in extra_tun {
+                                    let _ = inbound_tx.send(p).await;
+                                }
                             }
                         }
                     }
@@ -173,6 +189,7 @@ impl WgTunnel {
                     TunnResult::WriteToNetwork(pkt) => {
                         let mut pkt_vec = pkt.to_vec();
                         inject_client_id(&mut pkt_vec, &client_id);
+                        let mut extra = drain_to_network(&mut tunn, &mut out_buf, &client_id);
                         drop(tunn);
 
                         {
@@ -185,6 +202,9 @@ impl WgTunnel {
                         }
 
                         let _ = sock_w.send(&pkt_vec).await;
+                        for p in extra {
+                            let _ = sock_w.send(&p).await;
+                        }
 
                         if aethernoize.jc_after_hs > 0 {
                             let sock_clone = sock_w.clone();
@@ -208,6 +228,7 @@ impl WgTunnel {
                 if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
                     let mut pkt_vec = pkt.to_vec();
                     inject_client_id(&mut pkt_vec, &client_id);
+                    let mut extra = drain_to_network(&mut tunn, &mut tmp, &client_id);
                     drop(tunn);
 
                     if aethernoize_t.is_enabled() {
@@ -216,9 +237,15 @@ impl WgTunnel {
                         tokio::spawn(async move {
                             aethernoize::send_keepalive_junk(&sock_j, &cfg_j).await;
                             let _ = sock_j.send(&pkt_vec).await;
+                            for p in extra {
+                                let _ = sock_j.send(&p).await;
+                            }
                         });
                     } else {
                         let _ = sock_t.send(&pkt_vec).await;
+                        for p in extra {
+                            let _ = sock_t.send(&p).await;
+                        }
                     }
                 }
             }
@@ -232,6 +259,38 @@ impl WgTunnel {
 
         Ok(())
     }
+}
+
+/// Bound tunnel draining to avoid infinite allocation loops while ensuring
+/// handshake packets and queued data are flushed.
+fn drain_to_network(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> Vec<Vec<u8>> {
+    let mut wire = Vec::new();
+    for _ in 0..16 {
+        match tunn.decapsulate(None, &[], out_buf) {
+            TunnResult::WriteToNetwork(pkt) => {
+                let mut v = pkt.to_vec();
+                inject_client_id(&mut v, client_id);
+                wire.push(v);
+            }
+            TunnResult::Done | TunnResult::Err(_) => break,
+            _ => {}
+        }
+    }
+    wire
+}
+
+fn drain_to_tun(tunn: &mut Tunn, out_buf: &mut [u8]) -> Vec<Vec<u8>> {
+    let mut ip_packets = Vec::new();
+    for _ in 0..16 {
+        match tunn.decapsulate(None, &[], out_buf) {
+            TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+                ip_packets.push(pkt.to_vec());
+            }
+            TunnResult::Done | TunnResult::Err(_) => break,
+            _ => {}
+        }
+    }
+    ip_packets
 }
 
 fn build_dns_query() -> Vec<u8> {
@@ -474,6 +533,9 @@ pub async fn verify_endpoint_keep_session(
 
                 match tunn.decapsulate(None, &recv_buf[..n], &mut tmp_buf) {
                     TunnResult::Done => {
+                        for pkt in drain_to_network(&mut tunn, &mut out_buf, &client_id) {
+                            let _ = sock.send(&pkt).await;
+                        }
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake done in {:?}", elapsed);
                         if data_check {
@@ -497,6 +559,9 @@ pub async fn verify_endpoint_keep_session(
                         inject_client_id(&mut pkt_vec, &client_id);
                         log::debug!("[wg] sending response {} bytes", pkt_vec.len());
                         sock.send(&pkt_vec).await?;
+                        for pkt in drain_to_network(&mut tunn, &mut out_buf, &client_id) {
+                            let _ = sock.send(&pkt).await;
+                        }
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake success in {:?}", elapsed);
                         if data_check {
