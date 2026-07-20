@@ -102,7 +102,7 @@ const speedProfiles: {
   {
     id: "speed",
     label: "Speed",
-    hint: "MASQUE h2 - medium - balanced - local proxy only",
+    hint: "MASQUE h2 · medium noise · balanced scan · local proxy only",
     patch: {
       protocol: "masque",
       transport: "h2",
@@ -115,7 +115,7 @@ const speedProfiles: {
   {
     id: "max-tun",
     label: "Max (VPN)",
-    hint: "MASQUE h2 - medium - balanced - full device VPN",
+    hint: "MASQUE h2 · medium noise · balanced scan · full device VPN",
     patch: {
       protocol: "masque",
       transport: "h2",
@@ -128,7 +128,7 @@ const speedProfiles: {
   {
     id: "wireguard",
     label: "WireGuard",
-    hint: "UDP path - max - turbo hunt - full VPN",
+    hint: "WireGuard UDP · max noise · turbo scan · full VPN",
     patch: {
       protocol: "wireguard",
       transport: "h2",
@@ -141,7 +141,7 @@ const speedProfiles: {
   {
     id: "quic",
     label: "QUIC h3",
-    hint: "MASQUE HTTP/3 when UDP/QUIC is open - full VPN",
+    hint: "MASQUE h3 · off noise · balanced scan · full VPN",
     patch: {
       protocol: "masque",
       transport: "h3",

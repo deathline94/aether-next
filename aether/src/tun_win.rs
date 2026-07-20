@@ -84,91 +84,92 @@ fn default_gateway() -> Result<(String, Ipv4Addr)> {
     Err(AetherError::Other("default gateway not found".into()))
 }
 
-fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
-    // Point-to-point /32; gateway=none so Windows treats it as a tunnel NIC.
+fn ps(cmd: &str) -> Result<String> {
     run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ip",
-            "set",
-            "address",
-            &format!("name={name}"),
-            "static",
-            &ipv4.to_string(),
-            "255.255.255.255",
-            "none",
-        ],
-    )?;
-    // Point DNS at the tunnel so name lookups leave via TUN (not physical NIC).
-    run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ip",
-            "set",
-            "dns",
-            &format!("name={name}"),
-            "static",
-            "1.1.1.1",
-            "primary",
-        ],
-    )?;
-    let _ = run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ip",
-            "add",
-            "dns",
-            &format!("name={name}"),
-            "1.0.0.1",
-            "index=2",
-        ],
-    );
-    // Kernel TCP path: raise adapter MTU to match tunnel MTU (default 1280, up to 1400).
-    let mtu = crate::mtu::current().clamp(1280, 1400);
-    run_cmd(
-        "netsh",
-        &[
-            "interface",
-            "ipv4",
-            "set",
-            "subinterface",
-            name,
-            &format!("mtu={mtu}"),
-            "store=active",
-        ],
-    )?;
-    // Prefer TUN for default traffic (lower metric wins on Windows).
-    run_cmd(
-        "netsh",
-        &["interface", "ip", "set", "interface", name, "metric=1"],
-    )?;
-    // Ensure adapter is up (orphaned adapters can sit Disabled).
-    let _ = run_cmd(
         "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            &format!("Enable-NetAdapter -Name '{name}' -Confirm:$false -ErrorAction SilentlyContinue"),
-        ],
+        &["-NoProfile", "-NonInteractive", "-Command", cmd],
+    )
+}
+
+fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
+    // WireGuard-style: /32 on tunnel NIC, no gateway, low metric, DNS via tunnel.
+    let mtu = crate::mtu::current().clamp(1280, 1400);
+    let ip = ipv4.to_string();
+    // Enable + purge old IPv4 config, then set address/DNS/MTU/metric in one shot.
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$n = '{name}'
+Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Get-NetRoute -InterfaceAlias $n -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DestinationPrefix -ne '255.255.255.255/32' }} |
+  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+New-NetIPAddress -InterfaceAlias $n -IPAddress '{ip}' -PrefixLength 32 -PolicyStore ActiveStore | Out-Null
+Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @('1.1.1.1','1.0.0.1')
+Set-NetIPInterface -InterfaceAlias $n -InterfaceMetric 1 -NlMtuBytes {mtu} -ErrorAction SilentlyContinue
+Write-Output 'ok'
+"#
     );
-    log::info!("[tun] adapter {name} mtu={mtu} metric=1 (OS/kernel TCP stack)");
+    match ps(&script) {
+        Ok(out) => log::info!("[tun] adapter {name} configured via NetIP ({})", out.trim()),
+        Err(e) => {
+            // Fallback to netsh if NetCmdlets fail.
+            log::warn!("[tun] NetIP configure failed ({e}); trying netsh");
+            run_cmd(
+                "netsh",
+                &[
+                    "interface",
+                    "ip",
+                    "set",
+                    "address",
+                    &format!("name={name}"),
+                    "static",
+                    &ip,
+                    "255.255.255.255",
+                    "none",
+                ],
+            )?;
+            run_cmd(
+                "netsh",
+                &[
+                    "interface",
+                    "ip",
+                    "set",
+                    "dns",
+                    &format!("name={name}"),
+                    "static",
+                    "1.1.1.1",
+                    "primary",
+                ],
+            )?;
+            let _ = run_cmd(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "subinterface",
+                    name,
+                    &format!("mtu={mtu}"),
+                    "store=active",
+                ],
+            );
+            let _ = run_cmd(
+                "netsh",
+                &["interface", "ip", "set", "interface", name, "metric=1"],
+            );
+        }
+    }
+    log::info!("[tun] adapter {name} mtu={mtu} metric=1 ip={ip}/32");
     Ok(())
 }
 
 fn interface_index(name: &str) -> Result<u32> {
-    let out = run_cmd(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ifIndex)"
-            ),
-        ],
-    )?;
+    let out = ps(&format!(
+        "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ifIndex)"
+    ))?;
     let idx = out
         .lines()
         .map(str::trim)
@@ -189,75 +190,102 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
     };
     let (_iface, gw) = default_gateway()?;
     let if_index = interface_index(ADAPTER_NAME)?;
-
-    // Keep path to edge peer on physical gateway (not via TUN).
     let peer_s = peer_ip.to_string();
     let gw_s = gw.to_string();
-    run_cmd(
-        "route",
-        &[
-            "add",
-            &peer_s,
-            "mask",
-            "255.255.255.255",
-            &gw_s,
-            "metric",
-            "1",
-        ],
-    )?;
-
-    // Split default via TUN: next-hop MUST be the TUN interface IP (not 0.0.0.0).
-    // On-link 0.0.0.0 next-hop often installs but never carries traffic on WinTUN.
-    let ifs = if_index.to_string();
     let via = ipv4.to_string();
-    for dest in ["0.0.0.0", "128.0.0.0"] {
-        let mask = "128.0.0.0";
-        // Prefer delete-then-add so restarts don't leave stale/conflicting routes.
-        let _ = run_cmd("route", &["delete", dest, "mask", mask]);
-        if let Err(error) = run_cmd(
-            "route",
-            &[
-                "add",
-                dest,
-                "mask",
-                mask,
-                &via,
-                "metric",
-                "1",
-                "IF",
-                &ifs,
-            ],
-        ) {
-            remove_routes(peer, ipv4, gw);
-            return Err(error);
+
+    // WireGuard-Windows style: on-link split default on tunnel IF (NextHop 0.0.0.0),
+    // plus host route for edge peer via physical gateway. Prefer New-NetRoute.
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Continue'
+$tunIf = {if_index}
+$peer = '{peer_s}/32'
+$gw = '{gw_s}'
+$via = '{via}'
+# Drop stale split defaults (any interface)
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
+  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+}}
+# Peer exclude: force edge traffic out physical gateway
+Get-NetRoute -DestinationPrefix $peer -ErrorAction SilentlyContinue |
+  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+# Find physical interface that has the default gateway
+$phys = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.NextHop -eq $gw }} | Select-Object -First 1
+if ($phys) {{
+  New-NetRoute -DestinationPrefix $peer -InterfaceIndex $phys.InterfaceIndex -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+}} else {{
+  route add {peer_s} mask 255.255.255.255 {gw_s} metric 1 | Out-Null
+}}
+# Split default ON-LINK on WinTUN (this is what WireGuard uses)
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
+  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -NextHop '0.0.0.0' -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+  if (-not (Get-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -ErrorAction SilentlyContinue)) {{
+    # Fallback: next-hop = tunnel IP + IF
+    $dest = $p.Split('/')[0]
+    $mask = if ($p -like '0.0.0.0/*') {{ '128.0.0.0' }} else {{ '128.0.0.0' }}
+    route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
+  }}
+}}
+# Verify
+$v = @(Get-NetRoute -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') }} |
+  Select-Object -ExpandProperty DestinationPrefix)
+if ($v.Count -lt 2) {{ Write-Output 'WARN:missing-split-routes' }} else {{ Write-Output ('ok if=' + $tunIf + ' routes=' + ($v -join ',')) }}
+"#
+    );
+    match ps(&script) {
+        Ok(out) => {
+            let t = out.trim();
+            if t.contains("WARN") {
+                log::warn!("[tun] route install warning: {t}");
+            } else {
+                log::info!("[tun] routes installed: peer exclude via {gw_s}, {t}");
+            }
+        }
+        Err(e) => {
+            log::warn!("[tun] New-NetRoute failed ({e}); falling back to route.exe");
+            let ifs = if_index.to_string();
+            let _ = run_cmd(
+                "route",
+                &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1"],
+            );
+            for dest in ["0.0.0.0", "128.0.0.0"] {
+                let _ = run_cmd("route", &["delete", dest, "mask", "128.0.0.0"]);
+                run_cmd(
+                    "route",
+                    &["add", dest, "mask", "128.0.0.0", &via, "metric", "1", "IF", &ifs],
+                )?;
+            }
+            log::info!(
+                "[tun] routes installed (route.exe): peer via {gw_s}, split-default {via} IF={if_index}"
+            );
         }
     }
-    log::info!(
-        "[tun] routes installed: peer exclude via {gw_s}, split-default {via} IF={if_index}"
-    );
     Ok(gw)
 }
 
 fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
-    if let IpAddr::V4(v4) = peer.ip() {
-        let gateway = gateway.to_string();
-        let _ = run_cmd(
-            "route",
-            &[
-                "delete",
-                &v4.to_string(),
-                "mask",
-                "255.255.255.255",
-                &gateway,
-            ],
-        );
-    }
-    let via = ipv4.to_string();
-    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0", &via]);
-    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0", &via]);
-    // Fallback if Windows stored route without matching via string.
-    let _ = run_cmd("route", &["delete", "0.0.0.0", "mask", "128.0.0.0"]);
-    let _ = run_cmd("route", &["delete", "128.0.0.0", "mask", "128.0.0.0"]);
+    let _ = ipv4;
+    let peer_s = match peer.ip() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(_) => return,
+    };
+    let gw_s = gateway.to_string();
+    let script = format!(
+        r#"
+foreach ($p in @('0.0.0.0/1','128.0.0.0/1','{peer_s}/32')) {{
+  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+}}
+route delete {peer_s} mask 255.255.255.255 {gw_s} 2>$null
+route delete 0.0.0.0 mask 128.0.0.0 2>$null
+route delete 128.0.0.0 mask 128.0.0.0 2>$null
+"#
+    );
+    let _ = ps(&script);
 }
 
 fn route_state_path() -> Option<PathBuf> {

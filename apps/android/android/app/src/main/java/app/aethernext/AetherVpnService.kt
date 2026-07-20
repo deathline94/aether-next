@@ -229,7 +229,7 @@ class AetherVpnService : VpnService() {
         private const val MTU = 1280
         private const val TUN_ADDR = "198.18.0.1"
         // Unique local address for blackhole IPv6 route (no real IPv6 tunnel yet).
-        private const val TUN_ADDR_V6 = "fd00:aether::1"
+        private const val TUN_ADDR_V6 = "fd00:ae::1"
         private const val MAPPED_DNS = "198.18.0.2"
         @Volatile
         private var nativeLoaded = false

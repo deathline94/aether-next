@@ -312,9 +312,15 @@ fn handle_engine_line(
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
                 "error" => {
-                    if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
-                        emit_log(app, format!("engine error: {msg}"));
-                    }
+                    let msg = v
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Connection failed");
+                    emit_log(app, format!("engine error: {msg}"));
+                    let state = app.state::<AppState>();
+                    let endpoint = state.runtime.lock().unwrap().endpoint.clone();
+                    // Leave "connecting" immediately — do not wait for process exit / manual Disconnect.
+                    emit_state(app, &state, "error", msg, None, endpoint);
                 }
                 _ => {}
             }
@@ -653,12 +659,29 @@ fn watch_child(app: AppHandle) {
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 cleanup_routing(&app, &state);
-                let detail = if status.success() {
-                    "Engine stopped".into()
+                let already_error = state
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .status
+                    .eq_ignore_ascii_case("error");
+                if already_error {
+                    // Structured error event already set UI; keep it.
+                    continue;
+                }
+                let ever_connected = state.connected_once.load(Ordering::SeqCst);
+                let (ui_status, detail) = if status.success() {
+                    ("disconnected", "Engine stopped".to_string())
+                } else if !ever_connected {
+                    (
+                        "error",
+                        "Could not find a working gateway. Try HTTP/2 or another scan mode."
+                            .to_string(),
+                    )
                 } else {
-                    format!("Engine exited ({status})")
+                    ("disconnected", format!("Engine exited ({status})"))
                 };
-                emit_state(&app, &state, "disconnected", &detail, None, None);
+                emit_state(&app, &state, ui_status, &detail, None, None);
             }
             Ok(None) => {}
             Err(_) => {
@@ -667,7 +690,28 @@ fn watch_child(app: AppHandle) {
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 cleanup_routing(&app, &state);
-                emit_state(&app, &state, "disconnected", "Engine lost", None, None);
+                let already_error = state
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .status
+                    .eq_ignore_ascii_case("error");
+                if already_error {
+                    continue;
+                }
+                let ever_connected = state.connected_once.load(Ordering::SeqCst);
+                if ever_connected {
+                    emit_state(&app, &state, "disconnected", "Engine lost", None, None);
+                } else {
+                    emit_state(
+                        &app,
+                        &state,
+                        "error",
+                        "Engine lost before connect finished",
+                        None,
+                        None,
+                    );
+                }
             }
         }
     });
@@ -1181,8 +1225,22 @@ pub fn run() {
                 MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &connect_item, &disconnect_item, &quit])?;
+            // Prefer bundled PNG so tray is never a blank/default tile when window icon is missing.
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
+                .or_else(|_| {
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or_else(|| tauri::Error::AssetNotFound("window icon".into()))
+                })
+                .map_err(|e| {
+                    Box::new(std::io::Error::other(format!("tray icon: {e}")))
+                        as Box<dyn std::error::Error>
+                })?;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_icon(tray_icon.clone());
+            }
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
                 .tooltip("Aether Next")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {

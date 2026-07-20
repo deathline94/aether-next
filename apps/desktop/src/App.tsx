@@ -103,7 +103,7 @@ const speedProfiles: {
   {
     id: "speed",
     label: "Speed",
-    hint: "MASQUE h2 · firewall · balanced · system proxy",
+    hint: "MASQUE h2 · medium noise · balanced scan · system proxy",
     patch: {
       protocol: "masque",
       transport: "h2",
@@ -116,7 +116,7 @@ const speedProfiles: {
   {
     id: "max-tun",
     label: "Max (TUN)",
-    hint: "Same as Speed + kernel TCP via WinTUN (admin)",
+    hint: "MASQUE h2 · medium noise · balanced scan · full-system TUN (admin)",
     patch: {
       protocol: "masque",
       transport: "h2",
@@ -129,7 +129,7 @@ const speedProfiles: {
   {
     id: "wireguard",
     label: "WireGuard",
-    hint: "UDP path · aggressive · turbo hunt · proxy only",
+    hint: "WireGuard UDP · max noise · turbo scan · proxy only",
     patch: {
       protocol: "wireguard",
       transport: "h2",
@@ -142,7 +142,7 @@ const speedProfiles: {
   {
     id: "quic",
     label: "QUIC h3",
-    hint: "MASQUE HTTP/3 when UDP/QUIC is open",
+    hint: "MASQUE h3 · off noise · balanced scan · system proxy",
     patch: {
       protocol: "masque",
       transport: "h3",
@@ -227,7 +227,7 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.8");
+  const [appVersion, setAppVersion] = useState("1.0.9");
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
@@ -267,7 +267,7 @@ function App() {
           invoke<Settings>("get_settings"),
           invoke<RuntimeState>("get_state"),
           invoke<boolean>("is_admin").catch(() => false),
-          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.8" })),
+          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.9" })),
         ]);
         if (disposed) {
           return;
