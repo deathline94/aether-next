@@ -315,12 +315,31 @@ fn handle_engine_line(
                     let msg = v
                         .get("message")
                         .and_then(|m| m.as_str())
-                        .unwrap_or("Connection failed");
+                        .unwrap_or("Connection failed")
+                        .to_string();
                     emit_log(app, format!("engine error: {msg}"));
                     let state = app.state::<AppState>();
                     let endpoint = state.runtime.lock().unwrap().endpoint.clone();
-                    // Leave "connecting" immediately — do not wait for process exit / manual Disconnect.
-                    emit_state(app, &state, "error", msg, None, endpoint);
+                    
+                    // 1) Paint the banner.
+                    emit_state(app, &state, "error", &msg, None, endpoint);
+
+                    // 2) Tear the session down so the next Connect is allowed WITHOUT
+                    //    dismissing the banner. watch_child's `already_error` guard keeps
+                    //    the error banner visible when the child finally exits.
+                    state.generation.fetch_add(1, Ordering::SeqCst);
+                    state.connecting.store(false, Ordering::SeqCst);
+                    let child = state.child.lock().unwrap().take();
+                    if let Some(mut child) = child {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            use std::io::Write;
+                            let _ = stdin.write_all(b"shutdown\n");
+                            let _ = stdin.flush();
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    cleanup_routing(app, &state);
                 }
                 _ => {}
             }

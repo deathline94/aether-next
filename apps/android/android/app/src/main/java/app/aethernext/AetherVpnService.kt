@@ -32,6 +32,7 @@ class AetherVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var hevStarted = false
     private var stopRequested = false
+    private val lifecycleLock = Any()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -82,36 +83,39 @@ class AetherVpnService : VpnService() {
     }
 
     private fun establishTun(socksPort: Int) {
-        val builder = Builder()
-            .setSession("Aether Next")
-            .setMtu(MTU)
-            .setBlocking(false)
-            // Same address scheme as SocksTun / hev defaults.
-            .addAddress(TUN_ADDR, 32)
-            .addDnsServer(MAPPED_DNS)
-            .addRoute("0.0.0.0", 0)
-            // IPv6 tunnel not implemented: blackhole IPv6 so traffic cannot bypass full VPN.
-            // Apps needing real IPv6 fail closed (no silent leak).
-            .addAddress(TUN_ADDR_V6, 128)
-            .addRoute("::", 0)
+        synchronized(lifecycleLock) {
+            if (stopRequested) return
+            val builder = Builder()
+                .setSession("Aether Next")
+                .setMtu(MTU)
+                .setBlocking(false)
+                // Same address scheme as SocksTun / hev defaults.
+                .addAddress(TUN_ADDR, 32)
+                .addDnsServer(MAPPED_DNS)
+                .addRoute("0.0.0.0", 0)
+                // IPv6 tunnel not implemented: blackhole IPv6 so traffic cannot bypass full VPN.
+                // Apps needing real IPv6 fail closed (no silent leak).
+                .addAddress(TUN_ADDR_V6, 128)
+                .addRoute("::", 0)
 
-        // Keep engine + hev sockets off the TUN (otherwise infinite loop).
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) {
+            // Keep engine + hev sockets off the TUN (otherwise infinite loop).
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {
+            }
+
+            val established = builder.establish()
+            if (established == null) {
+                throw IllegalStateException("VpnService.Builder.establish() returned null")
+            }
+            tun = established
+
+            val configPath = writeHevConfig(socksPort)
+            Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")
+            TProxyStartService(configPath, established.fd)
+            hevStarted = true
+            Log.i(TAG, "VPN + hev-socks5-tunnel active")
         }
-
-        val established = builder.establish()
-        if (established == null) {
-            throw IllegalStateException("VpnService.Builder.establish() returned null")
-        }
-        tun = established
-
-        val configPath = writeHevConfig(socksPort)
-        Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")
-        TProxyStartService(configPath, established.fd)
-        hevStarted = true
-        Log.i(TAG, "VPN + hev-socks5-tunnel active")
     }
 
     private fun writeHevConfig(socksPort: Int): String {
@@ -183,26 +187,28 @@ class AetherVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
-        if (hevStarted) {
-            try {
-                TProxyStopService()
-            } catch (e: Exception) {
-                Log.w(TAG, "hev stop: ${e.message}")
-            } catch (e: UnsatisfiedLinkError) {
-                Log.w(TAG, "hev stop native: ${e.message}")
+        synchronized(lifecycleLock) {
+            if (hevStarted) {
+                try {
+                    TProxyStopService()
+                } catch (e: Exception) {
+                    Log.w(TAG, "hev stop: ${e.message}")
+                } catch (e: UnsatisfiedLinkError) {
+                    Log.w(TAG, "hev stop native: ${e.message}")
+                }
+                hevStarted = false
+                // Give hev threads a beat to release the TUN fd before close (avoids SIGSEGV).
+                try {
+                    Thread.sleep(150)
+                } catch (_: InterruptedException) {
+                }
             }
-            hevStarted = false
-            // Give hev threads a beat to release the TUN fd before close (avoids SIGSEGV).
             try {
-                Thread.sleep(150)
-            } catch (_: InterruptedException) {
+                tun?.close()
+            } catch (_: Exception) {
             }
+            tun = null
         }
-        try {
-            tun?.close()
-        } catch (_: Exception) {
-        }
-        tun = null
     }
 
     override fun onRevoke() {

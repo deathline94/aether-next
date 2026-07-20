@@ -149,7 +149,7 @@ pub async fn run(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     // Prefer assigned edge address when known; else identity-style fallback.
-    let probe_src = crate::runtime_env::var("AETHER_PROBE_SRC")
+    let mut probe_src = crate::runtime_env::var("AETHER_PROBE_SRC")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
 
@@ -294,6 +294,7 @@ pub async fn run(
                 &mut capsules,
                 &addr_tx,
                 &mut h3_ready,
+                &mut probe_src,
             )?;
         }
 
@@ -406,6 +407,7 @@ fn poll_h3(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
     h3_ready: &mut bool,
+    probe_src: &mut std::net::Ipv4Addr,
 ) -> Result<()> {
     let mut body = vec![0u8; 65535];
 
@@ -433,7 +435,7 @@ fn poll_h3(
                     }
                     capsules.push(&body[..n]);
                 }
-                drain_capsules(capsules, addr_tx);
+                drain_capsules(capsules, addr_tx, probe_src);
             }
 
             Ok((_stream_id, h3::Event::Finished)) => {}
@@ -511,13 +513,16 @@ fn build_h3_dns_probe(src: std::net::Ipv4Addr) -> Vec<u8> {
     pkt
 }
 
-fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>) {
+fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>, probe_src: &mut std::net::Ipv4Addr) {
     loop {
         match capsules.next() {
             Ok(Some(masque::Capsule::AddressAssign(addrs))) => {
                 for a in addrs {
                     if let Some(ip) = bytes_to_ip(a.ip_version, &a.address) {
                         log::info!("edge assigned {}/{}", ip, a.prefix_len);
+                        if let IpAddr::V4(v4) = ip {
+                            *probe_src = v4;
+                        }
                         if let Some(tx) = addr_tx {
                             let _ = tx.try_send(AssignedAddr {
                                 ip,

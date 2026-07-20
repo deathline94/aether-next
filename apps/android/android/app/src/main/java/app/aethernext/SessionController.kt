@@ -28,6 +28,7 @@ class SessionController(
     private val tunnelSeen = AtomicBoolean(false)
     private val vpnStarted = AtomicBoolean(false)
     private val vpnEstablished = AtomicBoolean(false)
+    private val tearingDown = AtomicBoolean(false)
     private var settings = store.load()
 
     private val runner = EngineRunner(
@@ -82,31 +83,35 @@ class SessionController(
             }
         }
 
-        val svc = Intent(context, EngineService::class.java)
-        context.startForegroundService(svc)
-
         setRuntime("connecting", "Scanning reachable routes", null, null)
         val err = runner.start(s)
         if (err != null) {
             setRuntime("error", err, null, null)
-            context.stopService(svc)
             return err
         }
+        
+        val svc = Intent(context, EngineService::class.java)
+        context.startForegroundService(svc)
+        
         setRuntime("connecting", "Scanning reachable routes", runner.pid(), null)
         // VPN (hev) starts once local SOCKS is listening — see maybeStartVpn().
         return null
     }
 
     fun disconnect() {
+        if (!tearingDown.compareAndSet(false, true)) return
         runner.stop()
         context.stopService(Intent(context, EngineService::class.java))
-        stopVpnService()
+        if (vpnStarted.get()) {
+            stopVpnService()
+        }
         connectedOnce.set(false)
         socksSeen.set(false)
         tunnelSeen.set(false)
         vpnStarted.set(false)
         vpnEstablished.set(false)
         setRuntime("disconnected", "Ready", null, null)
+        tearingDown.set(false)
     }
 
     fun testConnection(s: Settings): String {

@@ -28,6 +28,23 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, exception ->
+            Log.e(TAG, "Uncaught exception", exception)
+            runOnUiThread {
+                emitToJs(
+                    "session://state",
+                    RuntimeState(
+                        status = "error",
+                        detail = "App crashed: ${exception.message}",
+                        pid = null,
+                        endpoint = null
+                    ).toJson()
+                )
+            }
+            defaultHandler?.uncaughtException(thread, exception)
+        }
+
         // Helpful when diagnosing UI blanks on emulators / LDPlayer.
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 

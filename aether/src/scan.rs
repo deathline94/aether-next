@@ -34,7 +34,7 @@ impl ScanMode {
         match self {
             // High concurrency + short quiet window for snappy connects.
             ScanMode::Turbo => HuntStrategy {
-                concurrency: 64,
+                concurrency: 20,
                 per_probe_timeout: Duration::from_millis(3500),
                 overall_deadline: Duration::from_secs(120),
                 quiet_after_first: Duration::from_millis(500),
@@ -45,7 +45,7 @@ impl ScanMode {
                 candidate_cap: 768,
             },
             ScanMode::Balanced => HuntStrategy {
-                concurrency: 40,
+                concurrency: 16,
                 per_probe_timeout: Duration::from_millis(4500),
                 overall_deadline: Duration::from_secs(90),
                 quiet_after_first: Duration::from_secs(5),
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn turbo_is_highly_concurrent() {
-        assert!(ScanMode::Turbo.masque_strategy().concurrency >= 40);
-        assert!(ScanMode::Balanced.masque_strategy().concurrency >= 32);
+        assert!(ScanMode::Turbo.masque_strategy().concurrency >= 20);
+        assert!(ScanMode::Balanced.masque_strategy().concurrency >= 16);
     }
 }

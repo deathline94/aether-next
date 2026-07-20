@@ -442,7 +442,7 @@ async fn verify_dataplane(
     send: &mut h2::SendStream<Bytes>,
     recv_body: &mut h2::RecvStream,
     capsules: &mut CapsuleParser,
-    probe_src: std::net::Ipv4Addr,
+    mut probe_src: std::net::Ipv4Addr,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut confirms = 0u8;
@@ -475,6 +475,20 @@ async fn verify_dataplane(
                                 }
                             } else {
                                 log::debug!("[h2] ignoring unrelated inbound datagram during verify");
+                            }
+                        }
+                        Ok(Some(Capsule::AddressAssign(addrs))) => {
+                            for a in addrs {
+                                if a.ip_version == 4 && a.address.len() == 4 {
+                                    let new_ip = std::net::Ipv4Addr::new(
+                                        a.address[0], a.address[1], a.address[2], a.address[3]
+                                    );
+                                    if new_ip != probe_src {
+                                        log::info!("[h2] edge assigned ipv4 {}, updating probe_src", new_ip);
+                                        probe_src = new_ip;
+                                        resend_at = Instant::now();
+                                    }
+                                }
                             }
                         }
                         Ok(Some(_)) => {}
