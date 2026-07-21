@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 17
-        versionName = "1.0.18"
+        versionName = "1.0.19"
     }
 
     // Per-ABI APKs + one fat universal (all engines inside).

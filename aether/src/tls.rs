@@ -71,7 +71,10 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .unwrap_or(false);
     if dangerous {
         builder.set_verify(SslVerifyMode::NONE);
-        log::warn!("[tls] DANGER: server authentication explicitly disabled");
+        static DANGER_WARN: std::sync::Once = std::sync::Once::new();
+        DANGER_WARN.call_once(|| {
+            log::warn!("[tls] DANGER: server authentication explicitly disabled");
+        });
     } else {
         if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
             builder.set_ca_file(path.trim())

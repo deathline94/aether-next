@@ -197,6 +197,8 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     let deadline = Instant::now() + st.overall_deadline;
     let mut best: Option<WgProbeResult> = None;
     let mut found = 0usize;
+    let mut scanned = 0usize;
+    let total_candidates = candidates.len();
     let mut quiet_until: Option<Instant> = None;
 
     loop {
@@ -210,10 +212,10 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
                 if quiet_until.is_some() {
                     log::info!("[+] no new endpoints recently, finalizing selection");
                 } else {
-                    log::warn!("[-] scan deadline reached");
+                    log::info!("[-] scan deadline reached, finalizing selection");
                 }
             } else {
-                log::warn!("[-] scan deadline reached with no endpoint");
+                log::error!("[-] scan deadline reached with no endpoint");
             }
             break;
         }
@@ -222,24 +224,34 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
             item = stream.next() => {
                 match item {
                     None => break,
-                    Some(None) => continue,
-                    Some(Some(pr)) => {
-                        log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                        if st.early_exit_first {
-                            return Ok(pr);
+                    Some(res) => {
+                        scanned += 1;
+                        if scanned % 50 == 0 || scanned == total_candidates {
+                            log::info!("[*] wg scanning... {}/{} ips, found {} working", scanned, total_candidates, found);
                         }
-                        best = Some(match best {
-                            Some(cur) if cur.rtt <= pr.rtt => cur,
-                            _ => pr,
-                        });
-                        found += 1;
+                        
+                        match res {
+                            None => continue,
+                            Some(pr) => {
+                                log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                                if st.early_exit_first {
+                                    crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
+                                    return Ok(pr);
+                                }
+                                best = Some(match best {
+                                    Some(cur) if cur.rtt <= pr.rtt => cur,
+                                    _ => pr,
+                                });
+                                found += 1;
 
-                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
-                            log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
-                            if !st.quiet_after_first.is_zero() {
-                                quiet_until = Some(Instant::now() + st.quiet_after_first);
-                            } else {
-                                break;
+                                if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
+                                    log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
+                                    if !st.quiet_after_first.is_zero() {
+                                        quiet_until = Some(Instant::now() + st.quiet_after_first);
+                                    } else {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }

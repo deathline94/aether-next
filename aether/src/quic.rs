@@ -489,7 +489,7 @@ fn build_h3_dns_probe(src: std::net::Ipv4Addr) -> Vec<u8> {
     pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes());
     pkt.extend_from_slice(&[0x00, 0x00, 64, 17, 0x00, 0x00]);
     pkt.extend_from_slice(&src.octets());
-    pkt.extend_from_slice(&[8, 8, 8, 8]);
+    pkt.extend_from_slice(&[1, 1, 1, 1]);
     // checksum zeroed then filled
     let mut sum = 0u32;
     let mut i = 0;
