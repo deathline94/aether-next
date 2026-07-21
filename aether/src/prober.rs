@@ -441,84 +441,81 @@ async fn verify_one(
 }
 
 fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
-    let primary = ports.first().copied().unwrap_or(443);
-    let mut out: Vec<(IpAddr, u16)> = Vec::new();
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
+    let mut seeds_out: Vec<(IpAddr, u16)> = Vec::new();
+    let mut pool_out: Vec<(IpAddr, u16)> = Vec::new();
 
     let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
     let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
+    let mut pool_v4 = Vec::new();
     if ip.want_v4() {
-        for a in &seeds {
-            if seen.insert((IpAddr::V4(*a), primary)) {
-                out.push((IpAddr::V4(*a), primary));
-            }
-        }
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = MASQUE_CIDRS_V4
-            .iter()
-            .map(|c| {
-                if st.full_subnet {
-                    enumerate_cidr_v4(c)
-                } else {
-                    sample_cidr_v4(c, st.sample_per_cidr)
-                }
-            })
-            .collect();
-        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max_len {
-            for hosts in &cidr_hosts {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V4(*a), primary)) {
-                        out.push((IpAddr::V4(*a), primary));
-                    }
-                }
-            }
+        for c in MASQUE_CIDRS_V4 {
+            let hosts = if st.full_subnet {
+                enumerate_cidr_v4(c)
+            } else {
+                sample_cidr_v4(c, st.sample_per_cidr)
+            };
+            pool_v4.extend(hosts);
         }
     }
-
+    
+    let mut pool_v6 = Vec::new();
     if ip.want_v6() {
-        for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
-        }
         let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
-        let cidr6: Vec<Vec<Ipv6Addr>> = MASQUE_CIDRS_V6
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
-                    }
-                }
-            }
+        for c in MASQUE_CIDRS_V6 {
+            let hosts = sample_cidr_v6(c, per, MASQUE_CIDRS_V4);
+            pool_v6.extend(hosts);
         }
     }
 
+    let dedup_ports: Vec<u16> = {
+        let mut sp = HashSet::new();
+        ports.iter().copied().filter(|&p| sp.insert(p)).collect()
+    };
+    
     if ip.want_v4() {
         for a in &seeds {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
-                    out.push((IpAddr::V4(*a), port));
+            for &p in &dedup_ports {
+                if seen.insert((IpAddr::V4(*a), p)) {
+                    seeds_out.push((IpAddr::V4(*a), p));
                 }
             }
         }
     }
     if ip.want_v6() {
         for a in &seeds6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
+            for &p in &dedup_ports {
+                if seen.insert((IpAddr::V6(*a), p)) {
+                    seeds_out.push((IpAddr::V6(*a), p));
                 }
             }
         }
     }
 
-    out
+    for a in pool_v4 {
+        for &p in &dedup_ports {
+            if seen.insert((IpAddr::V4(a), p)) {
+                pool_out.push((IpAddr::V4(a), p));
+            }
+        }
+    }
+    for a in pool_v6 {
+        for &p in &dedup_ports {
+            if seen.insert((IpAddr::V6(a), p)) {
+                pool_out.push((IpAddr::V6(a), p));
+            }
+        }
+    }
+
+    seeds_out.shuffle(&mut rng);
+    pool_out.shuffle(&mut rng);
+
+    seeds_out.extend(pool_out);
+    seeds_out
 }
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {

@@ -90,8 +90,11 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
     if dangerous {
+        static DANGER_WARN: std::sync::Once = std::sync::Once::new();
+        DANGER_WARN.call_once(|| {
+            log::warn!("[tls] DANGER: H2 server authentication explicitly disabled");
+        });
         builder.set_verify(SslVerifyMode::NONE);
-        log::warn!("[tls] DANGER: H2 server authentication explicitly disabled");
     } else {
         if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
             builder.set_ca_file(path.trim()).map_err(|e| AetherError::Tls(format!("load TLS CA file: {e}")))?;

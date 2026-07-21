@@ -336,7 +336,10 @@ async fn verify_one_wg(
 }
 
 fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
-    let ports: Vec<u16> = {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+
+    let dedup_ports: Vec<u16> = {
         let mut seen_port: HashSet<u16> = HashSet::new();
         let deduped: Vec<u16> = ports.iter().copied().filter(|p| seen_port.insert(*p)).collect();
         if deduped.is_empty() {
@@ -355,22 +358,14 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
                 anchors.push(IpAddr::V4(a));
             }
         }
-        let cidr_hosts: Vec<Vec<Ipv4Addr>> = wireguard::WG_PREFIXES_V4
-            .iter()
-            .map(|c| {
-                if st.full_subnet {
-                    enumerate_cidr_v4(c)
-                } else {
-                    sample_cidr_v4(c, st.sample_per_cidr)
-                }
-            })
-            .collect();
-        let max_len = cidr_hosts.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max_len {
-            for hosts in &cidr_hosts {
-                if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V4(*a));
-                }
+        for c in wireguard::WG_PREFIXES_V4 {
+            let hosts = if st.full_subnet {
+                enumerate_cidr_v4(c)
+            } else {
+                sample_cidr_v4(c, st.sample_per_cidr)
+            };
+            for a in hosts {
+                pool.push(IpAddr::V4(a));
             }
         }
     }
@@ -382,36 +377,39 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
             }
         }
         let per = if st.sample_per_cidr == 0 { 80 } else { st.sample_per_cidr };
-        let cidr6: Vec<Vec<Ipv6Addr>> = wireguard::WG_PREFIXES_V6
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, wireguard::WG_PREFIXES_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V6(*a));
-                }
+        for c in wireguard::WG_PREFIXES_V6 {
+            let hosts = sample_cidr_v6(c, per, wireguard::WG_PREFIXES_V4);
+            for a in hosts {
+                pool.push(IpAddr::V6(a));
             }
         }
     }
 
-    let mut ips: Vec<IpAddr> = Vec::with_capacity(anchors.len() + pool.len());
-    ips.extend(anchors.iter().copied());
-    ips.extend(pool.iter().copied());
-
-    let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
-    let port_count = ports.len();
+    let mut anchors_out: Vec<(IpAddr, u16)> = Vec::new();
+    let mut pool_out: Vec<(IpAddr, u16)> = Vec::new();
 
-    for (idx, a) in ips.iter().enumerate() {
-        let port = ports[idx % port_count];
-        if seen.insert((*a, port)) {
-            out.push((*a, port));
+    for a in anchors {
+        for &p in &dedup_ports {
+            if seen.insert((a, p)) {
+                anchors_out.push((a, p));
+            }
         }
     }
 
-    out
+    for a in pool {
+        for &p in &dedup_ports {
+            if seen.insert((a, p)) {
+                pool_out.push((a, p));
+            }
+        }
+    }
+
+    anchors_out.shuffle(&mut rng);
+    pool_out.shuffle(&mut rng);
+
+    anchors_out.extend(pool_out);
+    anchors_out
 }
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
