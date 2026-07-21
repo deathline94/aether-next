@@ -27,7 +27,7 @@ pub async fn spawn(
     if crate::tun_win::enabled() {
         let tun = crate::tun_win::spawn(ipv4, peer, inbound_rx, outbound_tx).await?;
         log::info!("[+] TUN mode enabled (exclusive WinTUN routing, MTU={mtu})");
-        session_event::emit(SessionEvent::TunReady);
+        crate::session_event::emit(crate::session_event::SessionEvent::TunReady);
         return Ok((None, Some(TunGuard::Windows(tun))));
     }
 
