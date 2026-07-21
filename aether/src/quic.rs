@@ -187,9 +187,9 @@ pub async fn run(
     let mut established_ever = false;
     let mut ech_retried = false;
 
-    if let Some(sock) = sockets.get(&local) {
-        noize::pre_handshake(sock.as_ref(), peer, &cfg.noize).await;
-    }
+    // QUIC (H3) does not tolerate pre-handshake junk on the same UDP flow, 
+    // as it invalidates the QUIC Initial packet sequence for Cloudflare's edge.
+    // We intentionally skip noize::pre_handshake for H3.
 
     flush(&mut conn, &sockets).await?;
 
@@ -718,11 +718,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let start = Instant::now();
     let deadline = start + p.timeout;
 
-    // For H3, skip noize on the first Initial flight when profile is heavy —
-    // DPI junk often destroys QUIC. Probe path already retries with noize off.
-    if p.noize.is_enabled() && p.noize.jc_before_hs <= 2 {
-        noize::pre_handshake(&sock, p.peer, &p.noize).await;
-    }
+    // For H3, we completely skip pre-handshake junk, as UDP garbage causes
+    // the Cloudflare QUIC edge to drop the flow.
 
     flush_to(&mut conn, &sock, p.peer).await?;
 

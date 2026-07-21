@@ -7,6 +7,7 @@ mod dns;
 mod engine_config;
 mod error;
 mod http_proxy;
+mod cache;
 mod masque;
 mod masque_h2;
 mod mtu;
@@ -126,7 +127,7 @@ async fn run_session(cfg: EngineConfig) -> Result<()> {
                 device_id: identity.device_id.clone(),
                 ipv4: identity.ipv4.clone(),
             });
-            let peer = select_peer(&identity, protocol).await?;
+            let peer = select_peer(&identity, protocol, &base_config).await?;
             log::info!("[+] using cloudflare edge {peer}");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
@@ -148,7 +149,7 @@ async fn run_session(cfg: EngineConfig) -> Result<()> {
                 device_id: identity.device_id.clone(),
                 ipv4: identity.ipv4.clone(),
             });
-            run_wireguard(identity, listen, http_listen).await
+            run_wireguard(identity, listen, http_listen, &base_config).await
         }
         Protocol::WarpInWarp => {
             let primary_path = warp_config_path(&base_config);
@@ -162,7 +163,7 @@ async fn run_session(cfg: EngineConfig) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let peer = select_peer(&primary, Protocol::WireGuard).await?;
+            let peer = select_peer(&primary, Protocol::WireGuard, &base_config).await?;
             log::info!("[+] using cloudflare edge {peer} (outer)");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
@@ -269,7 +270,7 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
     Ok(identity)
 }
 
-async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result<SocketAddr> {
+async fn select_peer(identity: &account::Identity, protocol: Protocol, base_config: &str) -> Result<SocketAddr> {
     let force_peer = match protocol {
         Protocol::Masque => std::env::var("AETHER_PEER").ok(),
         Protocol::WireGuard | Protocol::WarpInWarp => std::env::var("AETHER_WG_PEER")
@@ -305,6 +306,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
                 ports: prober::MASQUE_PORTS.to_vec(),
                 ip,
                 local_ipv4: identity.ipv4.parse().unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2)),
+                config_path: base_config.to_string(),
             };
 
             let best = prober::hunt_best_gateway(&probe, mode).await?;
@@ -334,6 +336,7 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
                 aethernoize: aethernoize_config(),
                 ports: wireguard::WG_PORTS.to_vec(),
                 ip,
+                config_path: base_config.to_string(),
             };
 
             let best = wg_prober::hunt_best_wg_endpoint(&probe, mode).await?;
@@ -552,6 +555,7 @@ async fn run_wireguard(
     identity: account::Identity,
     listen: SocketAddr,
     http_listen: SocketAddr,
+    base_config: &str,
 ) -> Result<()> {
     let forced = std::env::var("AETHER_WG_PEER")
         .ok()
@@ -592,6 +596,7 @@ async fn run_wireguard(
             aethernoize: profile.clone(),
             ports: wireguard::WG_PORTS.to_vec(),
             ip,
+            config_path: base_config.to_string(),
         };
 
         let best = wg_prober::hunt_best_wg_endpoint(&probe, mode).await?;

@@ -122,15 +122,45 @@ pub struct WgProbe {
     pub private_key: Arc<[u8; 32]>,
     pub peer_public_key: Arc<[u8; 32]>,
     pub client_id: [u8; 3],
-    pub local_ipv4: Ipv4Addr,
-    pub aethernoize: AetherNoizeConfig,
+    pub local_ipv4: std::net::Ipv4Addr,
     pub ports: Vec<u16>,
     pub ip: IpScan,
+    pub aethernoize: crate::aethernoize::AetherNoizeConfig,
+    pub config_path: String,
 }
 
 pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<WgProbeResult> {
     let st = mode.strategy();
     let timeout = st.per_probe_timeout;
+    let ironclad = mode == WgScanMode::Ironclad;
+
+    // 1. Try cached endpoints first
+    let cached = crate::cache::get_wireguard(&probe.config_path);
+    if !cached.is_empty() {
+        log::info!("[*] probing {} cached wg endpoints...", cached.len());
+        let stream = futures::stream::iter(
+            cached.into_iter().map(|addr| verify_one_wg(probe, addr.ip(), addr.port(), timeout, ironclad))
+        ).buffer_unordered(st.concurrency);
+        tokio::pin!(stream);
+
+        let mut best: Option<WgProbeResult> = None;
+        while let Some(res) = stream.next().await {
+            if let Some(pr) = res {
+                log::info!("[+] cached wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                best = Some(match best {
+                    Some(cur) if cur.rtt <= pr.rtt => cur,
+                    _ => pr,
+                });
+            }
+        }
+        if let Some(pr) = best {
+            log::info!("[+] using best cached wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
+            return Ok(pr);
+        }
+        log::info!("[-] cached wg endpoints failed, falling back to full scan");
+    }
+
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !crate::prober::host_has_ipv6().await {
         if probe.ip.want_v4() {
@@ -233,6 +263,7 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     match best {
         Some(pr) => {
             log::info!("[+] best wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),

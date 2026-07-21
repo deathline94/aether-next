@@ -207,6 +207,7 @@ pub struct MasqueProbe {
     pub ports: Vec<u16>,
     pub ip: IpScan,
     pub local_ipv4: Ipv4Addr,
+    pub config_path: String,
 }
 
 pub async fn host_has_ipv6() -> bool {
@@ -219,6 +220,35 @@ pub async fn host_has_ipv6() -> bool {
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
     let st = mode.strategy();
     let timeout = st.per_probe_timeout;
+    let ironclad = mode == ScanMode::Ironclad;
+
+    // 1. Try cached endpoints first
+    let cached = crate::cache::get_masque(&probe.config_path);
+    if !cached.is_empty() {
+        log::info!("[*] probing {} cached masque endpoints...", cached.len());
+        let stream = futures::stream::iter(
+            cached.into_iter().map(|addr| verify_one(probe, addr.ip(), addr.port(), timeout, ironclad))
+        ).buffer_unordered(st.concurrency);
+        tokio::pin!(stream);
+
+        let mut best: Option<ProbeResult> = None;
+        while let Some(res) = stream.next().await {
+            if let Some(pr) = res {
+                log::info!("[+] cached candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                best = Some(match best {
+                    Some(cur) if cur.rtt <= pr.rtt => cur,
+                    _ => pr,
+                });
+            }
+        }
+        if let Some(pr) = best {
+            log::info!("[+] using best cached gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            crate::cache::add_to_masque(&probe.config_path, vec![std::net::SocketAddr::new(pr.ip, pr.port)]);
+            return Ok(pr);
+        }
+        log::info!("[-] cached endpoints failed, falling back to full scan");
+    }
+
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
         if probe.ip.want_v4() {
@@ -241,8 +271,6 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
         st.per_probe_timeout,
         st.overall_deadline,
     );
-
-    let ironclad = mode == ScanMode::Ironclad;
 
     let stream = futures::stream::iter(
         candidates
@@ -321,6 +349,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     match best {
         Some(pr) => {
             log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            crate::cache::add_to_masque(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),
