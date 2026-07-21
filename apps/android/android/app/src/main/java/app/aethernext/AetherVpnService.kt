@@ -257,12 +257,15 @@ class AetherVpnService : VpnService() {
 
         /** hev JNI (registered in hev-jni.c for AetherVpnService). */
         @JvmStatic
+        @androidx.annotation.Keep
         private external fun TProxyStartService(configPath: String, fd: Int)
 
         @JvmStatic
+        @androidx.annotation.Keep
         private external fun TProxyStopService()
 
         @JvmStatic
+        @androidx.annotation.Keep
         private external fun TProxyGetStats(): LongArray
     }
 }

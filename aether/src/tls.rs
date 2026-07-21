@@ -86,6 +86,8 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(AetherError::Quic)?;
 
+    config.verify_peer(!dangerous);
+
     config
         .set_application_protos(&[consts::ALPN_H3])
         .map_err(AetherError::Quic)?;
