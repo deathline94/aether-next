@@ -24,7 +24,7 @@ extern "C" {
     );
 }
 
-const CHROME_GROUPS: &str = "P-256:X25519:P-384";
+const CHROME_GROUPS: &str = "X25519:P-256:P-384";
 
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
@@ -49,9 +49,11 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_curves_list(groups)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let mut alpn = Vec::with_capacity(consts::ALPN_H3.len() + 1);
+    let mut alpn = Vec::new();
     alpn.push(consts::ALPN_H3.len() as u8);
     alpn.extend_from_slice(consts::ALPN_H3);
+    alpn.push(5);
+    alpn.extend_from_slice(b"h3-29");
     builder
         .set_alpn_protos(&alpn)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -92,7 +94,7 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     config.verify_peer(!dangerous);
 
     config
-        .set_application_protos(&[consts::ALPN_H3])
+        .set_application_protos(&[consts::ALPN_H3, b"h3-29"])
         .map_err(AetherError::Quic)?;
 
     config.set_max_idle_timeout(120_000);

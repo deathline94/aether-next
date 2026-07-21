@@ -33,7 +33,7 @@ type Status = "disconnected" | "connecting" | "connected" | "error";
 type Settings = {
   protocol: "masque" | "wireguard" | "gool";
   transport: "h2" | "h3";
-  scanMode: "turbo" | "balanced" | "thorough" | "stealth";
+  scanMode: "fast" | "balanced" | "deep" | "turbo" | "auto";
   ipVersion: "v4" | "v6" | "both";
   noize: string;
   noizeJc: number;
@@ -809,10 +809,11 @@ function App() {
                     patchSettings({ scanMode: event.target.value as Settings["scanMode"] })
                   }
                 >
-                  <option value="turbo">Turbo</option>
+                  <option value="fast">Fast</option>
                   <option value="balanced">Balanced</option>
-                  <option value="thorough">Thorough</option>
-                  <option value="stealth">Stealth</option>
+                  <option value="deep">Deep</option>
+                  <option value="turbo">Turbo</option>
+                  <option value="auto">Auto</option>
                 </select>
               </div>
               <div className="setting-row">

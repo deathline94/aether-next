@@ -294,14 +294,15 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol, base_conf
     match protocol {
         Protocol::Masque => {
             log::info!("[*] hunting for a working MASQUE gateway (deep connect-ip verification)");
+            let ech_config = resolve_ech().await;
             let mode = prober::ScanMode::parse(&mode_str);
             let probe = prober::MasqueProbe {
-                sni: consts::CONNECT_SNI.to_string(),
+                sni: if masque_h2::enabled() { consts::CONNECT_SNI.to_string() } else { consts::L4_CONNECT_SNI.to_string() },
                 authority: quic::default_authority().to_string(),
                 path: quic::default_path().to_string(),
                 cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
                 key_pem: std::sync::Arc::from(identity.key_pem.clone()),
-                ech_config_list: None,
+                ech_config_list: ech_config.clone().map(std::sync::Arc::from),
                 noize: noize_config(),
                 ports: prober::MASQUE_PORTS.to_vec(),
                 ip,
@@ -316,6 +317,10 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol, base_conf
                 best.port,
                 best.rtt
             );
+            session_event::emit(SessionEvent::EndpointSelected {
+                addr: format!("{}:{}", best.ip, best.port),
+                protocol: "masque".into(),
+            });
             Ok(SocketAddr::new(best.ip, best.port))
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
@@ -395,7 +400,7 @@ async fn run_masque_tunnel(
 
     let cfg = quic::TunnelConfig {
         peer,
-        sni: consts::CONNECT_SNI.to_string(),
+        sni: if masque_h2::enabled() { consts::CONNECT_SNI.to_string() } else { consts::L4_CONNECT_SNI.to_string() },
         authority: quic::default_authority().to_string(),
         path: quic::default_path().to_string(),
         cert_pem: identity.cert_pem.clone(),

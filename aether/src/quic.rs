@@ -181,7 +181,8 @@ pub async fn run(
         log::info!("ech config injected ({} bytes)", ech.len());
     }
 
-    let h3_config = h3::Config::new()?;
+    let mut h3_config = h3::Config::new()?;
+    h3_config.enable_extended_connect(true);
     let mut h3_conn: Option<h3::Connection> = None;
     let mut req_stream: Option<u64> = None;
     let mut capsules = CapsuleParser::new();
@@ -668,7 +669,7 @@ pub fn default_path() -> &'static str {
 }
 
 pub fn default_sni() -> &'static str {
-    consts::CONNECT_SNI
+    consts::L4_CONNECT_SNI
 }
 
 #[derive(Clone)]
@@ -693,6 +694,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         "[::]:0".parse().unwrap()
     };
     let sock = bind_udp_fast(bind).await?;
+    let _ = sock.connect(p.peer).await;
     let local = sock.local_addr()?;
 
     // Cheap UDP reachability: if nothing comes back after a QUIC Initial kick,
@@ -712,7 +714,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         let _ = tls::inject_ech(&mut conn, ech);
     }
 
-    let h3_config = h3::Config::new()?;
+    let mut h3_config = h3::Config::new()?;
+    h3_config.enable_extended_connect(true);
     let mut h3_conn: Option<h3::Connection> = None;
     let mut req_stream: Option<u64> = None;
 
@@ -796,7 +799,15 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         flush_to(&mut conn, &sock, p.peer).await?;
 
         if conn.is_closed() {
-            return Err(AetherError::Other("closed before 200".into()));
+            let mut reason = String::new();
+            if let Some(local_err) = conn.local_error() {
+                reason.push_str(&format!("local_error: {:?} (code {}) ", local_err.reason, local_err.error_code));
+            }
+            if let Some(peer_err) = conn.peer_error() {
+                reason.push_str(&format!("peer_error: {:?} (code {}) ", peer_err.reason, peer_err.error_code));
+            }
+            log::debug!("probe {} -> other: closed before 200, reason: {}", p.peer, reason);
+            return Err(AetherError::Other(format!("closed before 200: {reason}")));
         }
     }
 }
@@ -834,7 +845,9 @@ async fn flush_to(
                 } else {
                     send_info.to
                 };
-                sock.send_to(&out[..write], dest).await?;
+                if sock.send_to(&out[..write], dest).await.is_err() {
+                    let _ = sock.send(&out[..write]).await;
+                }
             }
             Err(quiche::Error::Done) => break,
             Err(e) => return Err(AetherError::Quic(e)),

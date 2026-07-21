@@ -46,7 +46,7 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "8.6.112.1",
 ];
 
-pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4443, 8443, 8095];
+pub const MASQUE_PORTS: &[u16] = &[2408, 443, 500, 1701, 4500, 4443, 8443, 8095];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:d0::/48",
