@@ -842,6 +842,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .env("AETHER_SOCKS", format!("127.0.0.1:{}", settings.socks_port))
             .env("AETHER_HTTP", format!("127.0.0.1:{}", settings.http_port))
             .env("AETHER_CONFIG", dir.join("aether.toml"))
+            .env("AETHER_DANGEROUS_DISABLE_TLS_VERIFY", "1")
             .env(
                 "AETHER_MASQUE_HTTP2",
                 if settings.transport == "h2" { "1" } else { "0" },
