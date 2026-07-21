@@ -10,7 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::masque::{self, CapsuleParser};
-use crate::noize::NoizeConfig;
+#[allow(unused_imports)]
+use crate::noize::{self, NoizeConfig};
 use crate::tls::{self, TlsParams};
 use crate::{consts, error::AetherError, error::Result};
 

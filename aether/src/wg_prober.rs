@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use futures::stream::StreamExt;
 use rand::Rng;
 
+#[allow(unused_imports)]
+use crate::aethernoize::AetherNoizeConfig;
 
 use crate::error::{AetherError, Result};
 use crate::prober::IpScan;
