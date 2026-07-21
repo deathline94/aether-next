@@ -91,3 +91,7 @@ local.properties
 *.tgz
 *.7z
 !packaging/**
+
+# ⚙ Runtime Configs & State
+aether*.toml
+aether*.json
