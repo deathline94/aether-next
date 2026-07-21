@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use futures::stream::StreamExt;
 use rand::Rng;
 
-use crate::aethernoize::AetherNoizeConfig;
+
 use crate::error::{AetherError, Result};
 use crate::prober::IpScan;
 use crate::wireguard;
@@ -186,6 +186,7 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
 
     let ironclad = mode == WgScanMode::Ironclad;
 
+    let total_candidates = candidates.len();
     let stream = futures::stream::iter(
         candidates
             .into_iter()
@@ -198,7 +199,6 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     let mut best: Option<WgProbeResult> = None;
     let mut found = 0usize;
     let mut scanned = 0usize;
-    let total_candidates = candidates.len();
     let mut quiet_until: Option<Instant> = None;
 
     loop {

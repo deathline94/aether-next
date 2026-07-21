@@ -272,6 +272,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
         st.overall_deadline,
     );
 
+    let total_candidates = candidates.len();
     let stream = futures::stream::iter(
         candidates
             .into_iter()
@@ -284,7 +285,6 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut scanned = 0usize;
-    let total_candidates = candidates.len();
     let mut quiet_until: Option<Instant> = None;
 
     loop {

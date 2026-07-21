@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use crate::error::Result;
 use crate::netstack;
-use crate::session_event::{self, SessionEvent};
+
 
 pub fn tunnel_mtu() -> usize { crate::mtu::current() }
 

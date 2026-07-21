@@ -286,7 +286,7 @@ fn drain_tunn(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> (Vec<
                 tun_pkts.push(pkt.to_vec());
             }
             TunnResult::Done | TunnResult::Err(_) => break,
-            _ => {}
+
         }
     }
     (wire, tun_pkts)
