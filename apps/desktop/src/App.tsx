@@ -65,10 +65,10 @@ type LogEntry = {
 const defaults: Settings = {
   protocol: "masque",
   transport: "h2",
-  // balanced: sample several edges and pick lowest RTT (turbo often locks a bad edge).
+  // balanced: sample several edges and pick lowest RTT.
   scanMode: "balanced",
   ipVersion: "v4",
-  noize: "medium",
+  noize: "off",
   noizeJc: 4,
   noizeJmin: 48,
   noizeJmax: 190,
@@ -94,7 +94,7 @@ const navigation = [
   { id: "logs" as const, label: "Activity", icon: ScrollText },
 ];
 
-/** One-click profiles — apply recommended combos for speed / system / UDP. */
+/** One-click speed profile presets in exact order. */
 const speedProfiles: {
   id: string;
   label: string;
@@ -102,51 +102,51 @@ const speedProfiles: {
   patch: Partial<Settings>;
 }[] = [
   {
-    id: "speed",
-    label: "Speed",
-    hint: "MASQUE h2 · medium noise · balanced scan · system proxy",
+    id: "masque-h3",
+    label: "MASQUE H3",
+    hint: "MASQUE h3 · noise off · balanced scan · system proxy",
     patch: {
       protocol: "masque",
-      transport: "h2",
-      noize: "medium",
+      transport: "h3",
+      noize: "off",
       scanMode: "balanced",
       ipVersion: "v4",
       routingMode: "system-proxy",
     },
   },
   {
-    id: "max-tun",
-    label: "Max (TUN)",
-    hint: "MASQUE h2 · medium noise · balanced scan · full-system TUN (admin)",
+    id: "masque-h2",
+    label: "MASQUE H2 (Default)",
+    hint: "MASQUE h2 · noise off · balanced scan · system proxy",
     patch: {
       protocol: "masque",
       transport: "h2",
-      noize: "medium",
+      noize: "off",
       scanMode: "balanced",
       ipVersion: "v4",
-      routingMode: "tun",
+      routingMode: "system-proxy",
     },
   },
   {
     id: "wireguard",
     label: "WireGuard",
-    hint: "WireGuard UDP · max noise · turbo scan · proxy only",
+    hint: "WireGuard · noise off · balanced scan · system proxy",
     patch: {
       protocol: "wireguard",
       transport: "h2",
-      noize: "max",
-      scanMode: "turbo",
+      noize: "off",
+      scanMode: "balanced",
       ipVersion: "v4",
-      routingMode: "proxy-only",
+      routingMode: "system-proxy",
     },
   },
   {
-    id: "quic",
-    label: "QUIC h3",
-    hint: "MASQUE h3 · off noise · balanced scan · system proxy",
+    id: "gool",
+    label: "Gool",
+    hint: "Gool (WARP-in-WARP) · noise off · balanced scan · system proxy",
     patch: {
-      protocol: "masque",
-      transport: "h3",
+      protocol: "gool",
+      transport: "h2",
       noize: "off",
       scanMode: "balanced",
       ipVersion: "v4",
@@ -230,7 +230,7 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.26");
+  const [appVersion, setAppVersion] = useState("1.0.27");
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
@@ -243,7 +243,7 @@ function App() {
       .then((data) => {
         if (data && data.tag_name) {
           const latestTag = data.tag_name.replace(/^v/, "");
-          if (latestTag > "1.0.26") {
+          if (latestTag > "1.0.27") {
             setUpdateAvailable({
               version: data.tag_name,
               url: data.html_url || "https://github.com/deathline94/aether-next/releases/latest",

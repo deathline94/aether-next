@@ -36,7 +36,7 @@ const defaults: Settings = {
   transport: "h2",
   scanMode: "balanced",
   ipVersion: "v4",
-  noize: "medium",
+  noize: "off",
   noizeJc: 4,
   noizeJmin: 48,
   noizeJmax: 190,

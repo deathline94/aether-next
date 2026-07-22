@@ -50,7 +50,7 @@ impl Default for Settings {
             // Prefer balanced over turbo: better edge RTT → higher throughput.
             scan_mode: "balanced".into(),
             ip_version: "v4".into(),
-            noize: "medium".into(),
+            noize: "off".into(),
             noize_jc: 4,
             noize_jmin: 48,
             noize_jmax: 190,
