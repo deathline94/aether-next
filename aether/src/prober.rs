@@ -46,7 +46,34 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "8.6.112.1",
 ];
 
-pub const MASQUE_PORTS: &[u16] = &[2408, 443, 500, 1701, 4500, 4443, 8443, 8095];
+/// Ports ordered by priority: primary web TLS first, then secondary, then legacy.
+pub const MASQUE_PORTS: &[u16] = &[443, 8443, 4443, 8095, 2408, 500, 1701, 4500];
+
+/// Weighted CIDR ranking — higher weight = probed earlier.
+/// Based on empirical Cloudflare edge health & responsiveness.
+const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
+    ("162.159.198.0/24", 10),  // Historically most responsive
+    ("162.159.192.0/24", 10),
+    ("162.159.193.0/24", 9),
+    ("162.159.195.0/24", 9),
+    ("162.159.196.0/24", 8),
+    ("162.159.197.0/24", 8),
+    ("188.114.96.0/24", 7),
+    ("188.114.97.0/24", 7),
+    ("188.114.98.0/24", 6),
+    ("188.114.99.0/24", 6),
+    ("162.159.36.0/24", 5),
+    ("162.159.46.0/24", 5),
+    ("162.159.204.0/24", 5),
+    ("172.65.251.0/24", 4),
+    ("8.34.146.0/24", 3),
+    ("8.39.214.0/24", 3),
+    ("8.39.204.0/24", 3),
+    ("8.6.112.0/24", 2),
+    ("8.35.211.0/24", 2),
+    ("8.39.125.0/24", 2),
+    ("8.47.69.0/24", 2),
+];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:d0::/48",
@@ -129,9 +156,9 @@ impl ScanMode {
     fn strategy(&self) -> Strategy {
         match self {
             ScanMode::Turbo => Strategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(6000),
-                overall_deadline: Duration::from_secs(45),
+                concurrency: 250,
+                per_probe_timeout: Duration::from_millis(1000),
+                overall_deadline: Duration::from_secs(15),
                 quiet_after_first: Duration::from_secs(0),
                 target_successes: 1,
                 early_exit_first: true,
@@ -139,39 +166,39 @@ impl ScanMode {
                 sample_per_cidr: 64,
             },
             ScanMode::Balanced => Strategy {
-                concurrency: 16,
-                per_probe_timeout: Duration::from_millis(6000),
-                overall_deadline: Duration::from_secs(120),
-                quiet_after_first: Duration::from_secs(20),
+                concurrency: 200,
+                per_probe_timeout: Duration::from_millis(1200),
+                overall_deadline: Duration::from_secs(30),
+                quiet_after_first: Duration::from_secs(8),
                 target_successes: 6,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 140,
             },
             ScanMode::Thorough => Strategy {
-                concurrency: 20,
-                per_probe_timeout: Duration::from_millis(10000),
-                overall_deadline: Duration::from_secs(300),
-                quiet_after_first: Duration::from_secs(30),
+                concurrency: 250,
+                per_probe_timeout: Duration::from_millis(1500),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(10),
                 target_successes: 0,
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
             ScanMode::Stealth => Strategy {
-                concurrency: 3,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(25),
+                concurrency: 8,
+                per_probe_timeout: Duration::from_millis(3000),
+                overall_deadline: Duration::from_secs(90),
+                quiet_after_first: Duration::from_secs(15),
                 target_successes: 4,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 64,
             },
             ScanMode::Ironclad => Strategy {
-                concurrency: 4,
-                per_probe_timeout: Duration::from_millis(15000),
-                overall_deadline: Duration::from_secs(180),
+                concurrency: 6,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(120),
                 quiet_after_first: Duration::from_secs(15),
                 target_successes: 3,
                 early_exit_first: false,
@@ -222,19 +249,21 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     let timeout = st.per_probe_timeout;
     let ironclad = mode == ScanMode::Ironclad;
 
-    // 1. Try cached endpoints first
-    let cached = crate::cache::get_masque(&probe.config_path);
+    // ── Tier-0: Ultra-fast cache probe (500ms timeout, parallel) ──
+    let cached = crate::cache::get_masque_sorted(&probe.config_path);
     if !cached.is_empty() {
-        log::info!("[*] probing {} cached masque endpoints...", cached.len());
+        let tier0_timeout = Duration::from_millis(500);
+        let tier0_concurrency = cached.len().min(10);
+        log::info!("[⚡] Tier-0 instant probe: {} cached endpoints (500ms timeout)", cached.len());
         let stream = futures::stream::iter(
-            cached.into_iter().map(|addr| verify_one(probe, addr.ip(), addr.port(), timeout, ironclad))
-        ).buffer_unordered(st.concurrency);
+            cached.into_iter().map(|(addr, _rtt)| verify_one(probe, addr.ip(), addr.port(), tier0_timeout, false))
+        ).buffer_unordered(tier0_concurrency);
         tokio::pin!(stream);
 
         let mut best: Option<ProbeResult> = None;
         while let Some(res) = stream.next().await {
             if let Some(pr) = res {
-                log::info!("[+] cached candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                log::info!("[⚡] Tier-0 cache hit {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                 best = Some(match best {
                     Some(cur) if cur.rtt <= pr.rtt => cur,
                     _ => pr,
@@ -242,11 +271,12 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
             }
         }
         if let Some(pr) = best {
-            log::info!("[+] using best cached gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::cache::add_to_masque(&probe.config_path, vec![std::net::SocketAddr::new(pr.ip, pr.port)]);
+            log::info!("[⚡] Tier-0 instant connect via cached gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            let rtt_ms = pr.rtt.as_millis() as u32;
+            crate::cache::add_to_masque_with_rtt(&probe.config_path, vec![(std::net::SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
             return Ok(pr);
         }
-        log::info!("[-] cached endpoints failed, falling back to full scan");
+        log::info!("[-] Tier-0 cache miss, falling back to full scan");
     }
 
     let mut effective_ip = probe.ip;
@@ -346,7 +376,8 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
 
                                 if st.early_exit_first {
                                     let final_best = best.unwrap_or(pr);
-                                    crate::cache::add_to_masque(&probe.config_path, vec![std::net::SocketAddr::new(final_best.ip, final_best.port)]);
+                                    let rtt_ms = final_best.rtt.as_millis() as u32;
+                                    crate::cache::add_to_masque_with_rtt(&probe.config_path, vec![(std::net::SocketAddr::new(final_best.ip, final_best.port), rtt_ms)]);
                                     return Ok(final_best);
                                 }
 
@@ -381,7 +412,8 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     match best {
         Some(pr) => {
             log::info!("[+] best gateway {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::cache::add_to_masque(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
+            let rtt_ms = pr.rtt.as_millis() as u32;
+            crate::cache::add_to_masque_with_rtt(&probe.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),
@@ -533,13 +565,21 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
     let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6.iter().filter_map(|s| s.parse().ok()).collect();
 
+    // ── Weighted CIDR ranking: sort CIDRs by weight (highest first) ──
+    let mut weighted_cidrs: Vec<(&str, u8)> = if ip.want_v4() {
+        MASQUE_CIDR_WEIGHTS.to_vec()
+    } else {
+        Vec::new()
+    };
+    weighted_cidrs.sort_by(|a, b| b.1.cmp(&a.1));
+
     let mut pool_v4 = Vec::new();
     if ip.want_v4() {
-        for c in MASQUE_CIDRS_V4 {
+        for &(cidr, _weight) in &weighted_cidrs {
             let hosts = if st.full_subnet {
-                enumerate_cidr_v4(c)
+                enumerate_cidr_v4(cidr)
             } else {
-                sample_cidr_v4(c, st.sample_per_cidr)
+                sample_cidr_v4(cidr, st.sample_per_cidr)
             };
             pool_v4.extend(hosts);
         }
@@ -554,11 +594,13 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         }
     }
 
+    // ── Port priority: dedup while preserving priority order from MASQUE_PORTS ──
     let dedup_ports: Vec<u16> = {
         let mut sp = HashSet::new();
         ports.iter().copied().filter(|&p| sp.insert(p)).collect()
     };
     
+    // Seeds get highest priority — probe them on the primary port (443) first
     if ip.want_v4() {
         for a in &seeds {
             for &p in &dedup_ports {
@@ -578,6 +620,7 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         }
     }
 
+    // Pool candidates: port-priority ordering — for each IP, probe primary port first
     for a in pool_v4 {
         for &p in &dedup_ports {
             if seen.insert((IpAddr::V4(a), p)) {
@@ -593,8 +636,8 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         }
     }
 
+    // Shuffle seeds among themselves; pool stays in weighted-CIDR then port-priority order
     seeds_out.shuffle(&mut rng);
-    pool_out.shuffle(&mut rng);
 
     seeds_out.extend(pool_out);
     seeds_out

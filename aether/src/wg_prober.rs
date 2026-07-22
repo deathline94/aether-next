@@ -53,9 +53,9 @@ impl WgScanMode {
     fn strategy(&self) -> WgStrategy {
         match self {
             WgScanMode::Turbo => WgStrategy {
-                concurrency: 12,
-                per_probe_timeout: Duration::from_millis(5000),
-                overall_deadline: Duration::from_secs(30),
+                concurrency: 250,
+                per_probe_timeout: Duration::from_millis(1000),
+                overall_deadline: Duration::from_secs(15),
                 quiet_after_first: Duration::from_secs(0),
                 target_successes: 1,
                 early_exit_first: true,
@@ -63,39 +63,39 @@ impl WgScanMode {
                 sample_per_cidr: 40,
             },
             WgScanMode::Balanced => WgStrategy {
-                concurrency: 8,
-                per_probe_timeout: Duration::from_millis(7000),
-                overall_deadline: Duration::from_secs(80),
-                quiet_after_first: Duration::from_secs(12),
+                concurrency: 200,
+                per_probe_timeout: Duration::from_millis(1200),
+                overall_deadline: Duration::from_secs(30),
+                quiet_after_first: Duration::from_secs(8),
                 target_successes: 5,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 120,
             },
             WgScanMode::Thorough => WgStrategy {
-                concurrency: 10,
-                per_probe_timeout: Duration::from_millis(9000),
-                overall_deadline: Duration::from_secs(250),
-                quiet_after_first: Duration::from_secs(25),
+                concurrency: 250,
+                per_probe_timeout: Duration::from_millis(1500),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(10),
                 target_successes: 0,
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
             WgScanMode::Stealth => WgStrategy {
-                concurrency: 3,
-                per_probe_timeout: Duration::from_millis(10000),
-                overall_deadline: Duration::from_secs(150),
-                quiet_after_first: Duration::from_secs(20),
+                concurrency: 8,
+                per_probe_timeout: Duration::from_millis(3000),
+                overall_deadline: Duration::from_secs(90),
+                quiet_after_first: Duration::from_secs(15),
                 target_successes: 3,
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: 50,
             },
             WgScanMode::Ironclad => WgStrategy {
-                concurrency: 4,
-                per_probe_timeout: Duration::from_millis(15000),
-                overall_deadline: Duration::from_secs(180),
+                concurrency: 6,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(120),
                 quiet_after_first: Duration::from_secs(15),
                 target_successes: 3,
                 early_exit_first: false,
@@ -136,19 +136,21 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     let timeout = st.per_probe_timeout;
     let ironclad = mode == WgScanMode::Ironclad;
 
-    // 1. Try cached endpoints first
-    let cached = crate::cache::get_wireguard(&probe.config_path);
+    // ── Tier-0: Ultra-fast cache probe (500ms timeout, parallel) ──
+    let cached = crate::cache::get_wireguard_sorted(&probe.config_path);
     if !cached.is_empty() {
-        log::info!("[*] probing {} cached wg endpoints...", cached.len());
+        let tier0_timeout = Duration::from_millis(500);
+        let tier0_concurrency = cached.len().min(10);
+        log::info!("[⚡] Tier-0 instant probe: {} cached wg endpoints (500ms timeout)", cached.len());
         let stream = futures::stream::iter(
-            cached.into_iter().map(|addr| verify_one_wg(probe, addr.ip(), addr.port(), timeout, ironclad))
-        ).buffer_unordered(st.concurrency);
+            cached.into_iter().map(|(addr, _rtt)| verify_one_wg(probe, addr.ip(), addr.port(), tier0_timeout, false))
+        ).buffer_unordered(tier0_concurrency);
         tokio::pin!(stream);
 
         let mut best: Option<WgProbeResult> = None;
         while let Some(res) = stream.next().await {
             if let Some(pr) = res {
-                log::info!("[+] cached wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                log::info!("[⚡] Tier-0 wg cache hit {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                 best = Some(match best {
                     Some(cur) if cur.rtt <= pr.rtt => cur,
                     _ => pr,
@@ -156,11 +158,12 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
             }
         }
         if let Some(pr) = best {
-            log::info!("[+] using best cached wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
+            log::info!("[⚡] Tier-0 instant connect via cached wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+            let rtt_ms = pr.rtt.as_millis() as u32;
+            crate::cache::add_to_wireguard_with_rtt(&probe.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
             return Ok(pr);
         }
-        log::info!("[-] cached wg endpoints failed, falling back to full scan");
+        log::info!("[-] Tier-0 wg cache miss, falling back to full scan");
     }
 
     let mut effective_ip = probe.ip;
@@ -262,7 +265,8 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
 
                                 if st.early_exit_first {
                                     let final_best = best.unwrap_or(pr);
-                                    crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(final_best.ip, final_best.port)]);
+                                    let rtt_ms = final_best.rtt.as_millis() as u32;
+                                    crate::cache::add_to_wireguard_with_rtt(&probe.config_path, vec![(SocketAddr::new(final_best.ip, final_best.port), rtt_ms)]);
                                     return Ok(final_best);
                                 }
 
@@ -297,7 +301,8 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     match best {
         Some(pr) => {
             log::info!("[+] best wg endpoint {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-            crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
+            let rtt_ms = pr.rtt.as_millis() as u32;
+            crate::cache::add_to_wireguard_with_rtt(&probe.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
             Ok(pr)
         }
         None => Err(AetherError::NoCleanEndpoint),
@@ -417,10 +422,28 @@ async fn drill_down_hot_subnet_wg(
     results
 }
 
+/// Weighted WG CIDR ranking — higher weight = probed earlier.
+const WG_CIDR_WEIGHTS: &[(&str, u8)] = &[
+    ("162.159.192.0/24", 10),
+    ("162.159.195.0/24", 10),
+    ("188.114.96.0/24", 8),
+    ("188.114.97.0/24", 8),
+    ("188.114.98.0/24", 7),
+    ("188.114.99.0/24", 7),
+    ("8.34.146.0/24", 5),
+    ("8.39.214.0/24", 5),
+    ("8.39.204.0/24", 4),
+    ("8.6.112.0/24", 3),
+    ("8.35.211.0/24", 3),
+    ("8.39.125.0/24", 2),
+    ("8.47.69.0/24", 2),
+];
+
 fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
 
+    // Port priority: dedup while preserving priority order from caller
     let dedup_ports: Vec<u16> = {
         let mut seen_port: HashSet<u16> = HashSet::new();
         let deduped: Vec<u16> = ports.iter().copied().filter(|p| seen_port.insert(*p)).collect();
@@ -434,17 +457,25 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
     let mut anchors: Vec<IpAddr> = Vec::new();
     let mut pool: Vec<IpAddr> = Vec::new();
 
+    // ── Weighted CIDR ranking: sort by weight (highest first) ──
+    let mut weighted_cidrs: Vec<(&str, u8)> = if ip.want_v4() {
+        WG_CIDR_WEIGHTS.to_vec()
+    } else {
+        Vec::new()
+    };
+    weighted_cidrs.sort_by(|a, b| b.1.cmp(&a.1));
+
     if ip.want_v4() {
         for s in wireguard::WG_SEEDS_V4 {
             if let Ok(a) = s.parse::<Ipv4Addr>() {
                 anchors.push(IpAddr::V4(a));
             }
         }
-        for c in wireguard::WG_PREFIXES_V4 {
+        for &(cidr, _weight) in &weighted_cidrs {
             let hosts = if st.full_subnet {
-                enumerate_cidr_v4(c)
+                enumerate_cidr_v4(cidr)
             } else {
-                sample_cidr_v4(c, st.sample_per_cidr)
+                sample_cidr_v4(cidr, st.sample_per_cidr)
             };
             for a in hosts {
                 pool.push(IpAddr::V4(a));
@@ -471,6 +502,7 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
     let mut anchors_out: Vec<(IpAddr, u16)> = Vec::new();
     let mut pool_out: Vec<(IpAddr, u16)> = Vec::new();
 
+    // Anchors get highest priority with port-priority ordering
     for a in anchors {
         for &p in &dedup_ports {
             if seen.insert((a, p)) {
@@ -479,6 +511,7 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
         }
     }
 
+    // Pool candidates: weighted-CIDR order then port-priority ordering
     for a in pool {
         for &p in &dedup_ports {
             if seen.insert((a, p)) {
@@ -487,8 +520,8 @@ fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAdd
         }
     }
 
+    // Shuffle anchors among themselves; pool stays in weighted order
     anchors_out.shuffle(&mut rng);
-    pool_out.shuffle(&mut rng);
 
     anchors_out.extend(pool_out);
     anchors_out
