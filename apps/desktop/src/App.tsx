@@ -228,7 +228,7 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.24");
+  const [appVersion, setAppVersion] = useState("1.0.25");
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
@@ -241,7 +241,7 @@ function App() {
       .then((data) => {
         if (data && data.tag_name) {
           const latestTag = data.tag_name.replace(/^v/, "");
-          if (latestTag > "1.0.24") {
+          if (latestTag > "1.0.25") {
             setUpdateAvailable({
               version: data.tag_name,
               url: data.html_url || "https://github.com/deathline94/aether-next/releases/latest",
