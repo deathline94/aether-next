@@ -1,6 +1,6 @@
 [package]
 name = "aether-desktop"
-version = "1.0.22"
+version = "1.0.23"
 description = "Aether Next for Windows"
 authors = ["deathline94"]
 edition = "2021"
