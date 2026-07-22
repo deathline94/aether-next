@@ -226,7 +226,17 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
     allow(
         "scan_mode",
         &settings.scan_mode,
-        &["fast", "balanced", "deep", "turbo", "auto"],
+        &[
+            "turbo",
+            "balanced",
+            "thorough",
+            "stealth",
+            "fast",
+            "deep",
+            "thorogh",
+            "auto",
+            "ironclad",
+        ],
     )?;
     allow(
         "ip_version",

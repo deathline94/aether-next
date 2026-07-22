@@ -310,7 +310,24 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol, base_conf
                 config_path: base_config.to_string(),
             };
 
-            let best = prober::hunt_best_gateway(&probe, mode).await?;
+            let best = match prober::hunt_best_gateway(&probe, mode).await {
+                Ok(b) => b,
+                Err(AetherError::NoCleanEndpoint) if !masque_h2::enabled() => {
+                    log::warn!("[!] no QUIC (H3) gateway found; falling back to HTTP/2 transport");
+                    session_event::emit(SessionEvent::TransportFallback {
+                        from: "h3".into(),
+                        to: "h2".into(),
+                    });
+                    runtime_env::set("AETHER_MASQUE_HTTP2", "1");
+                    let h2_probe = prober::MasqueProbe {
+                        sni: consts::CONNECT_SNI.to_string(),
+                        ech_config_list: None,
+                        ..probe
+                    };
+                    prober::hunt_best_gateway(&h2_probe, mode).await?
+                }
+                Err(e) => return Err(e),
+            };
             log::info!(
                 "[+] selected MASQUE gateway {}:{} (rtt {:?})",
                 best.ip,

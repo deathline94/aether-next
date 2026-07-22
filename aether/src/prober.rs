@@ -109,7 +109,7 @@ impl ScanMode {
     pub fn parse(s: &str) -> ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
-            "thorough" | "deep" | "pro" => ScanMode::Thorough,
+            "thorough" | "deep" | "pro" | "thorogh" => ScanMode::Thorough,
             "stealth" | "quiet" => ScanMode::Stealth,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,

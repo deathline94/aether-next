@@ -27,6 +27,10 @@ pub enum SessionEvent {
     Error {
         message: String,
     },
+    TransportFallback {
+        from: String,
+        to: String,
+    },
 }
 
 pub fn emit(event: SessionEvent) {

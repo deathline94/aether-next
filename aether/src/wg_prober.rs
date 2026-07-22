@@ -33,7 +33,7 @@ impl WgScanMode {
     pub fn parse(s: &str) -> WgScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => WgScanMode::Turbo,
-            "thorough" | "deep" | "pro" => WgScanMode::Thorough,
+            "thorough" | "deep" | "pro" | "thorogh" => WgScanMode::Thorough,
             "stealth" | "quiet" => WgScanMode::Stealth,
             "ironclad" | "real" | "verify" | "guaranteed" => WgScanMode::Ironclad,
             _ => WgScanMode::Balanced,
