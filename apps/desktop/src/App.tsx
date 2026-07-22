@@ -20,6 +20,7 @@ import {
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   TerminalSquare,
   Wifi,
   X,
@@ -227,11 +228,29 @@ function App() {
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.16");
+  const [appVersion, setAppVersion] = useState("1.0.24");
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running;
+
+  useEffect(() => {
+    fetch("https://api.github.com/repos/deathline94/aether-next/releases/latest")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.tag_name) {
+          const latestTag = data.tag_name.replace(/^v/, "");
+          if (latestTag > "1.0.24") {
+            setUpdateAvailable({
+              version: data.tag_name,
+              url: data.html_url || "https://github.com/deathline94/aether-next/releases/latest",
+            });
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const appendLog = useCallback((entry: Omit<LogEntry, "time">) => {
     setLogs((current) => [...current.slice(-499), { ...entry, time: now() }]);
@@ -472,6 +491,19 @@ function App() {
                 <span>{runtime.detail}</span>
                 <button type="button" onClick={() => void dismissError()} aria-label="Dismiss">
                   <X size={17} />
+                </button>
+              </div>
+            )}
+
+            {updateAvailable && (
+              <div className="update-banner">
+                <Sparkles size={18} />
+                <span>Aether {updateAvailable.version} is ready. Restart or click to update!</span>
+                <button
+                  type="button"
+                  onClick={() => invoke("plugin:opener|open_url", { url: updateAvailable.url }).catch(() => window.open(updateAvailable.url, "_blank"))}
+                >
+                  Update Now
                 </button>
               </div>
             )}

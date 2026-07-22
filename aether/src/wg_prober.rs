@@ -202,6 +202,7 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
     let mut found = 0usize;
     let mut scanned = 0usize;
     let mut quiet_until: Option<Instant> = None;
+    let mut hot_subnets = std::collections::HashSet::<u128>::new();
 
     loop {
         let effective = match quiet_until {
@@ -236,15 +237,34 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: WgScanMode) -> Result<
                             None => continue,
                             Some(pr) => {
                                 log::info!("[+] wg candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                                if st.early_exit_first {
-                                    crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(pr.ip, pr.port)]);
-                                    return Ok(pr);
-                                }
                                 best = Some(match best {
                                     Some(cur) if cur.rtt <= pr.rtt => cur,
                                     _ => pr,
                                 });
                                 found += 1;
+
+                                let sub_key = match pr.ip {
+                                    IpAddr::V4(v4) => u128::from(u32::from(v4) & 0xFFFFFF00),
+                                    IpAddr::V6(v6) => u128::from(v6) & 0xFFFFFFFFFFFF00000000000000000000,
+                                };
+                                if hot_subnets.insert(sub_key) {
+                                    log::info!("[🔥] Hot wg subnet detected near {}! Launching Stage-2 subnet drill-down...", pr.ip);
+                                    let hot_hits = drill_down_hot_subnet_wg(probe, pr.ip, pr.port, timeout, ironclad, st.concurrency).await;
+                                    for h_pr in hot_hits {
+                                        log::info!("[🔥] Hot wg subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
+                                        best = Some(match best {
+                                            Some(cur) if cur.rtt <= h_pr.rtt => cur,
+                                            _ => h_pr,
+                                        });
+                                        found += 1;
+                                    }
+                                }
+
+                                if st.early_exit_first {
+                                    let final_best = best.unwrap_or(pr);
+                                    crate::cache::add_to_wireguard(&probe.config_path, vec![SocketAddr::new(final_best.ip, final_best.port)]);
+                                    return Ok(final_best);
+                                }
 
                                 if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
                                     log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
@@ -333,6 +353,68 @@ async fn verify_one_wg(
             None
         }
     }
+}
+
+async fn drill_down_hot_subnet_wg(
+    probe: &WgProbe,
+    ip: IpAddr,
+    port: u16,
+    timeout: Duration,
+    ironclad: bool,
+    concurrency: usize,
+) -> Vec<WgProbeResult> {
+    let mut neighbors = Vec::new();
+    match ip {
+        IpAddr::V4(v4) => {
+            let base = u32::from(v4) & 0xFFFFFF00;
+            let current_host = v4.octets()[3] as u32;
+            for offset in [1, 2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 90, 100, 120, 150, 180, 200] {
+                let host1 = (current_host + offset) % 254 + 1;
+                let host2 = (current_host.wrapping_sub(offset)) % 254 + 1;
+                for h in [host1, host2] {
+                    if h != current_host && h > 0 && h < 255 {
+                        let neighbor_ip = IpAddr::V4(Ipv4Addr::from(base + h));
+                        if !neighbors.contains(&(neighbor_ip, port)) {
+                            neighbors.push((neighbor_ip, port));
+                        }
+                    }
+                }
+            }
+        }
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            let current_last = segs[7];
+            for offset in [1, 2, 3, 4, 5, 10, 20, 50, 100] {
+                let last = current_last.wrapping_add(offset);
+                if last != current_last {
+                    let neighbor_ip = IpAddr::V6(Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], last));
+                    if !neighbors.contains(&(neighbor_ip, port)) {
+                        neighbors.push((neighbor_ip, port));
+                    }
+                }
+            }
+        }
+    }
+
+    if neighbors.is_empty() {
+        return Vec::new();
+    }
+
+    let stream = futures::stream::iter(
+        neighbors
+            .into_iter()
+            .map(|(nip, nport)| verify_one_wg(probe, nip, nport, timeout, ironclad)),
+    )
+    .buffer_unordered(concurrency.min(16));
+    tokio::pin!(stream);
+
+    let mut results = Vec::new();
+    while let Some(res) = stream.next().await {
+        if let Some(pr) = res {
+            results.push(pr);
+        }
+    }
+    results
 }
 
 fn build_wg_candidates(st: &WgStrategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {

@@ -157,6 +157,11 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
 .error-banner span { flex: 1; }
 .error-banner button { border: 0; background: transparent; cursor: pointer; }
 
+.update-banner { margin-top: 14px; min-height: 44px; padding: 10px 14px; border: 1px solid #2e5944; border-radius: 6px; background: linear-gradient(90deg, #163628 0%, #1e4533 100%); color: #79f7c0; display: flex; align-items: center; gap: 12px; font-size: 12px; box-shadow: 0 4px 16px rgba(30, 69, 51, 0.3); }
+.update-banner span { flex: 1; font-weight: 500; }
+.update-banner button { border: 1px solid #3d8060; background: #255c42; color: #ffffff; padding: 6px 14px; border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
+.update-banner button:hover { background: #2d6e50; border-color: #4da67c; }
+
 .metrics-grid { margin-top: 16px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .metrics-grid article { min-height: 130px; padding: 17px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
 .metric-icon { width: 34px; height: 34px; margin-bottom: 15px; display: grid; place-items: center; border-radius: 6px; }
