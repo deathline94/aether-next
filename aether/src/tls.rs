@@ -128,7 +128,6 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     config.enable_dgram(true, 256_000, 256_000);
     // #1: Enable 0-RTT (early data) for session resumption on reconnect.
     config.enable_early_data();
-    config.set_max_early_data(0xFFFFFFFF);
 
     Ok(config)
 }

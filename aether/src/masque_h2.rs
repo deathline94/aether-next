@@ -7,7 +7,6 @@ use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, 
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -125,7 +124,6 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
 struct FragFirstWrite {
     inner: TcpStream,
     done: bool,
-    delay_ms: u64,
 }
 
 impl tokio::io::AsyncRead for FragFirstWrite {
@@ -149,27 +147,12 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
             self.done = true;
             return std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
         }
-        // Fragment: write first third, schedule the rest after a delay.
-        // Since poll_write can't sleep, we write the first part and return
-        // partial. The next poll_write call sends the remainder.
-        // tokio-boring will call poll_write again for the unsent bytes.
+        // Fragment: write first third only. Return partial count so tokio-boring
+        // calls poll_write again with the remainder — creating a natural TCP
+        // segment boundary that defeats single-segment DPI fingerprinting.
         self.done = true;
         let split = (buf.len() / 3).max(90).min(buf.len() - 1);
-        // Write only the first fragment. Return split as written count.
-        // The caller (tokio-boring) will retry with buf[split..] next.
-        match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..split]) {
-            std::task::Poll::Ready(Ok(n)) => {
-                // Schedule a flush + delay so the second fragment goes out later.
-                let inner = self.inner.clone();
-                let delay = self.delay_ms;
-                tokio::spawn(async move {
-                    let _ = inner.writable().await;
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                });
-                std::task::Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..split])
     }
 
     fn poll_flush(
@@ -197,11 +180,9 @@ async fn connect_tls(
         .map(|v| v.trim() == "0" || v.eq_ignore_ascii_case("off"))
         .unwrap_or(false);
 
-    let delay_ms = rand::Rng::gen_range(&mut rand::thread_rng(), 3..=8);
     let wrapper = FragFirstWrite {
         inner: tcp,
         done: !frag_enabled, // If disabled, mark done so first write passes through.
-        delay_ms,
     };
 
     tokio_boring::connect(config, sni, wrapper)

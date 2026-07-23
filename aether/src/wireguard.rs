@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::aethernoize::{self, AetherNoizeConfig};
 use crate::error::{AetherError, Result};
-use rand::Rng;
 
 const TIMER_TICK: Duration = Duration::from_millis(250);
 const MAX_PACKET: usize = 65536;
@@ -271,7 +270,7 @@ impl WgTunnel {
                     if last_activity.elapsed() > idle_threshold && !extra_keepalive_sent {
                         extra_keepalive_sent = true;
                         let mut tunn = tunn_t.lock().await;
-                        if let TunnResult::WriteToNetwork(pkt) = tunn.format_handshake_init(&mut tmp) {
+                        if let TunnResult::WriteToNetwork(pkt) = tunn.format_handshake_initiation(&mut tmp, true) {
                             let mut pkt_vec = pkt.to_vec();
                             inject_client_id(&mut pkt_vec, &client_id);
                             let _ = sock_t.send(&pkt_vec).await;
@@ -479,7 +478,7 @@ pub async fn verify_endpoint_keep_session(
     }
 
     let mut attempts = 0;
-    let mut retransmit_at = Instant::now() + Duration::from_millis(500);
+    let retransmit_at = Instant::now() + Duration::from_millis(500);
     let mut retransmitted = false;
     loop {
         if Instant::now() >= deadline {

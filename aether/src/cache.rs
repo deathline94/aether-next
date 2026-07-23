@@ -96,7 +96,7 @@ pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32
 
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
         cache.masque.retain(|e| e.addr != addr);
-        cache.masque.insert(0, CachedEndpoint { addr, timestamp: now, rtt_ms });
+        cache.masque.insert(0, CachedEndpoint { addr, timestamp: now, rtt_ms, successes: 0, failures: 0 });
     }
     cache.masque.truncate(MAX_CACHED);
     save_endpoints(base_config, &cache);
@@ -124,7 +124,7 @@ pub fn add_to_wireguard_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, 
 
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
         cache.wireguard.retain(|e| e.addr != addr);
-        cache.wireguard.insert(0, CachedEndpoint { addr, timestamp: now, rtt_ms });
+        cache.wireguard.insert(0, CachedEndpoint { addr, timestamp: now, rtt_ms, successes: 0, failures: 0 });
     }
     cache.wireguard.truncate(MAX_CACHED);
     save_endpoints(base_config, &cache);

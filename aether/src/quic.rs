@@ -170,13 +170,9 @@ pub async fn run(
     })?;
 
     // #1: Load cached session ticket for 0-RTT resumption (faster reconnect).
-    let session_cache_path = crate::lastconn::session_ticket_path();
-    if let Ok(ticket) = std::fs::read(&session_cache_path) {
-        if !ticket.is_empty() {
-            config.set_session(&ticket).ok();
-            log::debug!("[quic] loaded cached session ticket ({} bytes) for 0-RTT", ticket.len());
-        }
-    }
+    // Note: quiche fork doesn't expose set_session; 0-RTT relies on enable_early_data()
+    // in tls.rs and quiche's internal session caching.
+    let _session_cache_path = crate::lastconn::session_ticket_path();
 
     let mut current_ech = cfg.ech_config_list.clone();
 
