@@ -981,272 +981,56 @@ function App() {
                   <span>HTTP port (1024–65535)</span>
                   <input
                     type="number"
-                </button>
-                <small>
-                  {running
-                    ? "Tunnel active · Click to stop engine"
-                    : "Click to start proxy engine & connect"}
-                </small>
-              </div>
-            </section>
-
-            <section className="metrics-grid">
-              <div className="metric-card">
-                <Globe size={18} />
-                <span className="metric-label">Proxy Mode</span>
-                <strong>{settings.tun ? "TUN Device (All Apps)" : "SOCKS5 & HTTP"}</strong>
-                <small>{settings.tun ? "Full System Routing" : `SOCKS ${settings.socksPort} · HTTP ${settings.httpPort}`}</small>
-              </div>
-
-              <div className="metric-card">
-                <Cpu size={18} />
-                <span className="metric-label">Protocol Engine</span>
-                <strong>{protocolLabel(settings.protocol)}</strong>
-                <small>{settings.masqueHttp2 ? "HTTP/2 Encapsulation" : "HTTP/3 QUIC Engine"}</small>
-              </div>
-
-              <div className="metric-card">
-                <Gauge size={18} />
-                <span className="metric-label">Prober Strategy</span>
-                <strong>{settings.scanMode.toUpperCase()}</strong>
-                <small>Auto gateway discovery</small>
-              </div>
-
-              <div className="metric-card">
-                <ShieldCheck size={18} />
-                <span className="metric-label">Security & Identity</span>
-                <strong>{admin ? "Elevated (Admin)" : "Standard User"}</strong>
-                <small>{runtime.identity?.device_id ? `ID: ${runtime.identity.device_id.slice(0, 8)}...` : "Identity Ready"}</small>
-              </div>
-            </section>
-
-            <section className="endpoint-banner">
-              <div>
-                <Radio size={18} color="#6bb994" />
-                <div>
-                  <strong>Active Gateway Endpoint</strong>
-                  <p>
-                    {runtime.endpoint
-                      ? `${runtime.endpoint.addr} (${runtime.endpoint.protocol})`
-                      : "No endpoint connected yet. Click Connect to discover."}
-                  </p>
-                </div>
-              </div>
-              <span className={`pill ${runtime.endpoint ? "green" : ""}`}>
-                {runtime.endpoint ? "VERIFIED" : "IDLE"}
-              </span>
-            </section>
-          </div>
-        )}
-
-        {view === "settings" && (
-          <div className="settings-view">
-            {settingsLocked && (
-              <div className="lock-banner">
-                Settings are locked while tunnel is running. Disconnect to make changes.
-              </div>
-            )}
-
-            <section className="settings-section">
-              <div className="section-header">
-                <Zap size={18} />
-                <div>
-                  <h3>Protocol & Tunnel</h3>
-                  <p>Select engine backend and network transport strategy.</p>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label>Protocol Engine</label>
-                <div className={`segmented ${settingsLocked ? "disabled" : ""}`}>
-                  <button
-                    className={settings.protocol === "masque" ? "active" : ""}
-                    onClick={() => patchSettings({ protocol: "masque" })}
-                  >
-                    MASQUE (RFC 9484)
-                  </button>
-                  <button
-                    className={settings.protocol === "wireguard" ? "active" : ""}
-                    onClick={() => patchSettings({ protocol: "wireguard" })}
-                  >
-                    WireGuard
-                  </button>
-                </div>
-              </div>
-
-              {settings.protocol === "masque" && (
-                <div className="form-group">
-                  <label>MASQUE HTTP Transport</label>
-                  <div className="toggle-row">
-                    <div>
-                      <strong>Prefer HTTP/2 Transport</strong>
-                      <span>Uses HTTP/2 TCP encapsulation instead of HTTP/3 QUIC over UDP.</span>
-                    </div>
-                    <button
-                      className={`toggle ${settings.masqueHttp2 ? "on" : ""}`}
-                      disabled={settingsLocked}
-                      onClick={() => patchSettings({ masqueHttp2: !settings.masqueHttp2 })}
-                    >
-                      <span className="handle" />
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              <div className="form-group">
-                <label>IP Family Scan</label>
-                <div className={`segmented ${settingsLocked ? "disabled" : ""}`}>
-                  <button
-                    className={settings.ipScan === "v4" ? "active" : ""}
-                    onClick={() => patchSettings({ ipScan: "v4" })}
-                  >
-                    IPv4 Only
-                  </button>
-                  <button
-                    className={settings.ipScan === "v6" ? "active" : ""}
-                    onClick={() => patchSettings({ ipScan: "v6" })}
-                  >
-                    IPv6 Only
-                  </button>
-                  <button
-                    className={settings.ipScan === "both" ? "active" : ""}
-                    onClick={() => patchSettings({ ipScan: "both" })}
-                  >
-                    Dual-Stack
-                  </button>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label>Prober Strategy Profile</label>
-                <div className={`segmented ${settingsLocked ? "disabled" : ""}`}>
-                  <button
-                    className={settings.scanMode === "turbo" ? "active" : ""}
-                    onClick={() => patchSettings({ scanMode: "turbo" })}
-                  >
-                    Turbo
-                  </button>
-                  <button
-                    className={settings.scanMode === "balanced" ? "active" : ""}
-                    onClick={() => patchSettings({ scanMode: "balanced" })}
-                  >
-                    Balanced
-                  </button>
-                  <button
-                    className={settings.scanMode === "thorough" ? "active" : ""}
-                    onClick={() => patchSettings({ scanMode: "thorough" })}
-                  >
-                    Thorough
-                  </button>
-                  <button
-                    className={settings.scanMode === "stealth" ? "active" : ""}
-                    onClick={() => patchSettings({ scanMode: "stealth" })}
-                  >
-                    Stealth
-                  </button>
-                </div>
-              </div>
-            </section>
-
-            <section className="settings-section">
-              <div className="section-header">
-                <Globe size={18} />
-                <div>
-                  <h3>Network Proxy & Ports</h3>
-                  <p>Configure local listener ports for SOCKS5, HTTP, and TUN mode.</p>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label>TUN Adapter Mode (Full VPN)</label>
-                <div className="toggle-row">
-                  <div>
-                    <strong>Route All System Traffic via TUN</strong>
-                    <span>Creates a virtual network adapter. Requires Administrator privileges.</span>
-                  </div>
-                  <button
-                    className={`toggle ${settings.tun ? "on" : ""}`}
-                    disabled={settingsLocked}
-                    onClick={() => patchSettings({ tun: !settings.tun })}
-                  >
-                    <span className="handle" />
-                  </button>
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div className="form-group input-row">
-                  <label>SOCKS5 Port</label>
-                  <input
-                    type="number"
-                    disabled={settingsLocked}
-                    value={settings.socksPort}
-                    onChange={(event) => patchSettings({ socksPort: parseInt(event.target.value, 10) || 1080 })}
-                  />
-                </div>
-
-                <div className="form-group input-row">
-                  <label>HTTP Proxy Port</label>
-                  <input
-                    type="number"
+                    min={1024}
+                    max={65535}
                     disabled={settingsLocked}
                     value={settings.httpPort}
-                    onChange={(event) => patchSettings({ httpPort: parseInt(event.target.value, 10) || 8080 })}
+                    onChange={(event) =>
+                      patchSettings({ httpPort: clampPort(Number(event.target.value)) })
+                    }
                   />
-                </div>
+                </label>
+                <label>
+                  <span>SOCKS5 port (1024–65535)</span>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    disabled={settingsLocked}
+                    value={settings.socksPort}
+                    onChange={(event) =>
+                      patchSettings({ socksPort: clampPort(Number(event.target.value)) })
+                    }
+                  />
+                </label>
               </div>
-            </section>
-
-            <section className="settings-section">
-              <div className="section-header">
-                <Sliders size={18} />
+              <div className="setting-row path-row">
                 <div>
-                  <h3>Advanced Engine Parameters</h3>
-                  <p>Obfuscation, TLS rules, and local binary overrides.</p>
+                  <strong>Engine path</strong>
+                  <span>Optional path to aether.exe</span>
                 </div>
-              </div>
-
-              <div className="form-group">
-                <label>Obfuscation Profile</label>
-                <div className={`segmented ${settingsLocked ? "disabled" : ""}`}>
-                  <button
-                    className={settings.noize === "off" ? "active" : ""}
-                    onClick={() => patchSettings({ noize: "off" })}
-                  >
-                    Off
-                  </button>
-                  <button
-                    className={settings.noize === "light" ? "active" : ""}
-                    onClick={() => patchSettings({ noize: "light" })}
-                  >
-                    Light
-                  </button>
-                  <button
-                    className={settings.noize === "medium" ? "active" : ""}
-                    onClick={() => patchSettings({ noize: "medium" })}
-                  >
-                    Medium
-                  </button>
-                  <button
-                    className={settings.noize === "heavy" ? "active" : ""}
-                    onClick={() => patchSettings({ noize: "heavy" })}
-                  >
-                    Heavy
-                  </button>
-                </div>
-              </div>
-
-              <div className="form-group path-row">
-                <label>Custom Engine Executable Path (Optional)</label>
                 <input
-                  type="text"
                   disabled={settingsLocked}
-                  placeholder="Leave empty to use bundled aether.exe"
-                  value={settings.enginePath || ""}
+                  placeholder="Auto-detect"
+                  value={settings.enginePath}
                   onChange={(event) => patchSettings({ enginePath: event.target.value })}
                 />
               </div>
             </section>
+
+            <div className="save-bar">
+              <span>
+                {settingsLocked
+                  ? "Locked while connected"
+                  : saved
+                    ? "Saved automatically"
+                    : "Changes save automatically · Aether Next"}
+              </span>
+              <button disabled className="ghost">
+                {saved ? <Check size={17} /> : null}
+                {saved ? "Saved" : "Auto-save on"}
+              </button>
+            </div>
           </div>
         )}
 
