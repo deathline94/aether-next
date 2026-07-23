@@ -15,19 +15,52 @@ import {
   Radio,
   Route,
   ScrollText,
+  Search,
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   TerminalSquare,
   Wifi,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen, platformLabel } from "./bridge";
 import "./App.css";
 
-type View = "home" | "settings" | "logs";
+type View = "home" | "scanner" | "settings" | "logs";
 type Status = "disconnected" | "connecting" | "connected" | "error";
+
+type LogFilter = "milestones" | "hits" | "errors" | "raw";
+
+interface DiscoveredEndpoint {
+  addr: string;
+  rtt: string;
+  rttMs: number;
+  protocol: string;
+}
+
+interface ScanState {
+  active: boolean;
+  mode: string;
+  scanned: number;
+  total: number;
+  concurrency: number;
+  working: number;
+  bestRtt: string | null;
+  phase: string;
+}
+
+const initialScanState: ScanState = {
+  active: false,
+  mode: "balanced",
+  scanned: 0,
+  total: 0,
+  concurrency: 0,
+  working: 0,
+  bestRtt: null,
+  phase: "Idle",
+};
 
 type Settings = {
   protocol: "masque" | "wireguard" | "gool";
@@ -88,6 +121,7 @@ const initialRuntime: RuntimeState = {
 
 const navigation = [
   { id: "home" as const, label: "Connection", icon: Radio },
+  { id: "scanner" as const, label: "Scanner", icon: Search },
   { id: "settings" as const, label: "Settings", icon: SlidersHorizontal },
   { id: "logs" as const, label: "Activity", icon: ScrollText },
 ];
@@ -222,19 +256,105 @@ function App() {
   const [settings, setSettings] = useState<Settings>(defaults);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logFilter, setLogFilter] = useState<LogFilter>("milestones");
+  const [scanState, setScanState] = useState<ScanState>(initialScanState);
+  const [scannerProtocol, setScannerProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
+  const [scannerIpScan, setScannerIpScan] = useState<"v4" | "v6" | "both">("v4");
+  const [scannerConcurrency, setScannerConcurrency] = useState<number>(250);
+  const [scannerTimeoutMs, setScannerTimeoutMs] = useState<number>(1000);
+  const [discoveredEndpoints, setDiscoveredEndpoints] = useState<DiscoveredEndpoint[]>([]);
+  const [scannerActive, setScannerActive] = useState<boolean>(false);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.4");
+  const [appVersion, setAppVersion] = useState("1.0.28");
   const logEndRef = useRef<HTMLDivElement>(null);
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running;
 
   const appendLog = useCallback((entry: Omit<LogEntry, "time">) => {
-    setLogs((current) => [...current.slice(-499), { ...entry, time: now() }]);
+    const msg = entry.message;
+
+    // ── Scan Parser: Intercept engine scan progress for Live Scanner Card & Scanner Tab ──
+    if (msg.includes("scan mode=")) {
+      const modeMatch = msg.match(/scan mode=([a-z]+)/);
+      const candMatch = msg.match(/candidates=(\d+)/);
+      const concMatch = msg.match(/concurrency=(\d+)/);
+      setScanState({
+        active: true,
+        mode: modeMatch ? modeMatch[1] : "balanced",
+        total: candMatch ? parseInt(candMatch[1], 10) : 0,
+        concurrency: concMatch ? parseInt(concMatch[1], 10) : 200,
+        scanned: 0,
+        working: 0,
+        bestRtt: null,
+        phase: "Probing Pool",
+      });
+    } else if (msg.includes("scanning...") || msg.includes("wg scanning...")) {
+      const progMatch = msg.match(/scanning\.\.\.\s+(\d+)\/(\d+)\s+ips,\s+found\s+(\d+)\s+working/);
+      if (progMatch) {
+        setScanState((prev) => ({
+          ...prev,
+          active: true,
+          scanned: parseInt(progMatch[1], 10),
+          total: parseInt(progMatch[2], 10),
+          working: parseInt(progMatch[3], 10),
+        }));
+      }
+    } else if (msg.includes("candidate ok") || msg.includes("Tier-0 cache hit") || msg.includes("cached wg candidate ok")) {
+      const rttMatch = msg.match(/rtt=([\d\.]+(?:ms|s))/);
+      const rttStr = rttMatch ? rttMatch[1] : null;
+      setScanState((prev) => ({
+        ...prev,
+        working: prev.working + 1,
+        bestRtt: rttStr || prev.bestRtt,
+      }));
+      const addrMatch = msg.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+|\[[a-fA-F0-9:]+\]:\d+)/);
+      if (addrMatch && rttStr) {
+        const addr = addrMatch[1];
+        const rttMs = rttStr.endsWith("ms") ? parseFloat(rttStr) : parseFloat(rttStr) * 1000;
+        const protoStr = msg.includes("wg") ? "WireGuard" : msg.includes("h2") ? "MASQUE H2" : "MASQUE H3";
+        setDiscoveredEndpoints((prev) => {
+          if (prev.some((e) => e.addr === addr)) return prev;
+          const next = [...prev, { addr, rtt: rttStr, rttMs, protocol: protoStr }];
+          return next.sort((a, b) => a.rttMs - b.rttMs);
+        });
+      }
+    } else if (msg.includes("Hot") && msg.includes("subnet")) {
+      setScanState((prev) => ({ ...prev, phase: "Hot Subnet Drill-down" }));
+    } else if (msg.includes("best gateway") || msg.includes("best wg endpoint") || msg.includes("using best")) {
+      setScanState((prev) => ({ ...prev, phase: "Verified", active: false }));
+      setScannerActive(false);
+    } else if (msg.includes("No working gateway") || msg.includes("scan deadline reached")) {
+      setScanState((prev) => ({ ...prev, active: false, phase: "Finished" }));
+      setScannerActive(false);
+    }
+
+    setLogs((current) => [...current.slice(-999), { ...entry, time: now() }]);
   }, []);
+
+  const filteredLogs = useMemo(() => {
+    if (logFilter === "raw") return logs;
+    if (logFilter === "hits") {
+      return logs.filter(
+        (l) =>
+          l.message.includes("candidate ok") ||
+          l.message.includes("Tier-0") ||
+          l.message.includes("gateway") ||
+          l.message.includes("EndpointSelected")
+      );
+    }
+    if (logFilter === "errors") {
+      return logs.filter((l) => l.level === "error" || l.level === "warn");
+    }
+    return logs.filter(
+      (l) =>
+        !l.message.includes("scanning...") &&
+        !l.message.includes("probe src")
+    );
+  }, [logs, logFilter]);
 
   useEffect(() => {
     let disposed = false;
@@ -243,7 +363,7 @@ function App() {
       invoke<Settings>("get_settings"),
       invoke<RuntimeState>("get_state"),
       invoke<boolean>("is_admin").catch(() => false),
-      invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.4" })),
+      invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.28" })),
       listen<RuntimeState>("session://state", (event) => setRuntime(event.payload)),
       listen<{ level: LogEntry["level"]; message: string }>("session://log", (event) =>
         appendLog(event.payload),
@@ -270,7 +390,80 @@ function App() {
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+  }, [filteredLogs]);
+
+  async function startStandaloneScan() {
+    if (busy || scannerActive) return;
+    setScannerActive(true);
+    setDiscoveredEndpoints([]);
+    appendLog({
+      level: "info",
+      message: `Starting Standalone IP Scan: ${scannerProtocol.toUpperCase()} (concurrency=${scannerConcurrency}, timeout=${scannerTimeoutMs}ms)`,
+    });
+
+    const proto = scannerProtocol === "wireguard" ? "wireguard" : "masque";
+    const trans = scannerProtocol === "masque-h3" ? "h3" : "h2";
+    const nextSettings: Settings = {
+      ...settings,
+      protocol: proto,
+      transport: trans,
+      ipVersion: scannerIpScan,
+      scanMode: "turbo",
+    };
+
+    setBusy(true);
+    try {
+      if (running) {
+        await invoke("stop_session");
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      setRuntime({ status: "connecting", detail: "Scanning IP pool", pid: null, endpoint: null });
+      await invoke("start_session");
+    } catch (error) {
+      appendLog({ level: "error", message: `Standalone scan error: ${String(error)}` });
+      setScannerActive(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function stopStandaloneScan() {
+    setScannerActive(false);
+    if (running && !connected) {
+      try {
+        await invoke("stop_session");
+      } catch {}
+    }
+    appendLog({ level: "info", message: "Standalone scan stopped." });
+  }
+
+  async function connectDirectEndpoint(item: DiscoveredEndpoint) {
+    appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
+    const proto = item.protocol.toLowerCase().includes("wireguard") ? "wireguard" : "masque";
+    const trans = item.protocol.includes("H3") ? "h3" : "h2";
+
+    const nextSettings: Settings = {
+      ...settings,
+      protocol: proto,
+      transport: trans,
+    };
+
+    patchSettings(nextSettings);
+
+    setBusy(true);
+    try {
+      if (running) {
+        await invoke("stop_session");
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      setRuntime({ status: "connecting", detail: `Connecting to ${item.addr}`, pid: null, endpoint: null });
+      await invoke("start_session");
+    } catch (error) {
+      appendLog({ level: "error", message: `Direct connect error: ${String(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function persistSettings(next: Settings) {
     try {
@@ -613,6 +806,203 @@ function App() {
           </div>
         )}
 
+        {view === "scanner" && (
+          <div className="scanner-view">
+            <section className="settings-section">
+              <div className="section-heading">
+                <div>
+                  <p>STANDALONE ENGINE PROBER</p>
+                  <h3>Custom IP Scanner</h3>
+                </div>
+                <Search size={20} />
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>Target Protocol</strong>
+                  <span>Service engine to probe Cloudflare edge IPs for</span>
+                </div>
+                <div className="segmented">
+                  <button
+                    type="button"
+                    className={scannerProtocol === "masque-h3" ? "active" : ""}
+                    onClick={() => setScannerProtocol("masque-h3")}
+                  >
+                    MASQUE H3
+                  </button>
+                  <button
+                    type="button"
+                    className={scannerProtocol === "masque-h2" ? "active" : ""}
+                    onClick={() => setScannerProtocol("masque-h2")}
+                  >
+                    MASQUE H2
+                  </button>
+                  <button
+                    type="button"
+                    className={scannerProtocol === "wireguard" ? "active" : ""}
+                    onClick={() => setScannerProtocol("wireguard")}
+                  >
+                    WireGuard
+                  </button>
+                </div>
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>IP Family</strong>
+                  <span>Address family pool to enumerate & sample</span>
+                </div>
+                <div className="segmented">
+                  <button
+                    type="button"
+                    className={scannerIpScan === "v4" ? "active" : ""}
+                    onClick={() => setScannerIpScan("v4")}
+                  >
+                    IPv4 Only
+                  </button>
+                  <button
+                    type="button"
+                    className={scannerIpScan === "v6" ? "active" : ""}
+                    onClick={() => setScannerIpScan("v6")}
+                  >
+                    IPv6 Only
+                  </button>
+                  <button
+                    type="button"
+                    className={scannerIpScan === "both" ? "active" : ""}
+                    onClick={() => setScannerIpScan("both")}
+                  >
+                    Dual-Stack
+                  </button>
+                </div>
+              </div>
+
+              <div className="setting-row input-row">
+                <label>
+                  <span>Concurrency (Probes)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    value={scannerConcurrency}
+                    onChange={(e) => setScannerConcurrency(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                  />
+                </label>
+                <label>
+                  <span>Per-Probe Timeout (ms)</span>
+                  <input
+                    type="number"
+                    min={100}
+                    value={scannerTimeoutMs}
+                    onChange={(e) => setScannerTimeoutMs(Math.max(100, parseInt(e.target.value, 10) || 100))}
+                  />
+                </label>
+              </div>
+
+              <div className="scanner-action-bar" style={{ marginTop: 16 }}>
+                {!scannerActive ? (
+                  <button
+                    type="button"
+                    className="primary-cta connect"
+                    style={{ width: "100%", justifyContent: "center" }}
+                    onClick={startStandaloneScan}
+                    disabled={busy}
+                  >
+                    <Power size={18} />
+                    <span>Start Standalone Scan</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="primary-cta disconnect"
+                    style={{ width: "100%", justifyContent: "center" }}
+                    onClick={stopStandaloneScan}
+                  >
+                    <X size={18} />
+                    <span>Stop Scan</span>
+                  </button>
+                )}
+              </div>
+            </section>
+
+            <section className="test-panel" style={{ marginTop: 16 }}>
+              <div className="section-heading">
+                <div>
+                  <p>DISCOVERED ENDPOINTS</p>
+                  <h3>Healthy Gateways ({discoveredEndpoints.length})</h3>
+                </div>
+                <Radio size={20} />
+              </div>
+
+              {discoveredEndpoints.length === 0 ? (
+                <div className="empty-logs" style={{ padding: "30px 0" }}>
+                  <Search size={26} />
+                  <strong>No endpoints discovered yet</strong>
+                  <span>Click "Start Standalone Scan" above to probe healthy edge IPs.</span>
+                </div>
+              ) : (
+                <div className="discovered-list" style={{ padding: "12px 18px", display: "flex", flexDirection: "column", gap: 10 }}>
+                  {discoveredEndpoints.map((item, idx) => (
+                    <div
+                      className="discovered-row"
+                      key={`${item.addr}-${idx}`}
+                      style={{
+                        padding: "10px 14px",
+                        borderRadius: 6,
+                        background: "#0d1316",
+                        border: "1px solid #1f2a2f",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 12,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <code style={{ fontSize: 12, color: "#dff9eb" }}>{item.addr}</code>
+                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "#1b2923", color: "#6bb994" }}>
+                          {item.protocol}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            fontWeight: 600,
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            background: item.rttMs <= 50 ? "#122b1f" : item.rttMs <= 120 ? "#2b2312" : "#2b1414",
+                            color: item.rttMs <= 50 ? "#72e4aa" : item.rttMs <= 120 ? "#f3d481" : "#f38181",
+                            border: `1px solid ${item.rttMs <= 50 ? "#23523a" : item.rttMs <= 120 ? "#4a3e20" : "#522323"}`,
+                          }}
+                        >
+                          ⚡ {item.rtt}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => connectDirectEndpoint(item)}
+                          style={{
+                            height: 30,
+                            padding: "0 12px",
+                            border: "1px solid #3b6650",
+                            borderRadius: 5,
+                            background: "#173628",
+                            color: "#8be0b6",
+                            fontSize: 11,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Connect Direct
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
         {view === "settings" && (
           <div className="settings-view">
             {settingsLocked && (
@@ -904,11 +1294,73 @@ function App() {
 
         {view === "logs" && (
           <div className="logs-view">
+            {scanState.active && (
+              <div className="scan-card">
+                <div className="scan-card-header">
+                  <div className="scan-title">
+                    <Sparkles size={15} className="spin-icon" />
+                    <strong>Active Engine Scan ({scanState.mode.toUpperCase()})</strong>
+                    <span className="phase-pill">{scanState.phase}</span>
+                  </div>
+                  <div className="scan-badges">
+                    <span className="badge concurrency">⚡ {scanState.concurrency} Workers</span>
+                    <span className="badge working">🟢 {scanState.working} Working</span>
+                    {scanState.bestRtt && <span className="badge rtt">⚡ Best: {scanState.bestRtt}</span>}
+                  </div>
+                </div>
+                <div className="scan-progress-bar-bg">
+                  <div
+                    className="scan-progress-bar-fill"
+                    style={{
+                      width:
+                        scanState.total > 0
+                          ? `${Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))}%`
+                          : "0%",
+                    }}
+                  />
+                </div>
+                <div className="scan-card-footer">
+                  <small>
+                    Probed {scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} candidates
+                  </small>
+                  <small>
+                    {scanState.total > 0 ? `${Math.round((scanState.scanned / scanState.total) * 100)}%` : "0%"}
+                  </small>
+                </div>
+              </div>
+            )}
+
             <div className="log-toolbar">
               <div>
                 <span className={`status-dot ${runtime.status}`} />
-                <strong>Engine output</strong>
-                <small>{logs.length} events</small>
+                <strong>Activity Feed</strong>
+                <small>{filteredLogs.length} events</small>
+              </div>
+              <div className="log-filter-bar">
+                <button
+                  className={logFilter === "milestones" ? "active" : ""}
+                  onClick={() => setLogFilter("milestones")}
+                >
+                  Milestones ({logs.filter((l) => !l.message.includes("scanning...")).length})
+                </button>
+                <button
+                  className={logFilter === "hits" ? "active" : ""}
+                  onClick={() => setLogFilter("hits")}
+                >
+                  🟢 Hits ({logs.filter((l) => l.message.includes("candidate ok") || l.message.includes("Tier-0")).length})
+                </button>
+                <button
+                  className={logFilter === "errors" ? "active" : ""}
+                  onClick={() => setLogFilter("errors")}
+                >
+                  ⚠️ Errors ({logs.filter((l) => l.level === "error" || l.level === "warn").length})
+                </button>
+                <button
+                  className={logFilter === "raw" ? "active" : ""}
+                  onClick={() => setLogFilter("raw")}
+                >
+                  📜 Raw ({logs.length})
+                </button>
               </div>
               <div className="log-actions">
                 <button onClick={exportLogs}>Copy all</button>
@@ -916,14 +1368,14 @@ function App() {
               </div>
             </div>
             <section className="log-console">
-              {logs.length === 0 ? (
+              {filteredLogs.length === 0 ? (
                 <div className="empty-logs">
                   <TerminalSquare size={26} />
                   <strong>No activity yet</strong>
                   <span>Engine events appear here after connection starts.</span>
                 </div>
               ) : (
-                logs.map((entry, index) => (
+                filteredLogs.map((entry, index) => (
                   <div className={`log-line ${entry.level}`} key={`${entry.time}-${index}`}>
                     <time>{entry.time}</time>
                     <span>{entry.level}</span>
