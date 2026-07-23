@@ -25,11 +25,35 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type View = "home" | "settings" | "logs";
 type Status = "disconnected" | "connecting" | "connected" | "error";
+
+type LogFilter = "milestones" | "hits" | "errors" | "raw";
+
+interface ScanState {
+  active: boolean;
+  mode: string;
+  scanned: number;
+  total: number;
+  concurrency: number;
+  working: number;
+  bestRtt: string | null;
+  phase: string;
+}
+
+const initialScanState: ScanState = {
+  active: false,
+  mode: "balanced",
+  scanned: 0,
+  total: 0,
+  concurrency: 0,
+  working: 0,
+  bestRtt: null,
+  phase: "Idle",
+};
 
 type Settings = {
   protocol: "masque" | "wireguard" | "gool";
@@ -352,9 +376,30 @@ function App() {
     };
   }, []);
 
+  const filteredLogs = useMemo(() => {
+    if (logFilter === "raw") return logs;
+    if (logFilter === "hits") {
+      return logs.filter(
+        (l) =>
+          l.message.includes("candidate ok") ||
+          l.message.includes("Tier-0") ||
+          l.message.includes("gateway") ||
+          l.message.includes("EndpointSelected")
+      );
+    }
+    if (logFilter === "errors") {
+      return logs.filter((l) => l.level === "error" || l.level === "warn");
+    }
+    return logs.filter(
+      (l) =>
+        !l.message.includes("scanning...") &&
+        !l.message.includes("probe src")
+    );
+  }, [logs, logFilter]);
+
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [logs]);
+  }, [filteredLogs]);
 
   async function persistSettings(next: Settings) {
     try {
