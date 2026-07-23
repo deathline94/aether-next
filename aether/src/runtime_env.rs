@@ -33,3 +33,26 @@ pub fn var(key: &str) -> Option<String> {
     }
     std::env::var(key).ok()
 }
+
+// ─── Typed convenience accessors ────────────────────────────────────────────
+
+/// Read a boolean flag ("1", "true", "yes", "on").
+pub fn flag(key: &str) -> bool {
+    match var(key) {
+        Some(v) => {
+            let v = v.trim().to_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        None => false,
+    }
+}
+
+/// Read a usize value.
+pub fn usize(key: &str) -> Option<usize> {
+    var(key).and_then(|v| v.trim().parse().ok())
+}
+
+/// Read a u16 value.
+pub fn u16(key: &str) -> Option<u16> {
+    var(key).and_then(|v| v.trim().parse().ok())
+}

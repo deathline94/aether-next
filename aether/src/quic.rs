@@ -63,8 +63,8 @@ pub struct Channels {
 }
 
 pub fn channels() -> (Channels, Internals) {
-    let (outbound_tx, outbound_rx) = mpsc::channel(NET_QUEUE);
-    let (inbound_tx, inbound_rx) = mpsc::channel(NET_QUEUE);
+    let (outbound_tx, outbound_rx) = crate::tunnel::packet_channels();
+    let (inbound_tx, inbound_rx) = crate::tunnel::packet_channels();
     let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
 
     (
@@ -169,6 +169,15 @@ pub async fn run(
         key_pem: &cfg.key_pem,
     })?;
 
+    // #1: Load cached session ticket for 0-RTT resumption (faster reconnect).
+    let session_cache_path = crate::lastconn::session_ticket_path();
+    if let Ok(ticket) = std::fs::read(&session_cache_path) {
+        if !ticket.is_empty() {
+            config.set_session(&ticket).ok();
+            log::debug!("[quic] loaded cached session ticket ({} bytes) for 0-RTT", ticket.len());
+        }
+    }
+
     let mut current_ech = cfg.ech_config_list.clone();
 
     let scid_bytes = random_scid();
@@ -189,9 +198,12 @@ pub async fn run(
     let mut established_ever = false;
     let mut ech_retried = false;
 
-    // QUIC (H3) does not tolerate pre-handshake junk on the same UDP flow, 
-    // as it invalidates the QUIC Initial packet sequence for Cloudflare's edge.
-    // We intentionally skip noize::pre_handshake for H3.
+    // Send obfuscation noise before the QUIC Initial. Cloudflare's edge drops
+    // non-QUIC datagrams silently, but DPI boxes see the junk and lose flow
+    // correlation. The mother repo (CluvexStudio/Aether) confirms this works.
+    if let Some(sock) = sockets.get(&local) {
+        noize::pre_handshake(sock.as_ref(), peer, &cfg.noize).await;
+    }
 
     flush(&mut conn, &sockets).await?;
 
@@ -280,6 +292,10 @@ pub async fn run(
                 "quic handshake established; alpn={}",
                 String::from_utf8_lossy(conn.application_proto())
             );
+            // #1: Cache session ticket for 0-RTT on next connect.
+            if let Some(session) = conn.session() {
+                crate::lastconn::save_session_ticket(session);
+            }
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -307,7 +323,7 @@ pub async fn run(
             }
             if last_probe.elapsed() >= Duration::from_millis(700) {
                 if let Some(sid) = req_stream {
-                    let probe = build_h3_dns_probe(probe_src);
+                    let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(1, 1, 1, 1));
                     if let Ok(framed) = masque::encode_ip_datagram(sid, &probe) {
                         let _ = conn.dgram_send(&framed);
                     }
@@ -452,68 +468,6 @@ fn poll_h3(
     Ok(())
 }
 
-/// Strictly validate that an inbound IPv4 datagram is a UDP DNS reply from
-/// 1.1.1.1:53 (the resolver the probe targets). Prevents a stray datagram from
-/// being accepted as data-plane proof (S4 fix).
-fn is_dns_reply_from_resolver(pkt: &[u8]) -> bool {
-    if pkt.len() < 28 || pkt[0] >> 4 != 4 {
-        return false;
-    }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 17 {
-        return false;
-    }
-    if pkt[12..16] != [1, 1, 1, 1] {
-        return false;
-    }
-    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
-}
-
-fn build_h3_dns_probe(src: std::net::Ipv4Addr) -> Vec<u8> {
-    // NOTE (L3): sent inside the encrypted tunnel to prove the data plane; this
-    // is not the user's system resolver and does not leak DNS outside the tunnel.
-    let mut dns = Vec::with_capacity(64);
-    let id: u16 = rand::random();
-    dns.extend_from_slice(&id.to_be_bytes());
-    dns.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    for label in ["cloudflare", "com"] {
-        dns.push(label.len() as u8);
-        dns.extend_from_slice(label.as_bytes());
-    }
-    dns.push(0);
-    dns.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-    let udp_len = 8 + dns.len();
-    let total = 20 + udp_len;
-    let mut pkt = Vec::with_capacity(total);
-    pkt.push(0x45);
-    pkt.push(0x00);
-    pkt.extend_from_slice(&(total as u16).to_be_bytes());
-    pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00, 64, 17, 0x00, 0x00]);
-    pkt.extend_from_slice(&src.octets());
-    pkt.extend_from_slice(&[1, 1, 1, 1]);
-    // checksum zeroed then filled
-    let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < 20 {
-        if i != 10 {
-            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
-        }
-        i += 2;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-    let sport: u16 = 40000 + (rand::random::<u16>() % 20000);
-    pkt.extend_from_slice(&sport.to_be_bytes());
-    pkt.extend_from_slice(&53u16.to_be_bytes());
-    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00]);
-    pkt.extend_from_slice(&dns);
-    pkt
-}
 
 fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>, probe_src: &mut std::net::Ipv4Addr) {
     loop {
@@ -683,6 +637,8 @@ pub struct VerifyParams {
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
     pub timeout: Duration,
+    /// Local IPv4 for data-plane probe source address.
+    pub local_ipv4: std::net::Ipv4Addr,
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
@@ -722,8 +678,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let start = Instant::now();
     let deadline = start + p.timeout;
 
-    // For H3, we completely skip pre-handshake junk, as UDP garbage causes
-    // the Cloudflare QUIC edge to drop the flow.
+    // Obfuscation noise before QUIC Initial (same as run() — works with Cloudflare).
+    noize::pre_handshake(&sock, p.peer, &p.noize).await;
 
     flush_to(&mut conn, &sock, p.peer).await?;
 
@@ -780,7 +736,61 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                         for h in &list {
                             if h.name() == b":status" {
                                 if h.value() == b"200" {
-                                    return Ok(start.elapsed());
+                                    // Control-plane OK. Now verify data-plane:
+                                    // send 1 DNS probe through the datagram channel.
+                                    // Fast-path: 1 round-trip is enough during scan.
+                                    let probe_pkt = crate::dns::build_dataplane_probe(
+                                        p.local_ipv4,
+                                        std::net::Ipv4Addr::new(1, 1, 1, 1),
+                                    );
+                                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_pkt) {
+                                        let _ = conn.dgram_send(&framed);
+                                        flush_to(&mut conn, &sock, p.peer).await?;
+                                    }
+                                    // Wait for data-plane reply (up to 2s).
+                                    let dp_deadline = Instant::now() + Duration::from_secs(2).min(remaining(deadline));
+                                    loop {
+                                        if Instant::now() >= dp_deadline {
+                                            // Data-plane timeout — endpoint accepts control but drops traffic.
+                                            return Err(AetherError::Other(
+                                                "data-plane probe timeout (200 ok, no traffic)".into(),
+                                            ));
+                                        }
+                                        let dp_wait = dp_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(200));
+                                        tokio::select! {
+                                            r = sock.recv_from(&mut buf) => {
+                                                if let Ok((n, from)) = r {
+                                                    let info = quiche::RecvInfo { from, to: local };
+                                                    let _ = conn.recv(&mut buf[..n], info);
+                                                    // Check for datagram reply.
+                                                    let mut dgram_buf = vec![0u8; 65535];
+                                                    loop {
+                                                        match conn.dgram_recv(&mut dgram_buf) {
+                                                            Ok(dn) => {
+                                                                if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..dn], sid) {
+                                                                    // Data-plane confirmed!
+                                                                    return Ok(start.elapsed());
+                                                                }
+                                                            }
+                                                            Err(quiche::Error::Done) => break,
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ = tokio::time::sleep(dp_wait) => {
+                                                conn.on_timeout();
+                                                // Resend probe.
+                                                if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_pkt) {
+                                                    let _ = conn.dgram_send(&framed);
+                                                }
+                                            }
+                                        }
+                                        flush_to(&mut conn, &sock, p.peer).await?;
+                                        if conn.is_closed() {
+                                            return Err(AetherError::Other("closed during data-plane probe".into()));
+                                        }
+                                    }
                                 }
                                 return Err(AetherError::Other(format!(
                                     "status {}",

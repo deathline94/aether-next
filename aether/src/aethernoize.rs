@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rand::{Rng, RngCore};
-use regex::Regex;
 use tokio::net::UdpSocket;
+
+use crate::obfuscation::parse_cps;
 
 #[derive(Debug, Clone)]
 pub struct AetherNoizeConfig {
@@ -114,90 +115,6 @@ pub fn from_profile(name: &str) -> AetherNoizeConfig {
     }
 }
 
-fn parse_range(data: &str) -> usize {
-    let mut parts = data.split('-');
-    if let (Some(min_str), Some(max_str)) = (parts.next(), parts.next()) {
-        let min: usize = min_str.trim().parse().unwrap_or(0);
-        let max: usize = max_str.trim().parse().unwrap_or(0);
-        if max > min && min > 0 {
-            return rand::thread_rng().gen_range(min..=max).min(2048);
-        }
-    }
-    data.trim().parse().unwrap_or(0).min(2048)
-}
-
-pub fn parse_cps(spec: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-
-    let tag_regex = Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap();
-
-    for cap in tag_regex.captures_iter(spec) {
-        let tag_type = cap.get(1).map_or("", |m| m.as_str());
-        let tag_data = cap.get(2).map_or("", |m| m.as_str()).trim();
-
-        match tag_type {
-            "b" => {
-                let hex_str: String = tag_data.chars().filter(|c| !c.is_whitespace()).collect();
-                let clean = hex_str
-                    .strip_prefix("0x")
-                    .or_else(|| hex_str.strip_prefix("0X"))
-                    .unwrap_or(&hex_str);
-                if let Ok(decoded) = hex::decode(clean) {
-                    out.extend_from_slice(&decoded);
-                }
-            }
-            "t" => {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
-                out.extend_from_slice(&ts.to_be_bytes());
-            }
-            "c" => {
-                let counter = (SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    % 0xFFFFFFFF) as u32;
-                out.extend_from_slice(&counter.to_be_bytes());
-            }
-            "r" => {
-                let len = parse_range(tag_data);
-                if len > 0 {
-                    let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
-                    out.extend_from_slice(&r);
-                }
-            }
-            "rc" => {
-                let len = parse_range(tag_data);
-                if len > 0 {
-                    let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-                    let mut r = vec![0u8; len];
-                    for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
-                    }
-                    out.extend_from_slice(&r);
-                }
-            }
-            "rd" => {
-                let len = parse_range(tag_data);
-                if len > 0 {
-                    let chars = b"0123456789";
-                    let mut r = vec![0u8; len];
-                    for b in r.iter_mut() {
-                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
-                    }
-                    out.extend_from_slice(&r);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    out
-}
-
 fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     if payload.is_empty() {
         return payload.to_vec();
@@ -268,6 +185,24 @@ async fn send_connected(sock: &UdpSocket, pkt: &[u8]) {
     let _ = sock.send(pkt).await;
 }
 
+/// Random delay between `lo` and `hi` milliseconds. Breaks timing correlation
+/// so DPI cannot fingerprint the obfuscation sequence by inter-packet gaps.
+async fn jitter(lo: u64, hi: u64) {
+    let ms = rand::thread_rng().gen_range(lo..=hi);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Jitter derived from the config's junk_interval: uses the configured interval
+/// as a base and adds 0-4ms random noise on top.
+async fn jitter_from_cfg(cfg: &AetherNoizeConfig) {
+    let base = cfg.junk_interval.as_millis() as u64;
+    let extra = rand::thread_rng().gen_range(0..=4);
+    let total = base + extra;
+    if total > 0 {
+        tokio::time::sleep(Duration::from_millis(total)).await;
+    }
+}
+
 pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &AetherNoizeConfig) {
     if !cfg.is_enabled() {
         return;
@@ -278,24 +213,21 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         if !payload.is_empty() {
             let framed = wrap_ikev2(&payload);
             send_connected(sock, &framed).await;
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            // Jitter: 2-8ms random delay breaks timing correlation.
+            jitter(2, 8).await;
         }
     }
 
     for _ in 0..cfg.jc_after_i1 {
         let junk = generate_junk(cfg);
         send_connected(sock, &junk).await;
-        if !cfg.junk_interval.is_zero() {
-            tokio::time::sleep(cfg.junk_interval).await;
-        }
+        jitter_from_cfg(cfg).await;
     }
 
     for _ in 0..cfg.jc_before_hs {
         let junk = generate_junk(cfg);
         send_connected(sock, &junk).await;
-        if !cfg.junk_interval.is_zero() {
-            tokio::time::sleep(cfg.junk_interval).await;
-        }
+        jitter_from_cfg(cfg).await;
     }
 
     for s in [&cfg.i2, &cfg.i3, &cfg.i4, &cfg.i5]
@@ -305,7 +237,7 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         let pkt = parse_cps(s);
         if !pkt.is_empty() {
             send_connected(sock, &pkt).await;
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            jitter(2, 6).await;
         }
     }
 
@@ -318,23 +250,27 @@ pub async fn send_post_handshake_junk(sock: &UdpSocket, _peer: SocketAddr, cfg: 
     for _ in 0..cfg.jc_after_hs {
         let junk = generate_junk(cfg);
         send_connected(sock, &junk).await;
-        if !cfg.junk_interval.is_zero() {
-            tokio::time::sleep(cfg.junk_interval).await;
-        }
+        jitter_from_cfg(cfg).await;
     }
 }
 
+/// Data-phase decoy packets sent alongside keepalives. Blurs the size and
+/// timing profile of the tunnel during steady-state operation, making it
+/// harder for DPI to fingerprint WireGuard data packets by their predictable
+/// cadence and length distribution.
 pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
     if !cfg.is_enabled() {
         return;
     }
 
-    let base = cfg.jc_before_hs.max(1);
-    let extra = rand::thread_rng().gen_range(0..=base);
+    // More aggressive: base count + up to 2x extra random packets.
+    let base = cfg.jc_before_hs.max(2);
+    let extra = rand::thread_rng().gen_range(0..=(base * 2));
     let count = base + extra;
 
     for _ in 0..count {
         let mut junk = generate_junk(cfg);
+        // Avoid first byte matching WireGuard message types (1-4).
         if let Some(first) = junk.first_mut() {
             if *first >= 1 && *first <= 4 {
                 *first = first.wrapping_add(0x40);
@@ -342,10 +278,8 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         }
         send_connected(sock, &junk).await;
 
-        let jitter = rand::thread_rng().gen_range(0..=8);
-        let gap = cfg.junk_interval + Duration::from_millis(jitter);
-        if !gap.is_zero() {
-            tokio::time::sleep(gap).await;
-        }
+        // Wider jitter: 1-12ms random gap to break periodicity.
+        let gap_ms = rand::thread_rng().gen_range(1..=12);
+        tokio::time::sleep(Duration::from_millis(gap_ms)).await;
     }
 }

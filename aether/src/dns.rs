@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -135,4 +135,90 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
         }
         pos += 1 + len as usize;
     }
+}
+
+// ─── Shared data-plane probe builder ───────────────────────────────────────
+
+/// Compute the IPv4 header checksum over a 20-byte header (checksum field at
+/// offset 10..12 is treated as zero during computation).
+pub fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < header.len() {
+        if i == 10 {
+            i += 2;
+            continue;
+        }
+        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < header.len() {
+        sum += (header[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build a raw IPv4 + UDP + DNS A-query packet for in-tunnel data-plane
+/// validation. The packet is sent *inside* the encrypted tunnel to prove the
+/// L3 path works — it never leaks outside.
+///
+/// `src` is the tunnel-local IPv4 address; `resolver` is the upstream DNS
+/// target (typically 1.1.1.1 or 8.8.8.8).
+pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {
+    // DNS A query for cloudflare.com
+    let mut dns = Vec::with_capacity(64);
+    let id: u16 = rand::random();
+    dns.extend_from_slice(&id.to_be_bytes());
+    dns.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    for label in ["cloudflare", "com"] {
+        dns.push(label.len() as u8);
+        dns.extend_from_slice(label.as_bytes());
+    }
+    dns.push(0);
+    dns.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+
+    let udp_len = 8 + dns.len();
+    let total = 20 + udp_len;
+    let mut pkt = Vec::with_capacity(total);
+    // IPv4 header
+    pkt.push(0x45);
+    pkt.push(0x00);
+    pkt.extend_from_slice(&(total as u16).to_be_bytes());
+    pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes()); // identification
+    pkt.extend_from_slice(&[0x00, 0x00]); // flags + fragment
+    pkt.push(64); // TTL
+    pkt.push(17); // protocol: UDP
+    pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+    pkt.extend_from_slice(&src.octets());
+    pkt.extend_from_slice(&resolver.octets());
+    let csum = ipv4_checksum(&pkt[0..20]);
+    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    // UDP header
+    let sport: u16 = 40000 + (rand::random::<u16>() % 20000);
+    pkt.extend_from_slice(&sport.to_be_bytes());
+    pkt.extend_from_slice(&53u16.to_be_bytes());
+    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00]); // UDP checksum (optional for IPv4)
+    // DNS payload
+    pkt.extend_from_slice(&dns);
+    pkt
+}
+
+/// Validate that an inbound IPv4 datagram is a UDP DNS reply from the given
+/// resolver port 53. Used by data-plane verification to filter stray packets.
+pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
+    if pkt.len() < 28 || pkt[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 17 {
+        return false;
+    }
+    if pkt[12..16] != resolver.octets() {
+        return false;
+    }
+    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
 }

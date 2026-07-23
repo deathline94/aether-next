@@ -40,6 +40,9 @@ struct Settings {
     start_minimized: bool,
     launch_at_login: bool,
     engine_path: String,
+    /// Forced peer endpoint (set by Scanner "Connect Direct").
+    #[serde(default)]
+    peer: String,
 }
 
 impl Default for Settings {
@@ -61,6 +64,7 @@ impl Default for Settings {
             start_minimized: false,
             launch_at_login: false,
             engine_path: String::new(),
+            peer: String::new(),
         }
     }
 }
@@ -83,6 +87,7 @@ struct LogEvent {
 
 struct AppState {
     child: Mutex<Option<Child>>,
+    scan_child: Mutex<Option<Child>>,
     runtime: Mutex<RuntimeState>,
     proxy_enabled: AtomicBool,
     #[cfg(windows)]
@@ -97,6 +102,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            scan_child: Mutex::new(None),
             runtime: Mutex::new(RuntimeState {
                 status: "disconnected".into(),
                 detail: "Ready".into(),
@@ -872,6 +878,12 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Forced peer from Scanner "Connect Direct".
+        if !settings.peer.trim().is_empty() {
+            command.env("AETHER_PEER", settings.peer.trim());
+            command.env("AETHER_WG_PEER", settings.peer.trim());
+        }
+
         if settings.noize.eq_ignore_ascii_case("custom") {
             command
                 .env("AETHER_NOIZE_JC", settings.noize_jc.to_string())
@@ -1021,6 +1033,124 @@ fn test_connection(settings: Settings) -> Result<String, String> {
         .find_map(|l| l.strip_prefix("loc="))
         .unwrap_or("?");
     Ok(format!("OK via {proxy} · ip={ip} loc={loc}"))
+}
+
+#[tauri::command]
+fn scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    protocol: String,
+    ip_version: String,
+    concurrency: u32,
+    timeout_ms: u32,
+) -> Result<(), String> {
+    // Stop any existing scan first.
+    if let Some(mut child) = state.scan_child.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let settings = load_settings_file(&app);
+    let executable = engine_path(&app, &settings)?;
+    let dir = config_dir(&app)?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let engine_protocol = match protocol.as_str() {
+        "wireguard" => "wireguard",
+        _ => "masque",
+    };
+
+    let mut command = Command::new(&executable);
+    command
+        .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+        .env("AETHER_PROTOCOL", engine_protocol)
+        .env("AETHER_SCAN", "turbo")
+        .env("AETHER_IP", &ip_version)
+        .env("AETHER_NOIZE", &settings.noize)
+        .env("AETHER_CONFIG", dir.join("aether.toml"))
+        .env("AETHER_SCAN_ONLY", "1")
+        .env("AETHER_SCAN_CONCURRENCY", concurrency.to_string())
+        .env("AETHER_SCAN_TIMEOUT_MS", timeout_ms.to_string())
+        .env("AETHER_DANGEROUS_DISABLE_TLS_VERIFY", "1")
+        .env("AETHER_WG_NO_PROFILE_RETRY", "1")
+        .env(
+            "AETHER_MASQUE_HTTP2",
+            if protocol == "masque-h2" { "1" } else { "0" },
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Could not start scan: {e}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    *state.scan_child.lock().unwrap() = Some(child);
+
+    // Stream scan output and emit structured events to the frontend.
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let readers: Vec<Box<dyn std::io::Read + Send>> = {
+            let mut v: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+            if let Some(o) = stdout { v.push(Box::new(o)); }
+            if let Some(e) = stderr { v.push(Box::new(e)); }
+            v
+        };
+        for reader in readers {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                // Forward structured AETHER_EVENT lines as scan://event
+                if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
+                        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match ty {
+                            "endpoint_selected" => {
+                                let addr = v.get("addr").and_then(|a| a.as_str()).unwrap_or("");
+                                let proto = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("masque");
+                                let _ = app_clone.emit("scan://event", serde_json::json!({
+                                    "type": "scan_hit",
+                                    "addr": addr,
+                                    "rtt": "",
+                                    "rttMs": 0,
+                                    "protocol": proto,
+                                }));
+                            }
+                            "scan_done" => {
+                                let _ = app_clone.emit("scan://event", v);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Also emit as log
+                emit_log(&app_clone, line);
+            }
+        }
+        // When engine exits, emit scan_done if not already sent.
+        let _ = app_clone.emit("scan://event", serde_json::json!({
+            "type": "scan_done",
+            "addr": "",
+            "rtt": "",
+            "protocol": "",
+        }));
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_scan(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(mut child) = state.scan_child.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1339,7 +1469,9 @@ pub fn run() {
             connect,
             disconnect,
             app_info,
-            test_connection
+            test_connection,
+            scan,
+            stop_scan
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aether Next");

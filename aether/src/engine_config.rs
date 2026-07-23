@@ -1,6 +1,28 @@
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 use crate::error::{AetherError, Result};
+
+// ─── Global config accessor ─────────────────────────────────────────────────
+
+static GLOBAL: OnceLock<EngineConfig> = OnceLock::new();
+
+/// Initialize the process-wide config. Called once by the session orchestrator
+/// after `EngineConfig::from_env()`. Subsequent calls are no-ops.
+pub fn init(cfg: EngineConfig) {
+    let _ = GLOBAL.set(cfg);
+}
+
+/// Access the resolved engine config. Panics if called before `init()` —
+/// which can only happen during unit-test setup (intentionally).
+pub fn get() -> &'static EngineConfig {
+    GLOBAL.get().expect("EngineConfig::init() must be called before get()")
+}
+
+/// Try to access the resolved config without panicking.
+pub fn try_get() -> Option<&'static EngineConfig> {
+    GLOBAL.get()
+}
 
 /// Typed runtime options. Single place for env defaults + validation.
 #[derive(Debug, Clone)]
@@ -87,6 +109,16 @@ impl EngineConfig {
 
     pub fn has_forced_peer(&self) -> bool {
         self.peer.is_some() || self.wg_peer.is_some()
+    }
+
+    /// True if the MASQUE transport should use HTTP/2 (TCP) instead of H3 (QUIC).
+    pub fn is_h2(&self) -> bool {
+        self.masque_http2
+    }
+
+    /// True if full-device TUN mode is requested.
+    pub fn is_tun(&self) -> bool {
+        self.tun
     }
 }
 

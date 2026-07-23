@@ -5,6 +5,8 @@ use rand::Rng;
 use rand::RngCore;
 use tokio::net::UdpSocket;
 
+use crate::obfuscation::parse_cps;
+
 #[derive(Debug, Clone)]
 pub struct NoizeConfig {
     pub jc_before_hs: usize,
@@ -77,58 +79,6 @@ fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     rand::thread_rng().fill_bytes(&mut buf);
     buf
-}
-
-fn parse_cps(spec: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    let bytes = spec.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
-        }
-        let end = match spec[i..].find('>') {
-            Some(e) => i + e,
-            None => break,
-        };
-        let inner = spec[i + 1..end].trim();
-        let mut parts = inner.splitn(2, char::is_whitespace);
-        let tag = parts.next().unwrap_or("");
-        let data = parts.next().unwrap_or("").trim();
-
-        match tag {
-            "b" => {
-                let hexstr: String = data.chars().filter(|c| !c.is_whitespace()).collect();
-                if let Ok(decoded) = hex::decode(&hexstr) {
-                    out.extend_from_slice(&decoded);
-                }
-            },
-            "t" => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0);
-                out.extend_from_slice(&ts.to_be_bytes());
-            },
-            "n" => {
-                let nonce: u64 = rand::random();
-                out.extend_from_slice(&nonce.to_be_bytes());
-            },
-            "r" => {
-                let len: usize = data.parse().unwrap_or(0).min(1024);
-                if len > 0 {
-                    let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
-                    out.extend_from_slice(&r);
-                }
-            },
-            _ => {},
-        }
-
-        i = end + 1;
-    }
-    out
 }
 
 pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig) {

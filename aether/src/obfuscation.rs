@@ -1,6 +1,13 @@
 //! Unified obfuscation profile names for MASQUE (noize) and WireGuard (aethernoize).
+//!
+//! Also owns the canonical CPS (Custom Packet Signature) parser used by both
+//! transport obfuscators. Tags: `<b HEX>`, `<t>`, `<c>`, `<n>`, `<r N|MIN-MAX>`,
+//! `<rc N|MIN-MAX>`, `<rd N|MIN-MAX>`.
 use crate::aethernoize::AetherNoizeConfig;
 use crate::noize::NoizeConfig;
+
+use rand::{Rng, RngCore};
+use regex::Regex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -155,6 +162,107 @@ pub fn wg_profile_retry_names(primary: &str) -> Vec<String> {
     names
 }
 
+// ─── Canonical CPS parser ───────────────────────────────────────────────────
+
+/// Parse a range spec: either a fixed `N` or a randomized `MIN-MAX`.
+fn parse_range(data: &str) -> usize {
+    let mut parts = data.split('-');
+    if let (Some(min_str), Some(max_str)) = (parts.next(), parts.next()) {
+        let min: usize = min_str.trim().parse().unwrap_or(0);
+        let max: usize = max_str.trim().parse().unwrap_or(0);
+        if max > min && min > 0 {
+            return rand::thread_rng().gen_range(min..=max).min(2048);
+        }
+    }
+    data.trim().parse().unwrap_or(0).min(2048)
+}
+
+/// Canonical CPS (Custom Packet Signature) parser.
+///
+/// Recognized tags:
+/// - `<b HEX>`     — raw bytes from hex (optionally `0x`-prefixed)
+/// - `<t>`         — current UNIX timestamp (u32 BE)
+/// - `<c>`         — truncated counter (u32 BE, secs mod 0xFFFFFFFF)
+/// - `<n>`         — random nonce (u64 BE)
+/// - `<r N|MIN-MAX>` — random bytes
+/// - `<rc N|MIN-MAX>` — random ASCII alphabetic bytes
+/// - `<rd N|MIN-MAX>` — random ASCII digit bytes
+pub fn parse_cps(spec: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let tag_regex = Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap();
+
+    for cap in tag_regex.captures_iter(spec) {
+        let tag_type = cap.get(1).map_or("", |m| m.as_str());
+        let tag_data = cap.get(2).map_or("", |m| m.as_str()).trim();
+
+        match tag_type {
+            "b" => {
+                let hex_str: String = tag_data.chars().filter(|c| !c.is_whitespace()).collect();
+                let clean = hex_str
+                    .strip_prefix("0x")
+                    .or_else(|| hex_str.strip_prefix("0X"))
+                    .unwrap_or(&hex_str);
+                if let Ok(decoded) = hex::decode(clean) {
+                    out.extend_from_slice(&decoded);
+                }
+            }
+            "t" => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                out.extend_from_slice(&ts.to_be_bytes());
+            }
+            "c" => {
+                let counter = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    % 0xFFFFFFFF) as u32;
+                out.extend_from_slice(&counter.to_be_bytes());
+            }
+            "n" => {
+                let nonce: u64 = rand::random();
+                out.extend_from_slice(&nonce.to_be_bytes());
+            }
+            "r" => {
+                let len = parse_range(tag_data);
+                if len > 0 {
+                    let mut r = vec![0u8; len];
+                    rand::thread_rng().fill_bytes(&mut r);
+                    out.extend_from_slice(&r);
+                }
+            }
+            "rc" => {
+                let len = parse_range(tag_data);
+                if len > 0 {
+                    let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                    let mut r = vec![0u8; len];
+                    for b in r.iter_mut() {
+                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                    }
+                    out.extend_from_slice(&r);
+                }
+            }
+            "rd" => {
+                let len = parse_range(tag_data);
+                if len > 0 {
+                    let chars = b"0123456789";
+                    let mut r = vec![0u8; len];
+                    for b in r.iter_mut() {
+                        *b = chars[rand::thread_rng().gen_range(0..chars.len())];
+                    }
+                    out.extend_from_slice(&r);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +286,42 @@ mod tests {
             let _ = noize_from_name(n);
             let _ = aethernoize_from_name(n);
         }
+    }
+
+    #[test]
+    fn cps_basic_tags() {
+        // <b> produces exact bytes
+        let out = parse_cps("<b 0d0a0d0a>");
+        assert_eq!(out, vec![0x0d, 0x0a, 0x0d, 0x0a]);
+
+        // <t> produces 4 bytes
+        let out = parse_cps("<t>");
+        assert_eq!(out.len(), 4);
+
+        // <n> produces 8 bytes
+        let out = parse_cps("<n>");
+        assert_eq!(out.len(), 8);
+
+        // <r N> produces N bytes
+        let out = parse_cps("<r 24>");
+        assert_eq!(out.len(), 24);
+
+        // <r MIN-MAX> produces between MIN and MAX bytes
+        let out = parse_cps("<r 10-20>");
+        assert!(out.len() >= 10 && out.len() <= 20);
+
+        // <rc N> produces N alphabetic bytes
+        let out = parse_cps("<rc 16>");
+        assert_eq!(out.len(), 16);
+        assert!(out.iter().all(|&b| b.is_ascii_alphabetic()));
+
+        // <rd N> produces N digit bytes
+        let out = parse_cps("<rd 8>");
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&b| b.is_ascii_digit()));
+
+        // Combined
+        let out = parse_cps("<b 0d0a><t><r 4>");
+        assert!(out.len() >= 10); // 2 + 4 + 4
     }
 }

@@ -95,3 +95,9 @@ local.properties
 # ⚙ Runtime Configs & State
 aether*.toml
 aether*.json
+
+# ── Qoder / AI tooling artifacts ─────────────────────────────
+.qoder/
+PRODUCT.md
+architecture-review-*.html
+test_engine.log

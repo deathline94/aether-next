@@ -27,6 +27,28 @@ pub enum SessionEvent {
     Error {
         message: String,
     },
+    // ─── Scan-only mode events ──────────────────────────────────────────────
+    ScanStart {
+        mode: String,
+        total: usize,
+        concurrency: usize,
+    },
+    ScanProgress {
+        scanned: usize,
+        total: usize,
+        working: usize,
+    },
+    ScanHit {
+        addr: String,
+        rtt: String,
+        rtt_ms: f64,
+        protocol: String,
+    },
+    ScanDone {
+        addr: String,
+        rtt: String,
+        protocol: String,
+    },
 }
 
 pub fn emit(event: SessionEvent) {

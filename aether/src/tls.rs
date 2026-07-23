@@ -43,6 +43,18 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     builder.set_grease_enabled(true);
+
+    // #3: Rotate ClientHello profile per-session. Randomize cipher suite order
+    // so JA3/JA4 fingerprints differ across connections, defeating DPI caching.
+    let cipher_sets: &[&str] = &[
+        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+        "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
+        "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384",
+    ];
+    let idx = rand::random::<usize>() % cipher_sets.len();
+    let _ = builder.set_cipher_list(cipher_sets[idx]);
+
     let groups = std::env::var("AETHER_TLS_GROUPS").ok();
     let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
     builder
@@ -109,9 +121,14 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     config.set_initial_max_stream_data_uni(8_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
+    // #6: Enable active migration so QUIC can survive network changes
+    // (WiFi→mobile, IP rotation) without a full reconnect.
+    config.set_disable_active_migration(false);
     // Larger dgram queues so bulk IP traffic is not dropped under load.
     config.enable_dgram(true, 256_000, 256_000);
+    // #1: Enable 0-RTT (early data) for session resumption on reconnect.
+    config.enable_early_data();
+    config.set_max_early_data(0xFFFFFFFF);
 
     Ok(config)
 }

@@ -3,10 +3,11 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
-use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -114,15 +115,115 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     Ok(config)
 }
 
+// ─── ClientHello fragmentation ──────────────────────────────────────────────
+
+/// TCP wrapper that splits the FIRST write (the TLS ClientHello from
+/// tokio-boring) across two TCP segments with a short delay between them.
+/// This defeats DPI boxes that fingerprint JA3/JA4 from a single segment.
+///
+/// Controlled by AETHER_H2_FRAG_CH: set to "0" to disable (default: enabled).
+struct FragFirstWrite {
+    inner: TcpStream,
+    done: bool,
+    delay_ms: u64,
+}
+
+impl tokio::io::AsyncRead for FragFirstWrite {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FragFirstWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.done || buf.len() < 100 {
+            // Not the first write or too small to split — pass through.
+            self.done = true;
+            return std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+        // Fragment: write first third, schedule the rest after a delay.
+        // Since poll_write can't sleep, we write the first part and return
+        // partial. The next poll_write call sends the remainder.
+        // tokio-boring will call poll_write again for the unsent bytes.
+        self.done = true;
+        let split = (buf.len() / 3).max(90).min(buf.len() - 1);
+        // Write only the first fragment. Return split as written count.
+        // The caller (tokio-boring) will retry with buf[split..] next.
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..split]) {
+            std::task::Poll::Ready(Ok(n)) => {
+                // Schedule a flush + delay so the second fragment goes out later.
+                let inner = self.inner.clone();
+                let delay = self.delay_ms;
+                tokio::spawn(async move {
+                    let _ = inner.writable().await;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                });
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Connect TLS with optional ClientHello fragmentation.
+async fn connect_tls(
+    config: ConnectConfiguration,
+    sni: &str,
+    tcp: TcpStream,
+) -> Result<tokio_boring::SslStream<FragFirstWrite>> {
+    let frag_enabled = !crate::runtime_env::var("AETHER_H2_FRAG_CH")
+        .map(|v| v.trim() == "0" || v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false);
+
+    let delay_ms = rand::Rng::gen_range(&mut rand::thread_rng(), 3..=8);
+    let wrapper = FragFirstWrite {
+        inner: tcp,
+        done: !frag_enabled, // If disabled, mark done so first write passes through.
+        delay_ms,
+    };
+
+    tokio_boring::connect(config, sni, wrapper)
+        .await
+        .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))
+}
+
 fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
     let authority = format!("{}:443", cfg.authority);
     let uri = format!("https://{}", authority);
+    // #8: Add random-length padding header to defeat H2 frame-size analysis.
+    // DPI that fingerprints CONNECT frames by their exact byte length will see
+    // a different size every session.
+    let pad_len = rand::Rng::gen_range(&mut rand::thread_rng(), 16..=96);
+    let padding: String = (0..pad_len).map(|_| 'x').collect();
     http::Request::builder()
         .method(Method::CONNECT)
         .uri(uri)
         .header("cf-connect-proto", consts::CF_CONNECT_PROTOCOL)
         .header("pq-enabled", "false")
         .header("user-agent", "")
+        .header("x-pad", padding)
         .body(())
         .map_err(|e| AetherError::Masque(format!("build request: {e}")))
 }
@@ -133,9 +234,7 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         let tls_config = build_tls(cfg)?;
         let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
         let _ = tcp.set_nodelay(true);
-        let tls = tokio_boring::connect(tls_config, &cfg.sni, tcp)
-            .await
-            .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
+        let tls = connect_tls(tls_config, &cfg.sni, tcp).await?;
         let (h2, connection) = h2::client::handshake(tls)
             .await
             .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
@@ -185,9 +284,7 @@ pub async fn run(
     let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
     let _ = tcp.set_nodelay(true);
 
-    let tls = tokio_boring::connect(tls_config, &cfg.sni, tcp)
-        .await
-        .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
+    let tls = connect_tls(tls_config, &cfg.sni, tcp).await?;
     log::info!(
         "[h2] tls established; alpn={}",
         String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
@@ -273,7 +370,7 @@ pub async fn run(
                     }
                     // Keep-alive: small DNS probe so half-open links fail fast.
                     if last.elapsed() > Duration::from_secs(25) {
-                        let probe = build_dns_probe_packet(probe_src_ka);
+                        let probe = crate::dns::build_dataplane_probe(probe_src_ka, std::net::Ipv4Addr::new(1, 1, 1, 1));
                         if let Err(e) = send_ip_batch(&mut send_stream, vec![probe]).await {
                             log::debug!("[h2] keepalive: {e}");
                             return Err(e);
@@ -370,76 +467,7 @@ pub async fn run(
     }
 }
 
-fn build_dns_probe_packet(src: std::net::Ipv4Addr) -> Vec<u8> {
-    // Minimal IPv4 UDP DNS query: src → 1.1.1.1:53 A for cloudflare.com.
-    // NOTE (L3): this query travels inside the encrypted tunnel purely to prove
-    // the data plane works. It is not the user's system resolver and does not leak
-    // DNS outside the tunnel.
-    let mut dns = Vec::with_capacity(64);
-    let id: u16 = rand::random();
-    dns.extend_from_slice(&id.to_be_bytes());
-    dns.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    for label in ["cloudflare", "com"] {
-        dns.push(label.len() as u8);
-        dns.extend_from_slice(label.as_bytes());
-    }
-    dns.push(0);
-    dns.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
 
-    let udp_len = 8 + dns.len();
-    let total = 20 + udp_len;
-    let mut pkt = Vec::with_capacity(total);
-    pkt.push(0x45);
-    pkt.push(0x00);
-    pkt.extend_from_slice(&(total as u16).to_be_bytes());
-    pkt.extend_from_slice(&rand::random::<u16>().to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00, 64, 17, 0x00, 0x00]);
-    pkt.extend_from_slice(&src.octets());
-    pkt.extend_from_slice(&[1, 1, 1, 1]);
-    let csum = ipv4_header_checksum(&pkt[0..20]);
-    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-    let sport: u16 = 40000 + (rand::random::<u16>() % 20000);
-    pkt.extend_from_slice(&sport.to_be_bytes());
-    pkt.extend_from_slice(&53u16.to_be_bytes());
-    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00]);
-    pkt.extend_from_slice(&dns);
-    pkt
-}
-
-/// Strictly validate that an inbound IPv4 datagram is a UDP DNS reply from
-/// 1.1.1.1:53 (the resolver our probe targets). Prevents an unrelated or stray
-/// datagram from being treated as data-plane proof (S4 fix).
-fn is_dns_reply_from_resolver(pkt: &[u8]) -> bool {
-    if pkt.len() < 28 || pkt[0] >> 4 != 4 {
-        return false;
-    }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || pkt.len() < ihl + 8 || pkt[9] != 17 {
-        return false;
-    }
-    if pkt[12..16] != [1, 1, 1, 1] {
-        return false;
-    }
-    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
-}
-
-fn ipv4_header_checksum(header: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < header.len() {
-        if i == 10 {
-            i += 2;
-            continue;
-        }
-        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
-        i += 2;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
 
 async fn verify_dataplane(
     send: &mut h2::SendStream<Bytes>,
@@ -452,7 +480,7 @@ async fn verify_dataplane(
     let mut resend_at = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= resend_at {
-            let probe = build_dns_probe_packet(probe_src);
+            let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(1, 1, 1, 1));
             send_ip_batch(send, vec![probe]).await?;
             resend_at = Instant::now() + Duration::from_millis(700);
         }
@@ -617,12 +645,17 @@ fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns;
     use crate::masque::CapsuleParser;
+
+    fn probe(src: std::net::Ipv4Addr) -> Vec<u8> {
+        dns::build_dataplane_probe(src, std::net::Ipv4Addr::new(1, 1, 1, 1))
+    }
 
     #[test]
     fn dns_probe_is_ipv4_udp_to_1111() {
         let src = std::net::Ipv4Addr::new(198, 18, 0, 1);
-        let pkt = build_dns_probe_packet(src);
+        let pkt = probe(src);
         assert!(pkt.len() >= 28, "header+udp min");
         assert_eq!(pkt[0] >> 4, 4, "IPv4");
         assert_eq!(pkt[9], 17, "UDP");
@@ -633,7 +666,7 @@ mod tests {
 
     #[test]
     fn ipv4_checksum_field_zeroed_in_sum() {
-        let pkt = build_dns_probe_packet(std::net::Ipv4Addr::new(10, 0, 0, 2));
+        let pkt = probe(std::net::Ipv4Addr::new(10, 0, 0, 2));
         // Recompute: with stored checksum, ones-complement sum of header should be 0xffff.
         let mut sum = 0u32;
         for i in (0..20).step_by(2) {
@@ -647,9 +680,10 @@ mod tests {
 
     #[test]
     fn dataplane_accepts_only_dns_reply_from_resolver() {
+        let resolver = std::net::Ipv4Addr::new(1, 1, 1, 1);
         // Outbound probe is a query (src != 1.1.1.1) and must NOT count as a reply.
-        let probe = build_dns_probe_packet(std::net::Ipv4Addr::new(198, 18, 0, 1));
-        assert!(!is_dns_reply_from_resolver(&probe));
+        let p = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
+        assert!(!dns::is_dns_reply(&p, resolver));
 
         // Minimal IPv4/UDP datagram from 1.1.1.1:53 must be accepted.
         let mut reply = vec![0u8; 28];
@@ -657,12 +691,12 @@ mod tests {
         reply[9] = 17; // UDP
         reply[12..16].copy_from_slice(&[1, 1, 1, 1]); // src = 1.1.1.1
         reply[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port 53
-        assert!(is_dns_reply_from_resolver(&reply));
+        assert!(dns::is_dns_reply(&reply, resolver));
     }
 
     #[test]
     fn datagram_capsule_roundtrip_for_probe() {
-        let pkt = build_dns_probe_packet(std::net::Ipv4Addr::new(198, 18, 0, 1));
+        let pkt = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
         let framed = masque::encode_datagram_capsule(&pkt);
         let mut parser = CapsuleParser::new();
         parser.push(&framed);

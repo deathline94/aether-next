@@ -224,11 +224,19 @@ impl WgTunnel {
 
         let timer_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TIMER_TICK);
+            // #4: Adaptive keepalive — track idle time and send extra pings
+            // when the tunnel goes quiet (mobile NATs drop idle UDP after ~5-30s).
+            let mut last_activity = Instant::now();
+            let mut extra_keepalive_sent = false;
+            let idle_threshold = Duration::from_secs(4);
+
             loop {
                 interval.tick().await;
                 let mut tunn = tunn_t.lock().await;
                 let mut tmp = vec![0u8; MAX_PACKET];
                 if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
+                    last_activity = Instant::now();
+                    extra_keepalive_sent = false;
                     let mut pkt_vec = pkt.to_vec();
                     inject_client_id(&mut pkt_vec, &client_id);
                     let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp, &client_id);
@@ -254,6 +262,20 @@ impl WgTunnel {
                         }
                         for p in extra_tun {
                             let _ = inbound_tx_t.send(p).await;
+                        }
+                    }
+                } else {
+                    drop(tunn);
+                    // #4: If idle > threshold and haven't sent extra keepalive yet,
+                    // force a keepalive ping to prevent NAT mapping expiry.
+                    if last_activity.elapsed() > idle_threshold && !extra_keepalive_sent {
+                        extra_keepalive_sent = true;
+                        let mut tunn = tunn_t.lock().await;
+                        if let TunnResult::WriteToNetwork(pkt) = tunn.format_handshake_init(&mut tmp) {
+                            let mut pkt_vec = pkt.to_vec();
+                            inject_client_id(&mut pkt_vec, &client_id);
+                            let _ = sock_t.send(&pkt_vec).await;
+                            log::debug!("[wg] adaptive keepalive: idle {}s, sent extra ping", last_activity.elapsed().as_secs());
                         }
                     }
                 }
@@ -292,65 +314,7 @@ fn drain_tunn(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> (Vec<
     (wire, tun_pkts)
 }
 
-fn build_dns_query() -> Vec<u8> {
-    let id: u16 = rand::random();
-    let mut q = Vec::with_capacity(32);
-    q.extend_from_slice(&id.to_be_bytes());
-    q.extend_from_slice(&[0x01, 0x00]);
-    q.extend_from_slice(&[0x00, 0x01]);
-    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    for label in ["cloudflare", "com"] {
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0x00);
-    q.extend_from_slice(&[0x00, 0x01]);
-    q.extend_from_slice(&[0x00, 0x01]);
-    q
-}
 
-fn ipv4_checksum(header: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < header.len() {
-        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < header.len() {
-        sum += (header[i] as u32) << 8;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-fn build_dataplane_probe(src: Ipv4Addr) -> Vec<u8> {
-    let dns = build_dns_query();
-    let udp_len = 8 + dns.len();
-    let total_len = 20 + udp_len;
-    let mut pkt = Vec::with_capacity(total_len);
-    pkt.push(0x45);
-    pkt.push(0x00);
-    pkt.extend_from_slice(&(total_len as u16).to_be_bytes());
-    let id: u16 = rand::random();
-    pkt.extend_from_slice(&id.to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00]);
-    pkt.push(64);
-    pkt.push(17);
-    pkt.extend_from_slice(&[0x00, 0x00]);
-    pkt.extend_from_slice(&src.octets());
-    pkt.extend_from_slice(&Ipv4Addr::new(8, 8, 8, 8).octets());
-    let csum = ipv4_checksum(&pkt[0..20]);
-    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-    let sport: u16 = rand::thread_rng().gen_range(20000..60000);
-    pkt.extend_from_slice(&sport.to_be_bytes());
-    pkt.extend_from_slice(&53u16.to_be_bytes());
-    pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pkt.extend_from_slice(&[0x00, 0x00]);
-    pkt.extend_from_slice(&dns);
-    pkt
-}
 
 async fn send_dataplane_probe(
     sock: &UdpSocket,
@@ -374,7 +338,7 @@ async fn send_dataplane_probe(
 }
 
 const DATAPLANE_REQUIRED_SUCCESSES: u32 = 2;
-const DATAPLANE_PROBE_GAP: Duration = Duration::from_millis(600);
+const DATAPLANE_PROBE_GAP: Duration = Duration::from_millis(250);
 
 async fn verify_dataplane(
     sock: &UdpSocket,
@@ -384,7 +348,7 @@ async fn verify_dataplane(
     start: Instant,
     deadline: Instant,
 ) -> Result<Duration> {
-    let probe = build_dataplane_probe(local_ipv4);
+    let probe = crate::dns::build_dataplane_probe(local_ipv4, Ipv4Addr::new(8, 8, 8, 8));
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let mut tmp_buf = vec![0u8; MAX_PACKET];
@@ -515,13 +479,30 @@ pub async fn verify_endpoint_keep_session(
     }
 
     let mut attempts = 0;
+    let mut retransmit_at = Instant::now() + Duration::from_millis(500);
+    let mut retransmitted = false;
     loop {
         if Instant::now() >= deadline {
             log::debug!("[wg] timeout after {} recv attempts", attempts);
             return Err(AetherError::Other("verify timeout".into()));
         }
 
+        // #2: Retransmit Init once at 500ms if no response yet (handles single packet loss).
+        if !retransmitted && Instant::now() >= retransmit_at && attempts == 0 {
+            retransmitted = true;
+            match tunn.encapsulate(&[], &mut out_buf) {
+                TunnResult::WriteToNetwork(pkt) => {
+                    let mut pkt_vec = pkt.to_vec();
+                    inject_client_id(&mut pkt_vec, &client_id);
+                    log::debug!("[wg] retransmit init {} bytes to {}", pkt_vec.len(), peer);
+                    let _ = sock.send(&pkt_vec).await;
+                }
+                _ => {}
+            }
+        }
+
         let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(250));
 
         tokio::select! {
             r = sock.recv(&mut recv_buf) => {
@@ -589,9 +570,8 @@ pub async fn verify_endpoint_keep_session(
                     }
                 }
             }
-            _ = tokio::time::sleep(remaining) => {
-                log::debug!("[wg] sleep timeout");
-                return Err(AetherError::Other("verify timeout".into()));
+            _ = tokio::time::sleep(wait) => {
+                continue;
             }
         }
     }
@@ -621,6 +601,11 @@ pub const WG_PORTS: &[u16] = &[
     2408, 2506, 3138, 3476, 3581, 3854, 4177, 4198, 4233, 4500, 5279, 5956, 7103, 7152, 7156, 7281,
     7559, 8319, 8742, 8854, 8886,
 ];
+
+/// WG port tiers: Tier 1 = most common CF edge ports, scanned first.
+pub const WG_PORTS_T1: &[u16] = &[500, 4500, 1701, 2408];
+pub const WG_PORTS_T2: &[u16] = &[854, 880, 928, 942, 943, 946, 955, 987, 1002, 1010, 1014, 1070, 1074, 1180, 1387, 1843, 2371, 2506, 3138];
+// Tier 3 = everything else (remaining ports in WG_PORTS not in T1 or T2).
 
 pub const WG_SEEDS_V4: &[&str] = &[
     "162.159.192.1",

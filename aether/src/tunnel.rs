@@ -19,8 +19,8 @@ pub struct Internals {
 }
 
 pub fn channels() -> (Channels, Internals) {
-    let (outbound_tx, outbound_rx) = mpsc::channel(NET_QUEUE);
-    let (inbound_tx, inbound_rx) = mpsc::channel(NET_QUEUE);
+    let (outbound_tx, outbound_rx) = packet_channels();
+    let (inbound_tx, inbound_rx) = packet_channels();
     (
         Channels {
             outbound_tx,
@@ -31,6 +31,13 @@ pub fn channels() -> (Channels, Internals) {
             inbound_tx,
         },
     )
+}
+
+/// Create a single bidirectional packet channel pair (sender, receiver).
+/// Used by transports that compose their own channel sets (e.g. QUIC adds a
+/// control channel on top).
+pub fn packet_channels() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    mpsc::channel(NET_QUEUE)
 }
 
 /// Marker for transport kind — used by session events / logging.
