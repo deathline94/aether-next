@@ -20,9 +20,9 @@ jobs:
           components: rustfmt, clippy
       - uses: lukka/get-cmake@latest
       - uses: ilammy/setup-nasm@v1
-      - run: cargo check --locked --manifest-path aether/Cargo.toml
+      - run: cargo check --manifest-path aether/Cargo.toml
       - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --locked --manifest-path aether/Cargo.toml
+      - run: cargo test --manifest-path aether/Cargo.toml
 
   desktop-ui:
     name: Desktop UI
@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
   android-ui:
     name: Android UI

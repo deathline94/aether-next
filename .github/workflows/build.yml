@@ -42,7 +42,7 @@ jobs:
 
       - name: Build engine
         working-directory: aether
-        run: cargo build --locked --release
+        run: cargo build --release
 
       - name: Stage engine
         shell: pwsh
@@ -134,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            cargo ndk -t "$abi" --platform 26 build --locked --release
+            cargo ndk -t "$abi" --platform 26 build --release
           done
           mkdir -p ../apps/android/android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
           mkdir -p ../apps/android/android/app/src/main/assets/engine
