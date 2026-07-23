@@ -838,7 +838,7 @@ impl MasqueProbe {
     }
 
     /// Create the verify closure for MASQUE probing.
-    pub fn verify_fn(&self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> + Send + Sync + '_ {
+    pub fn verify_fn<'a>(&'a self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>> + Send + Sync + 'a {
         move |ip: IpAddr, port: u16, timeout: Duration, ironclad: bool| {
             Box::pin(async move {
                 if ironclad {
@@ -975,7 +975,7 @@ impl WgProbe {
     }
 
     /// Create the verify closure for WireGuard probing.
-    pub fn verify_fn(&self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> + Send + Sync + '_ {
+    pub fn verify_fn<'a>(&'a self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>> + Send + Sync + 'a {
         move |ip: IpAddr, port: u16, timeout: Duration, ironclad: bool| {
             Box::pin(async move {
                 let peer = SocketAddr::new(ip, port);
