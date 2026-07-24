@@ -284,10 +284,10 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
         if let Some(deadline) = this.next_chunk_at {
             let now = std::time::Instant::now();
             if now < deadline {
-                let sleep =
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
-                std::pin::pin!(sleep);
-                if std::future::Future::poll(sleep, cx)
+                let mut sleep = Box::pin(
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)),
+                );
+                if std::future::Future::poll(sleep.as_mut(), cx)
                     != std::task::Poll::Ready(())
                 {
                     return std::task::Poll::Pending;
