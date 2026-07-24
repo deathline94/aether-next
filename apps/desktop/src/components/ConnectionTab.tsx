@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity, Cable, CircleAlert, Copy, FlaskConical, Gauge, Globe2,
-  ListRestart, LockKeyhole, Network, Power, Route, ShieldCheck,
+  ListRestart, LockKeyhole, Network, Power, Route,
   Sparkles, TerminalSquare, X,
 } from "lucide-react";
 import type { RuntimeState, Settings } from "../types";
