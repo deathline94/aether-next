@@ -27,6 +27,18 @@ pub fn save(path: &str, peer: &str, profile: &str) {
     }
 }
 
+/// Path for the last-connection cache (smart reconnect). Sibling of the
+/// engine config so it moves with the user's profile.
+pub fn cache_path(base_config: &str) -> String {
+    if let Ok(p) = std::env::var("AETHER_LASTCONN_PATH") {
+        return p;
+    }
+    let dir_end = base_config.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let (dir, file) = base_config.split_at(dir_end);
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    format!("{dir}{stem}.lastconn.toml")
+}
+
 /// Path for the QUIC session ticket cache (0-RTT resumption).
 pub fn session_ticket_path() -> String {
     let base = crate::runtime_env::var("AETHER_CONFIG").unwrap_or_else(|| "aether.toml".into());

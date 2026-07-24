@@ -10,6 +10,40 @@ use foreign_types_shared::ForeignTypeRef;
 use crate::consts;
 use crate::error::{AetherError, Result};
 
+/// Compute SHA-256 hash of a certificate's SubjectPublicKeyInfo (SPKI).
+fn spki_sha256(cert: &boring::x509::X509Ref) -> Option<[u8; 32]> {
+    let pubkey = cert.public_key().ok()?;
+    let der = pubkey.public_key_to_der().ok()?;
+    use ring::digest;
+    let hash = digest::digest(&digest::SHA256, &der);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_ref());
+    Some(out)
+}
+
+/// Install SPKI certificate pinning on a TLS context builder.
+/// If `pins` is non-empty, sets a custom verify callback that checks the leaf
+/// cert's SPKI hash against the pinned set. Otherwise falls back to no-verify.
+pub fn install_pin_verification(
+    builder: &mut SslContextBuilder,
+    pins: &'static [&'static [u8; 32]],
+) {
+    if pins.is_empty() {
+        builder.set_verify(SslVerifyMode::NONE);
+        return;
+    }
+    builder.set_verify_callback(SslVerifyMode::PEER, move |_ok, ctx| {
+        let Some(chain) = ctx.chain() else { return false };
+        let Some(leaf) = chain.iter().next() else { return false };
+        let Some(hash) = spki_sha256(leaf) else { return false };
+        let matched = pins.iter().any(|pin| pin.as_slice() == hash.as_slice());
+        if !matched {
+            log::warn!("[tls] SPKI pin mismatch: {:02x?}", &hash[..8]);
+        }
+        matched
+    });
+}
+
 extern "C" {
     fn SSL_set1_ech_config_list(
         ssl: *mut c_void,

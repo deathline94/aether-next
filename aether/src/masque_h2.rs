@@ -102,19 +102,24 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if dangerous {
-        static DANGER_WARN: std::sync::Once = std::sync::Once::new();
-        DANGER_WARN.call_once(|| {
-            log::warn!("[tls] DANGER: H2 server authentication explicitly disabled");
+
+    // SPKI certificate pinning: cloudflare edges serve self-signed / mixed CA
+    // certs per SNI. Pin the known MASQUE edge SPKI hashes instead of trusting
+    // the system CA store, preventing MITM by any attacker who can mint a
+    // "cloudflare" looking certificate. Override with AETHER_DANGEROUS_*
+    // only for explicit debugging.
+    let pins_disabled = std::env::var("AETHER_MASQUE_DISABLE_SPKI_PINS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    if dangerous || pins_disabled {
+        static COFF_WARN: std::sync::Once = std::sync::Once::new();
+        COFF_WARN.call_once(|| {
+            log::warn!("[tls] H2 SPKI pinning disabled (AETHER_DANGEROUS_DISABLE_TLS_VERIFY or AETHER_MASQUE_DISABLE_SPKI_PINS set)");
         });
         builder.set_verify(SslVerifyMode::NONE);
     } else {
-        if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
-            builder.set_ca_file(path.trim()).map_err(|e| AetherError::Tls(format!("load TLS CA file: {e}")))?;
-        } else {
-            builder.set_default_verify_paths().map_err(|e| AetherError::Tls(format!("load system TLS roots: {e}")))?;
-        }
-        builder.set_verify(SslVerifyMode::PEER);
+        crate::tls::install_pin_verification(&mut builder, consts::MASQUE_PINS);
     }
 
     let connector = builder.build();
@@ -130,13 +135,111 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
 // ─── ClientHello fragmentation ──────────────────────────────────────────────
 
 /// TCP wrapper that splits the FIRST write (the TLS ClientHello from
-/// tokio-boring) across two TCP segments with a short delay between them.
-/// This defeats DPI boxes that fingerprint JA3/JA4 from a single segment.
+/// tokio-boring) across multiple TCP segments with optional inter-segment
+/// delays. This defeats DPI boxes that fingerprint JA3/JA4 from a single
+/// segment by introducing randomness into segment sizes and timing.
 ///
-/// Controlled by AETHER_H2_FRAG_CH: set to "0" to disable (default: enabled).
+/// Two env control surfaces (composable):
+///   - AETHER_H2_FRAG_CH=1                  legacy on/off toggle (simple 1/3 split)
+///   - AETHER_MASQUE_H2_FRAGMENT={1|true}   full random-fragmentation mode
+///   - AETHER_MASQUE_H2_FRAGMENT_SIZE=lo-hi byte range per chunk (default 16-32)
+///   - AETHER_MASQUE_H2_FRAGMENT_DELAY=lo-hi ms between chunks (default 2-10)
 struct FragFirstWrite {
     inner: TcpStream,
+    /// Once true, all further writes pass through unchanged (only the first
+    /// ClientHello-sized write is split).
     done: bool,
+    /// Resolved fragment config (active only for the first write).
+    cfg: FragmentConfig,
+    /// Pending inter-chunk delay timer; cleartext bytes are released only
+    /// after it elapses. None when fragmentation is off or no delay is due.
+    pending_delay: Option<std::pin::Pin<tokio::time::Sleep>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FragmentConfig {
+    enabled: bool,
+    size_min: usize,
+    size_max: usize,
+    delay_min_ms: u64,
+    delay_max_ms: u64,
+}
+
+impl FragmentConfig {
+    /// Legacy 1/3 split (no delay) when only `AETHER_H2_FRAG_CH=1` is set.
+    fn legacy_on() -> Self {
+        Self { enabled: true, size_min: 0, size_max: 0, delay_min_ms: 0, delay_max_ms: 0 }
+    }
+
+    fn disabled() -> Self {
+        Self { enabled: false, size_min: 0, size_max: 0, delay_min_ms: 0, delay_max_ms: 0 }
+    }
+
+    /// Full random-fragmentation mode driven by AETHER_MASQUE_H2_FRAGMENT* env vars.
+    /// Defaults when unset: chunks 16-32 bytes, delay 2-10 ms.
+    fn from_env() -> Self {
+        let enabled = is_truthy(std::env::var("AETHER_MASQUE_H2_FRAGMENT").as_deref().unwrap_or(""));
+        if !enabled {
+            return Self::disabled();
+        }
+        let (size_min, size_max) = parse_range(
+            &std::env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
+            (16, 32),
+        );
+        let (delay_min_ms, delay_max_ms) = parse_range(
+            &std::env::var("AETHER_MASQUE_H2_FRAGMENT_DELAY").unwrap_or_default(),
+            (2, 10),
+        );
+        let size_min = (size_min.max(1) as usize).max(1);
+        let size_max = (size_max.max(size_min as u64) as usize).max(1);
+        Self {
+            enabled: true,
+            size_min,
+            size_max,
+            delay_min_ms,
+            delay_max_ms: delay_max_ms.max(delay_min_ms),
+        }
+    }
+
+    fn pick_chunk_len(&self, remaining: usize) -> usize {
+        if self.size_max == 0 {
+            // Legacy mode: split at one-third of the first write.
+            return (remaining / 3).max(90).min(remaining.saturating_sub(1)).max(1);
+        }
+        let hi = self.size_max.min(remaining);
+        let lo = self.size_min.min(hi);
+        if lo >= hi { hi } else { rand::thread_rng().gen_range(lo..=hi) }
+    }
+
+    fn pick_delay(&self) -> std::time::Duration {
+        if self.delay_max_ms == 0 { return std::time::Duration::ZERO; }
+        let ms = if self.delay_max_ms <= self.delay_min_ms {
+            self.delay_min_ms
+        } else {
+            rand::thread_rng().gen_range(self.delay_min_ms..=self.delay_max_ms)
+        };
+        std::time::Duration::from_millis(ms)
+    }
+}
+
+fn is_truthy(v: &str) -> bool {
+    matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
+    let spec = spec.trim();
+    if spec.is_empty() { return default; }
+    match spec.split_once('-') {
+        Some((a, b)) => {
+            let lo = a.trim().parse().unwrap_or(default.0);
+            let hi = b.trim().parse().unwrap_or(default.1);
+            if hi < lo { (hi, lo) } else { (lo, hi) }
+        }
+        None => {
+            let v = spec.parse().unwrap_or(default.0);
+            (v, v)
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for FragFirstWrite {
@@ -155,17 +258,44 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        if self.done || buf.len() < 100 {
-            // Not the first write or too small to split — pass through.
+        // After the first write, OR if fragmentation disabled, OR slice too
+        // small to fragment: forward untouched.
+        if self.done || !self.cfg.enabled || buf.len() < 16 {
             self.done = true;
             return std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
         }
-        // Fragment: write first third only. Return partial count so tokio-boring
-        // calls poll_write again with the remainder — creating a natural TCP
-        // segment boundary that defeats single-segment DPI fingerprinting.
-        self.done = true;
-        let split = (buf.len() / 3).max(90).min(buf.len() - 1);
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..split])
+
+        // If an inter-chunk delay is pending, only emit once it elapses.
+        if let Some(sleep) = self.pending_delay.as_mut() {
+            match sleep.as_mut().poll(cx) {
+                std::task::Poll::Ready(()) => self.pending_delay = None,
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+
+        // First write only — split one chunk, let caller re-poll the remainder.
+        // Multi-chunk fragmentation emerges naturally: tokio-boring keeps
+        // calling poll_write with the leftover bytes; each call sends one chunk.
+        // We flip `done` only when the final chunk is about to be sent so the
+        // pattern terminates deterministically.
+        let chunk_len = self.cfg.pick_chunk_len(buf.len());
+        // Once the remaining buffer fits in a single chunk, mark done after this
+        // write so subsequent writes pass straight through (post-ClientHello).
+        if buf.len() - chunk_len < self.cfg.size_min.max(1) {
+            self.done = true;
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..chunk_len]) {
+            std::task::Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    let delay = self.cfg.pick_delay();
+                    if !delay.is_zero() {
+                        self.pending_delay = Some(Box::pin(tokio::time::sleep(delay)));
+                    }
+                }
+                std::task::Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(
@@ -190,15 +320,32 @@ async fn connect_tls(
     tcp: TcpStream,
 ) -> Result<tokio_boring::SslStream<FragFirstWrite>> {
     // ClientHello fragmentation is opt-in: it can break strict TLS servers and
-    // middleboxes for marginal DPI benefit, so H2 stays standards-compliant by
-    // default and only fragments when AETHER_H2_FRAG_CH is explicitly enabled.
-    let frag_enabled = crate::runtime_env::var("AETHER_H2_FRAG_CH")
-        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // middleboxes, so H2 stays standards-compliant by default. Two control paths:
+    //
+    //   legacy simple 1/3 split:  AETHER_H2_FRAG_CH=1        (default: off)
+    //   full random-fragmentation:  AETHER_MASQUE_H2_FRAGMENT=1 plus optional
+    //     AETHER_MASQUE_H2_FRAGMENT_SIZE=lo-hi  (bytes per chunk, default 16-32)
+    //     AETHER_MASQUE_H2_FRAGMENT_DELAY=lo-hi (ms between chunks, default 2-10)
+    //
+    // Full random takes precedence over the legacy toggle if both are set.
+    let mut cfg = FragmentConfig::from_env();
+    if !cfg.enabled {
+        let legacy = crate::runtime_env::var("AETHER_H2_FRAG_CH")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        if legacy {
+            cfg = FragmentConfig::legacy_on();
+        }
+    }
 
     let wrapper = FragFirstWrite {
         inner: tcp,
-        done: !frag_enabled, // If disabled, mark done so first write passes through.
+        done: !cfg.enabled,
+        cfg,
+        pending_delay: None,
     };
 
     tokio_boring::connect(config, sni, wrapper)
@@ -367,7 +514,7 @@ pub async fn run(
                     }
                     // Keep-alive: small DNS probe so half-open links fail fast.
                     if last.elapsed() > Duration::from_secs(25) {
-                        let probe = crate::dns::build_dataplane_probe(probe_src_ka, std::net::Ipv4Addr::new(1, 1, 1, 1));
+                        let probe = crate::dns::build_dataplane_probe(probe_src_ka, std::net::Ipv4Addr::new(8, 8, 8, 8));
                         if let Err(e) = send_ip_batch(&mut send_stream, vec![probe]).await {
                             log::debug!("[h2] keepalive: {e}");
                             return Err(e);
@@ -477,7 +624,7 @@ async fn verify_dataplane(
     let mut resend_at = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= resend_at {
-            let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(1, 1, 1, 1));
+            let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(8, 8, 8, 8));
             send_ip_batch(send, vec![probe]).await?;
             resend_at = Instant::now() + Duration::from_millis(700);
         }
@@ -646,7 +793,7 @@ mod tests {
     use crate::masque::CapsuleParser;
 
     fn probe(src: std::net::Ipv4Addr) -> Vec<u8> {
-        dns::build_dataplane_probe(src, std::net::Ipv4Addr::new(1, 1, 1, 1))
+        dns::build_dataplane_probe(src, std::net::Ipv4Addr::new(8, 8, 8, 8))
     }
 
     #[test]
@@ -657,7 +804,7 @@ mod tests {
         assert_eq!(pkt[0] >> 4, 4, "IPv4");
         assert_eq!(pkt[9], 17, "UDP");
         assert_eq!(&pkt[12..16], &src.octets());
-        assert_eq!(&pkt[16..20], &[1, 1, 1, 1]);
+        assert_eq!(&pkt[16..20], &[8, 8, 8, 8]);
         assert_eq!(u16::from_be_bytes([pkt[22], pkt[23]]), 53);
     }
 
@@ -677,7 +824,7 @@ mod tests {
 
     #[test]
     fn dataplane_accepts_only_dns_reply_from_resolver() {
-        let resolver = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let resolver = std::net::Ipv4Addr::new(8, 8, 8, 8);
         // Outbound probe is a query (src != 1.1.1.1) and must NOT count as a reply.
         let p = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
         assert!(!dns::is_dns_reply(&p, resolver));
@@ -686,7 +833,7 @@ mod tests {
         let mut reply = vec![0u8; 28];
         reply[0] = 0x45; // IPv4, IHL=5
         reply[9] = 17; // UDP
-        reply[12..16].copy_from_slice(&[1, 1, 1, 1]); // src = 1.1.1.1
+        reply[12..16].copy_from_slice(&[8, 8, 8, 8]); // src = 8.8.8.8
         reply[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port 53
         assert!(dns::is_dns_reply(&reply, resolver));
     }

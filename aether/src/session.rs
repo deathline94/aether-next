@@ -13,6 +13,7 @@ use crate::dns;
 use crate::engine_config::EngineConfig;
 use crate::error::{AetherError, Result};
 use crate::http_proxy;
+use crate::lastconn;
 use crate::masque_h2;
 use crate::mtu;
 use crate::netstack;
@@ -338,6 +339,32 @@ async fn select_peer(
                 config_path: base_config.to_string(),
             };
 
+            // Smart reconnect: re-verify the last working gateway before paying
+            // for a full scan. Skip with AETHER_QUICK_RECONNECT=0; force with =1.
+            if quick_reconnect_enabled() {
+                let cache_path = lastconn::cache_path(base_config);
+                if let Some(cached) = lastconn::load(&cache_path) {
+                    if let Ok(peer_addr) = cached.peer.parse::<SocketAddr>() {
+                        log::info!("[*] verifying cached gateway {peer_addr} before reuse");
+                        if let Ok(_rtt) = quick_verify_masque(
+                            &identity,
+                            peer_addr,
+                            &probe.sni,
+                            ech_config.as_deref(),
+                        ).await {
+                            log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
+                            session_event::emit(SessionEvent::EndpointSelected {
+                                addr: peer_addr.to_string(),
+                                protocol: "masque".into(),
+                            });
+                            return Ok(peer_addr);
+                        } else {
+                            log::warn!("[-] cached gateway {peer_addr} no longer works; scanning fresh");
+                        }
+                    }
+                }
+            }
+
             let best = prober::hunt_best_gateway(&probe, mode).await?;
             log::info!(
                 "[+] selected MASQUE gateway {}:{} (rtt {:?})",
@@ -345,11 +372,18 @@ async fn select_peer(
                 best.port,
                 best.rtt
             );
+            let peer = SocketAddr::new(best.ip, best.port);
+            // Cache the working gateway so the next session can quick-reconnect.
+            lastconn::save(
+                &lastconn::cache_path(base_config),
+                &peer.to_string(),
+                "",
+            );
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: "masque".into(),
             });
-            Ok(SocketAddr::new(best.ip, best.port))
+            Ok(peer)
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
             log::info!(
@@ -384,6 +418,48 @@ async fn select_peer(
             Ok(SocketAddr::new(best.ip, best.port))
         }
     }
+}
+
+/// Smart reconnect gating. Defaults ON (column requested); turn off via
+/// AETHER_QUICK_RECONNECT=0/false/no/off, force-on via =1/true/yes/on. Forcing
+/// only matters when nothing is cached (in which case there is nothing to
+/// verify anyway, so force-on is effectively the same as default here).
+fn quick_reconnect_enabled() -> bool {
+    match std::env::var("AETHER_QUICK_RECONNECT").as_deref() {
+        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
+        _ => true, // default: attempt cached-gateway reuse when present
+    }
+}
+
+/// Quick gate verify for smart reconnect: re-runs the same deep CONNECT-IP +
+/// data-plane proof path the scanner uses, but on a single cached endpoint
+/// with a tight timeout. Returns Ok(rtt) when the cached gateway is still
+/// serving live traffic, Err otherwise.
+async fn quick_verify_masque(
+    identity: &account::Identity,
+    peer: SocketAddr,
+    sni: &str,
+    ech: Option<&[u8]>,
+) -> Result<std::time::Duration> {
+    let local_ipv4: std::net::Ipv4Addr = identity
+        .ipv4
+        .parse()
+        .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2));
+
+    let vp = quic::VerifyParams {
+        peer,
+        sni: sni.to_string(),
+        authority: quic::default_authority().to_string(),
+        path: quic::default_path().to_string(),
+        cert_pem: identity.cert_pem.clone(),
+        key_pem: identity.key_pem.clone(),
+        ech_config_list: ech.map(|b| b.to_vec()),
+        noize: noize_config(),
+        timeout: std::time::Duration::from_secs(6),
+        local_ipv4,
+    };
+    quic::verify_masque(&vp).await
 }
 
 async fn resolve_ech() -> Option<Vec<u8>> {

@@ -101,6 +101,31 @@ impl Internals {
 
 type NetPacket = (SocketAddr, SocketAddr, Vec<u8>);
 
+/// Holds spawned UDP-reader tasks; aborts them on drop so old readers
+/// cannot leak when the tunnel migrates sockets, reconnects, or unwinds.
+/// Without this, a long-lived session that reconnects many times accumulates
+/// orphaned tokio tasks each holding a dedicated read buffer (>=64KB × N leaks).
+struct ReaderGuard {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl ReaderGuard {
+    fn new() -> Self {
+        Self { handles: Vec::new() }
+    }
+    fn push(&mut self, h: tokio::task::JoinHandle<()>) {
+        self.handles.push(h);
+    }
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        for h in self.handles.drain(..) {
+            h.abort();
+        }
+    }
+}
+
 fn bind_addr_for(peer: &SocketAddr) -> SocketAddr {
     if peer.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -115,7 +140,7 @@ fn random_scid() -> [u8; 16] {
     scid
 }
 
-fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) {
+fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -162,7 +187,11 @@ pub async fn run(
 
     let mut sockets: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
     sockets.insert(local, init_sock.clone());
-    spawn_reader(init_sock, local, net_tx.clone());
+    // ReaderGuard aborts ALL spawned readers when this scope exits (reconnect,
+    // tunnel-close, panic). Without it, every Migrate spawns a fresh reader
+    // that holds a 64KB buffer + task slot forever — long sessions leak.
+    let mut readers = ReaderGuard::new();
+    readers.push(spawn_reader(init_sock, local, net_tx.clone()));
 
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &cfg.cert_pem,
@@ -235,7 +264,7 @@ pub async fn run(
             ctrl = internals.ctrl_rx.recv() => {
                 match ctrl {
                     Some(Control::Migrate) => {
-                        if let Err(e) = do_migrate(&mut conn, peer, &mut sockets, &net_tx).await {
+                        if let Err(e) = do_migrate(&mut conn, peer, &mut sockets, &net_tx, &mut readers).await {
                             log::warn!("migration failed: {e}");
                         }
                     }
@@ -319,7 +348,7 @@ pub async fn run(
             }
             if last_probe.elapsed() >= Duration::from_millis(700) {
                 if let Some(sid) = req_stream {
-                    let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(1, 1, 1, 1));
+                    let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(8, 8, 8, 8));
                     if let Ok(framed) = masque::encode_ip_datagram(sid, &probe) {
                         let _ = conn.dgram_send(&framed);
                     }
@@ -584,6 +613,7 @@ async fn do_migrate(
     peer: SocketAddr,
     sockets: &mut HashMap<SocketAddr, Arc<UdpSocket>>,
     net_tx: &mpsc::Sender<NetPacket>,
+    readers: &mut ReaderGuard,
 ) -> Result<()> {
     if conn.available_dcids() == 0 {
         return Err(AetherError::Other("no spare dcids for migration".into()));
@@ -595,7 +625,7 @@ async fn do_migrate(
     let new_sock = Arc::new(new_sock);
 
     sockets.insert(new_local, new_sock.clone());
-    spawn_reader(new_sock, new_local, net_tx.clone());
+    readers.push(spawn_reader(new_sock, new_local, net_tx.clone()));
 
     conn.probe_path(new_local, peer)?;
     let seq = conn.migrate_source(new_local)?;
@@ -741,7 +771,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                     // Fast-path: 1 round-trip is enough during scan.
                                     let probe_pkt = crate::dns::build_dataplane_probe(
                                         p.local_ipv4,
-                                        std::net::Ipv4Addr::new(1, 1, 1, 1),
+                                        std::net::Ipv4Addr::new(8, 8, 8, 8),
                                     );
                                     if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_pkt) {
                                         let _ = conn.dgram_send(&framed);
