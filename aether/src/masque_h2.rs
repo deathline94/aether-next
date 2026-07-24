@@ -49,6 +49,19 @@ pub fn h2_peer(quic_peer: SocketAddr) -> SocketAddr {
     quic_peer
 }
 
+/// Effective TLS SNI for the ClientHello.
+///
+/// Defaults to the configured MASQUE SNI, but `AETHER_MASQUE_SNI` lets the user
+/// front behind a benign name (e.g. `cloudflare.com`) on networks that block the
+/// MASQUE SNI via SNI-based DPI. The HTTP/2 `:authority` still targets the real
+/// MASQUE host, so Cloudflare routes the CONNECT-IP correctly (domain fronting).
+fn handshake_sni(default_sni: &str) -> String {
+    crate::runtime_env::var("AETHER_MASQUE_SNI")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_sni.to_string())
+}
+
 fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -215,7 +228,7 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         let tls_config = build_tls(cfg)?;
         let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
         let _ = tcp.set_nodelay(true);
-        let tls = connect_tls(tls_config, &cfg.sni, tcp).await?;
+        let tls = connect_tls(tls_config, &handshake_sni(&cfg.sni), tcp).await?;
         let (h2, connection) = h2::client::handshake(tls)
             .await
             .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
@@ -265,7 +278,7 @@ pub async fn run(
     let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
     let _ = tcp.set_nodelay(true);
 
-    let tls = connect_tls(tls_config, &cfg.sni, tcp).await?;
+    let tls = connect_tls(tls_config, &handshake_sni(&cfg.sni), tcp).await?;
     log::info!(
         "[h2] tls established; alpn={}",
         String::from_utf8_lossy(tls.ssl().selected_alpn_protocol().unwrap_or(b""))
