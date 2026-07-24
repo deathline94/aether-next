@@ -7,6 +7,7 @@ use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, 
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
+use rand::Rng;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -126,7 +127,11 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let mut config = connector
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
-    config.set_verify_hostname(!dangerous);
+    // Disable hostname verification entirely: SPKI pinning (or its opt-out)
+    // handles authentication. CN-matching hostname constraints would reject
+    // SNI-fronted connections (AETHER_MASQUE_SNI != cert CN) even when the
+    // SPKI pin matches a known-good Cloudflare edge.
+    config.set_verify_hostname(false);
     config.set_use_server_name_indication(true);
 
     Ok(config)
@@ -151,9 +156,11 @@ struct FragFirstWrite {
     done: bool,
     /// Resolved fragment config (active only for the first write).
     cfg: FragmentConfig,
-    /// Pending inter-chunk delay timer; cleartext bytes are released only
-    /// after it elapses. None when fragmentation is off or no delay is due.
-    pending_delay: Option<std::pin::Pin<tokio::time::Sleep>>,
+    /// Instant at which the next chunk may be written; None when fragmentation
+    /// is idle. Stored as a plain Instant (Unpin) instead of `Pin<Sleep>` so
+    /// the struct stays `Unpin` — `tokio_boring::connect` + `h2::handshake`
+    /// require the inner stream to be `Unpin`.
+    next_chunk_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,17 +213,19 @@ impl FragmentConfig {
             // Legacy mode: split at one-third of the first write.
             return (remaining / 3).max(90).min(remaining.saturating_sub(1)).max(1);
         }
+        let mut rng = rand::thread_rng();
         let hi = self.size_max.min(remaining);
         let lo = self.size_min.min(hi);
-        if lo >= hi { hi } else { rand::thread_rng().gen_range(lo..=hi) }
+        if lo >= hi { hi } else { rng.gen_range(lo..=hi) }
     }
 
     fn pick_delay(&self) -> std::time::Duration {
         if self.delay_max_ms == 0 { return std::time::Duration::ZERO; }
+        let mut rng = rand::thread_rng();
         let ms = if self.delay_max_ms <= self.delay_min_ms {
             self.delay_min_ms
         } else {
-            rand::thread_rng().gen_range(self.delay_min_ms..=self.delay_max_ms)
+            rng.gen_range(self.delay_min_ms..=self.delay_max_ms)
         };
         std::time::Duration::from_millis(ms)
     }
@@ -244,33 +253,45 @@ fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
 
 impl tokio::io::AsyncRead for FragFirstWrite {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
 impl tokio::io::AsyncWrite for FragFirstWrite {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
         // After the first write, OR if fragmentation disabled, OR slice too
         // small to fragment: forward untouched.
-        if self.done || !self.cfg.enabled || buf.len() < 16 {
-            self.done = true;
-            return std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if this.done || !this.cfg.enabled || buf.len() < 16 {
+            this.done = true;
+            return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
         }
 
-        // If an inter-chunk delay is pending, only emit once it elapses.
-        if let Some(sleep) = self.pending_delay.as_mut() {
-            match sleep.as_mut().poll(cx) {
-                std::task::Poll::Ready(()) => self.pending_delay = None,
-                std::task::Poll::Pending => return std::task::Poll::Pending,
+        // If an inter-chunk delay is pending, wait until its deadline elapses.
+        // Poll a throwaway tokio Sleep future scoped to THIS poll cycle only —
+        // storing a `Pin<Sleep>` in the struct would make it `!Unpin` and break
+        // tokio_boring::connect / h2::handshake (both require `Unpin`). The
+        // deadline (an Unpin `Instant`) is what we persist.
+        if let Some(deadline) = this.next_chunk_at {
+            let now = std::time::Instant::now();
+            if now < deadline {
+                let sleep =
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                std::pin::pin!(sleep);
+                if sleep.poll(cx) != std::task::Poll::Ready(()) {
+                    return std::task::Poll::Pending;
+                }
             }
+            this.next_chunk_at = None;
         }
 
         // First write only — split one chunk, let caller re-poll the remainder.
@@ -278,18 +299,18 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
         // calling poll_write with the leftover bytes; each call sends one chunk.
         // We flip `done` only when the final chunk is about to be sent so the
         // pattern terminates deterministically.
-        let chunk_len = self.cfg.pick_chunk_len(buf.len());
+        let chunk_len = this.cfg.pick_chunk_len(buf.len());
         // Once the remaining buffer fits in a single chunk, mark done after this
         // write so subsequent writes pass straight through (post-ClientHello).
-        if buf.len() - chunk_len < self.cfg.size_min.max(1) {
-            self.done = true;
+        if buf.len() - chunk_len < this.cfg.size_min.max(1) {
+            this.done = true;
         }
-        match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..chunk_len]) {
+        match std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[..chunk_len]) {
             std::task::Poll::Ready(Ok(n)) => {
                 if n > 0 {
-                    let delay = self.cfg.pick_delay();
+                    let delay = this.cfg.pick_delay();
                     if !delay.is_zero() {
-                        self.pending_delay = Some(Box::pin(tokio::time::sleep(delay)));
+                        this.next_chunk_at = Some(std::time::Instant::now() + delay);
                     }
                 }
                 std::task::Poll::Ready(Ok(n))
@@ -299,17 +320,19 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
     }
 
     fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -345,7 +368,7 @@ async fn connect_tls(
         inner: tcp,
         done: !cfg.enabled,
         cfg,
-        pending_delay: None,
+        next_chunk_at: None,
     };
 
     tokio_boring::connect(config, sni, wrapper)

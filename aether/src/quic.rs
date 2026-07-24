@@ -157,7 +157,7 @@ fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPac
                 }
             }
         }
-    });
+    })
 }
 
 pub async fn run(
