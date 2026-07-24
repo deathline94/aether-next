@@ -8,6 +8,7 @@ use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
 use rand::Rng;
+use std::future::Future;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
