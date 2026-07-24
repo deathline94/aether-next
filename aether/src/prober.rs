@@ -244,6 +244,14 @@ pub async fn hunt_best(
     if let Some(ms) = crate::runtime_env::usize("AETHER_SCAN_TIMEOUT_MS") {
         st.per_probe_timeout = Duration::from_millis(ms as u64);
     }
+    // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
+    // No target_successes limit, no early exit, extended deadline.
+    if crate::runtime_env::flag("AETHER_SCAN_EXHAUSTIVE") {
+        st.target_successes = 0;
+        st.early_exit_first = false;
+        st.overall_deadline = Duration::from_secs(600); // 10 min hard cap (user stops via UI)
+        st.quiet_after_first = Duration::ZERO;
+    }
     let timeout = st.per_probe_timeout;
     let ironclad = mode == ScanMode::Ironclad;
     let label = config.label;

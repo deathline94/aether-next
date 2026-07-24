@@ -1043,6 +1043,7 @@ fn scan(
     ip_version: String,
     concurrency: u32,
     timeout_ms: u32,
+    noize: Option<String>,
 ) -> Result<(), String> {
     // Stop any existing scan first.
     if let Some(mut child) = state.scan_child.lock().unwrap().take() {
@@ -1065,8 +1066,9 @@ fn scan(
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
         .env("AETHER_PROTOCOL", engine_protocol)
         .env("AETHER_SCAN", "balanced")
+        .env("AETHER_SCAN_EXHAUSTIVE", "1")
         .env("AETHER_IP", &ip_version)
-        .env("AETHER_NOIZE", &settings.noize)
+        .env("AETHER_NOIZE", noize.as_deref().unwrap_or("off"))
         .env("AETHER_CONFIG", dir.join("aether.toml"))
         .env("AETHER_SCAN_ONLY", "1")
         .env("AETHER_SCAN_CONCURRENCY", concurrency.to_string())

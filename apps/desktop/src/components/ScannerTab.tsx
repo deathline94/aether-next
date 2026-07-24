@@ -11,6 +11,8 @@ interface ScannerTabProps {
   setConcurrency: (v: number) => void;
   timeoutMs: number;
   setTimeoutMs: (v: number) => void;
+  noize: string;
+  setNoize: (v: string) => void;
   endpoints: DiscoveredEndpoint[];
   active: boolean;
   scanState: ScanState;
@@ -26,6 +28,7 @@ export function ScannerTab({
   ipScan, setIpScan,
   concurrency, setConcurrency,
   timeoutMs, setTimeoutMs,
+  noize, setNoize,
   endpoints, active, scanState, busy,
   startScan, stopScan,
   connectDirect, connectBusy,
@@ -98,6 +101,24 @@ export function ScannerTab({
               onChange={(e) => setTimeoutMs(Math.max(100, parseInt(e.target.value, 10) || 100))}
             />
           </label>
+        </div>
+
+        <div className="setting-row">
+          <div>
+            <strong>Obfuscation</strong>
+            <span>Noise profile applied to probe handshakes</span>
+          </div>
+          <select
+            value={noize}
+            disabled={active}
+            onChange={(e) => setNoize(e.target.value)}
+          >
+            <option value="off">Off — no noise</option>
+            <option value="light">Light — low noise</option>
+            <option value="medium">Medium — default</option>
+            <option value="high">High — stronger</option>
+            <option value="max">Max — highest noise</option>
+          </select>
         </div>
 
         {/* Scan progress bar */}

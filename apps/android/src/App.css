@@ -70,7 +70,15 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
 .header-status { padding: 7px 10px; border: 1px solid #293338; border-radius: 6px; color: #849197; display: flex; align-items: center; gap: 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
 .header-status .status-dot { margin: 0; width: 6px; height: 6px; }
 
-.home-view, .settings-view, .logs-view { width: min(100%, 1060px); margin: 0 auto; padding: 34px clamp(25px, 4vw, 48px) 45px; }
+.home-view, .scanner-view, .settings-view, .logs-view { width: min(100%, 1060px); margin: 0 auto; padding: 34px clamp(25px, 4vw, 48px) 45px; }
+
+/* ── Global overflow guards (prevent out-of-bounds text on narrow screens) ── */
+.workspace section, .workspace article, .workspace div { min-width: 0; }
+.section-heading h3, .section-heading p { overflow-wrap: anywhere; word-break: break-word; }
+.section-heading > div { min-width: 0; }
+.about-panel span, .about-panel h3, .profile-card span, .setting-row > div > span,
+.mini-status span, .connection-copy p, .connection-copy h2, .test-row span { overflow-wrap: anywhere; }
+.about-panel code, .badge, .phase-pill { overflow-wrap: anywhere; word-break: break-all; }
 
 .profiles-panel {
   margin: 22px 0 0;
@@ -363,10 +371,32 @@ select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
   .test-row { flex-direction: column; align-items: stretch; }
   .logs-view { height: calc(100vh - 134px); }
   .save-bar { flex-direction: column; gap: 8px; align-items: stretch; }
+
+  /* Activity toolbar: stack the three groups and let filters wrap */
+  .log-toolbar { flex-direction: column; align-items: stretch; gap: 8px; padding: 10px 12px; }
+  .log-toolbar > div { flex-wrap: wrap; }
+  .log-filter-bar { flex-wrap: wrap; }
+  .log-filter-bar button { flex: 1 1 auto; }
+  .log-actions { justify-content: flex-end; }
+
+  /* Scan card: stack header + wrap badges so nothing spills out */
+  .scan-card-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .scan-title { flex-wrap: wrap; }
+  .scan-badges { flex-wrap: wrap; }
+
+  /* About panel: stack text above the version badge */
+  .about-panel { flex-direction: column; align-items: flex-start; gap: 10px; }
 }
 
 /* long endpoint IPs shouldn't blow the metric card */
 .metrics-grid article strong { max-width: 100%; }
+
+/* Scanner action button (referenced by scanner tab) */
+.scanner-action-bar { display: flex; }
+.primary-cta { display: flex; align-items: center; gap: 10px; height: 44px; border-radius: 6px; font-size: 13px; font-weight: 650; cursor: pointer; border: 1px solid; }
+.primary-cta.connect { border-color: #4f8067; background: #21533a; color: #dff9eb; }
+.primary-cta.disconnect { border-color: #69423b; background: #422721; color: #ff8b78; }
+.primary-cta:disabled { opacity: .5; cursor: not-allowed; }
 
 .scan-card {
   margin-bottom: 12px;

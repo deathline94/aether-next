@@ -110,6 +110,7 @@ function App() {
             ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
             concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
             timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
+            noize={scanner.noize} setNoize={scanner.setNoize}
             endpoints={scanner.endpoints} active={scanner.active}
             scanState={scanner.scanState} busy={scanner.busy}
             startScan={scanner.startScan} stopScan={scanner.stopScan}

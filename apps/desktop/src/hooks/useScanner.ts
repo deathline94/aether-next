@@ -11,7 +11,8 @@ export function useScanner(
   const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
   const [concurrency, setConcurrency] = useState(250);
-  const [timeoutMs, setTimeoutMs] = useState(1000);
+  const [timeoutMs, setTimeoutMs] = useState(3000);
+  const [noize, setNoize] = useState("off");
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
   const [active, setActive] = useState(false);
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
@@ -91,7 +92,7 @@ export function useScanner(
         await invoke("disconnect");
         await new Promise((r) => setTimeout(r, 400));
       }
-      await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs });
+      await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${String(error)}` });
       setActive(false);
@@ -99,7 +100,7 @@ export function useScanner(
     } finally {
       setBusy(false);
     }
-  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, running, appendLog]);
+  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog]);
 
   const stopScan = useCallback(async () => {
     setActive(false);
@@ -115,6 +116,7 @@ export function useScanner(
     ipScan, setIpScan,
     concurrency, setConcurrency,
     timeoutMs, setTimeoutMs,
+    noize, setNoize,
     endpoints, active, scanState, busy,
     startScan, stopScan,
   };

@@ -646,7 +646,11 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         "[::]:0".parse().unwrap()
     };
     let sock = bind_udp_fast(bind).await?;
-    let _ = sock.connect(p.peer).await;
+    // NOTE: do NOT connect() the socket. A connected UDP socket only delivers
+    // datagrams whose source exactly matches the peer; Cloudflare's anycast QUIC
+    // edge frequently replies from a rewritten path, so a connected socket would
+    // silently drop every reply (observed as "no UDP reply — QUIC may be filtered").
+    // Unconnected send_to/recv_from accepts replies from any source (matches run()).
     let local = sock.local_addr()?;
 
     // Cheap UDP reachability: if nothing comes back after a QUIC Initial kick,
