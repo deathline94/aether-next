@@ -127,6 +127,84 @@ class EngineRunner(
         }
     }
 
+    /**
+     * Start the engine in scan-only mode (no tunnel, no VPN).
+     * The engine emits AETHER_EVENT lines for scan progress/hits.
+     */
+    fun startScan(
+        protocol: String,
+        ipVersion: String,
+        concurrency: Int,
+        timeoutMs: Int,
+        noize: String,
+    ): String? {
+        val binary = resolveEngine("")
+            ?: return "Engine binary not found in the APK (libaether.so / assets)."
+        if (!running.compareAndSet(false, true)) {
+            return "Aether is already running"
+        }
+        val currentGeneration = generation.incrementAndGet()
+        return try {
+            val configDir = File(context.filesDir, "config").apply { mkdirs() }
+            val configPath = File(configDir, "aether.toml").absolutePath
+            val homeDir = context.filesDir.absolutePath
+
+            val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
+            val isH2 = protocol == "masque-h2"
+
+            val pb = ProcessBuilder(binary.absolutePath).apply {
+                directory(context.filesDir)
+                redirectErrorStream(true)
+                environment().apply {
+                    put("AETHER_PROTOCOL", protocolEnv)
+                    put("AETHER_SCAN_ONLY", "1")
+                    put("AETHER_SCAN_EXHAUSTIVE", "1")
+                    put("AETHER_SCAN", "balanced")
+                    put("AETHER_IP", ipVersion)
+                    put("AETHER_NOIZE", noize)
+                    put("AETHER_SCAN_CONCURRENCY", concurrency.toString())
+                    put("AETHER_SCAN_TIMEOUT_MS", timeoutMs.toString())
+                    put("AETHER_CONFIG", configPath)
+                    put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
+                    put("AETHER_DANGEROUS_DISABLE_TLS_VERIFY", "1")
+                    put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
+                    put("AETHER_TUN", "0")
+                    put("AETHER_WG_NO_PROFILE_RETRY", "1")
+                    put("RUST_LOG", "info")
+                    put("HOME", homeDir)
+                    put("TMPDIR", context.cacheDir.absolutePath)
+                }
+            }
+
+            val proc = pb.start()
+            processRef.set(proc)
+            Thread({
+                try {
+                    BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) {
+                            onLine(line!!)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "scan reader ended: ${e.message}")
+                } finally {
+                    val code = try { proc.waitFor() } catch (_: Exception) { null }
+                    if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
+                        running.set(false)
+                        processRef.compareAndSet(proc, null)
+                        onExit(code)
+                    }
+                }
+            }, "aether-scan-io").start()
+            null
+        } catch (e: Exception) {
+            running.set(false)
+            processRef.set(null)
+            "Could not start scan: ${e.message}"
+        }
+    }
+
     fun stop() {
         generation.incrementAndGet()
         val p = processRef.getAndSet(null) ?: return

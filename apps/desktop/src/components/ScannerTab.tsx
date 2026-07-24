@@ -106,11 +106,11 @@ export function ScannerTab({
         <div className="setting-row">
           <div>
             <strong>Obfuscation</strong>
-            <span>Noise profile applied to probe handshakes</span>
+            <span>{protocol === "masque-h2" ? "Not applicable for H2 (TCP)" : "Noise profile applied to probe handshakes"}</span>
           </div>
           <select
-            value={noize}
-            disabled={active}
+            value={protocol === "masque-h2" ? "off" : noize}
+            disabled={active || protocol === "masque-h2"}
             onChange={(e) => setNoize(e.target.value)}
           >
             <option value="off">Off — no noise</option>

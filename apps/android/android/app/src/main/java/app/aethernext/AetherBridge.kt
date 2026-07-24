@@ -44,6 +44,20 @@ class AetherBridge(
                     session.disconnect()
                     JSONObject.NULL
                 }
+                "scan" -> {
+                    val protocol = args.optString("protocol", "masque-h3")
+                    val ipVersion = args.optString("ipVersion", "v4")
+                    val concurrency = args.optInt("concurrency", 250)
+                    val timeoutMs = args.optInt("timeoutMs", 3000)
+                    val noize = args.optString("noize", "off")
+                    val err = session.scan(protocol, ipVersion, concurrency, timeoutMs, noize)
+                    if (err != null) throw IllegalStateException(err)
+                    JSONObject.NULL
+                }
+                "stop_scan" -> {
+                    session.stopScan()
+                    JSONObject.NULL
+                }
                 "test_connection" -> {
                     val s = if (args.has("settings")) {
                         Settings.fromJson(args.getJSONObject("settings"))

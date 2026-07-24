@@ -261,7 +261,8 @@ function App() {
   const [scannerProtocol, setScannerProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
   const [scannerIpScan, setScannerIpScan] = useState<"v4" | "v6" | "both">("v4");
   const [scannerConcurrency, setScannerConcurrency] = useState<number>(250);
-  const [scannerTimeoutMs, setScannerTimeoutMs] = useState<number>(1000);
+  const [scannerTimeoutMs, setScannerTimeoutMs] = useState<number>(3000);
+  const [scannerNoize, setScannerNoize] = useState<string>("off");
   const [discoveredEndpoints, setDiscoveredEndpoints] = useState<DiscoveredEndpoint[]>([]);
   const [scannerActive, setScannerActive] = useState<boolean>(false);
   const [busy, setBusy] = useState(false);
@@ -396,32 +397,29 @@ function App() {
     if (busy || scannerActive) return;
     setScannerActive(true);
     setDiscoveredEndpoints([]);
+    setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
       level: "info",
-      message: `Starting Standalone IP Scan: ${scannerProtocol.toUpperCase()} (concurrency=${scannerConcurrency}, timeout=${scannerTimeoutMs}ms)`,
+      message: `Starting Standalone IP Scan: ${scannerProtocol.toUpperCase()} (concurrency=${scannerConcurrency}, timeout=${scannerTimeoutMs}ms, noise=${scannerNoize})`,
     });
-
-    const proto = scannerProtocol === "wireguard" ? "wireguard" : "masque";
-    const trans = scannerProtocol === "masque-h3" ? "h3" : "h2";
-    const nextSettings: Settings = {
-      ...settings,
-      protocol: proto,
-      transport: trans,
-      ipVersion: scannerIpScan,
-      scanMode: "turbo",
-    };
 
     setBusy(true);
     try {
       if (running) {
-        await invoke("stop_session");
+        await invoke("disconnect");
         await new Promise((r) => setTimeout(r, 400));
       }
-      setRuntime({ status: "connecting", detail: "Scanning IP pool", pid: null, endpoint: null });
-      await invoke("start_session");
+      await invoke("scan", {
+        protocol: scannerProtocol,
+        ipVersion: scannerIpScan,
+        concurrency: scannerConcurrency,
+        timeoutMs: scannerTimeoutMs,
+        noize: scannerNoize,
+      });
     } catch (error) {
       appendLog({ level: "error", message: `Standalone scan error: ${String(error)}` });
       setScannerActive(false);
+      setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
     } finally {
       setBusy(false);
     }
@@ -429,11 +427,10 @@ function App() {
 
   async function stopStandaloneScan() {
     setScannerActive(false);
-    if (running && !connected) {
-      try {
-        await invoke("stop_session");
-      } catch {}
-    }
+    setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+    try {
+      await invoke("stop_scan");
+    } catch {}
     appendLog({ level: "info", message: "Standalone scan stopped." });
   }
 
@@ -896,6 +893,24 @@ function App() {
                     onChange={(e) => setScannerTimeoutMs(Math.max(100, parseInt(e.target.value, 10) || 100))}
                   />
                 </label>
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>Obfuscation</strong>
+                  <span>{scannerProtocol === "masque-h2" ? "Not applicable for H2 (TCP)" : "Noise profile applied to probe handshakes"}</span>
+                </div>
+                <select
+                  value={scannerProtocol === "masque-h2" ? "off" : scannerNoize}
+                  disabled={scannerActive || scannerProtocol === "masque-h2"}
+                  onChange={(e) => setScannerNoize(e.target.value)}
+                >
+                  <option value="off">Off — no noise</option>
+                  <option value="light">Light — low noise</option>
+                  <option value="medium">Medium — default</option>
+                  <option value="high">High — stronger</option>
+                  <option value="max">Max — highest noise</option>
+                </select>
               </div>
 
               <div className="scanner-action-bar" style={{ marginTop: 16 }}>

@@ -98,6 +98,34 @@ class SessionController(
         return null
     }
 
+    /**
+     * Standalone scan: starts engine in scan-only mode without VPN or foreground service.
+     */
+    fun scan(
+        protocol: String,
+        ipVersion: String,
+        concurrency: Int,
+        timeoutMs: Int,
+        noize: String,
+    ): String? {
+        if (runner.isRunning()) {
+            runner.stop()
+            Thread.sleep(300)
+        }
+        setRuntime("connecting", "Standalone scan", null, null)
+        val err = runner.startScan(protocol, ipVersion, concurrency, timeoutMs, noize)
+        if (err != null) {
+            setRuntime("error", err, null, null)
+            return err
+        }
+        setRuntime("connecting", "Scanning IP pool", runner.pid(), null)
+        return null
+    }
+
+    fun stopScan() {
+        runner.stop()
+    }
+
     fun disconnect() {
         if (!tearingDown.compareAndSet(false, true)) return
         runner.stop()
