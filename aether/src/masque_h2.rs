@@ -189,8 +189,11 @@ async fn connect_tls(
     sni: &str,
     tcp: TcpStream,
 ) -> Result<tokio_boring::SslStream<FragFirstWrite>> {
-    let frag_enabled = !crate::runtime_env::var("AETHER_H2_FRAG_CH")
-        .map(|v| v.trim() == "0" || v.eq_ignore_ascii_case("off"))
+    // ClientHello fragmentation is opt-in: it can break strict TLS servers and
+    // middleboxes for marginal DPI benefit, so H2 stays standards-compliant by
+    // default and only fragments when AETHER_H2_FRAG_CH is explicitly enabled.
+    let frag_enabled = crate::runtime_env::var("AETHER_H2_FRAG_CH")
+        .map(|v| v.trim() == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
     let wrapper = FragFirstWrite {
