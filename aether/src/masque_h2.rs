@@ -288,7 +288,9 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
                 let sleep =
                     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
                 std::pin::pin!(sleep);
-                if sleep.poll(cx) != std::task::Poll::Ready(()) {
+                if std::future::Future::poll(sleep.as_mut(), cx)
+                    != std::task::Poll::Ready(())
+                {
                     return std::task::Poll::Pending;
                 }
             }
