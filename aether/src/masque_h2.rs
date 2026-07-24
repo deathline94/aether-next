@@ -8,7 +8,6 @@ use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
 use rand::Rng;
-use std::future::Future;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -288,7 +287,7 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
                 let sleep =
                     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
                 std::pin::pin!(sleep);
-                if std::future::Future::poll(sleep.as_mut(), cx)
+                if std::future::Future::poll(sleep, cx)
                     != std::task::Poll::Ready(())
                 {
                     return std::task::Poll::Pending;
