@@ -227,6 +227,25 @@ pub async fn host_has_ipv6() -> bool {
     }
 }
 
+/// Emit a structured scan hit event so the GUI standalone scanner can list
+/// every working endpoint (not just the final best). Protocol is derived from
+/// the probe label + current MASQUE transport.
+fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration) {
+    let protocol = if label.contains("wg") {
+        "WireGuard"
+    } else if crate::masque_h2::enabled() {
+        "MASQUE H2"
+    } else {
+        "MASQUE H3"
+    };
+    crate::session_event::emit(crate::session_event::SessionEvent::ScanHit {
+        addr: format!("{ip}:{port}"),
+        rtt: format!("{}ms", rtt.as_millis()),
+        rtt_ms: rtt.as_secs_f64() * 1000.0,
+        protocol: protocol.to_string(),
+    });
+}
+
 /// Run the unified endpoint hunt: tier-0 cache → candidate generation → concurrent
 /// probing with hot-subnet drill-down → deadline/quiet-period management.
 pub async fn hunt_best(
@@ -311,6 +330,11 @@ pub async fn hunt_best(
     );
 
     let total_candidates = candidates.len();
+    crate::session_event::emit(crate::session_event::SessionEvent::ScanStart {
+        mode: mode.label().to_string(),
+        total: total_candidates,
+        concurrency: st.concurrency,
+    });
     let stream = futures::stream::iter(
         candidates
             .into_iter()
@@ -353,12 +377,18 @@ pub async fn hunt_best(
                         scanned += 1;
                         if scanned % 50 == 0 || scanned == total_candidates {
                             log::info!("[*] scanning... {}/{} ips, found {} working", scanned, total_candidates, found);
+                            crate::session_event::emit(crate::session_event::SessionEvent::ScanProgress {
+                                scanned,
+                                total: total_candidates,
+                                working: found,
+                            });
                         }
 
                         match res {
                             None => continue,
                             Some(pr) => {
                                 log::info!("[+] {} candidate ok {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
+                                emit_scan_hit(label, pr.ip, pr.port, pr.rtt);
                                 best = Some(match best {
                                     Some(cur) if cur.rtt <= pr.rtt => cur,
                                     _ => pr,
@@ -374,6 +404,7 @@ pub async fn hunt_best(
                                     let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency).await;
                                     for h_pr in hot_hits {
                                         log::info!("[🔥] Hot subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
+                                        emit_scan_hit(label, h_pr.ip, h_pr.port, h_pr.rtt);
                                         best = Some(match best {
                                             Some(cur) if cur.rtt <= h_pr.rtt => cur,
                                             _ => h_pr,

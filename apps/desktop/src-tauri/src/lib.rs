@@ -1112,15 +1112,30 @@ fn scan(
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
                         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match ty {
-                            "endpoint_selected" => {
-                                let addr = v.get("addr").and_then(|a| a.as_str()).unwrap_or("");
-                                let proto = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("masque");
+                            "scan_start" => {
+                                let _ = app_clone.emit("scan://event", serde_json::json!({
+                                    "type": "scan_start",
+                                    "mode": v.get("mode").and_then(|m| m.as_str()).unwrap_or(""),
+                                    "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
+                                    "concurrency": v.get("concurrency").and_then(|c| c.as_u64()).unwrap_or(0),
+                                }));
+                            }
+                            "scan_progress" => {
+                                let _ = app_clone.emit("scan://event", serde_json::json!({
+                                    "type": "scan_progress",
+                                    "scanned": v.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0),
+                                    "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
+                                    "working": v.get("working").and_then(|w| w.as_u64()).unwrap_or(0),
+                                }));
+                            }
+                            "scan_hit" => {
+                                // Engine emits snake_case rtt_ms; frontend expects rttMs.
                                 let _ = app_clone.emit("scan://event", serde_json::json!({
                                     "type": "scan_hit",
-                                    "addr": addr,
-                                    "rtt": "",
-                                    "rttMs": 0,
-                                    "protocol": proto,
+                                    "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
+                                    "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
+                                    "rttMs": v.get("rtt_ms").and_then(|r| r.as_f64()).unwrap_or(0.0),
+                                    "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
                                 }));
                             }
                             "scan_done" => {

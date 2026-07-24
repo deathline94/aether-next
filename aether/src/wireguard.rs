@@ -265,16 +265,18 @@ impl WgTunnel {
                     }
                 } else {
                     drop(tunn);
-                    // #4: If idle > threshold and haven't sent extra keepalive yet,
-                    // force a keepalive ping to prevent NAT mapping expiry.
+                    // #4: If idle > threshold, send a lightweight keepalive to hold the
+                    // NAT mapping open. Use an empty encapsulate (WireGuard keepalive),
+                    // NOT a handshake re-init — re-initiating every idle tick tears down
+                    // and rebuilds the session, which is the source of connection jank.
                     if last_activity.elapsed() > idle_threshold && !extra_keepalive_sent {
                         extra_keepalive_sent = true;
                         let mut tunn = tunn_t.lock().await;
-                        if let TunnResult::WriteToNetwork(pkt) = tunn.format_handshake_initiation(&mut tmp, true) {
+                        if let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], &mut tmp) {
                             let mut pkt_vec = pkt.to_vec();
                             inject_client_id(&mut pkt_vec, &client_id);
                             let _ = sock_t.send(&pkt_vec).await;
-                            log::debug!("[wg] adaptive keepalive: idle {}s, sent extra ping", last_activity.elapsed().as_secs());
+                            log::debug!("[wg] adaptive keepalive: idle {}s, sent empty keepalive", last_activity.elapsed().as_secs());
                         }
                     }
                 }
