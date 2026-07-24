@@ -1064,7 +1064,7 @@ fn scan(
     command
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
         .env("AETHER_PROTOCOL", engine_protocol)
-        .env("AETHER_SCAN", "turbo")
+        .env("AETHER_SCAN", "balanced")
         .env("AETHER_IP", &ip_version)
         .env("AETHER_NOIZE", &settings.noize)
         .env("AETHER_CONFIG", dir.join("aether.toml"))

@@ -388,6 +388,10 @@ async fn select_peer(
 
 async fn resolve_ech() -> Option<Vec<u8>> {
     match std::env::var("AETHER_ECH") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
+            log::info!("[+] ECH explicitly disabled via AETHER_ECH={v}");
+            None
+        }
         Ok(v) if v.eq_ignore_ascii_case("auto") => match dns::fetch_ech_config().await {
             Ok(raw) => {
                 log::info!(
@@ -413,25 +417,18 @@ async fn resolve_ech() -> Option<Vec<u8>> {
         },
         _ => {
             // Default: auto-fetch ECH to hide SNI from passive observers.
-            // Set AETHER_ECH=0 to explicitly disable.
-            match std::env::var("AETHER_ECH") {
-                Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
-                    log::info!("[+] ECH explicitly disabled via AETHER_ECH={v}");
+            match dns::fetch_ech_config().await {
+                Ok(raw) => {
+                    log::info!(
+                        "[+] fetched ECHConfigList automatically ({} bytes) — SNI encrypted",
+                        raw.len()
+                    );
+                    Some(raw)
+                }
+                Err(e) => {
+                    log::debug!("[-] ECH auto-fetch failed ({e}); continuing with cleartext SNI");
                     None
                 }
-                _ => match dns::fetch_ech_config().await {
-                    Ok(raw) => {
-                        log::info!(
-                            "[+] fetched ECHConfigList automatically ({} bytes) — SNI encrypted",
-                            raw.len()
-                        );
-                        Some(raw)
-                    }
-                    Err(e) => {
-                        log::debug!("[-] ECH auto-fetch failed ({e}); continuing with cleartext SNI");
-                        None
-                    }
-                },
             }
         }
     }
