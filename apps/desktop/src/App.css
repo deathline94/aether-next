@@ -125,6 +125,9 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
 }
 .connection-stage.connected { border-color: #315f4a; background: linear-gradient(115deg, #15251f 0%, #141d1a 56%, #111719 100%); }
 .connection-stage.connecting { border-color: #5c5132; }
+.connection-stage.error { border-color: #623c35; background: linear-gradient(115deg, #241a18 0%, #1a1614 56%, #111719 100%); }
+.error .eyebrow { color: var(--coral); }
+.error .signal-field span { border-color: #4a2f29; }
 .signal-field { position: absolute; right: -30px; top: 50%; width: 420px; height: 420px; transform: translateY(-50%); opacity: .44; }
 .signal-field span { position: absolute; inset: 50%; width: 90px; height: 90px; transform: translate(-50%, -50%); border: 1px solid #344248; border-radius: 50%; }
 .signal-field span:nth-child(2) { width: 210px; height: 210px; border-color: #2c3c40; }
@@ -161,6 +164,7 @@ nav button small { margin-left: auto; min-width: 22px; padding: 1px 5px; text-al
 .update-banner span { flex: 1; font-weight: 500; }
 .update-banner button { border: 1px solid #3d8060; background: #255c42; color: #ffffff; padding: 6px 14px; border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
 .update-banner button:hover { background: #2d6e50; border-color: #4da67c; }
+.update-banner .banner-dismiss { border: 0; background: transparent; color: #79f7c0; padding: 4px; display: grid; place-items: center; }
 
 .metrics-grid { margin-top: 16px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .metrics-grid article { min-height: 130px; padding: 17px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
@@ -250,7 +254,9 @@ select:focus, input:focus { border-color: #47705d; }
 .input-row input { width: 130px; max-width: 100%; }
 .path-row { align-items: flex-start; }
 .path-row input { width: min(48%, 400px); min-width: 180px; max-width: 100%; flex: 1 1 220px; }
-.save-bar { position: sticky; bottom: 0; min-height: 62px; padding: 10px 16px; border: 1px solid #303a3f; border-radius: 7px; background: rgba(20, 26, 29, .96); display: flex; align-items: center; justify-content: space-between; backdrop-filter: blur(16px); }.save-bar span { color: #748187; font-size: 10px; }.save-bar button { height: 36px; padding: 0 16px; border: 1px solid #4f8067; border-radius: 5px; background: #21533a; color: #dff9eb; display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; cursor: pointer; }
+.save-bar { position: sticky; bottom: 0; min-height: 62px; padding: 10px 16px; border: 1px solid #303a3f; border-radius: 7px; background: rgba(20, 26, 29, .96); display: flex; align-items: center; justify-content: space-between; backdrop-filter: blur(16px); }.save-bar span { color: #748187; font-size: 10px; }
+.save-indicator { display: flex; align-items: center; gap: 7px; height: 36px; padding: 0 16px; border: 1px solid #303b40; border-radius: 5px; background: #192125; color: #849197; font-size: 11px; font-weight: 600; }
+.setting-error { margin: 0; padding: 10px 20px 14px; color: #ff9b8a; font-size: 11px; }
 
 .lock-banner { margin-bottom: 12px; padding: 10px 14px; border: 1px solid #5c5132; border-radius: 6px; background: #2a2418; color: var(--yellow); font-size: 11px; }
 .segmented.disabled { opacity: .45; pointer-events: none; }
@@ -263,7 +269,7 @@ select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
 .test-row button:disabled { opacity: .45; cursor: not-allowed; }
 .test-result { display: block; margin: 0 18px 16px; padding: 10px 12px; border: 1px solid #303b40; border-radius: 5px; background: #0a0e10; color: #aeb9bd; font-family: "Cascadia Code", monospace; font-size: 10px; overflow-wrap: anywhere; }
 .log-actions { display: flex; gap: 12px; }
-.save-bar button.ghost { border-color: #303b40; background: #192125; color: #849197; }
+.log-actions button:disabled { opacity: .45; cursor: not-allowed; }
 .about-panel { margin-top: 16px; min-height: 78px; padding: 16px 20px; border: 1px solid var(--line); border-radius: 7px; background: linear-gradient(115deg, #152019 0%, #141a1d 100%); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .about-panel p { margin: 0 0 4px; color: #66757b; font-size: 9px; font-weight: 700; }
 .about-panel h3 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -395,6 +401,18 @@ select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
 @keyframes pulse { 50% { opacity: .4; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+@media (prefers-reduced-motion: reduce) {
+  .status-dot, .spin, .spin-icon { animation: none !important; }
+  .scan-progress-bar-fill, .power-button, .profile-card { transition: none; }
+}
+
+/* Crash screen rendered by the ErrorBoundary — last resort, keep it legible. */
+.crash-screen { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 12px; padding: 40px; text-align: center; }
+.crash-screen h1 { margin: 0; font-size: 20px; }
+.crash-screen p { margin: 0; color: var(--muted); font-size: 13px; }
+.crash-screen code { max-width: 560px; padding: 10px 12px; border: 1px solid #623c35; border-radius: 6px; background: #2c1c19; color: #ff9b8a; font-size: 11px; overflow-wrap: anywhere; }
+.crash-screen button { height: 36px; padding: 0 18px; border: 1px solid #4f8067; border-radius: 5px; background: #21533a; color: #dff9eb; font-size: 12px; font-weight: 600; cursor: pointer; }
+
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 76px minmax(0, 1fr); }
   .sidebar { padding-inline: 11px; }.brand { padding-inline: 7px; justify-content: center; }.brand > div:last-child, nav button span, nav button small, .sidebar-bottom .mini-status div, .version { display: none; }.mini-status { justify-content: center; }.mini-status .status-dot { margin: 0; }.sidebar nav button { justify-content: center; padding: 0; }
@@ -416,7 +434,8 @@ select:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
     flex-direction: row;
   }
   .brand, .sidebar-bottom { display: none; }
-  .sidebar nav { width: 100%; grid-template-columns: repeat(3, 1fr); }
+  /* four nav items — must match navigation length or the bar wraps */
+  .sidebar nav { width: 100%; grid-template-columns: repeat(4, 1fr); }
   .sidebar nav button { height: 43px; flex-direction: column; gap: 2px; }
   .sidebar nav button span { display: block; font-size: 9px; }
   .workspace { height: auto; min-height: calc(100vh - 58px); }

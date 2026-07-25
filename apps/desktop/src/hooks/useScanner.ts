@@ -14,10 +14,11 @@ export function useScanner(
   const [timeoutMs, setTimeoutMs] = useState(3000);
   const [noize, setNoize] = useState("off");
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
-  const [active, setActive] = useState(false);
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
   const [busy, setBusy] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // Single source of truth — buttons and progress UI must never disagree.
+  const active = scanState.active;
 
   // Listen for structured scan events from the Tauri backend
   useEffect(() => {
@@ -61,12 +62,10 @@ export function useScanner(
           break;
         case "scan_done":
           setScanState((prev) => ({ ...prev, active: false, phase: "Verified" }));
-          setActive(false);
           appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
           break;
         case "scan_failed":
           setScanState((prev) => ({ ...prev, active: false, phase: "Failed" }));
-          setActive(false);
           appendLog({ level: "error", message: `Scan failed: ${ev.message}` });
           break;
       }
@@ -80,7 +79,6 @@ export function useScanner(
   const startScan = useCallback(async () => {
     if (busy || active) return;
     setBusy(true);
-    setActive(true);
     setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
@@ -95,7 +93,6 @@ export function useScanner(
       await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${String(error)}` });
-      setActive(false);
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
     } finally {
       setBusy(false);
@@ -103,12 +100,16 @@ export function useScanner(
   }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog]);
 
   const stopScan = useCallback(async () => {
-    setActive(false);
+    // Ask the engine first — only report "Stopped" once it actually is.
     try {
       await invoke("stop_scan");
-    } catch { /* already stopped */ }
-    setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
-    appendLog({ level: "info", message: "Scan stopped." });
+      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+      appendLog({ level: "info", message: "Scan stopped." });
+    } catch (error) {
+      // Engine may have already finished; don't leave the UI stuck either way.
+      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+      appendLog({ level: "warn", message: `Stop scan: ${String(error)}` });
+    }
   }, [appendLog]);
 
   return {

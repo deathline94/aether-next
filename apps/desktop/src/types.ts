@@ -62,8 +62,13 @@ export type LogEntry = {
   id: number;
   level: "info" | "warn" | "error";
   message: string;
-  time: string;
+  /** Epoch milliseconds — formatted at render time so exports keep the date. */
+  ts: number;
 };
+
+export function formatLogTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
 
 export const defaults: Settings = {
   protocol: "masque",

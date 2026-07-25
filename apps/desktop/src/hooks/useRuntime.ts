@@ -1,27 +1,42 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime } from "../types";
 import type { RuntimeState, Settings } from "../types";
 
+const FALLBACK_VERSION = "0.0.0";
+const SAVE_DEBOUNCE_MS = 400;
+
 export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void) {
   const [settings, setSettings] = useState<Settings>(defaults);
+  // Settings must not be editable until hydrated from disk — otherwise a
+  // patch during that window persists `defaults` over the user's config.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
+  const [testBusy, setTestBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.29");
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSaveRef = useRef<Settings | null>(null);
+  // Mirrors the last settings object seen by the persist effect so hydration
+  // does not trigger a redundant write-back to disk.
+  const settingsRef = useRef(settings);
 
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
-  const settingsLocked = running;
+  const settingsLocked = running || !settingsLoaded;
 
   // Initialize: load settings, state, admin status, version + listen for events
   useEffect(() => {
     let disposed = false;
-    let receivedRuntimeEvent = { current: false };
+    const receivedRuntimeEvent = { current: false };
     const cleanup: Array<() => void> = [];
 
     async function initialize() {
@@ -39,33 +54,46 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
         );
         if (disposed) { unlistenLog(); return; }
         cleanup.push(unlistenLog);
-
-        const [loadedSettings, state, isAdmin, info] = await Promise.all([
-          invoke<Settings>("get_settings"),
-          invoke<RuntimeState>("get_state"),
-          invoke<boolean>("is_admin").catch(() => false),
-          invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.29" })),
-        ]);
-        if (disposed) return;
-        setSettings(loadedSettings);
-        if (!receivedRuntimeEvent.current) setRuntime(state);
-        setAdmin(isAdmin);
-        if (info?.version) setAppVersion(String(info.version));
       } catch (error) {
         appendLog({ level: "warn", message: String(error) });
       }
+
+      // Each fetch fails independently — one backend hiccup must not leave
+      // settings stuck on defaults or admin/version unknown.
+      const [loadedSettings, state, isAdmin, info] = await Promise.all([
+        invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${String(e)}` }); return null; }),
+        invoke<RuntimeState>("get_state").catch(() => null),
+        invoke<boolean>("is_admin").catch(() => false),
+        invoke<{ version?: string }>("app_info").catch(() => null),
+      ]);
+      if (disposed) return;
+      if (loadedSettings) {
+        settingsRef.current = loadedSettings;
+        setSettings(loadedSettings);
+        setSettingsLoaded(true);
+      }
+      if (state && !receivedRuntimeEvent.current) setRuntime(state);
+      setAdmin(isAdmin);
+      setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
     }
     void initialize();
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
   }, [appendLog]);
 
-  // Check for updates (semver-aware)
+  // Cleanup timers on unmount
+  useEffect(() => () => {
+    if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+  }, []);
+
+  // Check for updates once the real version is known (semver-aware).
   useEffect(() => {
+    if (!appVersion || appVersion === FALLBACK_VERSION) return;
     fetch("https://api.github.com/repos/deathline94/aether-next/releases/latest")
       .then((res) => res.json())
       .then((data) => {
         if (data?.tag_name) {
-          const latest = data.tag_name.replace(/^v/, "");
+          const latest = String(data.tag_name).replace(/^v/, "");
           if (semverGt(latest, appVersion)) {
             setUpdateAvailable({
               version: data.tag_name,
@@ -77,24 +105,37 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
       .catch(() => {});
   }, [appVersion]);
 
-  const persistSettings = useCallback(async (next: Settings) => {
-    try {
-      await invoke("save_settings", { settings: next });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1200);
-    } catch (error) {
-      appendLog({ level: "error", message: String(error) });
-    }
+  const persistSettings = useCallback((next: Settings) => {
+    // Debounced: NumberField commits and toggles can arrive in bursts;
+    // don't hit the disk per event.
+    pendingSaveRef.current = next;
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(async () => {
+      const toSave = pendingSaveRef.current;
+      if (!toSave) return;
+      try {
+        await invoke("save_settings", { settings: toSave });
+        setSaved(true);
+        if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+        savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
+      } catch (error) {
+        appendLog({ level: "error", message: String(error) });
+      }
+    }, SAVE_DEBOUNCE_MS);
   }, [appendLog]);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     if (settingsLocked) return;
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      void persistSettings(next);
-      return next;
-    });
-  }, [settingsLocked, persistSettings]);
+    setSettings((prev) => ({ ...prev, ...patch }));
+  }, [settingsLocked]);
+
+  // Persist as an effect of settings changing — keeps the state updater pure.
+  useEffect(() => {
+    const prev = settingsRef.current;
+    settingsRef.current = settings;
+    if (!settingsLoaded || prev === settings) return;
+    persistSettings(settings);
+  }, [settings, settingsLoaded, persistSettings]);
 
   const toggleConnection = useCallback(async () => {
     setBusy(true);
@@ -123,6 +164,9 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
         await new Promise((r) => setTimeout(r, 400));
       }
       const nextSettings: Settings = { ...settings, protocol: protocol as Settings["protocol"], transport: transport as Settings["transport"], peer };
+      // Keep UI state in sync with what the engine actually runs — otherwise
+      // the Connection tab reports the previous protocol.
+      setSettings(nextSettings);
       setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
@@ -133,7 +177,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
   }, [running, settings, appendLog]);
 
   const runTest = useCallback(async () => {
-    setBusy(true);
+    setTestBusy(true);
     setTestResult(null);
     try {
       const result = await invoke<string>("test_connection", { settings });
@@ -144,7 +188,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
       setTestResult(msg);
       appendLog({ level: "error", message: msg });
     } finally {
-      setBusy(false);
+      setTestBusy(false);
     }
   }, [settings, appendLog]);
 
@@ -153,18 +197,22 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     setRuntime(initialRuntime);
   }, []);
 
+  const dismissUpdate = useCallback(() => setUpdateDismissed(true), []);
+
   return {
-    settings, setSettings, runtime, setRuntime, busy, setBusy,
-    saved, admin, testResult, appVersion, updateAvailable,
-    connected, running, settingsLocked,
-    patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
+    settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
+    saved, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
+    connected, running, settingsLocked, settingsLoaded,
+    patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };
 }
 
-/** Semver-aware greater-than comparison. */
+/** Semver-aware greater-than comparison; tolerates pre-release suffixes. */
 function semverGt(a: string, b: string): boolean {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
+  const parse = (v: string) =>
+    v.split("-")[0].split(".").map((p) => Number.parseInt(p, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
   for (let i = 0; i < 3; i++) {
     const na = pa[i] || 0;
     const nb = pb[i] || 0;

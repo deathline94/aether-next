@@ -10,19 +10,14 @@ import { useRuntime } from "./hooks/useRuntime";
 import { useScanner } from "./hooks/useScanner";
 import type { DiscoveredEndpoint, View } from "./types";
 
-const navigation = [
-  { id: "home" as const, label: "Connection", icon: Radio },
-  { id: "scanner" as const, label: "Scanner", icon: Search },
-  { id: "settings" as const, label: "Settings", icon: SlidersHorizontal },
-  { id: "logs" as const, label: "Activity", icon: ScrollText },
+// Single definition per view — label + heading copy live together so they
+// can't drift apart.
+const navigation: { id: View; label: string; eyebrow: string; icon: typeof Radio }[] = [
+  { id: "home", label: "Connection", eyebrow: "SECURE ROUTING", icon: Radio },
+  { id: "scanner", label: "Scanner", eyebrow: "ENDPOINT DISCOVERY", icon: Search },
+  { id: "settings", label: "Settings", eyebrow: "CONFIGURATION", icon: SlidersHorizontal },
+  { id: "logs", label: "Activity", eyebrow: "LIVE ENGINE OUTPUT", icon: ScrollText },
 ];
-
-const viewTitles: Record<View, { eyebrow: string; title: string }> = {
-  home: { eyebrow: "SECURE ROUTING", title: "Connection" },
-  scanner: { eyebrow: "ENDPOINT DISCOVERY", title: "Scanner" },
-  settings: { eyebrow: "CONFIGURATION", title: "Settings" },
-  logs: { eyebrow: "LIVE ENGINE OUTPUT", title: "Activity" },
-};
 
 function App() {
   const [view, setView] = useState<View>("home");
@@ -33,26 +28,39 @@ function App() {
   } = useLogs();
 
   const {
-    settings, runtime, busy, saved, admin, testResult, appVersion, updateAvailable,
-    connected, running, settingsLocked,
-    patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
+    settings, runtime, busy, testBusy, saved, admin, testResult, appVersion, updateAvailable,
+    connected, running, settingsLocked, settingsLoaded,
+    patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   } = useRuntime(appendLog);
 
   const scanner = useScanner(appendLog, running);
 
   const connectDirect = useCallback((item: DiscoveredEndpoint) => {
-    const proto = item.protocol.toLowerCase().includes("wireguard") ? "wireguard" : "masque";
-    const trans = item.protocol.includes("H3") ? "h3" : "h2";
+    // Case-insensitive: the engine reports strings like "MASQUE H3" or
+    // "masque-h3" depending on the code path.
+    const protoLower = item.protocol.toLowerCase();
+    const proto = protoLower.includes("wireguard") ? "wireguard" : "masque";
+    const trans = protoLower.includes("h3") ? "h3" : "h2";
     appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
     void connectToPeer(item.addr, proto, trans);
   }, [connectToPeer, appendLog]);
 
-  const exportLogs = useCallback(() => {
-    const text = logs.map((l) => `${l.time}\t${l.level}\t${l.message}`).join("\n");
-    void navigator.clipboard.writeText(text || "(no logs)");
-  }, [logs]);
+  const exportLogs = useCallback(async (): Promise<boolean> => {
+    if (logs.length === 0) return false;
+    const text = logs
+      .map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`)
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      appendLog({ level: "warn", message: "Clipboard copy failed — is the window focused?" });
+      return false;
+    }
+  }, [logs, appendLog]);
 
-  const { eyebrow, title } = viewTitles[view];
+  const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
+  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Unprotected";
 
   return (
     <main className="app-shell">
@@ -62,22 +70,31 @@ function App() {
           <div><strong>Aether Next</strong><span>by deathline94</span></div>
         </div>
 
-        <nav>
+        <nav aria-label="Main">
           {navigation.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={view === id ? "active" : ""} onClick={() => setView(id)}>
-              <Icon size={18} />
+            <button
+              key={id}
+              className={view === id ? "active" : ""}
+              aria-current={view === id ? "page" : undefined}
+              onClick={() => setView(id)}
+            >
+              <Icon size={18} aria-hidden="true" />
               <span>{label}</span>
-              {id === "logs" && logs.length > 0 && <small>{Math.min(logs.length, 99)}</small>}
+              {id === "logs" && logs.length > 0 && (
+                <small aria-label={`${logs.length} log entries`}>
+                  {logs.length > 99 ? "99+" : logs.length}
+                </small>
+              )}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-bottom">
-          <div className={`mini-status ${runtime.status}`}>
-            <span className="status-dot" />
+          <div className={`mini-status ${runtime.status}`} role="status" aria-live="polite">
+            <span className="status-dot" aria-hidden="true" />
             <div>
-              <strong>{connected ? "Protected" : running ? "Connecting" : "Unprotected"}</strong>
-              <span>{runtime.detail}</span>
+              <strong>{statusText}</strong>
+              <span title={runtime.detail}>{runtime.detail}</span>
             </div>
           </div>
           <div className="version">AETHER NEXT <span>v{appVersion}</span></div>
@@ -86,19 +103,20 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><p>{eyebrow}</p><h1>{title}</h1></div>
-          <div className={`header-status ${runtime.status}`}>
-            <span className="status-dot" />
+          <div><p>{activeNav.eyebrow}</p><h1>{activeNav.label}</h1></div>
+          <div className={`header-status ${runtime.status}`} title={runtime.detail}>
+            <span className="status-dot" aria-hidden="true" />
             {runtime.status}
           </div>
         </header>
 
         {view === "home" && (
           <ConnectionTab
-            settings={settings} runtime={runtime} busy={busy}
+            settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
             connected={connected} running={running} settingsLocked={settingsLocked}
+            settingsLoaded={settingsLoaded}
             admin={admin} testResult={testResult} appVersion={appVersion}
-            updateAvailable={updateAvailable}
+            updateAvailable={updateAvailable} dismissUpdate={dismissUpdate}
             toggleConnection={toggleConnection} patchSettings={patchSettings}
             runTest={runTest} dismissError={dismissError} appendLog={appendLog}
           />
@@ -121,6 +139,7 @@ function App() {
         {view === "settings" && (
           <SettingsTab
             settings={settings} settingsLocked={settingsLocked}
+            settingsLoaded={settingsLoaded}
             saved={saved} patchSettings={patchSettings}
           />
         )}

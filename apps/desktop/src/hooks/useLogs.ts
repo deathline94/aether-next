@@ -1,55 +1,56 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { LogEntry, LogFilter } from "../types";
 
-function now() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
+const MAX_LOGS = 1000;
+/** Cap rendered entries for performance. */
+export const RENDER_CAP = 200;
 
-let nextId = 0;
+// Single source of truth for filter predicates — the tab counts and the
+// visible list must always agree.
+const isHit = (l: LogEntry) =>
+  l.message.includes("candidate ok") ||
+  l.message.includes("Tier-0") ||
+  l.message.includes("gateway") ||
+  l.message.includes("EndpointSelected") ||
+  l.message.includes("scan_hit");
+const isError = (l: LogEntry) => l.level === "error" || l.level === "warn";
+// milestones: exclude noisy progress lines
+const isMilestone = (l: LogEntry) =>
+  !l.message.includes("scanning...") && !l.message.includes("probe src");
+
+const predicates: Record<LogFilter, (l: LogEntry) => boolean> = {
+  milestones: isMilestone,
+  hits: isHit,
+  errors: isError,
+  raw: () => true,
+};
 
 export function useLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logFilter, setLogFilter] = useState<LogFilter>("milestones");
   const logEndRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  const nextIdRef = useRef(0);
 
-  const appendLog = useCallback((entry: Omit<LogEntry, "time" | "id">) => {
-    setLogs((current) => [...current.slice(-999), { ...entry, id: nextId++, time: now() }]);
+  const appendLog = useCallback((entry: Omit<LogEntry, "ts" | "id">) => {
+    // Build the entry outside the updater — updaters must stay pure
+    // (StrictMode double-invokes them).
+    const full: LogEntry = { ...entry, id: nextIdRef.current++, ts: Date.now() };
+    setLogs((current) => [...current.slice(-(MAX_LOGS - 1)), full]);
   }, []);
 
-  const filteredLogs = useMemo(() => {
-    if (logFilter === "raw") return logs;
-    if (logFilter === "hits") {
-      return logs.filter(
-        (l) =>
-          l.message.includes("candidate ok") ||
-          l.message.includes("Tier-0") ||
-          l.message.includes("gateway") ||
-          l.message.includes("EndpointSelected") ||
-          l.message.includes("scan_hit"),
-      );
-    }
-    if (logFilter === "errors") {
-      return logs.filter((l) => l.level === "error" || l.level === "warn");
-    }
-    // milestones: exclude noisy progress lines
-    return logs.filter(
-      (l) => !l.message.includes("scanning...") && !l.message.includes("probe src"),
-    );
-  }, [logs, logFilter]);
+  const filteredLogs = useMemo(() => logs.filter(predicates[logFilter]), [logs, logFilter]);
 
   const filterCounts = useMemo(
     () => ({
-      milestones: logs.filter((l) => !l.message.includes("scanning...") && !l.message.includes("probe src")).length,
-      hits: logs.filter((l) => l.message.includes("candidate ok") || l.message.includes("Tier-0") || l.message.includes("scan_hit")).length,
-      errors: logs.filter((l) => l.level === "error" || l.level === "warn").length,
+      milestones: logs.filter(isMilestone).length,
+      hits: logs.filter(isHit).length,
+      errors: logs.filter(isError).length,
       raw: logs.length,
     }),
     [logs],
   );
 
-  // Cap rendered entries for performance
-  const RENDER_CAP = 200;
   const visibleLogs = useMemo(() => {
     if (filteredLogs.length <= RENDER_CAP) return filteredLogs;
     return filteredLogs.slice(filteredLogs.length - RENDER_CAP);

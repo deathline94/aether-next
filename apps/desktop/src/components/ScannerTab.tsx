@@ -1,6 +1,6 @@
 import { Search, X, Zap, Radio } from "lucide-react";
 import type { DiscoveredEndpoint, ScanState } from "../types";
-import { Segmented } from "./ui";
+import { NumberField, Segmented } from "./ui";
 
 interface ScannerTabProps {
   protocol: "masque-h3" | "masque-h2" | "wireguard";
@@ -41,7 +41,7 @@ export function ScannerTab({
             <p>STANDALONE ENGINE PROBER</p>
             <h3>Custom IP Scanner</h3>
           </div>
-          <Search size={20} />
+          <Search size={20} aria-hidden="true" />
         </div>
 
         <div className="setting-row">
@@ -50,6 +50,7 @@ export function ScannerTab({
             <span>Service engine to probe Cloudflare edge IPs for</span>
           </div>
           <Segmented
+            label="Target protocol"
             value={protocol}
             options={[
               { value: "masque-h3", label: "MASQUE H3" },
@@ -67,6 +68,7 @@ export function ScannerTab({
             <span>Address family pool to enumerate &amp; sample</span>
           </div>
           <Segmented
+            label="IP family"
             value={ipScan}
             options={[
               { value: "v4", label: "IPv4 Only" },
@@ -81,24 +83,24 @@ export function ScannerTab({
         <div className="setting-row input-row">
           <label>
             <span>Concurrency (Probes)</span>
-            <input
-              type="number"
+            <NumberField
+              label="Scan concurrency"
               min={1}
               max={2000}
               value={concurrency}
               disabled={active}
-              onChange={(e) => setConcurrency(Math.max(1, parseInt(e.target.value, 10) || 1))}
+              onCommit={setConcurrency}
             />
           </label>
           <label>
             <span>Per-Probe Timeout (ms)</span>
-            <input
-              type="number"
+            <NumberField
+              label="Per-probe timeout in milliseconds"
               min={100}
               max={30000}
               value={timeoutMs}
               disabled={active}
-              onChange={(e) => setTimeoutMs(Math.max(100, parseInt(e.target.value, 10) || 100))}
+              onCommit={setTimeoutMs}
             />
           </label>
         </div>
@@ -109,6 +111,7 @@ export function ScannerTab({
             <span>{protocol === "masque-h2" ? "Not applicable for H2 (TCP)" : "Noise profile applied to probe handshakes"}</span>
           </div>
           <select
+            aria-label="Obfuscation noise profile for probes"
             value={protocol === "masque-h2" ? "off" : noize}
             disabled={active || protocol === "masque-h2"}
             onChange={(e) => setNoize(e.target.value)}
@@ -124,7 +127,14 @@ export function ScannerTab({
         {/* Scan progress bar */}
         {scanState.active && (
           <div className="scan-inline-progress">
-            <div className="scan-progress-bar-bg">
+            <div
+              className="scan-progress-bar-bg"
+              role="progressbar"
+              aria-label="Scan progress"
+              aria-valuemin={0}
+              aria-valuemax={scanState.total}
+              aria-valuenow={scanState.scanned}
+            >
               <div
                 className="scan-progress-bar-fill"
                 style={{
@@ -150,7 +160,7 @@ export function ScannerTab({
               onClick={startScan}
               disabled={busy}
             >
-              <Zap size={18} />
+              <Zap size={18} aria-hidden="true" />
               <span>{busy ? "Starting…" : "Start Standalone Scan"}</span>
             </button>
           ) : (
@@ -159,7 +169,7 @@ export function ScannerTab({
               className="primary-cta disconnect"
               onClick={stopScan}
             >
-              <X size={18} />
+              <X size={18} aria-hidden="true" />
               <span>Stop Scan</span>
             </button>
           )}
@@ -172,12 +182,12 @@ export function ScannerTab({
             <p>DISCOVERED ENDPOINTS</p>
             <h3>Healthy Gateways ({endpoints.length})</h3>
           </div>
-          <Radio size={20} />
+          <Radio size={20} aria-hidden="true" />
         </div>
 
         {endpoints.length === 0 ? (
           <div className="empty-logs">
-            <Search size={26} />
+            <Search size={26} aria-hidden="true" />
             <strong>No endpoints discovered yet</strong>
             <span>Click "Start Standalone Scan" to probe healthy edge IPs.</span>
           </div>
@@ -191,12 +201,13 @@ export function ScannerTab({
                 </div>
                 <div className="discovered-actions">
                   <span className={`rtt-badge ${item.rttMs <= 50 ? "fast" : item.rttMs <= 120 ? "mid" : "slow"}`}>
-                    ⚡ {item.rtt}
+                    {item.rtt}
                   </span>
                   <button
                     type="button"
                     className="connect-direct-btn"
-                    disabled={connectBusy}
+                    disabled={connectBusy || active}
+                    title={active ? "Stop the scan before connecting" : undefined}
                     onClick={() => connectDirect(item)}
                   >
                     Connect Direct

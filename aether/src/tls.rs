@@ -117,27 +117,33 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    if dangerous {
+
+    // SPKI certificate pinning (mirrors masque_h2): Cloudflare edges serve
+    // self-signed / mixed CA certs per SNI, so instead of trusting the system
+    // CA store the leaf cert's SPKI hash is checked against the pinned MASQUE
+    // edge set. This prevents MITM by any attacker able to mint a
+    // "cloudflare"-looking certificate. Override only for explicit debugging.
+    let pins_disabled = std::env::var("AETHER_MASQUE_DISABLE_SPKI_PINS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    if dangerous || pins_disabled {
         builder.set_verify(SslVerifyMode::NONE);
         static DANGER_WARN: std::sync::Once = std::sync::Once::new();
         DANGER_WARN.call_once(|| {
-            log::warn!("[tls] DANGER: server authentication explicitly disabled");
+            log::warn!("[tls] H3 SPKI pinning disabled (AETHER_DANGEROUS_DISABLE_TLS_VERIFY or AETHER_MASQUE_DISABLE_SPKI_PINS set)");
         });
     } else {
-        if let Ok(path) = std::env::var("AETHER_TLS_CA_FILE") {
-            builder.set_ca_file(path.trim())
-                .map_err(|e| AetherError::Tls(format!("load TLS CA file: {e}")))?;
-        } else {
-            builder.set_default_verify_paths()
-                .map_err(|e| AetherError::Tls(format!("load system TLS roots: {e}")))?;
-        }
-        builder.set_verify(SslVerifyMode::PEER);
+        install_pin_verification(&mut builder, consts::MASQUE_PINS);
     }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(AetherError::Quic)?;
 
-    config.verify_peer(!dangerous);
+    // Do NOT call config.verify_peer() here: quiche's verify_peer() resets the
+    // SSL_CTX verify callback (SSL_CTX_set_verify(..., None)), which would wipe
+    // the SPKI pin callback installed on the builder above. The builder already
+    // carries the correct verify mode for both the pinned and opt-out paths.
 
     config
         .set_application_protos(&[consts::ALPN_H3, b"h3-29"])
