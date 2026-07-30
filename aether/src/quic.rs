@@ -18,6 +18,112 @@ use crate::{consts, error::AetherError, error::Result};
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const NET_QUEUE: usize = 2048;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static QLOG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the SNI for the H3 (QUIC) MASQUE path.
+/// Precedence: `AETHER_MASQUE_H3_SNI` > `AETHER_MASQUE_SNI` > consumer-masque default.
+pub fn resolve_h3_sni() -> String {
+    resolve_h3_sni_from(
+        crate::runtime_env::var("AETHER_MASQUE_H3_SNI"),
+        crate::runtime_env::var("AETHER_MASQUE_SNI"),
+    )
+}
+
+fn resolve_h3_sni_from(h3_override: Option<String>, generic: Option<String>) -> String {
+    let pick = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    pick(h3_override)
+        .or_else(|| pick(generic))
+        .unwrap_or_else(|| consts::CONNECT_SNI.to_string())
+}
+
+/// Resolve the H3 CONNECT-IP `:authority` (override: `AETHER_MASQUE_H3_AUTHORITY`).
+pub fn resolve_h3_authority() -> String {
+    crate::runtime_env::var("AETHER_MASQUE_H3_AUTHORITY")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_authority().to_string())
+}
+
+/// Resolve the H3 CONNECT-IP `:path` (override: `AETHER_MASQUE_H3_PATH`).
+pub fn resolve_h3_path() -> String {
+    crate::runtime_env::var("AETHER_MASQUE_H3_PATH")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_path().to_string())
+}
+
+/// Send one IP packet over the H3 data plane, choosing QUIC DATAGRAM or a
+/// DATAGRAM capsule on the request stream per `use_capsule` (RFC 9297 fallback).
+fn send_ip_h3(
+    conn: &mut quiche::Connection,
+    h3c: &mut h3::Connection,
+    sid: u64,
+    ip_packet: &[u8],
+    use_capsule: bool,
+) {
+    if use_capsule {
+        let cap = masque::encode_datagram_capsule(ip_packet);
+        if let Err(e) = h3c.send_body(conn, sid, &cap, false) {
+            log::debug!("capsule dgram send: {e}");
+        }
+    } else {
+        match masque::encode_ip_datagram(sid, ip_packet) {
+            Ok(framed) => {
+                if let Err(e) = conn.dgram_send(&framed) {
+                    log::debug!("dgram_send: {e}");
+                }
+            }
+            Err(e) => log::debug!("encap: {e}"),
+        }
+    }
+}
+
+/// Emit a labeled H3 milestone to logs + as a structured `AETHER_EVENT` so the
+/// exact failing stage is unambiguous. `detail` must not contain double quotes.
+fn h3_stage(stage: &str, detail: &str) {
+    log::info!("[h3][stage] {stage} \u{2014} {detail}");
+    log::info!("AETHER_EVENT {{\"type\":\"h3_stage\",\"stage\":\"{stage}\",\"detail\":\"{detail}\"}}");
+}
+
+/// True when H3 per-stage tracing is requested (`AETHER_H3_TRACE`). The probe
+/// harness enables it; normal scans stay quiet to avoid per-probe log spam.
+fn h3_trace_on() -> bool {
+    crate::runtime_env::flag("AETHER_H3_TRACE")
+}
+
+/// Attach qlog (when `AETHER_QLOG_DIR` is set) and TLS keylog (`SSLKEYLOGFILE`) to
+/// a fresh connection for offline decryption/analysis. Must be called right
+/// after `quiche::connect`, before the first flush, or early events are lost.
+fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
+    if let Some(dir) = crate::runtime_env::var("AETHER_QLOG_DIR") {
+        let dir = dir.trim().to_string();
+        if !dir.is_empty() {
+            let _ = std::fs::create_dir_all(&dir);
+            let seq = QLOG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let file =
+                std::path::Path::new(&dir).join(format!("{tag}-{}-{seq}.qlog", std::process::id()));
+            match std::fs::File::create(&file) {
+                Ok(f) => {
+                    conn.set_qlog(Box::new(f), "aether-h3".to_string(), format!("qlog {tag}"));
+                    log::info!("[h3] qlog -> {}", file.display());
+                }
+                Err(e) => log::debug!("[h3] qlog create failed: {e}"),
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("SSLKEYLOGFILE") {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                conn.set_keylog(Box::new(f));
+                log::info!("[h3] keylog -> {path}");
+            }
+        }
+    }
+}
+
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     use socket2::{Socket, Domain, Type};
     let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
@@ -30,12 +136,6 @@ async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
-}
-
-#[derive(Debug, Clone)]
-pub enum Control {
-    Migrate,
-    Close,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +152,10 @@ pub struct TunnelConfig {
     pub path: String,
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+    /// Tunnel identity IPv4, used as the data-plane probe source. Threaded here
+    /// instead of via a process-global AETHER_PROBE_SRC that a concurrent scan
+    /// could clobber.
+    pub local_ipv4: std::net::Ipv4Addr,
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
 }
@@ -59,24 +163,20 @@ pub struct TunnelConfig {
 pub struct Channels {
     pub outbound_tx: mpsc::Sender<Vec<u8>>,
     pub inbound_rx: mpsc::Receiver<Vec<u8>>,
-    pub ctrl_tx: mpsc::Sender<Control>,
 }
 
 pub fn channels() -> (Channels, Internals) {
     let (outbound_tx, outbound_rx) = crate::tunnel::packet_channels();
     let (inbound_tx, inbound_rx) = crate::tunnel::packet_channels();
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
 
     (
         Channels {
             outbound_tx,
             inbound_rx,
-            ctrl_tx,
         },
         Internals {
             outbound_rx,
             inbound_tx,
-            ctrl_rx,
         },
     )
 }
@@ -84,7 +184,6 @@ pub fn channels() -> (Channels, Internals) {
 pub struct Internals {
     outbound_rx: mpsc::Receiver<Vec<u8>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
-    ctrl_rx: mpsc::Receiver<Control>,
 }
 
 impl Internals {
@@ -93,9 +192,8 @@ impl Internals {
     ) -> (
         mpsc::Receiver<Vec<u8>>,
         mpsc::Sender<Vec<u8>>,
-        mpsc::Receiver<Control>,
     ) {
-        (self.outbound_rx, self.inbound_tx, self.ctrl_rx)
+        (self.outbound_rx, self.inbound_tx)
     }
 }
 
@@ -174,10 +272,12 @@ pub async fn run(
     let mut last_probe = Instant::now()
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
-    // Prefer assigned edge address when known; else identity-style fallback.
+    // Data-plane probe source = the tunnel's own identity IPv4, threaded via the
+    // config rather than read from a process-global. AETHER_PROBE_SRC remains a
+    // diagnostic-only override.
     let mut probe_src = crate::runtime_env::var("AETHER_PROBE_SRC")
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
+        .unwrap_or(cfg.local_ipv4);
 
     let init_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
     let local = init_sock.local_addr()?;
@@ -209,6 +309,7 @@ pub async fn run(
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
     let mut conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
+    maybe_enable_diagnostics(&mut conn, "tunnel");
 
     if let Some(ref ech) = current_ech {
         tls::inject_ech(&mut conn, ech)?;
@@ -222,6 +323,14 @@ pub async fn run(
     let mut capsules = CapsuleParser::new();
     let mut established_ever = false;
     let mut ech_retried = false;
+    let mut udp_seen = false;
+    let mut h3_settings_logged = false;
+    let mut dgram_by_peer = false;
+    let mut addr_assigned = false;
+    let mut ready_since: Option<Instant> = None;
+    let h3_dgram_mode = crate::masque::H3DgramMode::from_env();
+    let inbound_tx = internals.inbound_tx.clone();
+    log::info!("[h3] data-plane mode: {}", h3_dgram_mode.label());
 
     // Send obfuscation noise before the QUIC Initial. Cloudflare's edge drops
     // non-QUIC datagrams silently, but DPI boxes see the junk and lose flow
@@ -251,6 +360,10 @@ pub async fn run(
             }
 
             Some((to_local, from, mut data)) = net_rx.recv() => {
+                if !udp_seen {
+                    udp_seen = true;
+                    h3_stage("udp_first_reply", &format!("from {from} bytes {}", data.len()));
+                }
                 let mut hdr_buf = data.clone();
                 if let Ok(hdr) = quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
                     log::debug!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
@@ -261,42 +374,15 @@ pub async fn run(
                 }
             }
 
-            ctrl = internals.ctrl_rx.recv() => {
-                match ctrl {
-                    Some(Control::Migrate) => {
-                        if let Err(e) = do_migrate(&mut conn, peer, &mut sockets, &net_tx, &mut readers).await {
-                            log::warn!("migration failed: {e}");
-                        }
-                    }
-                    Some(Control::Close) | None => {
-                        let _ = conn.close(true, 0x00, b"bye");
-                    }
-                }
-            }
-
             pkt = internals.outbound_rx.recv() => {
                 match pkt {
                     Some(ip_packet) => {
-                        if let Some(sid) = req_stream {
-                            match masque::encode_ip_datagram(sid, &ip_packet) {
-                                Ok(framed) => {
-                                    if let Err(e) = conn.dgram_send(&framed) {
-                                        log::debug!("dgram_send: {e}");
-                                    }
-                                }
-                                Err(e) => log::debug!("encap: {e}"),
-                            }
+                        let use_capsule = h3_dgram_mode.use_capsule(dgram_by_peer);
+                        if let (Some(sid), Some(h3c)) = (req_stream, h3_conn.as_mut()) {
+                            send_ip_h3(&mut conn, h3c, sid, &ip_packet, use_capsule);
                             // Batch remaining IP packets same tick.
                             while let Ok(more) = internals.outbound_rx.try_recv() {
-                                match masque::encode_ip_datagram(sid, &more) {
-                                    Ok(framed) => {
-                                        if let Err(e) = conn.dgram_send(&framed) {
-                                            log::debug!("dgram_send: {e}");
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => log::debug!("encap: {e}"),
-                                }
+                                send_ip_h3(&mut conn, h3c, sid, &more, use_capsule);
                             }
                         }
                     }
@@ -304,6 +390,13 @@ pub async fn run(
                         let _ = conn.close(true, 0x00, b"eof");
                     }
                 }
+            }
+
+            _ = tokio::time::sleep(Duration::from_millis(200)), if h3_ready && !dataplane_ok => {
+                // Drive the CONNECT-IP data-plane probe + its 8s timeout promptly.
+                // Otherwise, after a 200 with no inbound traffic this loop only
+                // wakes on QUIC timers / the 20s keepalive, stalling readiness
+                // (observed: connect_ip_status 200 then no progress for ~15s).
             }
 
             _ = sleep_opt(timeout) => {
@@ -316,6 +409,10 @@ pub async fn run(
             log::info!(
                 "quic handshake established; alpn={}",
                 String::from_utf8_lossy(conn.application_proto())
+            );
+            h3_stage(
+                "quic_established",
+                &format!("alpn={}", String::from_utf8_lossy(conn.application_proto())),
             );
             // #1: Cache session ticket for 0-RTT on next connect.
             if let Some(session) = conn.session() {
@@ -338,20 +435,44 @@ pub async fn run(
                 &addr_tx,
                 &mut h3_ready,
                 &mut probe_src,
+                &inbound_tx,
+                &mut dataplane_ok,
+                &mut addr_assigned,
             )?;
+        }
+
+        // Once the peer's SETTINGS are in, record whether H3 DATAGRAM + extended
+        // CONNECT were negotiated — the make-or-break capabilities for CONNECT-IP.
+        if !h3_settings_logged {
+            if let Some(h3c) = h3_conn.as_ref() {
+                if h3c.peer_settings_raw().is_some() {
+                    let dgram = h3c.dgram_enabled_by_peer(&conn);
+                    let ext = h3c.extended_connect_enabled_by_peer();
+                    dgram_by_peer = dgram;
+                    h3_stage("h3_settings", &format!("dgram_by_peer={dgram} ext_connect={ext}"));
+                    h3_settings_logged = true;
+                }
+            }
         }
 
         // After CONNECT-IP 200, prove data-plane with a DNS probe before ready signal.
         if h3_ready && !dataplane_ok {
             if probe_deadline.is_none() {
                 probe_deadline = Some(Instant::now() + Duration::from_secs(8));
+                ready_since = Some(Instant::now());
             }
-            if last_probe.elapsed() >= Duration::from_millis(700) {
-                if let Some(sid) = req_stream {
-                    let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(8, 8, 8, 8));
-                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe) {
-                        let _ = conn.dgram_send(&framed);
-                    }
+            // #4: prefer probing with a real edge-assigned source. Fall back to
+            // the default source only after a short grace period so endpoints
+            // that never send ADDRESS_ASSIGN are still exercised.
+            let grace_elapsed = ready_since
+                .map(|t| t.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(false);
+            let may_probe = addr_assigned || grace_elapsed;
+            if may_probe && last_probe.elapsed() >= Duration::from_millis(700) {
+                if let (Some(sid), Some(h3c)) = (req_stream, h3_conn.as_mut()) {
+                    let probe = crate::dns::build_dataplane_probe(probe_src, crate::dns::dataplane_probe_target());
+                    let use_capsule = h3_dgram_mode.use_capsule(dgram_by_peer);
+                    send_ip_h3(&mut conn, h3c, sid, &probe, use_capsule);
                 }
                 last_probe = Instant::now();
             }
@@ -401,6 +522,7 @@ pub async fn run(
                     let scid_bytes = random_scid();
                     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
                     conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
+                    maybe_enable_diagnostics(&mut conn, "tunnel-retry");
                     if let Some(ref ech) = current_ech {
                         tls::inject_ech(&mut conn, ech)?;
                     }
@@ -443,6 +565,7 @@ async fn sleep_opt(timeout: Option<Duration>) {
 }
 
 /// Returns true when CONNECT-IP response status is 200.
+#[allow(clippy::too_many_arguments)]
 fn poll_h3(
     conn: &mut quiche::Connection,
     h3c: &mut h3::Connection,
@@ -451,6 +574,9 @@ fn poll_h3(
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
     h3_ready: &mut bool,
     probe_src: &mut std::net::Ipv4Addr,
+    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    dataplane_ok: &mut bool,
+    addr_assigned: &mut bool,
 ) -> Result<()> {
     let mut body = vec![0u8; 65535];
 
@@ -461,6 +587,7 @@ fn poll_h3(
                     if h.name() == b":status" {
                         let status = String::from_utf8_lossy(h.value());
                         log::info!("connect-ip status: {status}");
+                        h3_stage("connect_ip_status", &format!("code={status}"));
                         if h.value() == b"200" {
                             *h3_ready = true;
                         }
@@ -478,7 +605,7 @@ fn poll_h3(
                     }
                     capsules.push(&body[..n]);
                 }
-                drain_capsules(capsules, addr_tx, probe_src);
+                drain_capsules(capsules, addr_tx, probe_src, inbound_tx, dataplane_ok, addr_assigned);
             }
 
             Ok((_stream_id, h3::Event::Finished)) => {}
@@ -494,13 +621,22 @@ fn poll_h3(
 }
 
 
-fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>, probe_src: &mut std::net::Ipv4Addr) {
+fn drain_capsules(
+    capsules: &mut CapsuleParser,
+    addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
+    probe_src: &mut std::net::Ipv4Addr,
+    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    dataplane_ok: &mut bool,
+    addr_assigned: &mut bool,
+) {
     loop {
         match capsules.next() {
             Ok(Some(masque::Capsule::AddressAssign(addrs))) => {
                 for a in addrs {
                     if let Some(ip) = bytes_to_ip(a.ip_version, &a.address) {
                         log::info!("edge assigned {}/{}", ip, a.prefix_len);
+                        h3_stage("address_assign", &format!("{}/{}", ip, a.prefix_len));
+                        *addr_assigned = true;
                         if let IpAddr::V4(v4) = ip {
                             *probe_src = v4;
                         }
@@ -514,7 +650,21 @@ fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<As
                 }
             }
             Ok(Some(masque::Capsule::RouteAdvertisement(routes))) => {
-                log::info!("received {} route advertisements", routes.len());
+                for r in &routes {
+                    log::info!(
+                        "route advertisement: v{} proto {} {:?}-{:?}",
+                        r.ip_version, r.protocol, r.start, r.end
+                    );
+                }
+            }
+            Ok(Some(masque::Capsule::Datagram(payload))) => {
+                // RFC 9297 stream fallback: IP packets arriving as DATAGRAM
+                // capsules (used when H3 DATAGRAM was not negotiated).
+                if !*dataplane_ok {
+                    h3_stage("first_inbound_datagram", "dataplane capsule received");
+                }
+                *dataplane_ok = true;
+                let _ = inbound_tx.try_send(payload);
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
@@ -560,6 +710,9 @@ async fn drain_datagrams(
                     // S4 fix rollback: accept any datagram (even ICMP errors) as proof 
                     // the tunnel isn't a zombie.
                     if watch_dataplane {
+                        if !*dataplane_ok {
+                            h3_stage("first_inbound_datagram", "dataplane packet received");
+                        }
                         *dataplane_ok = true;
                     }
                     // Prefer try_send so QUIC recv keeps moving; await only under backpressure.
@@ -608,38 +761,6 @@ async fn flush(
     Ok(())
 }
 
-async fn do_migrate(
-    conn: &mut quiche::Connection,
-    peer: SocketAddr,
-    sockets: &mut HashMap<SocketAddr, Arc<UdpSocket>>,
-    net_tx: &mpsc::Sender<NetPacket>,
-    readers: &mut ReaderGuard,
-) -> Result<()> {
-    if conn.available_dcids() == 0 {
-        return Err(AetherError::Other("no spare dcids for migration".into()));
-    }
-
-    let old_locals: Vec<SocketAddr> = sockets.keys().copied().collect();
-    let new_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
-    let new_local = new_sock.local_addr()?;
-    let new_sock = Arc::new(new_sock);
-
-    sockets.insert(new_local, new_sock.clone());
-    readers.push(spawn_reader(new_sock, new_local, net_tx.clone()));
-
-    conn.probe_path(new_local, peer)?;
-    let seq = conn.migrate_source(new_local)?;
-    log::info!("migrated to local {new_local} (path seq {seq})");
-    // Drop old sockets so their readers exit on next recv error (no unbounded leak).
-    for old in old_locals {
-        if old != new_local {
-            sockets.remove(&old);
-        }
-    }
-
-    Ok(())
-}
-
 pub fn default_authority() -> &'static str {
     "cloudflareaccess.com"
 }
@@ -648,8 +769,104 @@ pub fn default_path() -> &'static str {
     "/"
 }
 
-pub fn default_sni() -> &'static str {
-    consts::L4_CONNECT_SNI
+/// Result of a MASQUE endpoint fingerprint.
+#[derive(Debug, Clone, Copy)]
+pub struct H3Fingerprint {
+    pub reachable: bool,
+    pub ext_connect: bool,
+    pub dgram: bool,
+}
+
+impl H3Fingerprint {
+    /// A MASQUE-capable endpoint: extended CONNECT + H3 DATAGRAM both negotiated.
+    pub fn is_masque(&self) -> bool {
+        self.ext_connect && self.dgram
+    }
+}
+
+/// Fingerprint a QUIC/H3 endpoint by completing the handshake and reading its
+/// SETTINGS. Reports whether Extended CONNECT + H3 DATAGRAM are enabled — the
+/// make-or-break MASQUE capabilities, which arrive BEFORE any CONNECT-IP auth
+/// gate (403). Sends no request; closes immediately. Cheap enough to sweep a
+/// CIDR to enumerate the MASQUE endpoint surface. SPKI pins should be disabled
+/// by the caller (via env) so the handshake completes against any cert.
+pub async fn fingerprint_h3(
+    peer: SocketAddr,
+    sni: &str,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    timeout: Duration,
+) -> Result<H3Fingerprint> {
+    let bind: SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let sock = bind_udp_fast(bind).await?;
+    let local = sock.local_addr()?;
+    let mut config = tls::build_config(&TlsParams { cert_pem, key_pem })?;
+    let scid_bytes = random_scid();
+    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+    let mut conn = quiche::connect(Some(sni), &scid, local, peer, &mut config)?;
+    let mut h3_config = h3::Config::new()?;
+    h3_config.enable_extended_connect(true);
+    let mut h3c: Option<h3::Connection> = None;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    flush_to(&mut conn, &sock, peer).await?;
+    let mut buf = vec![0u8; 65535];
+    let mut reachable = false;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let wait = match conn.timeout() {
+            Some(t) => t.min(remaining(deadline)),
+            None => remaining(deadline),
+        };
+        tokio::select! {
+            r = sock.recv_from(&mut buf) => {
+                if let Ok((n, from)) = r {
+                    reachable = true;
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(&mut buf[..n], info);
+                }
+            }
+            _ = tokio::time::sleep(wait) => { conn.on_timeout(); }
+        }
+        if conn.is_established() && h3c.is_none() {
+            h3c = Some(h3::Connection::with_transport(&mut conn, &h3_config)?);
+        }
+        if let Some(h) = h3c.as_mut() {
+            // Drive the H3 control-stream exchange: peer_settings_raw() stays None
+            // until poll() processes the peer's SETTINGS frame off its control stream.
+            loop {
+                if h.poll(&mut conn).is_err() {
+                    break;
+                }
+            }
+            if h.peer_settings_raw().is_some() {
+                let ext = h.extended_connect_enabled_by_peer();
+                let dg = h.dgram_enabled_by_peer(&conn);
+                let _ = conn.close(true, 0x00, b"fp");
+                let _ = flush_to(&mut conn, &sock, peer).await;
+                return Ok(H3Fingerprint {
+                    reachable: true,
+                    ext_connect: ext,
+                    dgram: dg,
+                });
+            }
+        }
+        flush_to(&mut conn, &sock, peer).await?;
+        if conn.is_closed() {
+            break;
+        }
+    }
+    Ok(H3Fingerprint {
+        reachable,
+        ext_connect: false,
+        dgram: false,
+    })
 }
 
 #[derive(Clone)]
@@ -681,6 +898,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     // edge frequently replies from a rewritten path, so a connected socket would
     // silently drop every reply (observed as "no UDP reply — QUIC may be filtered").
     // Unconnected send_to/recv_from accepts replies from any source (matches run()).
+    // This is not an injection vector: QUIC drops any datagram whose DCID + AEAD tag
+    // do not match this connection, and each probe owns a distinct ephemeral socket,
+    // so a foreign/spoofed packet is simply ignored by conn.recv() below. (A source
+    // prefix filter would instead wrongly drop Cloudflare's rewritten-path replies.)
     let local = sock.local_addr()?;
 
     // Cheap UDP reachability: if nothing comes back after a QUIC Initial kick,
@@ -695,6 +916,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let scid_bytes = random_scid();
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
     let mut conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
+    maybe_enable_diagnostics(&mut conn, "verify");
 
     if let Some(ref ech) = p.ech_config_list {
         let _ = tls::inject_ech(&mut conn, ech);
@@ -715,6 +937,12 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
     let mut buf = vec![0u8; 65535];
     let mut saw_udp = false;
+    // Handshake RTT (connect -> quic_established). Returned as the ranking metric
+    // instead of the full verify time (handshake + CONNECT-IP + data-plane), which
+    // isn't comparable to steady-state latency across endpoints.
+    let mut handshake_rtt: Option<Duration> = None;
+    let trace = h3_trace_on();
+    let mut settings_logged = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -726,6 +954,16 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
             return Err(AetherError::Other("verify timeout (UDP ok, no connect-ip 200)".into()));
         }
 
+        // Fast-fail filtered / black-holed ports: a QUIC Initial that draws no UDP
+        // reply within a short window will not recover, so don't spend the full
+        // (now longer) H3 probe budget on it. Critical when scanning the tiered
+        // MASQUE ports, where most (e.g. a DPI-dropped 443) never answer.
+        if !saw_udp && start.elapsed() >= Duration::from_millis(2000) {
+            return Err(AetherError::Other(
+                "verify timeout (no UDP reply — QUIC may be filtered)".into(),
+            ));
+        }
+
         let wait = match conn.timeout() {
             Some(t) => t.min(remaining(deadline)),
             None => remaining(deadline),
@@ -735,7 +973,12 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
             r = sock.recv_from(&mut buf) => {
                 match r {
                     Ok((n, from)) => {
-                        saw_udp = true;
+                        if !saw_udp {
+                            saw_udp = true;
+                            if trace {
+                                h3_stage("udp_first_reply", &format!("from {from} bytes {n}"));
+                            }
+                        }
                         log::debug!("verify recv {n} bytes from {from}");
                         let info = quiche::RecvInfo { from, to: local };
                         if let Err(e) = conn.recv(&mut buf[..n], info) {
@@ -751,8 +994,15 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         }
 
         if conn.is_established() && h3_conn.is_none() {
+            handshake_rtt.get_or_insert(start.elapsed());
             log::debug!("verify quic established to {}", p.peer);
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
+            if trace {
+                h3_stage(
+                    "quic_established",
+                    &format!("alpn={}", String::from_utf8_lossy(conn.application_proto())),
+                );
+            }
             let headers = masque::connect_ip_request(&p.authority, &p.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
             req_stream = Some(sid);
@@ -765,18 +1015,26 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     Ok((stream_id, h3::Event::Headers { list, .. })) if stream_id == sid => {
                         for h in &list {
                             if h.name() == b":status" {
+                                if trace {
+                                    h3_stage(
+                                        "connect_ip_status",
+                                        &format!("code={}", String::from_utf8_lossy(h.value())),
+                                    );
+                                }
                                 if h.value() == b"200" {
                                     // Control-plane OK. Now verify data-plane:
                                     // send 1 DNS probe through the datagram channel.
                                     // Fast-path: 1 round-trip is enough during scan.
                                     let probe_pkt = crate::dns::build_dataplane_probe(
                                         p.local_ipv4,
-                                        std::net::Ipv4Addr::new(8, 8, 8, 8),
+                                        crate::dns::dataplane_probe_target(),
                                     );
-                                    if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_pkt) {
-                                        let _ = conn.dgram_send(&framed);
-                                        flush_to(&mut conn, &sock, p.peer).await?;
-                                    }
+                                    let use_capsule = crate::masque::H3DgramMode::from_env()
+                                        .use_capsule(h3c.dgram_enabled_by_peer(&conn));
+                                    let mut dp_capsules = CapsuleParser::new();
+                                    let mut dp_body = vec![0u8; 65535];
+                                    send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
+                                    flush_to(&mut conn, &sock, p.peer).await?;
                                     // Wait for data-plane reply (up to 2s).
                                     let dp_deadline = Instant::now() + Duration::from_secs(2).min(remaining(deadline));
                                     loop {
@@ -792,18 +1050,45 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                 if let Ok((n, from)) = r {
                                                     let info = quiche::RecvInfo { from, to: local };
                                                     let _ = conn.recv(&mut buf[..n], info);
-                                                    // Check for datagram reply.
+                                                    // Check for a QUIC DATAGRAM reply.
                                                     let mut dgram_buf = vec![0u8; 65535];
                                                     loop {
                                                         match conn.dgram_recv(&mut dgram_buf) {
                                                             Ok(dn) => {
                                                                 if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..dn], sid) {
-                                                                    // Data-plane confirmed!
-                                                                    return Ok(start.elapsed());
+                                                                    if trace {
+                                                                        h3_stage("first_inbound_datagram", "quic datagram confirmed");
+                                                                    }
+                                                                    return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
                                                                 }
                                                             }
                                                             Err(quiche::Error::Done) => break,
                                                             Err(_) => break,
+                                                        }
+                                                    }
+                                                    // Also accept a DATAGRAM capsule on the stream (RFC 9297 fallback).
+                                                    loop {
+                                                        match h3c.poll(&mut conn) {
+                                                            Ok((s, h3::Event::Data)) if s == sid => {
+                                                                while let Ok(bn) = h3c.recv_body(&mut conn, sid, &mut dp_body) {
+                                                                    if bn == 0 { break; }
+                                                                    dp_capsules.push(&dp_body[..bn]);
+                                                                }
+                                                            }
+                                                            Ok(_) => {}
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                    loop {
+                                                        match dp_capsules.next() {
+                                                            Ok(Some(masque::Capsule::Datagram(_))) => {
+                                                                if trace {
+                                                                    h3_stage("first_inbound_datagram", "capsule datagram confirmed");
+                                                                }
+                                                                return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
+                                                            }
+                                                            Ok(Some(_)) => {}
+                                                            Ok(None) | Err(_) => break,
                                                         }
                                                     }
                                                 }
@@ -811,9 +1096,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                             _ = tokio::time::sleep(dp_wait) => {
                                                 conn.on_timeout();
                                                 // Resend probe.
-                                                if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_pkt) {
-                                                    let _ = conn.dgram_send(&framed);
-                                                }
+                                                send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
                                             }
                                         }
                                         flush_to(&mut conn, &sock, p.peer).await?;
@@ -833,6 +1116,12 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     Err(h3::Error::Done) => break,
                     Err(e) => return Err(AetherError::H3(e)),
                 }
+            }
+            if trace && !settings_logged && h3c.peer_settings_raw().is_some() {
+                let dg = h3c.dgram_enabled_by_peer(&conn);
+                let ext = h3c.extended_connect_enabled_by_peer();
+                h3_stage("h3_settings", &format!("dgram_by_peer={dg} ext_connect={ext}"));
+                settings_logged = true;
             }
         }
 
@@ -854,20 +1143,6 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
-}
-
-async fn flush_connected(conn: &mut quiche::Connection, sock: &UdpSocket) -> Result<()> {
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
-    loop {
-        match conn.send(&mut out) {
-            Ok((write, _info)) => {
-                sock.send(&out[..write]).await?;
-            }
-            Err(quiche::Error::Done) => break,
-            Err(e) => return Err(AetherError::Quic(e)),
-        }
-    }
-    Ok(())
 }
 
 async fn flush_to(
@@ -894,4 +1169,31 @@ async fn flush_to(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h3_sni_defaults_to_consumer_masque() {
+        assert_eq!(resolve_h3_sni_from(None, None), consts::CONNECT_SNI);
+    }
+
+    #[test]
+    fn h3_sni_prefers_specific_override() {
+        assert_eq!(
+            resolve_h3_sni_from(Some("a.example".into()), Some("b.example".into())),
+            "a.example"
+        );
+    }
+
+    #[test]
+    fn h3_sni_falls_back_to_generic_then_blank_ignored() {
+        assert_eq!(
+            resolve_h3_sni_from(Some("   ".into()), Some("b.example".into())),
+            "b.example"
+        );
+        assert_eq!(resolve_h3_sni_from(Some(String::new()), None), consts::CONNECT_SNI);
+    }
 }

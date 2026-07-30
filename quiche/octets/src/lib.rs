@@ -253,6 +253,17 @@ impl<'a> Octets<'a> {
     /// The Huffman code implemented is the one defined for HPACK (RFC7541).
     #[cfg(feature = "huffman_hpack")]
     pub fn get_huffman_decoded(&mut self) -> Result<Vec<u8>> {
+        self.get_huffman_decoded_with_max_length(usize::MAX)
+    }
+
+    /// Decodes a Huffman-encoded value from the current offset. The `max_len`
+    /// parameter controls the maximum length of the decoded value.
+    ///
+    /// The Huffman code implemented is the one defined for HPACK (RFC7541).
+    #[cfg(feature = "huffman_hpack")]
+    pub fn get_huffman_decoded_with_max_length(
+        &mut self, max_len: usize,
+    ) -> Result<Vec<u8>> {
         use self::huffman_table::DECODE_TABLE;
 
         const FLAG_END: u8 = 1;
@@ -260,7 +271,8 @@ impl<'a> Octets<'a> {
         const FLAG_ERR: u8 = 4;
 
         // Max compression ratio is >= 0.5.
-        let mut out = Vec::with_capacity(self.cap() << 1);
+        let initial_cap = (self.cap() * 2).min(max_len);
+        let mut out = Vec::with_capacity(initial_cap);
 
         let mut state = 0;
         let mut eos = false;
@@ -273,6 +285,10 @@ impl<'a> Octets<'a> {
                     // Data followed the "end" marker.
                     return Err(BufferTooShortError);
                 } else if flags & FLAG_SYM == FLAG_SYM {
+                    // Error if pushing sym (1 byte) would overflow.
+                    if out.len() + 1 > max_len {
+                        return Err(BufferTooShortError);
+                    }
                     out.push(sym);
                 }
 

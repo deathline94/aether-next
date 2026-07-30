@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::consts;
 use crate::error::{AetherError, Result};
 use crate::masque::{self, Capsule, CapsuleParser};
-use crate::quic::{AssignedAddr, Control, Internals};
+use crate::quic::{AssignedAddr, Internals};
 
 // OpenSSL wire format: length-prefixed protocol list.
 const H2_ALPN: &[u8] = b"\x02h2";
@@ -24,7 +24,6 @@ pub struct H2TunnelConfig {
     pub peer: SocketAddr,
     pub sni: String,
     pub authority: String,
-    pub path: String,
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     /// Preferred IPv4 source for data-plane DNS probe (edge-assigned / identity).
@@ -445,7 +444,7 @@ pub async fn run(
     addr_tx: Option<mpsc::Sender<AssignedAddr>>,
     ready_tx: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
-    let (mut outbound_rx, inbound_tx, mut ctrl_rx) = internals.into_parts();
+    let (mut outbound_rx, inbound_tx) = internals.into_parts();
 
     let tls_config = build_tls(&cfg)?;
 
@@ -545,16 +544,6 @@ pub async fn run(
                             return Err(e);
                         }
                         *last_send.lock().await = Instant::now();
-                    }
-                }
-                ctrl = ctrl_rx.recv() => {
-                    match ctrl {
-                        Some(Control::Close) | None => {
-                            let _ = send_stream.send_data(Bytes::new(), true);
-                            log::info!("[h2] closing tunnel (send)");
-                            return Ok::<(), AetherError>(());
-                        }
-                        Some(Control::Migrate) => {}
                     }
                 }
                 pkt = outbound_rx.recv() => {
@@ -787,7 +776,12 @@ async fn drain_capsules(
                 }
             }
             Ok(Some(Capsule::RouteAdvertisement(routes))) => {
-                log::info!("[h2] received {} route advertisements", routes.len());
+                for r in &routes {
+                    log::info!(
+                        "[h2] route advertisement: v{} proto {} {:?}-{:?}",
+                        r.ip_version, r.protocol, r.start, r.end
+                    );
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) => break,

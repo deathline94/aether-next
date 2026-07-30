@@ -38,6 +38,11 @@ pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
 
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
 
+/// Maximum PRIORITY_UPDATE frame payload size we accept. Bounds state-buffer
+/// growth against a peer that sends oversized priority updates (RFC 9218
+/// recommends 256). See <https://datatracker.ietf.org/doc/html/rfc9218#section-7.2>.
+const PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE: u64 = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Type {
     Control,
@@ -435,6 +440,19 @@ impl Stream {
                 ) => {
                     if len == 0 {
                         return Err(Error::FrameError);
+                    }
+
+                    (State::FramePayload, true)
+                },
+
+                // RFC 9218 s7.2: bound PRIORITY_UPDATE payload so a peer cannot
+                // force unbounded state buffering with oversized priority frames.
+                Some(
+                    frame::PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID |
+                    frame::PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID,
+                ) => {
+                    if len > PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE {
+                        return Err(Error::ExcessiveLoad);
                     }
 
                     (State::FramePayload, true)

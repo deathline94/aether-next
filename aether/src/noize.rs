@@ -60,14 +60,6 @@ impl NoizeConfig {
     }
 }
 
-pub fn from_profile(name: &str) -> NoizeConfig {
-    match name {
-        "off" | "none" => NoizeConfig::off(),
-        "gfw" => NoizeConfig::gfw(),
-        _ => NoizeConfig::firewall(),
-    }
-}
-
 fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let (lo, hi) = if cfg.jmax > cfg.jmin && cfg.jmin > 0 {

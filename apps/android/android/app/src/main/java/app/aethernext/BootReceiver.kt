@@ -13,6 +13,12 @@ class BootReceiver : BroadcastReceiver() {
         val launch = Intent(context, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(launch)
+        // Only opens the UI (never starts the VPN foreground service from boot,
+        // which Android 12+ forbids). Background activity starts are restricted on
+        // Android 10+ and may be dropped; guard so a throwing OEM can't crash boot.
+        try {
+            context.startActivity(launch)
+        } catch (_: Exception) {
+        }
     }
 }

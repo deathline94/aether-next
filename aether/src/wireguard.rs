@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,6 @@ pub struct WgConfig {
     pub local_private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub peer_endpoint: SocketAddr,
-    pub local_ipv4: Ipv4Addr,
-    pub local_ipv6: Ipv6Addr,
     pub client_id: [u8; 3],
     pub preshared_key: Option<[u8; 32]>,
     pub persistent_keepalive: Option<u16>,
@@ -411,28 +409,6 @@ async fn verify_dataplane(
     }
 }
 
-pub async fn verify_endpoint(
-    peer: SocketAddr,
-    private_key: [u8; 32],
-    peer_public: [u8; 32],
-    client_id: [u8; 3],
-    local_ipv4: Ipv4Addr,
-    aethernoize: &AetherNoizeConfig,
-    timeout: Duration,
-) -> Result<Duration> {
-    let (elapsed, _session) = verify_endpoint_keep_session(
-        peer,
-        private_key,
-        peer_public,
-        client_id,
-        local_ipv4,
-        aethernoize,
-        timeout,
-    )
-    .await?;
-    Ok(elapsed)
-}
-
 pub async fn verify_endpoint_keep_session(
     peer: SocketAddr,
     private_key: [u8; 32],
@@ -491,14 +467,11 @@ pub async fn verify_endpoint_keep_session(
         // #2: Retransmit Init once at 500ms if no response yet (handles single packet loss).
         if !retransmitted && Instant::now() >= retransmit_at && attempts == 0 {
             retransmitted = true;
-            match tunn.encapsulate(&[], &mut out_buf) {
-                TunnResult::WriteToNetwork(pkt) => {
-                    let mut pkt_vec = pkt.to_vec();
-                    inject_client_id(&mut pkt_vec, &client_id);
-                    log::debug!("[wg] retransmit init {} bytes to {}", pkt_vec.len(), peer);
-                    let _ = sock.send(&pkt_vec).await;
-                }
-                _ => {}
+            if let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], &mut out_buf) {
+                let mut pkt_vec = pkt.to_vec();
+                inject_client_id(&mut pkt_vec, &client_id);
+                log::debug!("[wg] retransmit init {} bytes to {}", pkt_vec.len(), peer);
+                let _ = sock.send(&pkt_vec).await;
             }
         }
 
@@ -603,8 +576,10 @@ pub const WG_PORTS: &[u16] = &[
     7559, 8319, 8742, 8854, 8886,
 ];
 
-/// WG port tiers: Tier 1 = most common CF edge ports, scanned first.
-pub const WG_PORTS_T1: &[u16] = &[500, 4500, 1701, 2408];
+/// WG port tiers: Tier 1 = most common CF edge ports, scanned first. Cloudflare's
+/// documented default is 2408, then the 500/1701/4500 fallbacks — try them in that
+/// order rather than leading with 500.
+pub const WG_PORTS_T1: &[u16] = &[2408, 500, 1701, 4500];
 pub const WG_PORTS_T2: &[u16] = &[854, 880, 928, 942, 943, 946, 955, 987, 1002, 1010, 1014, 1070, 1074, 1180, 1387, 1843, 2371, 2506, 3138];
 // Tier 3 = everything else (remaining ports in WG_PORTS not in T1 or T2).
 

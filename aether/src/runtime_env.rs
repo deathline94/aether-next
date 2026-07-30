@@ -51,8 +51,3 @@ pub fn flag(key: &str) -> bool {
 pub fn usize(key: &str) -> Option<usize> {
     var(key).and_then(|v| v.trim().parse().ok())
 }
-
-/// Read a u16 value.
-pub fn u16(key: &str) -> Option<u16> {
-    var(key).and_then(|v| v.trim().parse().ok())
-}

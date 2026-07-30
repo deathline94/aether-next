@@ -23,6 +23,8 @@ pub struct PersistedIdentity {
     pub wg_peer_public_key: String,
     #[serde(default)]
     pub client_id: String,
+    #[serde(default)]
+    pub masque_endpoint: Option<String>,
 }
 
 impl From<&Identity> for PersistedIdentity {
@@ -38,6 +40,7 @@ impl From<&Identity> for PersistedIdentity {
             wg_peer_public_key: base64::engine::general_purpose::STANDARD
                 .encode(id.wg_peer_public_key),
             client_id: base64::engine::general_purpose::STANDARD.encode(id.client_id),
+            masque_endpoint: id.masque_endpoint.clone(),
         }
     }
 }
@@ -86,6 +89,7 @@ impl TryFrom<PersistedIdentity> for Identity {
             wg_private_key,
             wg_peer_public_key,
             client_id: client_id_arr,
+            masque_endpoint: p.masque_endpoint,
         })
     }
 }
@@ -132,7 +136,16 @@ fn private_atomic_write(path: &str, data: &[u8]) -> Result<()> {
     if Path::new(path).exists() { std::fs::remove_file(path)?; }
     std::fs::rename(&tmp,path)?;
     #[cfg(windows)] if let Ok(user)=std::env::var("USERNAME") {
-        let _=std::process::Command::new("icacls").args([path,"/inheritance:r","/grant:r",&format!("{user}:F")]).output();
+        // Lock the identity file (keys/token) to the current user. Surface a warning
+        // if icacls fails so a world-readable config is not left silently.
+        match std::process::Command::new("icacls").args([path,"/inheritance:r","/grant:r",&format!("{user}:F")]).output() {
+            Ok(out) if !out.status.success() => log::warn!(
+                "[config] icacls could not restrict {path} permissions (identity file may be readable by other users): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => log::warn!("[config] failed to run icacls on {path} (identity file may be readable by other users): {e}"),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -159,20 +172,5 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let text = toml::to_string_pretty(&persisted)
         .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
     let data=encode(text.as_bytes())?;
-    private_atomic_write(path, &data)
-}
-
-pub fn save_masque_creds(path: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
-    if !Path::new(path).exists() {
-        return Ok(());
-    }
-    let text = read_text(path)?;
-    let mut persisted: PersistedIdentity =
-        toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
-    persisted.cert_pem = String::from_utf8_lossy(cert_pem).to_string();
-    persisted.key_pem = String::from_utf8_lossy(key_pem).to_string();
-    let updated = toml::to_string_pretty(&persisted)
-        .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    let data=encode(updated.as_bytes())?;
     private_atomic_write(path, &data)
 }

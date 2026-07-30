@@ -43,10 +43,6 @@ enum Target {
     Domain(String),
 }
 
-pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    serve_listener(bind(listen).await?, stack).await
-}
-
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
     if !listen.ip().is_loopback() && std::env::var_os("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
         return Err(AetherError::Other("refusing non-loopback SOCKS bind".into()));
@@ -269,10 +265,6 @@ fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]);
     (id, q)
-}
-
-fn parse_dns_answer(resp: &[u8], want_type: u16) -> Option<IpAddr> {
-    parse_dns_answer_id(resp, want_type, None)
 }
 
 fn parse_dns_answer_id(resp: &[u8], want_type: u16, expect_id: Option<u16>) -> Option<IpAddr> {
@@ -547,7 +539,7 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dns_answer, select_auth_method};
+    use super::{parse_dns_answer_id, select_auth_method};
 
     #[test]
     fn rejects_clients_without_no_auth_method() {
@@ -564,7 +556,7 @@ mod tests {
         resp.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
         // Answer: pointer to name + type A + class IN + ttl + rdlen 4 + 1.2.3.4
         resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
-        let ip = parse_dns_answer(&resp, 1).expect("A");
+        let ip = parse_dns_answer_id(&resp, 1, None).expect("A");
         assert_eq!(ip.to_string(), "1.2.3.4");
 
         let mut resp6 = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
@@ -572,7 +564,7 @@ mod tests {
         let mut ans = vec![0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16];
         ans.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         resp6.extend_from_slice(&ans);
-        let ip6 = parse_dns_answer(&resp6, 28).expect("AAAA");
+        let ip6 = parse_dns_answer_id(&resp6, 28, None).expect("AAAA");
         assert_eq!(ip6.to_string(), "2001:db8::1");
     }
 }

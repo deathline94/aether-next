@@ -57,6 +57,18 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Peer {
     pub public_key: String,
+    #[serde(default)]
+    pub endpoint: Endpoint,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Endpoint {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub v4: String,
+    #[serde(default)]
+    pub v6: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -85,6 +97,10 @@ pub struct Identity {
     pub wg_private_key: [u8; 32],
     pub wg_peer_public_key: [u8; 32],
     pub client_id: [u8; 3],
+    /// MASQUE data-plane endpoint (host:443) from the enroll_key response's first
+    /// peer. None for identities provisioned before this was captured; callers
+    /// fall back to the known MASQUE anycast.
+    pub masque_endpoint: Option<String>,
 }
 
 /// Capability view — what this identity can run without re-provisioning.
@@ -167,11 +183,90 @@ pub fn generate_masque_keypair() -> Result<MasqueKeyPair> {
     })
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+const API_HOST: &str = "api.cloudflareclient.com";
+
+/// Cloudflare anycast edges that front the API. Used to bypass a poisoned or blocked
+/// DNS for `api.cloudflareclient.com`: Cloudflare's edge routes by SNI/Host (not IP),
+/// so the domain is reachable on any of its anycast IPs with no DNS lookup. TCP/443
+/// survives networks that only DPI-drop QUIC, so this keeps first-time signup working
+/// where the resolver is tampered.
+const API_FALLBACK_EDGES: &[&str] = &["162.159.192.1", "162.159.195.1", "188.114.96.1"];
+
+/// Build the API HTTP client. When `edge` is set, DNS for the API host is pinned to
+/// that Cloudflare edge IP (camouflaged, DNS-free path); SNI still follows the URL.
+fn http_client(edge: Option<&str>) -> Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
         .user_agent(consts::UA_REGISTER)
-        .build()
-        .map_err(|e| AetherError::Api(e.to_string()))
+        .timeout(std::time::Duration::from_secs(20));
+    if let Some(ip) = edge {
+        if let Ok(addr) = format!("{ip}:443").parse::<std::net::SocketAddr>() {
+            b = b.resolve(API_HOST, addr);
+        }
+    }
+    b.build().map_err(|e| AetherError::Api(e.to_string()))
+}
+
+/// Parse a `Retry-After` header (delta-seconds form) into a Duration.
+fn retry_after(resp: &reqwest::Response) -> Option<std::time::Duration> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+/// Send an API request resiliently: exponential backoff on transient errors and
+/// 429/5xx (honoring Retry-After), then a camouflaged fallback to direct Cloudflare
+/// edge IPs (no DNS) when `api.cloudflareclient.com` is blocked or poisoned. `build`
+/// reconstructs the request from the supplied client on each attempt.
+async fn send_resilient(
+    build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    // Attempt targets: normal DNS first, then each camouflaged edge IP.
+    let mut targets: Vec<Option<&str>> = vec![None];
+    targets.extend(API_FALLBACK_EDGES.iter().map(|e| Some(*e)));
+
+    let mut last = String::from("no attempt made");
+    for (ti, edge) in targets.iter().enumerate() {
+        let client = match http_client(*edge) {
+            Ok(c) => c,
+            Err(e) => {
+                last = e.to_string();
+                continue;
+            }
+        };
+        for attempt in 0u32..3 {
+            match build(&client).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.as_u16() == 429 || status.is_server_error() {
+                        let wait = retry_after(&resp).unwrap_or_else(|| {
+                            std::time::Duration::from_millis(500u64 << attempt)
+                        });
+                        last = format!("HTTP {status}");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    last = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
+                }
+            }
+        }
+        if ti == 0 {
+            log::warn!(
+                "[account] api.cloudflareclient.com unreachable via DNS ({last}); trying camouflaged edge fallback"
+            );
+        }
+    }
+    Err(AetherError::Api(format!(
+        "account API unreachable after retries and edge fallback: {last}"
+    )))
 }
 
 fn base_headers() -> reqwest::header::HeaderMap {
@@ -229,16 +324,14 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<(A
     };
 
     let url = format!("{}/{}/reg", consts::API_URL, consts::API_VERSION);
-    let mut req = http_client()?
-        .post(url)
-        .headers(base_headers())
-        .json(&body);
-
-    if let Some(jwt) = jwt {
-        req = req.header("CF-Access-Jwt-Assertion", jwt);
-    }
-
-    let resp = req.send().await.map_err(|e| AetherError::Api(e.to_string()))?;
+    let resp = send_resilient(|client| {
+        let mut req = client.post(&url).headers(base_headers()).json(&body);
+        if let Some(jwt) = jwt {
+            req = req.header("CF-Access-Jwt-Assertion", jwt);
+        }
+        req
+    })
+    .await?;
     let account = parse_account(resp).await?;
     Ok((account, wg_private))
 }
@@ -257,14 +350,14 @@ pub async fn enroll_key(
     };
 
     let url = format!("{}/{}/reg/{}", consts::API_URL, consts::API_VERSION, device_id);
-    let resp = http_client()?
-        .patch(url)
-        .headers(base_headers())
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AetherError::Api(e.to_string()))?;
+    let resp = send_resilient(|client| {
+        client
+            .patch(&url)
+            .headers(base_headers())
+            .bearer_auth(token)
+            .json(&body)
+    })
+    .await?;
 
     parse_account(resp).await
 }
@@ -276,8 +369,17 @@ async fn parse_account(resp: reqwest::Response) -> Result<AccountData> {
     if !status.is_success() {
         return Err(AetherError::Api(format!("upstream account API returned {status}")));
     }
-    serde_json::from_str::<AccountData>(&text)
-        .map_err(|e| AetherError::Api(format!("invalid account API response: {e}")))
+    let acct = serde_json::from_str::<AccountData>(&text)
+        .map_err(|e| AetherError::Api(format!("invalid account API response: {e}")))?;
+    for (i, p) in acct.config.peers.iter().enumerate() {
+        if !p.endpoint.host.is_empty() || !p.endpoint.v4.is_empty() || !p.endpoint.v6.is_empty() {
+            log::info!(
+                "[account] peer[{i}] endpoint host={:?} v4={:?} v6={:?}",
+                p.endpoint.host, p.endpoint.v4, p.endpoint.v6
+            );
+        }
+    }
+    Ok(acct)
 }
 
 fn extract_wg_peer(reg: &AccountData) -> Result<[u8; 32]> {
@@ -330,19 +432,43 @@ pub async fn provision_wg(model: &str, locale: &str, jwt: Option<&str>) -> Resul
         wg_private_key: wg_private,
         wg_peer_public_key: wg_peer_public,
         client_id: client_id_arr,
+        masque_endpoint: None,
     })
 }
 
-pub async fn ensure_masque_enrolled(identity: &Identity) -> Result<(Vec<u8>, Vec<u8>)> {
+pub async fn ensure_masque_enrolled(
+    identity: &Identity,
+) -> Result<(Vec<u8>, Vec<u8>, Option<String>)> {
     if !identity.cert_pem.is_empty() && !identity.key_pem.is_empty() {
-        return Ok((identity.cert_pem.clone(), identity.key_pem.clone()));
+        return Ok((
+            identity.cert_pem.clone(),
+            identity.key_pem.clone(),
+            identity.masque_endpoint.clone(),
+        ));
     }
 
     log::info!("[+] enrolling MASQUE key for device {}", identity.device_id);
     let keypair = generate_masque_keypair()?;
-    enroll_key(&identity.device_id, &identity.access_token, &keypair.spki_der, None).await?;
-    log::info!("[+] MASQUE key enrolled");
-    Ok((keypair.cert_pem, keypair.key_pem))
+    let acct =
+        enroll_key(&identity.device_id, &identity.access_token, &keypair.spki_der, None).await?;
+    let endpoint = masque_endpoint_from(&acct);
+    log::info!("[+] MASQUE key enrolled (endpoint={endpoint:?})");
+    Ok((keypair.cert_pem, keypair.key_pem, endpoint))
+}
+
+/// Extract the MASQUE data-plane endpoint (host:443) from a registration/enroll
+/// response's first peer. The API returns `endpoint.v4` like "162.159.198.2:0";
+/// the MASQUE QUIC port is 443, so normalize it.
+fn masque_endpoint_from(acct: &AccountData) -> Option<String> {
+    let ep = acct.config.peers.first()?.endpoint.v4.trim();
+    if ep.is_empty() {
+        return None;
+    }
+    let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{host}:443"))
 }
 
 impl Identity {
@@ -368,9 +494,5 @@ impl Identity {
 
     pub fn can_run_masque(&self) -> bool {
         matches!(self.capability(), IdentityCapability::MasqueReady)
-    }
-
-    pub fn can_run_wireguard(&self) -> bool {
-        !self.device_id.is_empty() && self.wg_private_key != [0u8; 32]
     }
 }

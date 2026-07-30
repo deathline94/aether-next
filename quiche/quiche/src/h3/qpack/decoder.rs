@@ -65,6 +65,49 @@ impl Representation {
     }
 }
 
+/// Helper for tracking decoded field list sizes.
+///
+/// The size of a field list is calculated based on the uncompressed size of
+/// fields, including the length of the name and value in bytes plus an overhead
+/// of 32 bytes for each field. See
+/// <https://datatracker.ietf.org/doc/html/rfc9114#section-4.2.2>
+struct FieldListSizeTracker {
+    remaining: u64,
+}
+
+impl FieldListSizeTracker {
+    /// Initialize tracker with the maximum field list size.
+    fn new(max_size: u64) -> Self {
+        Self { remaining: max_size }
+    }
+
+    /// Mark the start of parsing a new field.
+    fn on_field_start(&mut self) -> Result<()> {
+        // Each complete field has a 32-byte overhead, so subtract that first.
+        self.remaining = self
+            .remaining
+            .checked_sub(32)
+            .ok_or(Error::HeaderListTooLarge)?;
+
+        Ok(())
+    }
+
+    /// Marks when a field part (either name or value) has been decoded.
+    fn on_field_part_decoded(&mut self, len: u64) -> Result<()> {
+        self.remaining = self
+            .remaining
+            .checked_sub(len)
+            .ok_or(Error::HeaderListTooLarge)?;
+
+        Ok(())
+    }
+
+    /// The remaining number of bytes in the tracker.
+    fn left(&self) -> u64 {
+        self.remaining
+    }
+}
+
 /// A QPACK decoder.
 #[derive(Default)]
 pub struct Decoder {}
@@ -87,7 +130,7 @@ impl Decoder {
 
         let mut out = Vec::new();
 
-        let mut left = max_size;
+        let mut size_tracker = FieldListSizeTracker::new(max_size);
 
         let req_insert_count = decode_int(&mut b, 8)?;
         let base = decode_int(&mut b, 7)?;
@@ -96,6 +139,8 @@ impl Decoder {
 
         while b.cap() > 0 {
             let first = b.peek_u8()?;
+
+            size_tracker.on_field_start()?;
 
             match Representation::from_byte(first) {
                 Representation::Indexed => {
@@ -113,9 +158,9 @@ impl Decoder {
 
                     let (name, value) = lookup_static(index)?;
 
-                    left = left
-                        .checked_sub((name.len() + value.len()) as u64)
-                        .ok_or(Error::HeaderListTooLarge)?;
+                    size_tracker.on_field_part_decoded(
+                        (name.len() + value.len()) as u64,
+                    )?;
 
                     let hdr = Header::new(name, value);
                     out.push(hdr);
@@ -137,24 +182,29 @@ impl Decoder {
                     let mut name = b.get_bytes(name_len)?;
 
                     let name = if name_huff {
-                        name.get_huffman_decoded()?
+                        name.get_huffman_decoded_with_max_length(
+                            size_tracker.left() as usize,
+                        )
+                        .map_err(|_| Error::HeaderListTooLarge)?
                     } else {
+                        if name_len > size_tracker.left() as usize {
+                            return Err(Error::HeaderListTooLarge);
+                        }
                         name.to_vec()
                     };
 
-                    let name = name.to_vec();
-                    let value = decode_str(&mut b)?;
+                    size_tracker.on_field_part_decoded(name.len() as u64)?;
+
+                    let value = decode_str(&mut b, size_tracker.left() as usize)?;
 
                     trace!(
                         "Literal Without Name Reference name={name:?} value={value:?}",
                     );
 
-                    left = left
-                        .checked_sub((name.len() + value.len()) as u64)
-                        .ok_or(Error::HeaderListTooLarge)?;
+                    size_tracker.on_field_part_decoded(value.len() as u64)?;
 
                     // Instead of calling Header::new(), create Header directly
-                    // from `name` and `value`, which are already String.
+                    // from `name` and `value`.
                     let hdr = Header(name, value);
                     out.push(hdr);
                 },
@@ -163,27 +213,28 @@ impl Decoder {
                     const STATIC: u8 = 0x10;
 
                     let s = first & STATIC == STATIC;
-                    let name_idx = decode_int(&mut b, 4)?;
-                    let value = decode_str(&mut b)?;
-
-                    trace!(
-                        "Literal name_idx={name_idx} static={s} value={value:?}"
-                    );
 
                     if !s {
                         // TODO: implement dynamic table
                         return Err(Error::InvalidHeaderValue);
                     }
 
+                    let name_idx = decode_int(&mut b, 4)?;
+
                     let (name, _) = lookup_static(name_idx)?;
 
-                    left = left
-                        .checked_sub((name.len() + value.len()) as u64)
-                        .ok_or(Error::HeaderListTooLarge)?;
+                    size_tracker.on_field_part_decoded(name.len() as u64)?;
+
+                    let value = decode_str(&mut b, size_tracker.left() as usize)?;
+
+                    trace!(
+                        "Literal name_idx={name_idx} static={s} value={value:?}"
+                    );
+
+                    size_tracker.on_field_part_decoded(value.len() as u64)?;
 
                     // Instead of calling Header::new(), create Header directly
-                    // from `value`, which is already String, but clone `name`
-                    // as it is just a reference.
+                    // from `value`, but clone `name` as it is just a reference.
                     let hdr = Header(name.to_vec(), value);
                     out.push(hdr);
                 },
@@ -240,7 +291,7 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     Err(Error::BufferTooShort)
 }
 
-fn decode_str(b: &mut octets::Octets) -> Result<Vec<u8>> {
+fn decode_str(b: &mut octets::Octets, max_len: usize) -> Result<Vec<u8>> {
     let first = b.peek_u8()?;
 
     let huff = first & 0x80 == 0x80;
@@ -250,8 +301,12 @@ fn decode_str(b: &mut octets::Octets) -> Result<Vec<u8>> {
     let mut val = b.get_bytes(len)?;
 
     let val = if huff {
-        val.get_huffman_decoded()?
+        val.get_huffman_decoded_with_max_length(max_len)
+            .map_err(|_| Error::HeaderListTooLarge)?
     } else {
+        if len > max_len {
+            return Err(Error::HeaderListTooLarge);
+        }
         val.to_vec()
     };
 

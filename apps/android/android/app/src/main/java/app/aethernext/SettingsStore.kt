@@ -19,6 +19,7 @@ data class Settings(
     var startMinimized: Boolean = false,
     var launchAtLogin: Boolean = false,
     var enginePath: String = "",
+    var peer: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("protocol", protocol)
@@ -36,6 +37,7 @@ data class Settings(
         put("startMinimized", startMinimized)
         put("launchAtLogin", launchAtLogin)
         put("enginePath", enginePath)
+        put("peer", peer)
     }
 
     companion object {
@@ -55,6 +57,7 @@ data class Settings(
             startMinimized = o.optBoolean("startMinimized", false),
             launchAtLogin = o.optBoolean("launchAtLogin", false),
             enginePath = o.optString("enginePath", ""),
+            peer = o.optString("peer", ""),
         )
     }
 }

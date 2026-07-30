@@ -794,6 +794,9 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         return Err("Aether is already running".into());
     }
     let result = (|| -> Result<(), String> {
+        // A scan and a tunnel must not run at once: stop any active scan first
+        // (gracefully, persisting its best-so-far) before bringing up the tunnel.
+        stop_scan_child(&state.scan_child);
         if state.child.lock().unwrap().is_some() {
             return Err("Aether is already running".into());
         }
@@ -1045,11 +1048,20 @@ fn scan(
     timeout_ms: u32,
     noize: Option<String>,
 ) -> Result<(), String> {
-    // Stop any existing scan first.
-    if let Some(mut child) = state.scan_child.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    // Serialize with connect/disconnect/stop_scan (QA-5) so two engine processes
+    // can't spawn concurrently (double device registration + proxy-port contention).
+    let _operation = state.operation.lock().unwrap();
+    // A tunnel and a scan must not run at once. The frontend disconnects first,
+    // but guard here too in case that flow is bypassed.
+    if state.child.lock().unwrap().is_some() {
+        return Err("Disconnect before starting a scan.".into());
     }
+    // Clamp scan parameters defensively: the UI clamps too, but a replayed/direct
+    // invoke could pass out-of-range values.
+    let concurrency = concurrency.clamp(1, 2000);
+    let timeout_ms = timeout_ms.clamp(100, 30_000);
+    // Gracefully stop any existing scan first (persist its best-so-far).
+    stop_scan_child(&state.scan_child);
 
     let settings = load_settings_file(&app);
     let executable = engine_path(&app, &settings)?;
@@ -1079,6 +1091,10 @@ fn scan(
             "AETHER_MASQUE_HTTP2",
             if protocol == "masque-h2" { "1" } else { "0" },
         )
+        // Control channel so Stop can cooperatively cancel (persist best-so-far)
+        // instead of SIGKILL mid cache-write.
+        .env("AETHER_CONTROL_STDIN", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1105,6 +1121,9 @@ fn scan(
             if let Some(e) = stderr { v.push(Box::new(e)); }
             v
         };
+        // Track whether the engine forwarded its own terminal event, so we don't
+        // emit a second empty scan_done on exit (which logged "best:  ()").
+        let mut terminal_sent = false;
         for reader in readers {
             for line in BufReader::new(reader).lines().map_while(Result::ok) {
                 // Forward structured AETHER_EVENT lines as scan://event
@@ -1139,6 +1158,7 @@ fn scan(
                                 }));
                             }
                             "scan_done" => {
+                                terminal_sent = true;
                                 let _ = app_clone.emit("scan://event", v);
                             }
                             _ => {}
@@ -1149,24 +1169,55 @@ fn scan(
                 emit_log(&app_clone, line);
             }
         }
-        // When engine exits, emit scan_done if not already sent.
-        let _ = app_clone.emit("scan://event", serde_json::json!({
-            "type": "scan_done",
-            "addr": "",
-            "rtt": "",
-            "protocol": "",
-        }));
+        // When the engine exits, emit a terminal scan_done only if it didn't
+        // already send one — so a crash still unsticks the UI, but a normal
+        // finish doesn't double-log an empty "best".
+        if !terminal_sent {
+            let _ = app_clone.emit("scan://event", serde_json::json!({
+                "type": "scan_done",
+                "addr": "",
+                "rtt": "",
+                "protocol": "",
+            }));
+        }
     });
 
     Ok(())
 }
 
+/// Gracefully stop the scan child: ask the engine to cancel (so it persists the
+/// best endpoint found so far), wait briefly, then kill as a fallback. Does not
+/// touch the `operation` lock, so callers already holding it won't deadlock.
+fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
+    let mut child = match scan_child.lock().unwrap().take() {
+        Some(c) => c,
+        None => return,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"cancel\n");
+        let _ = stdin.flush();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn stop_scan(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(mut child) = state.scan_child.lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    // Serialize with connect/disconnect (QA-5) and cancel gracefully (QA-1).
+    let _operation = state.operation.lock().unwrap();
+    stop_scan_child(&state.scan_child);
     Ok(())
 }
 

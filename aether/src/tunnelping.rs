@@ -89,7 +89,6 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
         let quic::Channels {
             outbound_tx,
             inbound_rx,
-            ctrl_tx,
         } = chans;
 
         let stack = netstack::spawn(
@@ -107,7 +106,6 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 peer: masque_h2::h2_peer(p.peer),
                 sni: p.sni.clone(),
                 authority: p.authority.clone(),
-                path: p.path.clone(),
                 cert_pem: p.cert_pem.clone(),
                 key_pem: p.key_pem.clone(),
                 probe_src: Some(p.local_ipv4),
@@ -121,6 +119,7 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 path: p.path.clone(),
                 cert_pem: p.cert_pem.clone(),
                 key_pem: p.key_pem.clone(),
+                local_ipv4: p.local_ipv4,
                 ech_config_list: None,
                 noize: p.noize.clone(),
             };
@@ -136,7 +135,6 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
         let start = Instant::now();
         let result = http_probe(&stack).await.map(|()| start.elapsed());
 
-        drop(ctrl_tx);
         drop(tunnel_task);
         result
     };

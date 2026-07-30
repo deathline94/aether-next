@@ -12,10 +12,6 @@ const MAX_CLIENTS: usize = 256;
 const MAX_REQUEST_LINE: usize = 4096;
 const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
-pub async fn serve(listen: SocketAddr, stack: StackHandle) -> Result<()> {
-    serve_listener(bind(listen).await?, stack).await
-}
-
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
     if !listen.ip().is_loopback() && std::env::var_os("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
         return Err(AetherError::Other("refusing non-loopback HTTP proxy bind".into()));

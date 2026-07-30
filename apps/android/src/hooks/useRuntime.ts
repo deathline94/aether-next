@@ -1,16 +1,17 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke, listen } from "../bridge";
 import { defaults, initialRuntime } from "../types";
 import type { RuntimeState, Settings } from "../types";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
+/** If the engine stays "connecting" past this, surface a timeout instead of hanging forever. */
+const CONNECT_WATCHDOG_MS = 90_000;
 
 export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void) {
   const [settings, setSettings] = useState<Settings>(defaults);
-  // Settings must not be editable until hydrated from disk — otherwise a
-  // patch during that window persists `defaults` over the user's config.
+  // Settings must not be editable until hydrated from disk — otherwise a patch
+  // during that window persists `defaults` over the user's real config.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
@@ -19,21 +20,18 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
-  const [updateDismissed, setUpdateDismissed] = useState(false);
 
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Settings | null>(null);
-  // Mirrors the last settings object seen by the persist effect so hydration
-  // does not trigger a redundant write-back to disk.
   const settingsRef = useRef(settings);
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running || !settingsLoaded;
 
-  // Initialize: load settings, state, admin status, version + listen for events
+  // Initialize: load settings, state, admin/version + subscribe to engine events.
   useEffect(() => {
     let disposed = false;
     const receivedRuntimeEvent = { current: false };
@@ -58,8 +56,8 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
         appendLog({ level: "warn", message: String(error) });
       }
 
-      // Each fetch fails independently — one backend hiccup must not leave
-      // settings stuck on defaults or admin/version unknown.
+      // Each fetch fails independently — one backend hiccup must not strand
+      // settings on defaults or leave admin/version unknown.
       const [loadedSettings, state, isAdmin, info] = await Promise.all([
         invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${String(e)}` }); return null; }),
         invoke<RuntimeState>("get_state").catch(() => null),
@@ -68,46 +66,46 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
       ]);
       if (disposed) return;
       if (loadedSettings) {
-        settingsRef.current = loadedSettings;
-        setSettings(loadedSettings);
+        settingsRef.current = { ...defaults, ...loadedSettings };
+        setSettings(settingsRef.current);
         setSettingsLoaded(true);
       }
       if (state && !receivedRuntimeEvent.current) setRuntime(state);
-      setAdmin(isAdmin);
+      setAdmin(Boolean(isAdmin));
       setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
     }
     void initialize();
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
   }, [appendLog]);
 
-  // Cleanup timers on unmount
+  // Cleanup timers on unmount.
   useEffect(() => () => {
     if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    if (watchdogRef.current) clearTimeout(watchdogRef.current);
   }, []);
 
-  // Check for updates once the real version is known (semver-aware).
+  // Connection watchdog: never let the UI sit on "connecting" forever.
   useEffect(() => {
-    if (!appVersion || appVersion === FALLBACK_VERSION) return;
-    fetch("https://api.github.com/repos/deathline94/aether-next/releases/latest")
-      .then((res) => res.json())
-      .then((data) => {
-        if (data?.tag_name) {
-          const latest = String(data.tag_name).replace(/^v/, "");
-          if (semverGt(latest, appVersion)) {
-            setUpdateAvailable({
-              version: data.tag_name,
-              url: data.html_url || "https://github.com/deathline94/aether-next/releases/latest",
-            });
-          }
-        }
-      })
-      .catch(() => {});
-  }, [appVersion]);
+    if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
+    if (runtime.status !== "connecting") return;
+    watchdogRef.current = setTimeout(() => {
+      setRuntime((prev) =>
+        prev.status === "connecting"
+          ? { status: "error", detail: "Connection timed out — no reachable route found. Try another protocol or network.", pid: null, endpoint: null }
+          : prev,
+      );
+      void invoke("disconnect").catch(() => {});
+      appendLog({ level: "error", message: "Connection timed out after 90s; engine stopped." });
+    }, CONNECT_WATCHDOG_MS);
+    return () => {
+      if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
+    };
+  }, [runtime.status, appendLog]);
 
   const persistSettings = useCallback((next: Settings) => {
-    // Debounced: NumberField commits and toggles can arrive in bursts;
-    // don't hit the disk per event.
+    // Debounced: NumberField commits and toggles arrive in bursts; don't hit
+    // storage per event.
     pendingSaveRef.current = next;
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     saveDebounceRef.current = setTimeout(async () => {
@@ -119,7 +117,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
       } catch (error) {
-        appendLog({ level: "error", message: String(error) });
+        appendLog({ level: "error", message: `Save settings failed: ${String(error)}` });
       }
     }, SAVE_DEBOUNCE_MS);
   }, [appendLog]);
@@ -145,8 +143,12 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
       if (running) {
         await invoke("disconnect");
       } else {
+        // Primary "Connect" always does a fresh scan — clear any pinned peer so
+        // a previously-dead Connect-Direct endpoint can't block the main flow.
+        const fresh: Settings = { ...settings, peer: "" };
+        if (settings.peer) setSettings(fresh);
         setRuntime({ status: "connecting", detail: "Starting engine", pid: null, endpoint: null });
-        await invoke("connect", { settings });
+        await invoke("connect", { settings: fresh });
       }
     } catch (error) {
       const detail = String(error);
@@ -157,22 +159,24 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     }
   }, [busy, running, settings, appendLog]);
 
-  const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
+  const connectToPeer = useCallback(async (peer: string, protocol: Settings["protocol"], transport: Settings["transport"]) => {
     if (busy) return;
     setBusy(true);
+    setTestResult(null);
     try {
       if (running) {
         await invoke("disconnect");
         await new Promise((r) => setTimeout(r, 400));
       }
-      const nextSettings: Settings = { ...settings, protocol: protocol as Settings["protocol"], transport: transport as Settings["transport"], peer };
-      // Keep UI state in sync with what the engine actually runs — otherwise
-      // the Connection tab reports the previous protocol.
+      // Pin the chosen endpoint so the engine skips scanning and dials it directly.
+      const nextSettings: Settings = { ...settings, protocol, transport, peer };
       setSettings(nextSettings);
-      setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
+      setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: peer });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
-      appendLog({ level: "error", message: `Direct connect error: ${String(error)}` });
+      const detail = `Direct connect error: ${String(error)}`;
+      setRuntime({ status: "error", detail, pid: null, endpoint: null });
+      appendLog({ level: "error", message: detail });
     } finally {
       setBusy(false);
     }
@@ -199,27 +203,10 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     setRuntime(initialRuntime);
   }, []);
 
-  const dismissUpdate = useCallback(() => setUpdateDismissed(true), []);
-
   return {
-    settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
-    saved, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
+    settings, runtime, busy, testBusy, saved, admin, testResult,
+    appVersion: appVersion ?? "…",
     connected, running, settingsLocked, settingsLoaded,
-    patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
+    patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   };
-}
-
-/** Semver-aware greater-than comparison; tolerates pre-release suffixes. */
-function semverGt(a: string, b: string): boolean {
-  const parse = (v: string) =>
-    v.split("-")[0].split(".").map((p) => Number.parseInt(p, 10) || 0);
-  const pa = parse(a);
-  const pb = parse(b);
-  for (let i = 0; i < 3; i++) {
-    const na = pa[i] || 0;
-    const nb = pb[i] || 0;
-    if (na > nb) return true;
-    if (na < nb) return false;
-  }
-  return false;
 }

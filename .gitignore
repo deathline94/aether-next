@@ -74,6 +74,7 @@ Desktop.ini
 tmp/
 temp/
 .kotlin/
+rustup-init.exe
 
 # ── Secrets / local env ───────────────────────────────────────
 .release-signing/

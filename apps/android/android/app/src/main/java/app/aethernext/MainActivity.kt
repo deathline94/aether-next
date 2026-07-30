@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.webkit.ConsoleMessage
@@ -150,6 +151,19 @@ class MainActivity : AppCompatActivity() {
         )
         Log.i(TAG, "loading $entry")
         webView.loadUrl(entry)
+
+        // Android 13+ suppresses the foreground-service notification unless this
+        // runtime permission is granted, so request it up front. Denial is
+        // non-fatal (the tunnel still runs; the notification just won't show).
+        maybeRequestNotificationPermission()
+    }
+
+    private fun maybeRequestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val perm = android.Manifest.permission.POST_NOTIFICATIONS
+        if (checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(perm), REQ_NOTIFICATIONS)
+        }
     }
 
     private fun showLoadError(description: String, url: String) {
@@ -234,6 +248,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "AetherMain"
         private const val REQ_VPN = 1001
+        private const val REQ_NOTIFICATIONS = 1002
         private const val APP_HOST = "appassets.androidplatform.net"
     }
 }

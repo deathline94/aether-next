@@ -114,10 +114,6 @@ impl TcpConn {
             .map_err(|_| AetherError::Other("netstack closed".into()))
     }
 
-    pub async fn close(&self) {
-        let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
-    }
-
     pub fn into_split(self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
         (
             TcpSender {
@@ -154,17 +150,6 @@ pub struct UdpConn {
 }
 
 impl UdpConn {
-    pub async fn send_to(&self, dst: SocketAddr, data: Vec<u8>) -> Result<()> {
-        self.data_in
-            .send(DataIn::Udp(self.id, dst, data))
-            .await
-            .map_err(|_| AetherError::Other("netstack closed".into()))
-    }
-
-    pub async fn close(&self) {
-        let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
-    }
-
     pub fn into_split(self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
         (
             UdpSender {

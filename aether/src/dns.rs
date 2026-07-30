@@ -167,6 +167,15 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
 ///
 /// `src` is the tunnel-local IPv4 address; `resolver` is the upstream DNS
 /// target (typically 1.1.1.1 or 8.8.8.8).
+/// The IPv4 resolver the data-plane probe targets. Configurable via
+/// `AETHER_DATAPLANE_PROBE_IP` because the default (8.8.8.8) is blocked in some
+/// regions, which would make a perfectly good tunnel fail verification.
+pub fn dataplane_probe_target() -> Ipv4Addr {
+    crate::runtime_env::var("AETHER_DATAPLANE_PROBE_IP")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(Ipv4Addr::new(8, 8, 8, 8))
+}
+
 pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {
     // DNS A query for cloudflare.com
     let mut dns = Vec::with_capacity(64);
@@ -208,7 +217,9 @@ pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {
 }
 
 /// Validate that an inbound IPv4 datagram is a UDP DNS reply from the given
-/// resolver port 53. Used by data-plane verification to filter stray packets.
+/// resolver on port 53. Currently exercised only by tests (the live data-plane
+/// path decodes QUIC DATAGRAMs), so it is compiled for tests only.
+#[cfg(test)]
 pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
     if pkt.len() < 28 || pkt[0] >> 4 != 4 {
         return false;

@@ -110,12 +110,15 @@ fn ps(cmd: &str) -> Result<String> {
     )
 }
 
-fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr) -> Result<()> {
+fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr, mtu: usize) -> Result<()> {
     if !ps_literal_is_safe(name) {
         return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
     }
     // WireGuard-style: /32 on tunnel NIC, no gateway, low metric, DNS via tunnel.
-    let mtu = crate::mtu::current().clamp(1280, 1400);
+    // MTU is threaded in from the tunnel runner (the H3 data plane caps it to 1280
+    // to fit QUIC DATAGRAMs) instead of read from a global, so a concurrent
+    // scan/tunnel in the same process cannot clobber it.
+    let mtu = mtu.clamp(1280, 1400);
     let ip = ipv4.to_string();
     // Enable + purge old IPv4 config, then set address/DNS/MTU/metric in one shot.
     // Also disable IPv6 on the adapter to prevent router advertisements from overriding.
@@ -427,6 +430,7 @@ impl Drop for TunHandle {
 pub async fn spawn(
     ipv4_cidr: &str,
     peer: SocketAddr,
+    mtu: usize,
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<TunHandle> {
@@ -451,7 +455,7 @@ pub async fn spawn(
     let ipv4 = parse_v4(ipv4_cidr)?;
     // Wait briefly for adapter to appear in Windows.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    configure_adapter_ip(ADAPTER_NAME, ipv4)?;
+    configure_adapter_ip(ADAPTER_NAME, ipv4, mtu)?;
 
     let session = adapter
         .start_session(MAX_RING_CAPACITY)
@@ -492,7 +496,7 @@ pub async fn spawn(
                     continue;
                 }
                 n += 1;
-                if n == 1 || n % 5000 == 0 {
+                if n == 1 || n.is_multiple_of(5000) {
                     log::info!("[tun] rx from kernel packets={n} last_len={}", data.len());
                 }
                 match out_tx.try_send(data) {
@@ -559,7 +563,7 @@ pub async fn spawn(
                     .await
                     .unwrap_or(0);
                     n += wrote as u64;
-                    if n <= batch_len as u64 || n % 5000 == 0 {
+                    if n <= batch_len as u64 || n.is_multiple_of(5000) {
                         log::info!("[tun] tx to kernel packets={n} batch={batch_len}");
                     }
                 }

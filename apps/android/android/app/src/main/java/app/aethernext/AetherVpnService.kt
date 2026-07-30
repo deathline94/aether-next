@@ -85,6 +85,9 @@ class AetherVpnService : VpnService() {
     private fun establishTun(socksPort: Int) {
         synchronized(lifecycleLock) {
             if (stopRequested) return
+            // Idempotent: two onStartCommands can both observe tun == null before this
+            // runs on the single worker thread; establishing twice would leak the first fd.
+            if (tun != null) return
             val builder = Builder()
                 .setSession("Aether Next")
                 .setMtu(MTU)

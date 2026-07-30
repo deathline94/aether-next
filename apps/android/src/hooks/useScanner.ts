@@ -1,9 +1,13 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke, listen } from "../bridge";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 
+/**
+ * Owns standalone-scanner state. Progress/hits arrive as structured
+ * `scan://event` messages forwarded by the native bridge — no log-string
+ * parsing. `running` lets us disconnect an active tunnel before scanning.
+ */
 export function useScanner(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
   running: boolean,
@@ -20,7 +24,6 @@ export function useScanner(
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
 
-  // Listen for structured scan events from the Tauri backend
   useEffect(() => {
     let disposed = false;
     listen<ScanEvent>("scan://event", (event) => {
@@ -40,19 +43,10 @@ export function useScanner(
           });
           break;
         case "scan_progress":
-          setScanState((prev) => ({
-            ...prev,
-            scanned: ev.scanned,
-            total: ev.total,
-            working: ev.working,
-          }));
+          setScanState((prev) => ({ ...prev, scanned: ev.scanned, total: ev.total, working: ev.working }));
           break;
         case "scan_hit":
-          setScanState((prev) => ({
-            ...prev,
-            working: prev.working + 1,
-            bestRtt: ev.rtt || prev.bestRtt,
-          }));
+          setScanState((prev) => ({ ...prev, working: prev.working + 1, bestRtt: ev.rtt || prev.bestRtt }));
           setEndpoints((prev) => {
             if (prev.some((e) => e.addr === ev.addr)) return prev;
             return [...prev, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
@@ -62,7 +56,7 @@ export function useScanner(
           break;
         case "scan_done":
           setScanState((prev) => ({ ...prev, active: false, phase: "Verified" }));
-          appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
+          if (ev.addr) appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
           break;
         case "scan_failed":
           setScanState((prev) => ({ ...prev, active: false, phase: "Failed" }));
@@ -70,12 +64,16 @@ export function useScanner(
           break;
       }
     }).then((unlisten) => {
-      if (disposed) { unlisten(); return; }
+      if (disposed) {
+        unlisten();
+        return;
+      }
       unlistenRef.current = unlisten;
-    }).catch((err) => {
-      appendLog({ level: "error", message: `Scan event listener failed to start: ${String(err)}` });
     });
-    return () => { disposed = true; unlistenRef.current?.(); };
+    return () => {
+      disposed = true;
+      unlistenRef.current?.();
+    };
   }, [appendLog]);
 
   const startScan = useCallback(async () => {
@@ -102,15 +100,14 @@ export function useScanner(
   }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog]);
 
   const stopScan = useCallback(async () => {
-    // Ask the engine first — only report "Stopped" once it actually is.
+    // Ask the engine first; report "Stopped" regardless so the UI never sticks.
     try {
       await invoke("stop_scan");
-      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
       appendLog({ level: "info", message: "Scan stopped." });
     } catch (error) {
-      // Engine may have already finished; don't leave the UI stuck either way.
-      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
       appendLog({ level: "warn", message: `Stop scan: ${String(error)}` });
+    } finally {
+      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
     }
   }, [appendLog]);
 

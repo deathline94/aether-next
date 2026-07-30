@@ -46,6 +46,11 @@ class SessionController(
                 null,
                 null,
             )
+            // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
+            emit(
+                "scan://event",
+                JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
+            )
             context.stopService(Intent(context, EngineService::class.java))
             stopVpnService()
         },
@@ -187,6 +192,13 @@ class SessionController(
                     "endpoint_selected" -> {
                         runtime.endpoint = json.optString("addr").ifEmpty { null }
                         emitState()
+                        // The connect path emits no scan_done — close the live scan card
+                        // once a gateway is chosen so it does not linger during the tunnel.
+                        emit(
+                            "scan://event",
+                            JSONObject().put("type", "scan_done")
+                                .put("addr", json.optString("addr")).put("rtt", "").put("protocol", ""),
+                        )
                     }
                     "proxy_ready" -> {
                         socksSeen.set(true)
@@ -197,6 +209,10 @@ class SessionController(
                         maybeStartVpn()
                     }
                     "error" -> emitLog("engine error: ${json.optString("message")}")
+                    // Forward structured scan telemetry to the webview (scan://event),
+                    // mirroring the desktop Tauri bridge. The UI consumes these instead
+                    // of regex-parsing log lines.
+                    "scan_start", "scan_progress", "scan_hit", "scan_done" -> emitScanEvent(json)
                 }
             } catch (_: Exception) {
             }
@@ -325,6 +341,35 @@ class SessionController(
 
     private fun emitState() {
         emit("session://state", runtime.toJson())
+    }
+
+    /**
+     * Re-shape an engine AETHER_EVENT scan payload into the webview's scan://event
+     * contract. The engine emits snake_case `rtt_ms`; the UI expects `rttMs`.
+     */
+    private fun emitScanEvent(src: JSONObject) {
+        val type = src.optString("type")
+        val out = JSONObject().put("type", type)
+        when (type) {
+            "scan_start" -> out
+                .put("mode", src.optString("mode"))
+                .put("total", src.optLong("total"))
+                .put("concurrency", src.optLong("concurrency"))
+            "scan_progress" -> out
+                .put("scanned", src.optLong("scanned"))
+                .put("total", src.optLong("total"))
+                .put("working", src.optLong("working"))
+            "scan_hit" -> out
+                .put("addr", src.optString("addr"))
+                .put("rtt", src.optString("rtt"))
+                .put("rttMs", src.optDouble("rtt_ms", 0.0))
+                .put("protocol", src.optString("protocol"))
+            "scan_done" -> out
+                .put("addr", src.optString("addr"))
+                .put("rtt", src.optString("rtt"))
+                .put("protocol", src.optString("protocol"))
+        }
+        emit("scan://event", out)
     }
 
     private fun emitLog(message: String) {

@@ -39,23 +39,3 @@ pub fn channels() -> (Channels, Internals) {
 pub fn packet_channels() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
     mpsc::channel(NET_QUEUE)
 }
-
-/// Marker for transport kind — used by session events / logging.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportKind {
-    MasqueH3,
-    MasqueH2,
-    WireGuard,
-    Gool,
-}
-
-impl TransportKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TransportKind::MasqueH3 => "h3",
-            TransportKind::MasqueH2 => "h2",
-            TransportKind::WireGuard => "wireguard",
-            TransportKind::Gool => "gool",
-        }
-    }
-}

@@ -178,8 +178,25 @@ pub enum CacheKind {
     WireGuard,
 }
 
+/// How expensive a single verify probe is. QUIC/H3 verification runs a full
+/// handshake + CONNECT-IP + data-plane round-trip and builds a BoringSSL context
+/// per probe, so it needs a longer timeout and a hard concurrency ceiling; TCP/H2
+/// and WireGuard handshakes are comparatively cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyCost {
+    Cheap,
+    Expensive,
+}
+
+/// Per-probe budget floors/ceilings for expensive (QUIC/BoringSSL) verification.
+const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_secs(5);
+const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
+const EXPENSIVE_MAX_CONCURRENCY: usize = 16;
+
 /// Static configuration describing the IP pool and cache behavior for a scan.
 pub struct ProbeConfig {
+    /// Cost of one verify probe; drives concurrency/timeout tuning below.
+    pub verify_cost: VerifyCost,
     pub cidrs_v4: &'static [&'static str],
     pub cidrs_v6: &'static [&'static str],
     pub cidr_weights_v4: &'static [(&'static str, u8)],
@@ -221,10 +238,20 @@ pub type VerifyFn<'a> = dyn Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Futur
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn host_has_ipv6() -> bool {
-    match tokio::net::UdpSocket::bind("[::]:0").await {
-        Ok(sock) => sock.connect("[2606:4700:d0::a29f:c001]:443").await.is_ok(),
-        Err(_) => false,
+    let sock = match tokio::net::UdpSocket::bind("[::]:0").await {
+        Ok(s) => s,
+        Err(_) => return false, // no IPv6 stack at all
+    };
+    // UDP connect() only performs a route lookup (no packet is sent), so this
+    // tests "is there a route to a global v6 address", not reachability of one
+    // specific host. Try more than one target so a single withdrawn prefix does
+    // not produce a false negative.
+    for target in ["[2606:4700:d0::a29f:c001]:443", "[2001:4860:4860::8888]:443"] {
+        if sock.connect(target).await.is_ok() {
+            return true;
+        }
     }
+    false
 }
 
 /// Emit a structured scan hit event so the GUI standalone scanner can list
@@ -248,6 +275,20 @@ fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration) {
 
 /// Run the unified endpoint hunt: tier-0 cache → candidate generation → concurrent
 /// probing with hot-subnet drill-down → deadline/quiet-period management.
+/// Cooperative scan cancellation. `hunt_best` checks this each iteration and
+/// stops gracefully (returning the best endpoint found so far), so a scan can be
+/// stopped without killing the process mid-work. Wire `request_scan_cancel` to a
+/// Ctrl-C / SIGTERM handler or an IPC "stop" command.
+static SCAN_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_scan_cancel() {
+    SCAN_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scan_cancelled() -> bool {
+    SCAN_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn hunt_best(
     config: &ProbeConfig,
     ports: &[u16],
@@ -255,13 +296,28 @@ pub async fn hunt_best(
     mode: ScanMode,
     verify: &VerifyFn<'_>,
 ) -> Result<ProbeResult> {
+    // Clear any stale cancellation from a previous scan before starting a new one.
+    SCAN_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let mut st = mode.strategy(&config.profile);
+    // Expensive (QUIC/H3) verification needs a longer per-probe budget than the
+    // fast TCP/UDP defaults, or every probe times out mid-handshake. This models
+    // per-protocol verify cost instead of hard-coding a protocol check.
+    if config.verify_cost == VerifyCost::Expensive {
+        st.per_probe_timeout = st.per_probe_timeout.max(EXPENSIVE_MIN_TIMEOUT);
+        st.concurrency = st.concurrency.min(EXPENSIVE_DEFAULT_CONCURRENCY);
+    }
     // User overrides from the GUI scanner tab (AETHER_SCAN_CONCURRENCY / AETHER_SCAN_TIMEOUT_MS).
     if let Some(c) = crate::runtime_env::usize("AETHER_SCAN_CONCURRENCY") {
         st.concurrency = c.max(1);
     }
     if let Some(ms) = crate::runtime_env::usize("AETHER_SCAN_TIMEOUT_MS") {
         st.per_probe_timeout = Duration::from_millis(ms as u64);
+    }
+    // Hard safety ceiling for expensive verifies: many concurrent BoringSSL
+    // handshakes abort the process (0xC0000409). Enforced AFTER env overrides so
+    // no user/GUI setting can crash an H3 scan.
+    if config.verify_cost == VerifyCost::Expensive {
+        st.concurrency = st.concurrency.min(EXPENSIVE_MAX_CONCURRENCY);
     }
     // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
     // No target_successes limit, no early exit, extended deadline.
@@ -369,13 +425,18 @@ pub async fn hunt_best(
             break;
         }
 
+        if scan_cancelled() {
+            log::info!("[*] scan cancelled by request; finalizing with best so far");
+            break;
+        }
+
         tokio::select! {
             item = stream.next() => {
                 match item {
                     None => break,
                     Some(res) => {
                         scanned += 1;
-                        if scanned % 50 == 0 || scanned == total_candidates {
+                        if scanned.is_multiple_of(50) || scanned == total_candidates {
                             log::info!("[*] scanning... {}/{} ips, found {} working", scanned, total_candidates, found);
                             crate::session_event::emit(crate::session_event::SessionEvent::ScanProgress {
                                 scanned,
@@ -455,7 +516,22 @@ pub async fn hunt_best(
             config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
             Ok(pr)
         }
-        None => Err(AetherError::NoCleanEndpoint),
+        None => {
+            // A completed scan that found nothing usually means the endpoints are
+            // fine but the network is dropping this transport on every port. Say so
+            // explicitly so the user doesn't blame the IPs and rescan forever.
+            let hint = if label.contains("gateway") {
+                if crate::masque_h2::enabled() {
+                    "no MASQUE/HTTP2 gateway answered on any port; the network may be blocking TLS to Cloudflare (try WireGuard)"
+                } else {
+                    "no MASQUE/HTTP3 gateway answered on any port; the network may be blocking QUIC/UDP (try HTTP/2 or WireGuard)"
+                }
+            } else {
+                "no WireGuard endpoint answered on any port; the network may be blocking UDP"
+            };
+            log::warn!("[-] scan found no reachable endpoint — {hint}");
+            Err(AetherError::NoCleanEndpoint)
+        }
     }
 }
 
@@ -561,105 +637,137 @@ fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpSc
     let mut tier2_out: Vec<(IpAddr, u16)> = Vec::new();
     let mut tier3_out: Vec<(IpAddr, u16)> = Vec::new();
 
-    // ── Weighted CIDR ranking: sort CIDRs by weight (highest first) ──
-    let mut weighted_cidrs: Vec<(&str, u8)> = if ip.want_v4() {
-        config.cidr_weights_v4.to_vec()
-    } else {
-        Vec::new()
-    };
-    weighted_cidrs.sort_by(|a, b| b.1.cmp(&a.1));
-    let max_weight = weighted_cidrs.first().map(|&(_, w)| w.max(1)).unwrap_or(1) as usize;
-
-    // ── Weight-proportional sampling: higher-weight CIDRs get more samples ──
-    let sample_for_weight = |weight: u8| -> usize {
-        if st.full_subnet { return 0; } // full_subnet ignores sampling
-        let base = st.sample_per_cidr;
-        if base == 0 { return 0; }
-        let proportional = (base * weight as usize) / max_weight;
-        proportional.max(base / 5).max(8) // floor: at least 8 or 20% of base
-    };
-
-    // Helper: generate candidates for a set of ports across CIDRs
-    let mut gen_pool = |port_set: &[u16], out: &mut Vec<(IpAddr, u16)>| {
+    // ── Seeds on ALL tiered ports (443 group first, then 8443/4443/8095, then
+    // 2408/500/1701/4500), placed at the FRONT of the probe order by the assembly
+    // below. Pairing the known-good seed VIPs with every port — not just 443 — is
+    // what lets the scan punch through networks that DPI-drop QUIC on :443 while
+    // leaving the alternate UDP ports (the ones WARP uses) open. Generated BEFORE
+    // the CIDR sweep so a seed IP that also falls inside a sampled CIDR stays in the
+    // seed set (guaranteed first) instead of being randomly demoted into a tier.
+    let tiered_ports: Vec<u16> = t1_ports
+        .iter()
+        .chain(t2_ports.iter())
+        .chain(t3_ports.iter())
+        .copied()
+        .collect();
+    let mut v4_seeds: Vec<Ipv4Addr> =
+        config.seeds_v4.iter().filter_map(|s| s.parse().ok()).collect();
+    let mut v6_seeds: Vec<Ipv6Addr> =
+        config.seeds_v6.iter().filter_map(|s| s.parse().ok()).collect();
+    v4_seeds.shuffle(&mut rng);
+    v6_seeds.shuffle(&mut rng);
+    let mut seeds_out: Vec<(IpAddr, u16)> = Vec::new();
+    for &p in &tiered_ports {
         if ip.want_v4() {
-            for &(cidr, weight) in &weighted_cidrs {
-                let n = sample_for_weight(weight);
-                let hosts = if st.full_subnet {
-                    enumerate_cidr_v4(cidr)
-                } else {
-                    sample_cidr_v4(cidr, n)
-                };
-                for a in hosts {
-                    for &p in port_set {
-                        if seen.insert((IpAddr::V4(a), p)) {
-                            out.push((IpAddr::V4(a), p));
-                        }
-                    }
+            for a in &v4_seeds {
+                if seen.insert((IpAddr::V4(*a), p)) {
+                    seeds_out.push((IpAddr::V4(*a), p));
                 }
             }
         }
         if ip.want_v6() {
-            let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
-            for c in config.cidrs_v6 {
-                let hosts = sample_cidr_v6(c, per, config.cidrs_v4);
-                for a in hosts {
-                    for &p in port_set {
-                        if seen.insert((IpAddr::V6(a), p)) {
-                            out.push((IpAddr::V6(a), p));
-                        }
-                    }
+            for a in &v6_seeds {
+                if seen.insert((IpAddr::V6(*a), p)) {
+                    seeds_out.push((IpAddr::V6(*a), p));
                 }
             }
         }
-    };
+    }
 
-    // Generate in tier order: T1 first (port-443-first for MASQUE), then T2, then T3.
-    gen_pool(&t1_ports, &mut tier1_out);
-    gen_pool(&t2_ports, &mut tier2_out);
-    gen_pool(&t3_ports, &mut tier3_out);
+    // CIDR sweep per tier (443-first for MASQUE, then T2, then T3). Runs AFTER the
+    // seed pairing so the shared `seen` set already holds the seeds; the sweep then
+    // naturally skips them and fills the tiers with fresh hosts. Extracted to a free
+    // fn — no more captured-closure borrow gymnastics over `seen`.
+    cidr_pool(config, st, ip, &t1_ports, &mut seen, &mut tier1_out);
+    cidr_pool(config, st, ip, &t2_ports, &mut seen, &mut tier2_out);
+    cidr_pool(config, st, ip, &t3_ports, &mut seen, &mut tier3_out);
 
-    // ── Seeds: shuffled and prepended to Tier 1 (known-good anchors) ──
-    let mut seeds_out: Vec<(IpAddr, u16)> = Vec::new();
+    cap_and_order(seeds_out, tier1_out, tier2_out, tier3_out)
+}
+
+/// Weight-proportional sample size for one v4 CIDR: higher weight -> more
+/// samples; `full_subnet` or a zero base disables sampling.
+fn sample_for_weight(st: &Strategy, weight: u8, max_weight: usize) -> usize {
+    if st.full_subnet || st.sample_per_cidr == 0 {
+        return 0;
+    }
+    let base = st.sample_per_cidr;
+    ((base * weight as usize) / max_weight).max(base / 5).max(8)
+}
+
+/// Append weighted-sampled CIDR candidates for one port set to `out` (unique by
+/// (ip, port) via `seen`). v4 CIDRs are weighted so hot subnets are sampled
+/// harder; v6 uses a flat per-CIDR sample.
+fn cidr_pool(
+    config: &ProbeConfig,
+    st: &Strategy,
+    ip: IpScan,
+    port_set: &[u16],
+    seen: &mut HashSet<(IpAddr, u16)>,
+    out: &mut Vec<(IpAddr, u16)>,
+) {
     if ip.want_v4() {
-        for s in config.seeds_v4 {
-            if let Ok(a) = s.parse::<Ipv4Addr>() {
-                for &p in &t1_ports {
+        let mut weighted: Vec<(&str, u8)> = config.cidr_weights_v4.to_vec();
+        weighted.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+        let max_weight = weighted.first().map(|&(_, w)| w.max(1)).unwrap_or(1) as usize;
+        for &(cidr, weight) in &weighted {
+            let hosts = if st.full_subnet {
+                enumerate_cidr_v4(cidr)
+            } else {
+                sample_cidr_v4(cidr, sample_for_weight(st, weight, max_weight))
+            };
+            for a in hosts {
+                for &p in port_set {
                     if seen.insert((IpAddr::V4(a), p)) {
-                        seeds_out.push((IpAddr::V4(a), p));
+                        out.push((IpAddr::V4(a), p));
                     }
                 }
             }
         }
     }
     if ip.want_v6() {
-        for s in config.seeds_v6 {
-            if let Ok(a) = s.parse::<Ipv6Addr>() {
-                for &p in &t1_ports {
+        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
+        for c in config.cidrs_v6 {
+            for a in sample_cidr_v6(c, per, config.cidrs_v4) {
+                for &p in port_set {
                     if seen.insert((IpAddr::V6(a), p)) {
-                        seeds_out.push((IpAddr::V6(a), p));
+                        out.push((IpAddr::V6(a), p));
                     }
                 }
             }
         }
     }
-    seeds_out.shuffle(&mut rng);
+}
 
-    // ── Cap thorough mode to prevent excessive candidate counts ──
+/// Cap the total candidate count while guaranteeing tier3 (alt ports) a floor —
+/// on a DPI-blocked-443 network those are the only ports that can answer — then
+/// return candidates in probe order: seeds first, then T1, T2, T3.
+fn cap_and_order(
+    mut seeds: Vec<(IpAddr, u16)>,
+    mut t1: Vec<(IpAddr, u16)>,
+    mut t2: Vec<(IpAddr, u16)>,
+    mut t3: Vec<(IpAddr, u16)>,
+) -> Vec<(IpAddr, u16)> {
     const MAX_CANDIDATES: usize = 20_000;
-    let total = seeds_out.len() + tier1_out.len() + tier2_out.len() + tier3_out.len();
+    const TIER3_FLOOR: usize = 1_000;
+    let total = seeds.len() + t1.len() + t2.len() + t3.len();
     if total > MAX_CANDIDATES {
-        // Keep all seeds + tier1, truncate tier2/tier3 proportionally.
-        let budget = MAX_CANDIDATES.saturating_sub(seeds_out.len() + tier1_out.len());
-        let t2_keep = budget * tier2_out.len() / (tier2_out.len() + tier3_out.len()).max(1);
-        tier2_out.truncate(t2_keep);
-        tier3_out.truncate(budget.saturating_sub(t2_keep));
+        let budget = MAX_CANDIDATES.saturating_sub(seeds.len());
+        let t3_floor = t3.len().min(TIER3_FLOOR).min(budget);
+        let rest = budget - t3_floor;
+        let t1_keep = t1.len().min(rest);
+        let rest = rest - t1_keep;
+        let t2_keep = t2.len().min(rest);
+        let rest = rest - t2_keep;
+        let t3_keep = (t3_floor + rest).min(t3.len());
+        t1.truncate(t1_keep);
+        t2.truncate(t2_keep);
+        t3.truncate(t3_keep);
     }
-
-    // Final order: seeds → tier1 → tier2 → tier3
-    seeds_out.extend(tier1_out);
-    seeds_out.extend(tier2_out);
-    seeds_out.extend(tier3_out);
-    seeds_out
+    seeds.extend(t1);
+    seeds.extend(t2);
+    seeds.extend(t3);
+    seeds
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -680,12 +788,20 @@ fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
     if host_bits == 0 {
         return vec![Ipv4Addr::from(base)];
     }
-    if host_bits > 12 {
-        return Vec::new();
+    // Cap enumeration so a large CIDR (e.g. /16) can't explode the candidate set.
+    // Prefixes shorter than /20 are capped to their first block AND logged, rather
+    // than silently returning nothing (the old behaviour skipped them entirely).
+    const MAX_ENUM_HOST_BITS: u32 = 12; // 4096 hosts
+    if host_bits > MAX_ENUM_HOST_BITS {
+        log::debug!(
+            "[scan] {cidr} larger than /{}; enumerating first {} hosts only",
+            32 - MAX_ENUM_HOST_BITS,
+            1u32 << MAX_ENUM_HOST_BITS
+        );
     }
-    let size = 1u32 << host_bits;
+    let size = 1u32 << host_bits.min(MAX_ENUM_HOST_BITS);
     (1..size.saturating_sub(1))
-        .map(|off| Ipv4Addr::from(base + off))
+        .map(|off| Ipv4Addr::from(base.saturating_add(off)))
         .collect()
 }
 
@@ -797,7 +913,6 @@ pub const MASQUE_PORTS: &[u16] = &[443, 8443, 4443, 8095, 2408, 500, 1701, 4500]
 /// MASQUE port tiers: Tier 1 scanned first, Tier 2 next, Tier 3 last.
 const MASQUE_PORTS_T1: &[u16] = &[443];
 const MASQUE_PORTS_T2: &[u16] = &[8443, 4443, 8095];
-const MASQUE_PORTS_T3: &[u16] = &[2408, 500, 1701, 4500];
 
 const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("162.159.198.0/24", 10),
@@ -810,8 +925,6 @@ const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("188.114.97.0/24", 7),
     ("188.114.98.0/24", 6),
     ("188.114.99.0/24", 6),
-    ("162.159.36.0/24", 5),
-    ("162.159.46.0/24", 5),
     ("162.159.204.0/24", 5),
     ("172.65.251.0/24", 4),
     ("8.34.146.0/24", 3),
@@ -821,6 +934,11 @@ const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("8.35.211.0/24", 2),
     ("8.39.125.0/24", 2),
     ("8.47.69.0/24", 2),
+    // 162.159.36/46.0/24 are Cloudflare's 1.1.1.1 DNS-over-HTTPS ranges: they never
+    // answer a MASQUE handshake, so weight them lowest (swept last) rather than
+    // mid-pack where they waste probe budget ahead of ranges that actually work.
+    ("162.159.36.0/24", 1),
+    ("162.159.46.0/24", 1),
 ];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
@@ -858,6 +976,11 @@ impl MasqueProbe {
     /// Build a [`ProbeConfig`] for MASQUE scanning.
     pub fn probe_config(&self) -> ProbeConfig {
         ProbeConfig {
+            verify_cost: if crate::masque_h2::enabled() {
+                VerifyCost::Cheap
+            } else {
+                VerifyCost::Expensive
+            },
             cidrs_v4: MASQUE_CIDRS_V4,
             cidrs_v6: MASQUE_CIDRS_V6,
             cidr_weights_v4: MASQUE_CIDR_WEIGHTS,
@@ -910,7 +1033,6 @@ impl MasqueProbe {
                         peer: SocketAddr::new(ip, port),
                         sni: self.sni.clone(),
                         authority: self.authority.clone(),
-                        path: self.path.clone(),
                         cert_pem: self.cert_pem.to_vec(),
                         key_pem: self.key_pem.to_vec(),
                         probe_src: Some(self.local_ipv4),
@@ -995,6 +1117,7 @@ impl WgProbe {
     /// Build a [`ProbeConfig`] for WireGuard scanning.
     pub fn probe_config(&self) -> ProbeConfig {
         ProbeConfig {
+            verify_cost: VerifyCost::Cheap,
             cidrs_v4: crate::wireguard::WG_PREFIXES_V4,
             cidrs_v6: crate::wireguard::WG_PREFIXES_V6,
             cidr_weights_v4: WG_CIDR_WEIGHTS,
@@ -1066,4 +1189,126 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: ScanMode) -> Result<Pr
     let config = probe.probe_config();
     let verify = probe.verify_fn();
     hunt_best(&config, &probe.ports, probe.ip, mode, &verify).await
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn test_config() -> ProbeConfig {
+        ProbeConfig {
+            verify_cost: VerifyCost::Cheap,
+            cidrs_v4: &["10.0.0.0/24", "10.0.1.0/24"],
+            cidrs_v6: &[],
+            cidr_weights_v4: &[("10.0.0.0/24", 10), ("10.0.1.0/24", 5)],
+            seeds_v4: &["10.0.0.1", "10.0.1.1"],
+            seeds_v6: &[],
+            cache_kind: CacheKind::Masque,
+            label: "gateway",
+            config_path: String::new(),
+            profile: StrategyProfile {
+                turbo_sample: 4,
+                balanced_target: 1,
+                balanced_sample: 4,
+                stealth_target: 1,
+                stealth_sample: 4,
+            },
+        }
+    }
+
+    fn test_strategy() -> Strategy {
+        Strategy {
+            concurrency: 8,
+            per_probe_timeout: Duration::from_secs(1),
+            overall_deadline: Duration::from_secs(10),
+            quiet_after_first: Duration::from_secs(0),
+            target_successes: 1,
+            early_exit_first: true,
+            full_subnet: false,
+            sample_per_cidr: 4,
+        }
+    }
+
+    #[test]
+    fn seeds_come_first_across_all_ports() {
+        let cands = build_candidates(&test_config(), &test_strategy(), &[443, 500], IpScan::V4);
+        // 2 seeds x 2 tiered ports = 4 seed candidates, ahead of any CIDR sample.
+        let seed_ips: std::collections::HashSet<IpAddr> = ["10.0.0.1", "10.0.1.1"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        for c in cands.iter().take(4) {
+            assert!(seed_ips.contains(&c.0), "first candidates must be seeds, got {c:?}");
+        }
+        // Both the primary (443) and alt port (500) are covered by seeds first, so a
+        // DPI-blocked 443 still reaches the alt port early.
+        assert!(cands.iter().take(4).any(|c| c.1 == 443));
+        assert!(cands.iter().take(4).any(|c| c.1 == 500));
+    }
+
+    #[test]
+    fn candidates_are_deduplicated() {
+        let cands = build_candidates(&test_config(), &test_strategy(), &[443, 500, 443], IpScan::V4);
+        let set: std::collections::HashSet<(IpAddr, u16)> = cands.iter().copied().collect();
+        assert_eq!(set.len(), cands.len(), "duplicate (ip, port) candidates must not appear");
+    }
+
+    #[test]
+    fn enumerate_cidr_caps_large_prefix_instead_of_empty() {
+        // Regression: host_bits > 12 used to return an empty vec (silent skip).
+        let big = enumerate_cidr_v4("10.5.0.0/16");
+        assert!(!big.is_empty(), "large CIDR must not silently yield nothing");
+        assert!(big.len() <= 4096, "enumeration must be capped");
+        // A small CIDR still enumerates fully (excludes network + broadcast).
+        assert_eq!(enumerate_cidr_v4("10.9.9.0/30").len(), 2);
+    }
+
+    // QA-1 verification: a scan cancelled mid-flight (e.g. the user pressing Stop)
+    // must finalize with, and persist, the best endpoint found so far rather than
+    // discarding it. Exercises request_scan_cancel() -> hunt_best break -> cache write.
+    #[test]
+    fn cancel_persists_best_so_far() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        // Fresh temp cache so the persisted best-so-far can be read back.
+        let dir = std::env::temp_dir().join(format!("aether-cancel-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("aether.toml").to_string_lossy().to_string();
+
+        let mut config = test_config();
+        config.config_path = cfg_path.clone();
+
+        // The seed VIP verifies and, like a user hitting Stop, requests cancellation
+        // on that first hit; every other candidate fails.
+        let hit: IpAddr = "10.0.0.1".parse().unwrap();
+        let verify = move |ip: IpAddr, port: u16, _t: Duration, _iron: bool|
+            -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
+            Box::pin(async move {
+                if ip == hit {
+                    request_scan_cancel();
+                    Some(ProbeResult { ip, port, rtt: Duration::from_millis(10) })
+                } else {
+                    None
+                }
+            })
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res = rt.block_on(hunt_best(&config, &[443], IpScan::V4, ScanMode::Balanced, &verify));
+
+        assert!(res.is_ok(), "a cancelled scan that already found an endpoint must finalize Ok");
+        assert_eq!(res.unwrap().ip, hit);
+        // The best-so-far must be written to the cache on cancel, not discarded.
+        let cached = crate::cache::get_masque_sorted(&cfg_path);
+        assert!(
+            cached.iter().any(|(a, _)| a.ip() == hit && a.port() == 443),
+            "cancelled scan must persist its best-so-far endpoint; cache was {cached:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

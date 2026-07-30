@@ -1,1406 +1,153 @@
-import {
-  Activity,
-  Cable,
-  Check,
-  ChevronRight,
-  CircleAlert,
-  Copy,
-  FlaskConical,
-  Gauge,
-  Globe2,
-  ListRestart,
-  LockKeyhole,
-  Network,
-  Power,
-  Radio,
-  Route,
-  ScrollText,
-  Search,
-  Settings2,
-  ShieldCheck,
-  SlidersHorizontal,
-  Sparkles,
-  TerminalSquare,
-  Wifi,
-  X,
-} from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke, listen, platformLabel } from "./bridge";
+import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { useCallback, useState } from "react";
 import "./App.css";
+import { ActivityTab } from "./components/ActivityTab";
+import { ConnectionTab } from "./components/ConnectionTab";
+import { ScannerTab } from "./components/ScannerTab";
+import { SettingsTab } from "./components/SettingsTab";
+import { useLogs } from "./hooks/useLogs";
+import { useOnline } from "./hooks/useOnline";
+import { useRuntime } from "./hooks/useRuntime";
+import { useScanner } from "./hooks/useScanner";
+import type { DiscoveredEndpoint, View } from "./types";
 
-type View = "home" | "scanner" | "settings" | "logs";
-type Status = "disconnected" | "connecting" | "connected" | "error";
-
-type LogFilter = "milestones" | "hits" | "errors" | "raw";
-
-interface DiscoveredEndpoint {
-  addr: string;
-  rtt: string;
-  rttMs: number;
-  protocol: string;
-}
-
-interface ScanState {
-  active: boolean;
-  mode: string;
-  scanned: number;
-  total: number;
-  concurrency: number;
-  working: number;
-  bestRtt: string | null;
-  phase: string;
-}
-
-const initialScanState: ScanState = {
-  active: false,
-  mode: "balanced",
-  scanned: 0,
-  total: 0,
-  concurrency: 0,
-  working: 0,
-  bestRtt: null,
-  phase: "Idle",
-};
-
-type Settings = {
-  protocol: "masque" | "wireguard" | "gool";
-  transport: "h2" | "h3";
-  scanMode: "turbo" | "balanced" | "thorough" | "stealth";
-  ipVersion: "v4" | "v6" | "both";
-  noize: string;
-  noizeJc: number;
-  noizeJmin: number;
-  noizeJmax: number;
-  noizeIntervalMs: number;
-  routingMode: "system-proxy" | "proxy-only" | "tun";
-  socksPort: number;
-  httpPort: number;
-  startMinimized: boolean;
-  launchAtLogin: boolean;
-  enginePath: string;
-};
-
-type RuntimeState = {
-  status: Status;
-  detail: string;
-  pid: number | null;
-  endpoint: string | null;
-};
-
-type LogEntry = {
-  level: "info" | "warn" | "error";
-  message: string;
-  time: string;
-};
-
-const defaults: Settings = {
-  protocol: "masque",
-  transport: "h2",
-  scanMode: "balanced",
-  ipVersion: "v4",
-  noize: "off",
-  noizeJc: 4,
-  noizeJmin: 48,
-  noizeJmax: 190,
-  noizeIntervalMs: 4,
-  // Android default: full-device VPN (VpnService + hev tun2socks).
-  routingMode: "tun",
-  socksPort: 1819,
-  httpPort: 1820,
-  startMinimized: false,
-  launchAtLogin: false,
-  enginePath: "",
-};
-
-const initialRuntime: RuntimeState = {
-  status: "disconnected",
-  detail: "Ready",
-  pid: null,
-  endpoint: null,
-};
-
-const navigation = [
-  { id: "home" as const, label: "Connection", icon: Radio },
-  { id: "scanner" as const, label: "Scanner", icon: Search },
-  { id: "settings" as const, label: "Settings", icon: SlidersHorizontal },
-  { id: "logs" as const, label: "Activity", icon: ScrollText },
+// One definition per view — label + eyebrow copy live together so they can't drift.
+const navigation: { id: View; label: string; eyebrow: string; icon: typeof Radio }[] = [
+  { id: "home", label: "Connection", eyebrow: "SECURE ROUTING", icon: Radio },
+  { id: "scanner", label: "Scanner", eyebrow: "ENDPOINT DISCOVERY", icon: Search },
+  { id: "settings", label: "Settings", eyebrow: "CONFIGURATION", icon: SlidersHorizontal },
+  { id: "logs", label: "Activity", eyebrow: "LIVE ENGINE OUTPUT", icon: ScrollText },
 ];
-
-/** One-click speed profile presets in exact order. */
-const speedProfiles: {
-  id: string;
-  label: string;
-  hint: string;
-  patch: Partial<Settings>;
-}[] = [
-  {
-    id: "masque-h3",
-    label: "MASQUE H3",
-    hint: "MASQUE h3 · noise off · balanced scan · system vpn",
-    patch: {
-      protocol: "masque",
-      transport: "h3",
-      noize: "off",
-      scanMode: "balanced",
-      ipVersion: "v4",
-      routingMode: "tun",
-    },
-  },
-  {
-    id: "masque-h2",
-    label: "MASQUE H2 (Default)",
-    hint: "MASQUE h2 · noise off · balanced scan · system vpn",
-    patch: {
-      protocol: "masque",
-      transport: "h2",
-      noize: "off",
-      scanMode: "balanced",
-      ipVersion: "v4",
-      routingMode: "tun",
-    },
-  },
-  {
-    id: "wireguard",
-    label: "WireGuard",
-    hint: "WireGuard · noise off · balanced scan · system vpn",
-    patch: {
-      protocol: "wireguard",
-      transport: "h2",
-      noize: "off",
-      scanMode: "balanced",
-      ipVersion: "v4",
-      routingMode: "tun",
-    },
-  },
-  {
-    id: "gool",
-    label: "Gool",
-    hint: "Gool (WARP-in-WARP) · noise off · balanced scan · system vpn",
-    patch: {
-      protocol: "gool",
-      transport: "h2",
-      noize: "off",
-      scanMode: "balanced",
-      ipVersion: "v4",
-      routingMode: "tun",
-    },
-  },
-];
-
-function now() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function profileActive(settings: Settings, patch: Partial<Settings>) {
-  return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);
-}
-
-function clampPort(value: number) {
-  if (!Number.isFinite(value)) return 1024;
-  return Math.min(65535, Math.max(1024, Math.trunc(value)));
-}
-
-function Segmented<T extends string>({
-  value,
-  options,
-  onChange,
-  disabled,
-}: {
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (value: T) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className={`segmented ${disabled ? "disabled" : ""}`}>
-      {options.map((option) => (
-        <button
-          type="button"
-          key={option.value}
-          disabled={disabled}
-          className={value === option.value ? "active" : ""}
-          onClick={() => onChange(option.value)}
-        >
-          {option.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function Toggle({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      className={`toggle ${checked ? "on" : ""}`}
-      onClick={() => !disabled && onChange(!checked)}
-    >
-      <span />
-    </button>
-  );
-}
 
 function App() {
   const [view, setView] = useState<View>("home");
-  const [settings, setSettings] = useState<Settings>(defaults);
-  const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [logFilter, setLogFilter] = useState<LogFilter>("milestones");
-  const [scanState, setScanState] = useState<ScanState>(initialScanState);
-  const [scannerProtocol, setScannerProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
-  const [scannerIpScan, setScannerIpScan] = useState<"v4" | "v6" | "both">("v4");
-  const [scannerConcurrency, setScannerConcurrency] = useState<number>(250);
-  const [scannerTimeoutMs, setScannerTimeoutMs] = useState<number>(3000);
-  const [scannerNoize, setScannerNoize] = useState<string>("off");
-  const [discoveredEndpoints, setDiscoveredEndpoints] = useState<DiscoveredEndpoint[]>([]);
-  const [scannerActive, setScannerActive] = useState<boolean>(false);
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [admin, setAdmin] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
-  const [appVersion, setAppVersion] = useState("1.0.28");
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const connected = runtime.status === "connected";
-  const running = runtime.status === "connecting" || connected;
-  const settingsLocked = running;
+  const online = useOnline();
 
-  const appendLog = useCallback((entry: Omit<LogEntry, "time">) => {
-    const msg = entry.message;
+  const {
+    logs, logFilter, setLogFilter, appendLog, clearLogs,
+    visibleLogs, hasMore, filterCounts, logEndRef, autoScroll, setAutoScroll,
+  } = useLogs();
 
-    // ── Scan Parser: Intercept engine scan progress for Live Scanner Card & Scanner Tab ──
-    if (msg.includes("scan mode=")) {
-      const modeMatch = msg.match(/scan mode=([a-z]+)/);
-      const candMatch = msg.match(/candidates=(\d+)/);
-      const concMatch = msg.match(/concurrency=(\d+)/);
-      setScanState({
-        active: true,
-        mode: modeMatch ? modeMatch[1] : "balanced",
-        total: candMatch ? parseInt(candMatch[1], 10) : 0,
-        concurrency: concMatch ? parseInt(concMatch[1], 10) : 200,
-        scanned: 0,
-        working: 0,
-        bestRtt: null,
-        phase: "Probing Pool",
-      });
-    } else if (msg.includes("scanning...") || msg.includes("wg scanning...")) {
-      const progMatch = msg.match(/scanning\.\.\.\s+(\d+)\/(\d+)\s+ips,\s+found\s+(\d+)\s+working/);
-      if (progMatch) {
-        setScanState((prev) => ({
-          ...prev,
-          active: true,
-          scanned: parseInt(progMatch[1], 10),
-          total: parseInt(progMatch[2], 10),
-          working: parseInt(progMatch[3], 10),
-        }));
-      }
-    } else if (msg.includes("candidate ok") || msg.includes("Tier-0 cache hit") || msg.includes("cached wg candidate ok")) {
-      const rttMatch = msg.match(/rtt=([\d\.]+(?:ms|s))/);
-      const rttStr = rttMatch ? rttMatch[1] : null;
-      setScanState((prev) => ({
-        ...prev,
-        working: prev.working + 1,
-        bestRtt: rttStr || prev.bestRtt,
-      }));
-      const addrMatch = msg.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+|\[[a-fA-F0-9:]+\]:\d+)/);
-      if (addrMatch && rttStr) {
-        const addr = addrMatch[1];
-        const rttMs = rttStr.endsWith("ms") ? parseFloat(rttStr) : parseFloat(rttStr) * 1000;
-        const protoStr = msg.includes("wg") ? "WireGuard" : msg.includes("h2") ? "MASQUE H2" : "MASQUE H3";
-        setDiscoveredEndpoints((prev) => {
-          if (prev.some((e) => e.addr === addr)) return prev;
-          const next = [...prev, { addr, rtt: rttStr, rttMs, protocol: protoStr }];
-          return next.sort((a, b) => a.rttMs - b.rttMs);
-        });
-      }
-    } else if (msg.includes("Hot") && msg.includes("subnet")) {
-      setScanState((prev) => ({ ...prev, phase: "Hot Subnet Drill-down" }));
-    } else if (msg.includes("best gateway") || msg.includes("best wg endpoint") || msg.includes("using best")) {
-      setScanState((prev) => ({ ...prev, phase: "Verified", active: false }));
-      setScannerActive(false);
-    } else if (msg.includes("No working gateway") || msg.includes("scan deadline reached")) {
-      setScanState((prev) => ({ ...prev, active: false, phase: "Finished" }));
-      setScannerActive(false);
-    }
+  const {
+    settings, runtime, busy, testBusy, saved, admin, testResult, appVersion,
+    connected, running, settingsLocked, settingsLoaded,
+    patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
+  } = useRuntime(appendLog);
 
-    setLogs((current) => [...current.slice(-999), { ...entry, time: now() }]);
-  }, []);
+  const scanner = useScanner(appendLog, running);
 
-  const filteredLogs = useMemo(() => {
-    if (logFilter === "raw") return logs;
-    if (logFilter === "hits") {
-      return logs.filter(
-        (l) =>
-          l.message.includes("candidate ok") ||
-          l.message.includes("Tier-0") ||
-          l.message.includes("gateway") ||
-          l.message.includes("EndpointSelected")
-      );
-    }
-    if (logFilter === "errors") {
-      return logs.filter((l) => l.level === "error" || l.level === "warn");
-    }
-    return logs.filter(
-      (l) =>
-        !l.message.includes("scanning...") &&
-        !l.message.includes("probe src")
-    );
-  }, [logs, logFilter]);
-
-  useEffect(() => {
-    let disposed = false;
-    const cleanup: Array<() => void> = [];
-    Promise.all([
-      invoke<Settings>("get_settings"),
-      invoke<RuntimeState>("get_state"),
-      invoke<boolean>("is_admin").catch(() => false),
-      invoke<{ version?: string }>("app_info").catch(() => ({ version: "1.0.28" })),
-      listen<RuntimeState>("session://state", (event) => setRuntime(event.payload)),
-      listen<{ level: LogEntry["level"]; message: string }>("session://log", (event) =>
-        appendLog(event.payload),
-      ),
-    ])
-      .then(([loadedSettings, state, isAdmin, info, unlistenState, unlistenLog]) => {
-        if (disposed) {
-          unlistenState();
-          unlistenLog();
-          return;
-        }
-        setSettings(loadedSettings);
-        setRuntime(state);
-        setAdmin(isAdmin);
-        if (info?.version) setAppVersion(String(info.version));
-        cleanup.push(unlistenState, unlistenLog);
-      })
-      .catch((error) => appendLog({ level: "warn", message: String(error) }));
-    return () => {
-      disposed = true;
-      cleanup.forEach((fn) => fn());
-    };
-  }, []);
-
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [filteredLogs]);
-
-  async function startStandaloneScan() {
-    if (busy || scannerActive) return;
-    setScannerActive(true);
-    setDiscoveredEndpoints([]);
-    setScanState({ ...initialScanState, active: true, phase: "Starting" });
-    appendLog({
-      level: "info",
-      message: `Starting Standalone IP Scan: ${scannerProtocol.toUpperCase()} (concurrency=${scannerConcurrency}, timeout=${scannerTimeoutMs}ms, noise=${scannerNoize})`,
-    });
-
-    setBusy(true);
-    try {
-      if (running) {
-        await invoke("disconnect");
-        await new Promise((r) => setTimeout(r, 400));
-      }
-      await invoke("scan", {
-        protocol: scannerProtocol,
-        ipVersion: scannerIpScan,
-        concurrency: scannerConcurrency,
-        timeoutMs: scannerTimeoutMs,
-        noize: scannerNoize,
-      });
-    } catch (error) {
-      appendLog({ level: "error", message: `Standalone scan error: ${String(error)}` });
-      setScannerActive(false);
-      setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function stopStandaloneScan() {
-    setScannerActive(false);
-    setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
-    try {
-      await invoke("stop_scan");
-    } catch {}
-    appendLog({ level: "info", message: "Standalone scan stopped." });
-  }
-
-  async function connectDirectEndpoint(item: DiscoveredEndpoint) {
+  const connectDirect = useCallback((item: DiscoveredEndpoint) => {
+    // Case-insensitive: the engine reports "MASQUE H3", "masque-h3", etc.
+    const proto = item.protocol.toLowerCase();
+    const protocol = proto.includes("wireguard") || proto.includes("wg") ? "wireguard" : "masque";
+    const transport = proto.includes("h3") ? "h3" : "h2";
     appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
-    const proto = item.protocol.toLowerCase().includes("wireguard") ? "wireguard" : "masque";
-    const trans = item.protocol.includes("H3") ? "h3" : "h2";
+    void connectToPeer(item.addr, protocol, transport);
+    setView("home");
+  }, [connectToPeer, appendLog]);
 
-    const nextSettings: Settings = {
-      ...settings,
-      protocol: proto,
-      transport: trans,
-    };
-
-    patchSettings(nextSettings);
-
-    setBusy(true);
+  const exportLogs = useCallback(async (): Promise<boolean> => {
+    if (logs.length === 0) return false;
+    const text = logs.map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`).join("\n");
     try {
-      if (running) {
-        await invoke("stop_session");
-        await new Promise((r) => setTimeout(r, 400));
-      }
-      setRuntime({ status: "connecting", detail: `Connecting to ${item.addr}`, pid: null, endpoint: null });
-      await invoke("start_session");
-    } catch (error) {
-      appendLog({ level: "error", message: `Direct connect error: ${String(error)}` });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function persistSettings(next: Settings) {
-    try {
-      await invoke("save_settings", { settings: next });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1200);
-    } catch (error) {
-      appendLog({ level: "error", message: String(error) });
-    }
-  }
-
-  function patchSettings(patch: Partial<Settings>) {
-    if (settingsLocked) return;
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      void persistSettings(next);
-      return next;
-    });
-  }
-
-  async function toggleConnection() {
-    setBusy(true);
-    setTestResult(null);
-    try {
-      if (running) {
-        await invoke("disconnect");
-      } else {
-        setRuntime({ status: "connecting", detail: "Starting engine", pid: null, endpoint: null });
-        await invoke("connect", { settings });
-      }
-    } catch (error) {
-      const detail = String(error);
-      setRuntime({ status: "error", detail, pid: null, endpoint: null });
-      appendLog({ level: "error", message: detail });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function runTest() {
-    setBusy(true);
-    setTestResult(null);
-    try {
-      const result = await invoke<string>("test_connection", { settings });
-      setTestResult(result);
-      appendLog({ level: "info", message: result });
-    } catch (error) {
-      const msg = String(error);
-      setTestResult(msg);
-      appendLog({ level: "error", message: msg });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function copyEndpoint(value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      appendLog({ level: "info", message: `Copied ${value}` });
+      await navigator.clipboard.writeText(text);
+      return true;
     } catch {
       appendLog({ level: "warn", message: "Clipboard copy failed" });
+      return false;
     }
-  }
+  }, [logs, appendLog]);
 
-  function exportLogs() {
-    const text = logs.map((l) => `${l.time}\t${l.level}\t${l.message}`).join("\n");
-    void copyEndpoint(text || "(no logs)");
-  }
+  const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
+  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Unprotected";
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">
-            <ShieldCheck size={22} strokeWidth={1.8} />
-          </div>
-          <div>
-            <strong>Aether Next</strong>
-            <span>by deathline94</span>
-          </div>
+          <div className="brand-mark"><ShieldCheck size={22} strokeWidth={1.8} /></div>
+          <div><strong>Aether Next</strong><span>by deathline94</span></div>
         </div>
 
-        <nav>
+        <nav aria-label="Main">
           {navigation.map(({ id, label, icon: Icon }) => (
-            <button key={id} className={view === id ? "active" : ""} onClick={() => setView(id)}>
-              <Icon size={18} />
+            <button
+              key={id}
+              className={view === id ? "active" : ""}
+              aria-current={view === id ? "page" : undefined}
+              onClick={() => setView(id)}
+            >
+              <Icon size={18} aria-hidden="true" />
               <span>{label}</span>
-              {id === "logs" && logs.length > 0 && <small>{Math.min(logs.length, 99)}</small>}
+              {id === "logs" && logs.length > 0 && (
+                <small aria-label={`${logs.length} log entries`}>{logs.length > 99 ? "99+" : logs.length}</small>
+              )}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-bottom">
-          <div className={`mini-status ${runtime.status}`}>
-            <span className="status-dot" />
+          <div className={`mini-status ${runtime.status}`} role="status" aria-live="polite">
+            <span className="status-dot" aria-hidden="true" />
             <div>
-              <strong>{connected ? "Protected" : running ? "Connecting" : "Unprotected"}</strong>
-              <span>{runtime.detail}</span>
+              <strong>{statusText}</strong>
+              <span title={runtime.detail}>{runtime.detail}</span>
             </div>
           </div>
-          <div className="version">
-            AETHER NEXT <span>v{appVersion}</span>
-          </div>
+          <div className="version">AETHER NEXT <span>v{appVersion}</span></div>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <div>
-            <p>
-              {view === "home"
-                ? "SECURE ROUTING"
-                : view === "settings"
-                  ? "CONFIGURATION"
-                  : "LIVE ENGINE OUTPUT"}
-            </p>
-            <h1>{view === "home" ? "Connection" : view === "settings" ? "Settings" : "Activity"}</h1>
-          </div>
-          <div className={`header-status ${runtime.status}`}>
-            <span className="status-dot" />
+          <div><p>{activeNav.eyebrow}</p><h1>{activeNav.label}</h1></div>
+          <div className={`header-status ${runtime.status}`} title={runtime.detail}>
+            <span className="status-dot" aria-hidden="true" />
             {runtime.status}
           </div>
         </header>
 
         {view === "home" && (
-          <div className="home-view">
-            <section className={`connection-stage ${runtime.status}`}>
-              <div className="signal-field" aria-hidden="true">
-                <span />
-                <span />
-                <span />
-              </div>
-              <div className="connection-copy">
-                <div className="eyebrow">
-                  <LockKeyhole size={15} />{" "}
-                  {connected
-                    ? "TUNNEL ESTABLISHED"
-                    : running
-                      ? "NEGOTIATING ROUTE"
-                      : "READY TO CONNECT"}
-                </div>
-                <h2>
-                  {connected
-                    ? "Traffic protected"
-                    : running
-                      ? "Finding a clear path"
-                      : "Your route is open"}
-                </h2>
-                <p>
-                  {connected
-                    ? `Aether Next is routing ${platformLabel()} traffic through ${settings.protocol.toUpperCase()}${runtime.endpoint ? ` via ${runtime.endpoint}` : ""}.`
-                    : running
-                      ? runtime.detail
-                      : "Connect to discover a reachable Cloudflare edge and secure your traffic."}
-                </p>
-              </div>
-              <button
-                className={`power-button ${running ? "stop" : ""}`}
-                onClick={toggleConnection}
-                disabled={busy}
-                aria-label={running ? "Disconnect" : "Connect"}
-              >
-                {busy ? <ListRestart className="spin" size={30} /> : <Power size={31} />}
-              </button>
-              <span className="power-label">{running ? "DISCONNECT" : "CONNECT"}</span>
-            </section>
-
-            {runtime.status === "error" && (
-              <div className="error-banner">
-                <CircleAlert size={18} />
-                <span>{runtime.detail}</span>
-                <button onClick={() => setRuntime(initialRuntime)} aria-label="Dismiss">
-                  <X size={17} />
-                </button>
-              </div>
-            )}
-
-            <section className="profiles-panel">
-              <div className="section-heading">
-                <div>
-                  <p>PRESETS</p>
-                  <h3>Speed profiles</h3>
-                </div>
-                <Gauge size={20} />
-              </div>
-              <div className="profile-grid">
-                {speedProfiles.map((profile) => {
-                  const active = profileActive(settings, profile.patch);
-                  return (
-                    <button
-                      key={profile.id}
-                      type="button"
-                      className={`profile-card ${active ? "active" : ""}`}
-                      disabled={settingsLocked}
-                      onClick={() => {
-                        if (settingsLocked) return;
-                        patchSettings(profile.patch);
-                        appendLog({
-                          level: "info",
-                          message: `Applied profile: ${profile.label} - ${profile.hint}`,
-                        });
-                      }}
-                    >
-                      <strong>{profile.label}</strong>
-                      <span>{profile.hint}</span>
-                      {active && <small>ACTIVE</small>}
-                    </button>
-                  );
-                })}
-              </div>
-              {!admin && (
-                <p className="profile-note">
-                  Max (VPN) needs the Android VPN permission. Use Speed for local SOCKS/HTTP proxy mode.
-                </p>
-              )}
-            </section>
-
-            <section className="metrics-grid">
-              <article>
-                <div className="metric-icon coral">
-                  <Route size={19} />
-                </div>
-                <span>Protocol</span>
-                <strong>
-                  {settings.protocol === "gool" ? "WARP-in-WARP" : settings.protocol.toUpperCase()}
-                </strong>
-                <small>
-                  {settings.protocol === "masque"
-                    ? `HTTP/${settings.transport === "h2" ? "2" : "3"}`
-                    : settings.noize}
-                </small>
-              </article>
-              <article>
-                <div className="metric-icon green">
-                  <Globe2 size={19} />
-                </div>
-                <span>Routing</span>
-                <strong>
-                  {settings.routingMode === "system-proxy"
-                    ? "App proxy"
-                    : settings.routingMode === "tun"
-                      ? "Full VPN"
-                      : "Proxy only"}
-                </strong>
-                <small>{settings.routingMode === "tun" ? "VpnService" : "Local ports"}</small>
-              </article>
-              <article>
-                <div className="metric-icon blue">
-                  <Gauge size={19} />
-                </div>
-                <span>Endpoint</span>
-                <strong>{runtime.endpoint || (running ? "Scanning..." : "-")}</strong>
-                <small>
-                  {settings.scanMode} - {settings.ipVersion.toUpperCase()}
-                </small>
-              </article>
-              <article>
-                <div className="metric-icon yellow">
-                  <Activity size={19} />
-                </div>
-                <span>Process</span>
-                <strong>{runtime.pid ? `PID ${runtime.pid}` : "Standby"}</strong>
-                <small>{connected ? "Healthy" : "Not running"}</small>
-              </article>
-            </section>
-
-            <section className="proxy-panel">
-              <div className="section-heading">
-                <div>
-                  <p>LOCAL ACCESS</p>
-                  <h3>Proxy endpoints</h3>
-                </div>
-                <Network size={20} />
-              </div>
-              <div className="endpoint-row">
-                <div className="endpoint-kind">
-                  <TerminalSquare size={18} />
-                  <div>
-                    <strong>HTTP / HTTPS</strong>
-                    <span>HTTP CONNECT proxy</span>
-                  </div>
-                </div>
-                <code>127.0.0.1:{settings.httpPort}</code>
-                <button
-                  onClick={() => copyEndpoint(`127.0.0.1:${settings.httpPort}`)}
-                  title="Copy HTTP proxy"
-                >
-                  <Copy size={16} />
-                </button>
-              </div>
-              <div className="endpoint-row">
-                <div className="endpoint-kind">
-                  <Cable size={18} />
-                  <div>
-                    <strong>SOCKS5</strong>
-                    <span>Direct application access</span>
-                  </div>
-                </div>
-                <code>127.0.0.1:{settings.socksPort}</code>
-                <button
-                  onClick={() => copyEndpoint(`127.0.0.1:${settings.socksPort}`)}
-                  title="Copy SOCKS5 proxy"
-                >
-                  <Copy size={16} />
-                </button>
-              </div>
-            </section>
-
-            <section className="test-panel">
-              <div className="section-heading">
-                <div>
-                  <p>VERIFY</p>
-                  <h3>Live connection test</h3>
-                </div>
-                <FlaskConical size={20} />
-              </div>
-              <div className="test-row">
-                <span>
-                  {connected
-                    ? "Hits Cloudflare via local HTTP proxy"
-                    : "Connect first, then verify the path"}
-                </span>
-                <button onClick={runTest} disabled={busy || !connected}>
-                  Test connection
-                </button>
-              </div>
-              {testResult && <code className="test-result">{testResult}</code>}
-            </section>
-
-            <section className="about-panel">
-              <div>
-                <p>ANDROID</p>
-                <h3>Aether Next</h3>
-                <span>
-                  Built by <strong>deathline94</strong> - full rework, not a fork
-                </span>
-              </div>
-              <code>v{appVersion}</code>
-            </section>
-          </div>
+          <ConnectionTab
+            settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
+            connected={connected} running={running} settingsLocked={settingsLocked}
+            settingsLoaded={settingsLoaded} admin={admin} online={online}
+            testResult={testResult} appVersion={appVersion}
+            toggleConnection={toggleConnection} patchSettings={patchSettings}
+            runTest={runTest} dismissError={dismissError} appendLog={appendLog}
+          />
         )}
 
         {view === "scanner" && (
-          <div className="scanner-view">
-            <section className="settings-section">
-              <div className="section-heading">
-                <div>
-                  <p>STANDALONE ENGINE PROBER</p>
-                  <h3>Custom IP Scanner</h3>
-                </div>
-                <Search size={20} />
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>Target Protocol</strong>
-                  <span>Service engine to probe Cloudflare edge IPs for</span>
-                </div>
-                <div className="segmented">
-                  <button
-                    type="button"
-                    className={scannerProtocol === "masque-h3" ? "active" : ""}
-                    onClick={() => setScannerProtocol("masque-h3")}
-                  >
-                    MASQUE H3
-                  </button>
-                  <button
-                    type="button"
-                    className={scannerProtocol === "masque-h2" ? "active" : ""}
-                    onClick={() => setScannerProtocol("masque-h2")}
-                  >
-                    MASQUE H2
-                  </button>
-                  <button
-                    type="button"
-                    className={scannerProtocol === "wireguard" ? "active" : ""}
-                    onClick={() => setScannerProtocol("wireguard")}
-                  >
-                    WireGuard
-                  </button>
-                </div>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>IP Family</strong>
-                  <span>Address family pool to enumerate & sample</span>
-                </div>
-                <div className="segmented">
-                  <button
-                    type="button"
-                    className={scannerIpScan === "v4" ? "active" : ""}
-                    onClick={() => setScannerIpScan("v4")}
-                  >
-                    IPv4 Only
-                  </button>
-                  <button
-                    type="button"
-                    className={scannerIpScan === "v6" ? "active" : ""}
-                    onClick={() => setScannerIpScan("v6")}
-                  >
-                    IPv6 Only
-                  </button>
-                  <button
-                    type="button"
-                    className={scannerIpScan === "both" ? "active" : ""}
-                    onClick={() => setScannerIpScan("both")}
-                  >
-                    Dual-Stack
-                  </button>
-                </div>
-              </div>
-
-              <div className="setting-row input-row">
-                <label>
-                  <span>Concurrency (Probes)</span>
-                  <input
-                    type="number"
-                    min={1}
-                    value={scannerConcurrency}
-                    onChange={(e) => setScannerConcurrency(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                  />
-                </label>
-                <label>
-                  <span>Per-Probe Timeout (ms)</span>
-                  <input
-                    type="number"
-                    min={100}
-                    value={scannerTimeoutMs}
-                    onChange={(e) => setScannerTimeoutMs(Math.max(100, parseInt(e.target.value, 10) || 100))}
-                  />
-                </label>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>Obfuscation</strong>
-                  <span>{scannerProtocol === "masque-h2" ? "Not applicable for H2 (TCP)" : "Noise profile applied to probe handshakes"}</span>
-                </div>
-                <select
-                  value={scannerProtocol === "masque-h2" ? "off" : scannerNoize}
-                  disabled={scannerActive || scannerProtocol === "masque-h2"}
-                  onChange={(e) => setScannerNoize(e.target.value)}
-                >
-                  <option value="off">Off — no noise</option>
-                  <option value="light">Light — low noise</option>
-                  <option value="medium">Medium — default</option>
-                  <option value="high">High — stronger</option>
-                  <option value="max">Max — highest noise</option>
-                </select>
-              </div>
-
-              <div className="scanner-action-bar" style={{ marginTop: 16 }}>
-                {!scannerActive ? (
-                  <button
-                    type="button"
-                    className="primary-cta connect"
-                    style={{ width: "100%", justifyContent: "center" }}
-                    onClick={startStandaloneScan}
-                    disabled={busy}
-                  >
-                    <Power size={18} />
-                    <span>Start Standalone Scan</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="primary-cta disconnect"
-                    style={{ width: "100%", justifyContent: "center" }}
-                    onClick={stopStandaloneScan}
-                  >
-                    <X size={18} />
-                    <span>Stop Scan</span>
-                  </button>
-                )}
-              </div>
-            </section>
-
-            <section className="test-panel" style={{ marginTop: 16 }}>
-              <div className="section-heading">
-                <div>
-                  <p>DISCOVERED ENDPOINTS</p>
-                  <h3>Healthy Gateways ({discoveredEndpoints.length})</h3>
-                </div>
-                <Radio size={20} />
-              </div>
-
-              {discoveredEndpoints.length === 0 ? (
-                <div className="empty-logs" style={{ padding: "30px 0" }}>
-                  <Search size={26} />
-                  <strong>No endpoints discovered yet</strong>
-                  <span>Click "Start Standalone Scan" above to probe healthy edge IPs.</span>
-                </div>
-              ) : (
-                <div className="discovered-list" style={{ padding: "12px 18px", display: "flex", flexDirection: "column", gap: 10 }}>
-                  {discoveredEndpoints.map((item, idx) => (
-                    <div
-                      className="discovered-row"
-                      key={`${item.addr}-${idx}`}
-                      style={{
-                        padding: "10px 14px",
-                        borderRadius: 6,
-                        background: "#0d1316",
-                        border: "1px solid #1f2a2f",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <code style={{ fontSize: 12, color: "#dff9eb" }}>{item.addr}</code>
-                        <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "#1b2923", color: "#6bb994" }}>
-                          {item.protocol}
-                        </span>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <span
-                          style={{
-                            fontSize: 11,
-                            fontWeight: 600,
-                            padding: "2px 8px",
-                            borderRadius: 4,
-                            background: item.rttMs <= 50 ? "#122b1f" : item.rttMs <= 120 ? "#2b2312" : "#2b1414",
-                            color: item.rttMs <= 50 ? "#72e4aa" : item.rttMs <= 120 ? "#f3d481" : "#f38181",
-                            border: `1px solid ${item.rttMs <= 50 ? "#23523a" : item.rttMs <= 120 ? "#4a3e20" : "#522323"}`,
-                          }}
-                        >
-                          ⚡ {item.rtt}
-                        </span>
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => connectDirectEndpoint(item)}
-                          style={{
-                            height: 30,
-                            padding: "0 12px",
-                            border: "1px solid #3b6650",
-                            borderRadius: 5,
-                            background: "#173628",
-                            color: "#8be0b6",
-                            fontSize: 11,
-                            fontWeight: 600,
-                            cursor: "pointer",
-                          }}
-                        >
-                          Connect Direct
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          </div>
+          <ScannerTab
+            protocol={scanner.protocol} setProtocol={scanner.setProtocol}
+            ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
+            concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
+            timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
+            noize={scanner.noize} setNoize={scanner.setNoize}
+            endpoints={scanner.endpoints} active={scanner.active}
+            scanState={scanner.scanState} busy={scanner.busy}
+            startScan={scanner.startScan} stopScan={scanner.stopScan}
+            connectDirect={connectDirect} connectBusy={busy}
+          />
         )}
 
         {view === "settings" && (
-          <div className="settings-view">
-            {settingsLocked && (
-              <div className="lock-banner">
-                Settings locked while connected. Disconnect to change tunnel options.
-              </div>
-            )}
-            <section className="settings-section">
-              <div className="section-heading">
-                <div>
-                  <p>TRANSPORT</p>
-                  <h3>Tunnel behavior</h3>
-                </div>
-                <Wifi size={20} />
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>Protocol</strong>
-                  <span>Carrier used to reach Cloudflare</span>
-                </div>
-                <Segmented
-                  disabled={settingsLocked}
-                  value={settings.protocol}
-                  options={[
-                    { value: "masque", label: "MASQUE" },
-                    { value: "wireguard", label: "WireGuard" },
-                    { value: "gool", label: "Gool" },
-                  ]}
-                  onChange={(protocol) => patchSettings({ protocol })}
-                />
-              </div>
-              {settings.protocol === "masque" && (
-                <div className="setting-row">
-                  <div>
-                    <strong>MASQUE transport</strong>
-                    <span>HTTP/2 works on networks blocking QUIC</span>
-                  </div>
-                  <Segmented
-                    disabled={settingsLocked}
-                    value={settings.transport}
-                    options={[
-                      { value: "h2", label: "HTTP/2" },
-                      { value: "h3", label: "HTTP/3" },
-                    ]}
-                    onChange={(transport) => patchSettings({ transport })}
-                  />
-                </div>
-              )}
-              <div className="setting-row">
-                <div>
-                  <strong>Obfuscation</strong>
-                  <span>Noise before handshake (low → high)</span>
-                </div>
-                <select
-                  disabled={settingsLocked}
-                  value={
-                    ["off", "light", "medium", "high", "max", "custom"].includes(settings.noize)
-                      ? settings.noize
-                      : settings.noize === "firewall" || settings.noize === "balanced"
-                        ? "medium"
-                        : settings.noize === "gfw"
-                          ? "high"
-                          : settings.noize === "aggressive" || settings.noize === "heavy"
-                            ? "max"
-                            : "medium"
-                  }
-                  onChange={(event) => patchSettings({ noize: event.target.value })}
-                >
-                  <option value="off">Off — no noise</option>
-                  <option value="light">Light — low noise</option>
-                  <option value="medium">Medium — default</option>
-                  <option value="high">High — stronger</option>
-                  <option value="max">Max — highest noise</option>
-                  <option value="custom">Custom — manual values</option>
-                </select>
-              </div>
-              {settings.noize === "custom" && (
-                <div className="setting-stack" style={{ gap: 10, marginTop: 8 }}>
-                  <div className="setting-row">
-                    <div>
-                      <strong>Junk count</strong>
-                      <span>Packets before handshake (0–64)</span>
-                    </div>
-                    <input
-                      type="number"
-                      min={0}
-                      max={64}
-                      disabled={settingsLocked}
-                      value={settings.noizeJc}
-                      onChange={(e) =>
-                        patchSettings({
-                          noizeJc: Math.max(0, Math.min(64, Number(e.target.value) || 0)),
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="setting-row">
-                    <div>
-                      <strong>Min size</strong>
-                      <span>Bytes</span>
-                    </div>
-                    <input
-                      type="number"
-                      min={0}
-                      max={2048}
-                      disabled={settingsLocked}
-                      value={settings.noizeJmin}
-                      onChange={(e) =>
-                        patchSettings({
-                          noizeJmin: Math.max(0, Math.min(2048, Number(e.target.value) || 0)),
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="setting-row">
-                    <div>
-                      <strong>Max size</strong>
-                      <span>Bytes (≥ min)</span>
-                    </div>
-                    <input
-                      type="number"
-                      min={0}
-                      max={2048}
-                      disabled={settingsLocked}
-                      value={settings.noizeJmax}
-                      onChange={(e) =>
-                        patchSettings({
-                          noizeJmax: Math.max(0, Math.min(2048, Number(e.target.value) || 0)),
-                        })
-                      }
-                    />
-                  </div>
-                  <div className="setting-row">
-                    <div>
-                      <strong>Interval</strong>
-                      <span>Milliseconds between junk</span>
-                    </div>
-                    <input
-                      type="number"
-                      min={0}
-                      max={5000}
-                      disabled={settingsLocked}
-                      value={settings.noizeIntervalMs}
-                      onChange={(e) =>
-                        patchSettings({
-                          noizeIntervalMs: Math.max(
-                            0,
-                            Math.min(5000, Number(e.target.value) || 0),
-                          ),
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-              )}
-            </section>
-
-            <section className="settings-section">
-              <div className="section-heading">
-                <div>
-                  <p>DISCOVERY</p>
-                  <h3>Endpoint scanning</h3>
-                </div>
-                <Radio size={20} />
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>Scan mode</strong>
-                  <span>Balance startup time and route quality</span>
-                </div>
-                <select
-                  disabled={settingsLocked}
-                  value={settings.scanMode}
-                  onChange={(event) =>
-                    patchSettings({ scanMode: event.target.value as Settings["scanMode"] })
-                  }
-                >
-                  <option value="turbo">Turbo</option>
-                  <option value="balanced">Balanced</option>
-                  <option value="thorough">Thorough</option>
-                  <option value="stealth">Stealth</option>
-                </select>
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>IP version</strong>
-                  <span>Address families included in search</span>
-                </div>
-                <Segmented
-                  disabled={settingsLocked}
-                  value={settings.ipVersion}
-                  options={[
-                    { value: "v4", label: "IPv4" },
-                    { value: "v6", label: "IPv6" },
-                    { value: "both", label: "Both" },
-                  ]}
-                  onChange={(ipVersion) => patchSettings({ ipVersion })}
-                />
-              </div>
-            </section>
-
-            <section className="settings-section">
-              <div className="section-heading">
-                <div>
-                  <p>ANDROID</p>
-                  <h3>Routing</h3>
-                </div>
-                <Settings2 size={20} />
-              </div>
-              <div className="setting-row">
-                <div>
-                  <strong>Routing mode</strong>
-                  <span>
-                    {settings.routingMode === "tun"
-                      ? admin
-                        ? "VPN permission granted - full device tunnel"
-                        : "Will request Android VPN permission"
-                      : "Local SOCKS5/HTTP for apps that support a proxy"}
-                  </span>
-                </div>
-                <select
-                  disabled={settingsLocked}
-                  value={settings.routingMode}
-                  onChange={(event) =>
-                    patchSettings({
-                      routingMode: event.target.value as Settings["routingMode"],
-                    })
-                  }
-                >
-                  <option value="proxy-only">Proxy only</option>
-                  <option value="tun">Full VPN (VpnService)</option>
-                </select>
-              </div>
-            </section>
-
-            <section className="settings-section advanced">
-              <div className="section-heading">
-                <div>
-                  <p>ADVANCED</p>
-                  <h3>Local ports</h3>
-                </div>
-                <ChevronRight size={20} />
-              </div>
-              <div className="setting-row input-row">
-                <label>
-                  <span>HTTP port (1024-65535)</span>
-                  <input
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    disabled={settingsLocked}
-                    value={settings.httpPort}
-                    onChange={(event) =>
-                      patchSettings({ httpPort: clampPort(Number(event.target.value)) })
-                    }
-                  />
-                </label>
-                <label>
-                  <span>SOCKS5 port (1024-65535)</span>
-                  <input
-                    type="number"
-                    min={1024}
-                    max={65535}
-                    disabled={settingsLocked}
-                    value={settings.socksPort}
-                    onChange={(event) =>
-                      patchSettings({ socksPort: clampPort(Number(event.target.value)) })
-                    }
-                  />
-                </label>
-              </div>
-            </section>
-
-            <div className="save-bar">
-              <span>
-                {settingsLocked
-                  ? "Locked while connected"
-                  : saved
-                    ? "Saved automatically"
-                    : "Changes save automatically · Aether Next"}
-              </span>
-              <button disabled className="ghost">
-                {saved ? <Check size={17} /> : null}
-                {saved ? "Saved" : "Auto-save on"}
-              </button>
-            </div>
-          </div>
+          <SettingsTab
+            settings={settings} settingsLocked={settingsLocked}
+            settingsLoaded={settingsLoaded} saved={saved} admin={admin}
+            patchSettings={patchSettings}
+          />
         )}
 
         {view === "logs" && (
-          <div className="logs-view">
-            {scanState.active && (
-              <div className="scan-card">
-                <div className="scan-card-header">
-                  <div className="scan-title">
-                    <Sparkles size={15} className="spin-icon" />
-                    <strong>Active Engine Scan ({scanState.mode.toUpperCase()})</strong>
-                    <span className="phase-pill">{scanState.phase}</span>
-                  </div>
-                  <div className="scan-badges">
-                    <span className="badge concurrency">⚡ {scanState.concurrency} Workers</span>
-                    <span className="badge working">🟢 {scanState.working} Working</span>
-                    {scanState.bestRtt && <span className="badge rtt">⚡ Best: {scanState.bestRtt}</span>}
-                  </div>
-                </div>
-                <div className="scan-progress-bar-bg">
-                  <div
-                    className="scan-progress-bar-fill"
-                    style={{
-                      width:
-                        scanState.total > 0
-                          ? `${Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))}%`
-                          : "0%",
-                    }}
-                  />
-                </div>
-                <div className="scan-card-footer">
-                  <small>
-                    Probed {scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} candidates
-                  </small>
-                  <small>
-                    {scanState.total > 0 ? `${Math.round((scanState.scanned / scanState.total) * 100)}%` : "0%"}
-                  </small>
-                </div>
-              </div>
-            )}
-
-            <div className="log-toolbar">
-              <div>
-                <span className={`status-dot ${runtime.status}`} />
-                <strong>Activity Feed</strong>
-                <small>{filteredLogs.length} events</small>
-              </div>
-              <div className="log-filter-bar">
-                <button
-                  className={logFilter === "milestones" ? "active" : ""}
-                  onClick={() => setLogFilter("milestones")}
-                >
-                  Milestones ({logs.filter((l) => !l.message.includes("scanning...")).length})
-                </button>
-                <button
-                  className={logFilter === "hits" ? "active" : ""}
-                  onClick={() => setLogFilter("hits")}
-                >
-                  🟢 Hits ({logs.filter((l) => l.message.includes("candidate ok") || l.message.includes("Tier-0")).length})
-                </button>
-                <button
-                  className={logFilter === "errors" ? "active" : ""}
-                  onClick={() => setLogFilter("errors")}
-                >
-                  ⚠️ Errors ({logs.filter((l) => l.level === "error" || l.level === "warn").length})
-                </button>
-                <button
-                  className={logFilter === "raw" ? "active" : ""}
-                  onClick={() => setLogFilter("raw")}
-                >
-                  📜 Raw ({logs.length})
-                </button>
-              </div>
-              <div className="log-actions">
-                <button onClick={exportLogs}>Copy all</button>
-                <button onClick={() => setLogs([])}>Clear</button>
-              </div>
-            </div>
-            <section className="log-console">
-              {filteredLogs.length === 0 ? (
-                <div className="empty-logs">
-                  <TerminalSquare size={26} />
-                  <strong>No activity yet</strong>
-                  <span>Engine events appear here after connection starts.</span>
-                </div>
-              ) : (
-                filteredLogs.map((entry, index) => (
-                  <div className={`log-line ${entry.level}`} key={`${entry.time}-${index}`}>
-                    <time>{entry.time}</time>
-                    <span>{entry.level}</span>
-                    <p>{entry.message}</p>
-                  </div>
-                ))
-              )}
-              <div ref={logEndRef} />
-            </section>
-          </div>
+          <ActivityTab
+            visibleLogs={visibleLogs} hasMore={hasMore}
+            filterCounts={filterCounts} logFilter={logFilter} setLogFilter={setLogFilter}
+            logEndRef={logEndRef} autoScroll={autoScroll} setAutoScroll={setAutoScroll}
+            exportLogs={exportLogs} clearLogs={clearLogs}
+            scanState={scanner.scanState} status={runtime.status}
+          />
         )}
       </section>
     </main>
@@ -1408,5 +155,3 @@ function App() {
 }
 
 export default App;
-
-

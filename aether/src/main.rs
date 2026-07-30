@@ -5,6 +5,7 @@ mod consts;
 mod dns;
 mod engine_config;
 mod error;
+mod h3_probe;
 mod http_proxy;
 mod cache;
 mod masque;
@@ -71,8 +72,13 @@ async fn shutdown_request() {
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().eq_ignore_ascii_case("shutdown") {
-            return;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "shutdown" => return,
+            // Cooperative cancel: let an in-flight scan finalize with its best
+            // result (and persist it) instead of being dropped mid-work. The
+            // session future then completes on its own.
+            "cancel" => crate::prober::request_scan_cancel(),
+            _ => {}
         }
     }
 }

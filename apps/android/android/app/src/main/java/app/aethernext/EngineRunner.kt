@@ -22,6 +22,9 @@ class EngineRunner(
     private val processRef = AtomicReference<Process?>(null)
     private val running = AtomicBoolean(false)
     private val generation = java.util.concurrent.atomic.AtomicLong(0)
+    // True when the current process was launched as a scan, so stop() sends the
+    // cooperative "cancel" (persist best-so-far) rather than "shutdown".
+    private val scanMode = AtomicBoolean(false)
 
     fun isRunning(): Boolean = running.get()
 
@@ -38,6 +41,7 @@ class EngineRunner(
     fun start(settings: Settings): String? {
         val binary = resolveEngine(settings.enginePath)
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
+        scanMode.set(false)
         if (!running.compareAndSet(false, true)) {
             return "Aether is already running"
         }
@@ -62,6 +66,8 @@ class EngineRunner(
                 redirectErrorStream(true)
                 environment().apply {
                     put("AETHER_PROTOCOL", protocolEnv)
+                    // Forced endpoint from Scanner "Connect Direct"; empty = auto-scan.
+                    if (settings.peer.isNotBlank()) put("AETHER_PEER", settings.peer)
                     put("AETHER_SCAN", settings.scanMode)
                     put("AETHER_IP", settings.ipVersion)
                     put("AETHER_NOIZE", settings.noize)
@@ -74,6 +80,8 @@ class EngineRunner(
                     // Android full-device routing uses hev tun2socks + VpnService, not engine TUN.
                     put("AETHER_TUN", "0")
                     put("AETHER_WG_NO_PROFILE_RETRY", "1")
+                    // Control channel so stop() can shut the session down gracefully.
+                    put("AETHER_CONTROL_STDIN", "1")
                     put("RUST_LOG", "info")
                     put("HOME", homeDir)
                     put("TMPDIR", context.cacheDir.absolutePath)
@@ -140,6 +148,7 @@ class EngineRunner(
     ): String? {
         val binary = resolveEngine("")
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
+        scanMode.set(true)
         if (!running.compareAndSet(false, true)) {
             return "Aether is already running"
         }
@@ -170,6 +179,8 @@ class EngineRunner(
                     put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
                     put("AETHER_TUN", "0")
                     put("AETHER_WG_NO_PROFILE_RETRY", "1")
+                    // Control channel so stop() can cancel the scan gracefully.
+                    put("AETHER_CONTROL_STDIN", "1")
                     put("RUST_LOG", "info")
                     put("HOME", homeDir)
                     put("TMPDIR", context.cacheDir.absolutePath)
@@ -207,18 +218,35 @@ class EngineRunner(
 
     fun stop() {
         generation.incrementAndGet()
-        val p = processRef.getAndSet(null) ?: return
+        val p = processRef.getAndSet(null) ?: run {
+            running.set(false)
+            return
+        }
+        // Graceful teardown over the engine's control channel instead of an
+        // immediate SIGKILL that can interrupt a cache write: a scan gets "cancel"
+        // (persist best-so-far), a tunnel gets "shutdown" (end the session).
         try {
-            p.destroy()
-            Thread {
-                try {
-                    Thread.sleep(1500)
-                    if (p.isAlive) p.destroyForcibly()
-                } catch (_: Exception) {
-                }
-            }.start()
+            val cmd = if (scanMode.get()) "cancel\n" else "shutdown\n"
+            p.outputStream.write(cmd.toByteArray())
+            p.outputStream.flush()
         } catch (_: Exception) {
         }
+        Thread({
+            try {
+                // Wait for a clean exit, then escalate: SIGTERM, then SIGKILL.
+                val graceful = System.currentTimeMillis() + 3000
+                while (p.isAlive && System.currentTimeMillis() < graceful) Thread.sleep(50)
+                if (p.isAlive) {
+                    p.destroy()
+                    val hard = System.currentTimeMillis() + 2000
+                    while (p.isAlive && System.currentTimeMillis() < hard) Thread.sleep(50)
+                    if (p.isAlive) p.destroyForcibly()
+                }
+            } catch (_: Exception) {
+                try { p.destroyForcibly() } catch (_: Exception) {
+                }
+            }
+        }, "aether-engine-stop").start()
         running.set(false)
     }
 

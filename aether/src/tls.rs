@@ -150,9 +150,16 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .map_err(AetherError::Quic)?;
 
     config.set_max_idle_timeout(120_000);
-    // Match raised tunnel MTU / typical path MTU for fewer QUIC packets.
-    config.set_max_recv_udp_payload_size(1350);
-    config.set_max_send_udp_payload_size(1350);
+    // UDP payload size (QUIC `max_udp_payload_size` transport param + our send cap).
+    // Default 1350 suits ~1420-MTU tunnels; on smaller-MTU paths (e.g. a 1280-MTU
+    // WireGuard/WARP tunnel) advertising 1350 makes the peer send handshake packets
+    // that exceed the path and get dropped inbound -> "no UDP reply". Env-tunable so
+    // small-MTU networks can lower it (floor 1200 = QUIC Initial minimum).
+    let max_udp = crate::runtime_env::usize("AETHER_QUIC_MAX_UDP_PAYLOAD")
+        .unwrap_or(1350)
+        .clamp(1200, 1452);
+    config.set_max_recv_udp_payload_size(max_udp);
+    config.set_max_send_udp_payload_size(max_udp);
     // CONNECT-IP rides on H3 DATAGRAMS; still raise stream/conn FC for control plane
     // and any non-dgram path. 100MB conn window avoids artificial throttling.
     config.set_initial_max_data(100_000_000);

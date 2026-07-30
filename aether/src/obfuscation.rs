@@ -149,19 +149,6 @@ pub fn aethernoize_from_name(name: &str) -> AetherNoizeConfig {
     }
 }
 
-/// Profile retry list for WireGuard endpoint hunt.
-pub fn wg_profile_retry_names(primary: &str) -> Vec<String> {
-    let mut names = vec![normalize(primary).to_string()];
-    if std::env::var("AETHER_WG_NO_PROFILE_RETRY").is_err() {
-        for fallback in ["medium", "max", "light", "off"] {
-            if !names.iter().any(|n| n == fallback) {
-                names.push(fallback.to_string());
-            }
-        }
-    }
-    names
-}
-
 // ─── Canonical CPS parser ───────────────────────────────────────────────────
 
 /// Parse a range spec: either a fixed `N` or a randomized `MIN-MAX`.
