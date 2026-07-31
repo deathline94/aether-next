@@ -344,8 +344,26 @@ pub async fn run(
     let mut out_buf = vec![0u8; 65535];
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
     keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let started = Instant::now();
 
     loop {
+        // Fast-fail on a QUIC-hostile path: instead of burning the session's full
+        // data-plane budget (and hanging the UI for ~45s), bail quickly with a
+        // clear reason when there is no sign of QUIC life. Only before the data
+        // plane is up; once traffic flows these checks are inert.
+        if !dataplane_ok {
+            let elapsed = started.elapsed();
+            if !udp_seen && elapsed >= Duration::from_secs(6) {
+                let msg = "no UDP reply from gateway; the network may be blocking QUIC/UDP (try HTTP/2 or WireGuard)";
+                log::warn!("[h3] fast-fail: {msg}");
+                return Err(AetherError::Other(msg.into()));
+            }
+            if udp_seen && !established_ever && elapsed >= Duration::from_secs(12) {
+                let msg = "QUIC handshake did not complete; the path may be interfering with QUIC (try HTTP/2 or WireGuard)";
+                log::warn!("[h3] fast-fail: {msg}");
+                return Err(AetherError::Other(msg.into()));
+            }
+        }
         let timeout = conn.timeout();
 
         tokio::select! {

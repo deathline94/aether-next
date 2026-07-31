@@ -214,13 +214,20 @@ pub fn provision_lock(base_config: &str) -> ProvisionGuard {
 /// Write `data` to `path` atomically (temp file + rename) so a crash or a
 /// concurrent reader never observes a half-written / truncated file.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // Per-process, per-call unique temp name. A shared "<file>.tmp" made two engine
+    // processes (scan + connect) collide on the same temp and fail the rename with
+    // ERROR_ACCESS_DENIED on Windows; a unique name removes that collision.
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), seq));
     let tmp = PathBuf::from(tmp);
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -228,7 +235,20 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     // std::fs::rename replaces an existing destination on both Unix and Windows.
-    std::fs::rename(&tmp, path)
+    // Windows can still transiently return ERROR_ACCESS_DENIED when the destination
+    // is briefly held (AV/indexer, or a racing writer), so retry with backoff.
+    let mut last = Ok(());
+    for attempt in 0..8u32 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Err(e);
+                std::thread::sleep(Duration::from_millis(20 * u64::from(attempt + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    last
 }
 
 /// Run `f` under the cross-process lock: acquire, load (pruning stale), mutate,

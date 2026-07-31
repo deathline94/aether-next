@@ -49,7 +49,7 @@ pub enum H3HeaderMode {
 }
 
 impl H3HeaderMode {
-    /// Resolve from `AETHER_MASQUE_H3_HEADERS` (default: `cf`).
+    /// Resolve from `AETHER_MASQUE_H3_HEADERS` (default: `standard`).
     pub fn from_env() -> Self {
         match crate::runtime_env::var("AETHER_MASQUE_H3_HEADERS")
             .unwrap_or_default()
@@ -57,11 +57,14 @@ impl H3HeaderMode {
             .to_ascii_lowercase()
             .as_str()
         {
-            "standard" | "std" | "rfc" => H3HeaderMode::Standard,
             "cf" => H3HeaderMode::Cf,
-            // Default: Both = extended CONNECT (:protocol cf-connect-ip) + the cf
-            // headers. Proven live to reach 200 + data-plane on the MASQUE edge.
-            _ => H3HeaderMode::Both,
+            "both" => H3HeaderMode::Both,
+            // Default: Standard = clean RFC 9484 extended CONNECT (:protocol
+            // cf-connect-ip + :scheme/:authority/:path). Proven live to reach 200 +
+            // data-plane on the MASQUE VIP. The previous `Both` default piled the
+            // legacy cf-connect-proto/pq-enabled headers on top, which some edges
+            // reject with 400 (observed on 162.159.198.2) -> H3 could not connect.
+            _ => H3HeaderMode::Standard,
         }
     }
 }

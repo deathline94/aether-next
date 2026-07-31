@@ -132,6 +132,18 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // so we still attempt a connect rather than aborting the session.
             let peer = match select_peer(&identity, protocol, &base_config).await {
                 Ok(p) => p,
+                Err(e) if scan_only() => {
+                    // Standalone scanner: finding nothing is a completed scan, not a
+                    // session error. Emit a terminal ScanDone so the GUI stops
+                    // cleanly (and don't fabricate an anycast "selection").
+                    log::warn!("[-] standalone scan found no reachable endpoint: {e}");
+                    session_event::emit(SessionEvent::ScanDone {
+                        addr: String::new(),
+                        rtt: String::new(),
+                        protocol: "masque".into(),
+                    });
+                    return Ok(());
+                }
                 Err(e) if !masque_h2::enabled() => {
                     let ep = identity
                         .masque_endpoint
@@ -195,14 +207,25 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 device_id: identity.device_id.clone(),
                 ipv4: identity.ipv4.clone(),
             });
-            // Scan-only mode: select peer then report.
+            // Scan-only mode: select peer then report. A scan that finds nothing is
+            // a completed scan, not a session error, so emit a terminal ScanDone
+            // either way and let the GUI stop cleanly.
             if scan_only() {
-                let peer = select_peer(&identity, protocol, &base_config).await?;
-                session_event::emit(SessionEvent::ScanDone {
-                    addr: peer.to_string(),
-                    rtt: String::new(),
-                    protocol: "wireguard".into(),
-                });
+                match select_peer(&identity, protocol, &base_config).await {
+                    Ok(peer) => session_event::emit(SessionEvent::ScanDone {
+                        addr: peer.to_string(),
+                        rtt: String::new(),
+                        protocol: "wireguard".into(),
+                    }),
+                    Err(e) => {
+                        log::warn!("[-] standalone WireGuard scan found no endpoint: {e}");
+                        session_event::emit(SessionEvent::ScanDone {
+                            addr: String::new(),
+                            rtt: String::new(),
+                            protocol: "wireguard".into(),
+                        });
+                    }
+                }
                 return Ok(());
             }
             run_wireguard(identity, listen, http_listen, &base_config).await
@@ -409,7 +432,10 @@ async fn select_peer(
 
             // Smart reconnect: re-verify the last working gateway before paying
             // for a full scan. Skip with AETHER_QUICK_RECONNECT=0; force with =1.
-            if quick_reconnect_enabled() {
+            // Never quick-reconnect in scan-only (standalone scanner) mode: the
+            // scanner must enumerate the whole pool and stream hits, not short-
+            // circuit to one cached endpoint.
+            if quick_reconnect_enabled() && !scan_only() {
                 let cache_path = lastconn::cache_path(base_config);
                 if let Some(cached) = lastconn::load(&cache_path) {
                     if let Ok(peer_addr) = cached.peer.parse::<SocketAddr>() {
@@ -564,20 +590,14 @@ async fn resolve_ech() -> Option<Vec<u8>> {
             }
         },
         _ => {
-            // Default: auto-fetch ECH to hide SNI from passive observers.
-            match dns::fetch_ech_config().await {
-                Ok(raw) => {
-                    log::info!(
-                        "[+] fetched ECHConfigList automatically ({} bytes) — SNI encrypted",
-                        raw.len()
-                    );
-                    Some(raw)
-                }
-                Err(e) => {
-                    log::debug!("[-] ECH auto-fetch failed ({e}); continuing with cleartext SNI");
-                    None
-                }
-            }
+            // Default: OFF. Auto-fetching an ECHConfigList and injecting it into the
+            // QUIC ClientHello can trip a BoringSSL assertion in
+            // encrypted_client_hello.cc and abort() the whole process mid-handshake
+            // (observed on H3). ECH only encrypts the SNI (already the expected
+            // consumer-masque name to Cloudflare), so a hard crash is never worth it.
+            // Opt in with AETHER_ECH=auto or a base64 ECHConfigList.
+            log::info!("[+] ECH off by default (set AETHER_ECH=auto to encrypt SNI)");
+            None
         }
     }
 }
@@ -706,7 +726,7 @@ async fn run_masque_tunnel(
         tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
     };
 
-    match tokio::time::timeout(Duration::from_secs(45), ready_rx).await {
+    match tokio::time::timeout(Duration::from_secs(20), ready_rx).await {
         Ok(Ok(())) => {
             if stack.is_some() {
                 session_event::emit(SessionEvent::ProxyReady {
@@ -733,7 +753,7 @@ async fn run_masque_tunnel(
                 let _ = task.await;
             }
             return Err(AetherError::Other(
-                "tunnel closed before data-plane ready".into(),
+                "MASQUE data-plane did not come up (the network may be blocking QUIC/UDP; try HTTP/2 or WireGuard)".into(),
             ));
         }
         Err(_) => {
@@ -747,7 +767,7 @@ async fn run_masque_tunnel(
                 let _ = task.await;
             }
             return Err(AetherError::Other(
-                "timeout waiting for MASQUE data-plane".into(),
+                "timed out waiting for MASQUE data-plane (the network may be blocking QUIC/UDP; try HTTP/2 or WireGuard)".into(),
             ));
         }
     }

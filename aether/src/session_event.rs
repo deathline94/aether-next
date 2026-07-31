@@ -53,7 +53,16 @@ pub enum SessionEvent {
 
 pub fn emit(event: SessionEvent) {
     if let Ok(json) = serde_json::to_string(&event) {
-        // Always info so default filter shows it; prefix is the protocol.
-        log::info!("AETHER_EVENT {json}");
+        // Write structured events to STDOUT (one line, flushed immediately) rather
+        // than the stderr logger. GUI consumers read stdout for live progress; the
+        // desktop scan reader drains stdout first, so events on stderr only surfaced
+        // after the process exited (scanner looked frozen until Stop). stdout is a
+        // LineWriter behind a pipe, so an explicit flush guarantees each event ships
+        // the instant it is emitted.
+        use std::io::Write;
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        let _ = writeln!(lock, "AETHER_EVENT {json}");
+        let _ = lock.flush();
     }
 }

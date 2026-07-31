@@ -321,7 +321,8 @@ pub async fn hunt_best(
     }
     // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
     // No target_successes limit, no early exit, extended deadline.
-    if crate::runtime_env::flag("AETHER_SCAN_EXHAUSTIVE") {
+    let exhaustive = crate::runtime_env::flag("AETHER_SCAN_EXHAUSTIVE");
+    if exhaustive {
         st.target_successes = 0;
         st.early_exit_first = false;
         st.overall_deadline = Duration::from_secs(600); // 10 min hard cap (user stops via UI)
@@ -334,7 +335,14 @@ pub async fn hunt_best(
     // ── Tier-0: Ultra-fast cache RACE (first-hit-wins, parallel) ──
     // #2: Race top cached endpoints simultaneously. Return the FIRST that
     // verifies successfully instead of waiting for all to complete.
-    let cached = config.cache_kind.read_sorted(&config.config_path);
+    // Skipped for the standalone scanner (exhaustive): it must enumerate the whole
+    // pool and stream ScanStart/ScanHit/progress to the UI, not short-circuit to one
+    // cached endpoint (which left the scanner tab stuck at 0/0 with no results).
+    let cached = if exhaustive {
+        Vec::new()
+    } else {
+        config.cache_kind.read_sorted(&config.config_path)
+    };
     if !cached.is_empty() {
         let tier0_timeout = Duration::from_millis(600);
         let race_count = cached.len().min(5); // Race top-5 by trust score.

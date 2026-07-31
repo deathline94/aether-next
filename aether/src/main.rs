@@ -64,6 +64,15 @@ async fn main() -> Result<()> {
         session_event::emit(SessionEvent::Error { message });
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     }
+    // Scan-only sessions finish on their own, but the control-stdin reader parks a
+    // tokio::io::stdin() blocking read that blocks tokio's runtime shutdown and
+    // hangs the process on exit -- so the GUI never sees the scan end and the
+    // Scanner tab stays "active" until Stop is pressed. Scan-only sets up no
+    // TUN/routes/netstack, so exit explicitly to bypass the runtime Drop. (Connect
+    // must return normally so route/TUN teardown Drops run.)
+    if std::env::var("AETHER_SCAN_ONLY").as_deref() == Ok("1") {
+        std::process::exit(if result.is_err() { 1 } else { 0 });
+    }
     result
 }
 

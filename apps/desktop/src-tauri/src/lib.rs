@@ -1112,68 +1112,28 @@ fn scan(
     let stderr = child.stderr.take();
     *state.scan_child.lock().unwrap() = Some(child);
 
-    // Stream scan output and emit structured events to the frontend.
-    let app_clone = app.clone();
+    // Stream scan output on a SEPARATE thread per pipe. The engine writes
+    // AETHER_EVENT progress to stdout and diagnostics to stderr; reading them
+    // sequentially (stdout to EOF, then stderr) made a live scan show nothing until
+    // Stop killed the process and stdout finally closed. One thread per stream
+    // keeps both live.
+    let terminal_sent = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+    if let Some(o) = stdout {
+        handles.push(pump_scan_stream(app.clone(), Box::new(o), terminal_sent.clone()));
+    }
+    if let Some(e) = stderr {
+        handles.push(pump_scan_stream(app.clone(), Box::new(e), terminal_sent.clone()));
+    }
+    let app_done = app.clone();
     std::thread::spawn(move || {
-        let readers: Vec<Box<dyn std::io::Read + Send>> = {
-            let mut v: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
-            if let Some(o) = stdout { v.push(Box::new(o)); }
-            if let Some(e) = stderr { v.push(Box::new(e)); }
-            v
-        };
-        // Track whether the engine forwarded its own terminal event, so we don't
-        // emit a second empty scan_done on exit (which logged "best:  ()").
-        let mut terminal_sent = false;
-        for reader in readers {
-            for line in BufReader::new(reader).lines().map_while(Result::ok) {
-                // Forward structured AETHER_EVENT lines as scan://event
-                if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
-                        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match ty {
-                            "scan_start" => {
-                                let _ = app_clone.emit("scan://event", serde_json::json!({
-                                    "type": "scan_start",
-                                    "mode": v.get("mode").and_then(|m| m.as_str()).unwrap_or(""),
-                                    "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
-                                    "concurrency": v.get("concurrency").and_then(|c| c.as_u64()).unwrap_or(0),
-                                }));
-                            }
-                            "scan_progress" => {
-                                let _ = app_clone.emit("scan://event", serde_json::json!({
-                                    "type": "scan_progress",
-                                    "scanned": v.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0),
-                                    "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
-                                    "working": v.get("working").and_then(|w| w.as_u64()).unwrap_or(0),
-                                }));
-                            }
-                            "scan_hit" => {
-                                // Engine emits snake_case rtt_ms; frontend expects rttMs.
-                                let _ = app_clone.emit("scan://event", serde_json::json!({
-                                    "type": "scan_hit",
-                                    "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
-                                    "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
-                                    "rttMs": v.get("rtt_ms").and_then(|r| r.as_f64()).unwrap_or(0.0),
-                                    "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
-                                }));
-                            }
-                            "scan_done" => {
-                                terminal_sent = true;
-                                let _ = app_clone.emit("scan://event", v);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                // Also emit as log
-                emit_log(&app_clone, line);
-            }
+        for h in handles {
+            let _ = h.join();
         }
-        // When the engine exits, emit a terminal scan_done only if it didn't
-        // already send one — so a crash still unsticks the UI, but a normal
-        // finish doesn't double-log an empty "best".
-        if !terminal_sent {
-            let _ = app_clone.emit("scan://event", serde_json::json!({
+        // Terminal scan_done only if the engine didn't already send one, so a crash
+        // still unsticks the UI but a normal finish doesn't double-log.
+        if !terminal_sent.load(Ordering::SeqCst) {
+            let _ = app_done.emit("scan://event", serde_json::json!({
                 "type": "scan_done",
                 "addr": "",
                 "rtt": "",
@@ -1183,6 +1143,58 @@ fn scan(
     });
 
     Ok(())
+}
+
+/// Read one scan output pipe on its own thread, forwarding AETHER_EVENT lines as
+/// `scan://event` and every line to the activity log. Returns a join handle so the
+/// caller can emit the terminal event only after all pipes drain.
+fn pump_scan_stream(
+    app: AppHandle,
+    reader: Box<dyn std::io::Read + Send>,
+    terminal_sent: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
+                    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match ty {
+                        "scan_start" => {
+                            let _ = app.emit("scan://event", serde_json::json!({
+                                "type": "scan_start",
+                                "mode": v.get("mode").and_then(|m| m.as_str()).unwrap_or(""),
+                                "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
+                                "concurrency": v.get("concurrency").and_then(|c| c.as_u64()).unwrap_or(0),
+                            }));
+                        }
+                        "scan_progress" => {
+                            let _ = app.emit("scan://event", serde_json::json!({
+                                "type": "scan_progress",
+                                "scanned": v.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0),
+                                "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
+                                "working": v.get("working").and_then(|w| w.as_u64()).unwrap_or(0),
+                            }));
+                        }
+                        "scan_hit" => {
+                            let _ = app.emit("scan://event", serde_json::json!({
+                                "type": "scan_hit",
+                                "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
+                                "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
+                                "rttMs": v.get("rtt_ms").and_then(|r| r.as_f64()).unwrap_or(0.0),
+                                "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
+                            }));
+                        }
+                        "scan_done" => {
+                            terminal_sent.store(true, Ordering::SeqCst);
+                            let _ = app.emit("scan://event", v);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            emit_log(&app, line);
+        }
+    })
 }
 
 /// Gracefully stop the scan child: ask the engine to cancel (so it persists the

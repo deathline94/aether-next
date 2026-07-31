@@ -39,15 +39,14 @@ pub async fn resolve_mtu(protocol: &str) -> usize {
 }
 
 async fn auto_probe(protocol: &str) -> usize {
-    // WireGuard outer packets add ~60B; stay conservative unless probe says OK.
-    // MASQUE h2 is TCP to :443 — slightly more tolerant of larger inner MTU.
-    let prefer_large = protocol.eq_ignore_ascii_case("masque")
-        || crate::runtime_env::var("AETHER_MASQUE_HTTP2")
-            .map(|v| {
-                let v = v.to_ascii_lowercase();
-                v == "1" || v == "true" || v == "h2" || v == "on"
-            })
-            .unwrap_or(false);
+    // WireGuard outer packets add ~60B; stay conservative (<=1280) — especially
+    // when a system-wide VPN sits underneath, whose own overhead shrinks the path.
+    // Only MASQUE (H2 over TCP) may try the larger 1400 inner MTU; MASQUE H3 is
+    // re-capped to 1280 by the tunnel runner. The old check also keyed off
+    // AETHER_MASQUE_HTTP2, which the desktop sets from the transport setting even
+    // for a WireGuard connection — that leaked a 1400 MTU into WG and stalled the
+    // data plane (handshake ok, pages never load).
+    let prefer_large = protocol.eq_ignore_ascii_case("masque");
 
     for &mtu in CANDIDATES {
         if !prefer_large && mtu > 1280 {
