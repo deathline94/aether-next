@@ -149,7 +149,7 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
     case "test_connection":
       return "OK via http://127.0.0.1:1820 · ip=mock loc=?" as T;
     case "app_info":
-      return { name: "Aether Next", version: "1.1.9", author: "deathline94", engine: "deathline94/aether-next", platform: "web" } as T;
+      return { name: "Aether Next", version: "1.1.10", author: "deathline94", engine: "deathline94/aether-next", platform: "web" } as T;
     default:
       throw new Error(`unknown command ${cmd}`);
   }

@@ -49,6 +49,10 @@ export type Settings = {
   enginePath: string;
   /** Forced peer endpoint (set by Scanner "Connect Direct"); empty = auto-scan. */
   peer: string;
+  /** H3 anti-DPI: split the QUIC Initial ClientHello across two datagrams. */
+  quicInitialFrag: boolean;
+  /** H3 anti-DPI: bytes of ClientHello in the first Initial (16–512). */
+  quicInitialFragSize: number;
 };
 
 export type RuntimeState = {
@@ -88,6 +92,8 @@ export const defaults: Settings = {
   launchAtLogin: false,
   enginePath: "",
   peer: "",
+  quicInitialFrag: false,
+  quicInitialFragSize: 96,
 };
 
 export const initialRuntime: RuntimeState = {

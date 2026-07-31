@@ -20,6 +20,8 @@ data class Settings(
     var launchAtLogin: Boolean = false,
     var enginePath: String = "",
     var peer: String = "",
+    var quicInitialFrag: Boolean = false,
+    var quicInitialFragSize: Int = 96,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("protocol", protocol)
@@ -38,6 +40,8 @@ data class Settings(
         put("launchAtLogin", launchAtLogin)
         put("enginePath", enginePath)
         put("peer", peer)
+        put("quicInitialFrag", quicInitialFrag)
+        put("quicInitialFragSize", quicInitialFragSize)
     }
 
     companion object {
@@ -58,6 +62,8 @@ data class Settings(
             launchAtLogin = o.optBoolean("launchAtLogin", false),
             enginePath = o.optString("enginePath", ""),
             peer = o.optString("peer", ""),
+            quicInitialFrag = o.optBoolean("quicInitialFrag", false),
+            quicInitialFragSize = o.optInt("quicInitialFragSize", 96),
         )
     }
 }

@@ -43,6 +43,17 @@ struct Settings {
     /// Forced peer endpoint (set by Scanner "Connect Direct").
     #[serde(default)]
     peer: String,
+    /// H3 anti-DPI: split the QUIC Initial ClientHello across two datagrams so
+    /// on-path DPI can't read the SNI from the first Initial packet.
+    #[serde(default)]
+    quic_initial_frag: bool,
+    /// H3 anti-DPI: bytes of ClientHello CRYPTO carried in the first Initial.
+    #[serde(default = "default_quic_frag_size")]
+    quic_initial_frag_size: u32,
+}
+
+fn default_quic_frag_size() -> u32 {
+    96
 }
 
 impl Default for Settings {
@@ -65,6 +76,8 @@ impl Default for Settings {
             launch_at_login: false,
             engine_path: String::new(),
             peer: String::new(),
+            quic_initial_frag: false,
+            quic_initial_frag_size: 96,
         }
     }
 }
@@ -865,6 +878,14 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .env(
                 "AETHER_MASQUE_HTTP2",
                 if settings.transport == "h2" { "1" } else { "0" },
+            )
+            .env(
+                "AETHER_QUIC_INITIAL_FRAG",
+                if settings.quic_initial_frag {
+                    settings.quic_initial_frag_size.clamp(16, 512).to_string()
+                } else {
+                    "0".to_string()
+                },
             )
             .env(
                 "AETHER_TUN",

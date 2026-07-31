@@ -1,6 +1,6 @@
 import { Check, ChevronRight, Radio, Settings2, Wifi } from "lucide-react";
 import type { Settings } from "../types";
-import { NumberField, Segmented } from "./ui";
+import { NumberField, Segmented, Toggle } from "./ui";
 
 interface SettingsTabProps {
   settings: Settings;
@@ -52,6 +52,20 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, a
             <Segmented label="MASQUE transport" disabled={settingsLocked} value={settings.transport}
               options={[{ value: "h2", label: "HTTP/2" }, { value: "h3", label: "HTTP/3" }]}
               onChange={(transport) => patchSettings({ transport })} />
+          </div>
+        )}
+        {settings.protocol === "masque" && settings.transport === "h3" && (
+          <div className="setting-row">
+            <div><strong>QUIC Initial fragmentation</strong><span>Split the H3 ClientHello across datagrams (anti-DPI)</span></div>
+            <Toggle label="QUIC Initial fragmentation" checked={settings.quicInitialFrag} disabled={settingsLocked}
+              onChange={(quicInitialFrag) => patchSettings({ quicInitialFrag })} />
+          </div>
+        )}
+        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
+          <div className="setting-row">
+            <div><strong>First fragment size</strong><span>Bytes of ClientHello in the first Initial (16–512)</span></div>
+            <NumberField label="QUIC Initial first fragment size" min={16} max={512} disabled={settingsLocked}
+              value={settings.quicInitialFragSize} onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })} />
           </div>
         )}
         <div className="setting-row">

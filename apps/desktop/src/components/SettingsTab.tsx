@@ -42,6 +42,20 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
               onChange={(transport) => patchSettings({ transport })} />
           </div>
         )}
+        {settings.protocol === "masque" && settings.transport === "h3" && (
+          <div className="setting-row">
+            <div><strong>QUIC Initial fragmentation</strong><span>Split the H3 ClientHello across datagrams (anti-DPI)</span></div>
+            <Toggle label="QUIC Initial fragmentation" checked={settings.quicInitialFrag} disabled={settingsLocked}
+              onChange={(quicInitialFrag) => patchSettings({ quicInitialFrag })} />
+          </div>
+        )}
+        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
+          <div className="setting-row">
+            <div><strong>First fragment size</strong><span>Bytes of ClientHello in the first Initial (16–512)</span></div>
+            <NumberField label="QUIC Initial first fragment size" min={16} max={512} disabled={settingsLocked}
+              value={settings.quicInitialFragSize} onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })} />
+          </div>
+        )}
         <div className="setting-row">
           <div><strong>Obfuscation</strong><span>Noise before handshake (low → high)</span></div>
           <select disabled={settingsLocked} aria-label="Obfuscation noise profile"

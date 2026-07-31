@@ -595,6 +595,12 @@ pub struct Config {
 
     max_send_udp_payload_size: usize,
 
+    // Aether anti-DPI: size (bytes) of the FIRST Initial CRYPTO fragment. When
+    // set, the client ClientHello is split so the first Initial carries only
+    // this many CRYPTO bytes and the remainder is forced into a separate
+    // datagram, defeating DPI that reads the SNI from the first Initial only.
+    initial_crypto_frag: Option<usize>,
+
     max_connection_window: u64,
     max_stream_window: u64,
 
@@ -683,6 +689,7 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+            initial_crypto_frag: None,
         })
     }
 
@@ -922,6 +929,17 @@ impl Config {
     /// The default and minimum value is `1200`.
     pub fn set_max_send_udp_payload_size(&mut self, v: usize) {
         self.max_send_udp_payload_size = cmp::max(v, MAX_SEND_UDP_PAYLOAD_SIZE);
+    }
+
+    /// Aether anti-DPI: split the client Initial's ClientHello so the first
+    /// Initial packet carries only `v` CRYPTO bytes (in its own UDP datagram)
+    /// and the remainder follows in a separate datagram. `0` disables it.
+    ///
+    /// Multi-packet CRYPTO with offsets is standard QUIC, so the server
+    /// reassembles the ClientHello transparently; each Initial is still padded
+    /// to the 1200-byte minimum.
+    pub fn set_initial_crypto_fragment(&mut self, v: usize) {
+        self.initial_crypto_frag = if v == 0 { None } else { Some(v) };
     }
 
     /// Sets the `initial_max_data` transport parameter.
@@ -1355,6 +1373,10 @@ where
 
     /// The configuration for recovery.
     recovery_config: recovery::RecoveryConfig,
+
+    /// Aether anti-DPI: first Initial CRYPTO fragment size, if enabled
+    /// (see `Config::set_initial_crypto_fragment`).
+    initial_crypto_frag: Option<usize>,
 
     /// The path manager.
     paths: path::PathMap,
@@ -2079,6 +2101,8 @@ impl<F: BufFactory> Connection<F> {
             session: None,
 
             recovery_config,
+
+            initial_crypto_frag: config.initial_crypto_frag,
 
             paths,
             path_challenge_recv_max_queue_len: config
@@ -4054,6 +4078,16 @@ impl<F: BufFactory> Connection<F> {
                 _ => (),
             };
 
+            // Aether anti-DPI: when Initial CRYPTO fragmentation is enabled, stop
+            // coalescing after an Initial that still has CRYPTO buffered, so the
+            // remaining ClientHello bytes are forced into a separate datagram.
+            if self.initial_crypto_frag.is_some() &&
+                ty == Type::Initial &&
+                self.crypto_ctx[packet::Epoch::Initial].data_available()
+            {
+                break;
+            }
+
             // When sending multiple PTO probes, don't coalesce them together,
             // so they are sent on separate UDP datagrams.
             if let Ok(epoch) = ty.to_epoch() {
@@ -4109,6 +4143,10 @@ impl<F: BufFactory> Connection<F> {
         if self.is_draining() {
             return Err(Error::Done);
         }
+
+        // Aether anti-DPI: capture the Initial CRYPTO fragment size before the
+        // field borrows below (Copy, so no borrow conflict at the emit site).
+        let initial_crypto_frag = self.initial_crypto_frag;
 
         let is_closing = self.local_error.is_some();
 
@@ -5032,7 +5070,16 @@ impl<F: BufFactory> Connection<F> {
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
 
-            if let Some(max_len) = left.checked_sub(hdr_len) {
+            if let Some(mut max_len) = left.checked_sub(hdr_len) {
+                // Aether anti-DPI: cap the FIRST Initial CRYPTO fragment
+                // (offset 0) so the ClientHello splits across two datagrams; the
+                // coalescing loop in send_on_path breaks right after this packet.
+                if pkt_type == Type::Initial && crypto_off == 0 {
+                    if let Some(frag) = initial_crypto_frag {
+                        max_len = cmp::min(max_len, frag);
+                    }
+                }
+
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
 

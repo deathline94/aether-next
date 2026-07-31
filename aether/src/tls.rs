@@ -160,6 +160,24 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .clamp(1200, 1452);
     config.set_max_recv_udp_payload_size(max_udp);
     config.set_max_send_udp_payload_size(max_udp);
+    // Aether anti-DPI: optionally split the client ClientHello across two QUIC
+    // Initial datagrams so on-path DPI that decrypts the first Initial (its keys
+    // derive from the clear DCID) can't read the SNI. Off unless
+    // AETHER_QUIC_INITIAL_FRAG is set to the first-fragment size in bytes; a
+    // small value (~64-128) makes the SNI straddle the datagram boundary. The
+    // server reassembles multi-packet CRYPTO transparently.
+    if let Some(frag) = crate::runtime_env::usize("AETHER_QUIC_INITIAL_FRAG") {
+        if frag > 0 {
+            config.set_initial_crypto_fragment(frag);
+            // Log once per process, not once per probe: build_config runs for
+            // every scan candidate, so an unconditional info! here floods the
+            // scan output with hundreds of identical lines.
+            static FRAG_LOG: std::sync::Once = std::sync::Once::new();
+            FRAG_LOG.call_once(|| {
+                log::info!("[tls] QUIC Initial fragmentation ON: first CRYPTO fragment = {frag} bytes");
+            });
+        }
+    }
     // CONNECT-IP rides on H3 DATAGRAMS; still raise stream/conn FC for control plane
     // and any non-dgram path. 100MB conn window avoids artificial throttling.
     config.set_initial_max_data(100_000_000);
