@@ -49,11 +49,13 @@ pub fn session_ticket_path() -> String {
 }
 
 /// Save a QUIC session ticket for 0-RTT resumption on next connect.
+/// A session ticket is a resumption credential, so it goes through the same
+/// locked-down atomic writer as the identity file (was: plain fs::write with
+/// default ACLs/perms).
 pub fn save_session_ticket(data: &[u8]) {
     let path = session_ticket_path();
-    if let Err(e) = std::fs::write(&path, data) {
-        log::debug!("[lastconn] failed to cache session ticket: {e}");
-    } else {
-        log::debug!("[lastconn] cached session ticket ({} bytes)", data.len());
+    match crate::config::write_private_file(&path, data) {
+        Ok(()) => log::debug!("[lastconn] cached session ticket ({} bytes)", data.len()),
+        Err(e) => log::debug!("[lastconn] failed to cache session ticket: {e}"),
     }
 }

@@ -109,6 +109,70 @@ struct AppState {
     connecting: AtomicBool,
     generation: AtomicU64,
     operation: Mutex<()>,
+    #[cfg(windows)]
+    job: Mutex<Option<engine_job::Job>>,
+}
+
+/// M8 fix: the engine child runs inside a kill-on-close Job Object. If the GUI
+// is force-killed or crashes, the kernel closes the job handle and the engine
+// dies with it instead of surviving as an orphan holding ports 1819/1820 and
+// the system-proxy registry while every future launch fails to bind.
+#[cfg(windows)]
+mod engine_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// Stored as isize so `Job` stays Send+Sync (HANDLE is a raw pointer in
+    /// windows-sys 0.61, which would poison AppState's Send bound).
+    pub struct Job(isize);
+
+    impl Job {
+        pub fn create() -> Result<Self, String> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err("CreateJobObjectW failed".into());
+            }
+            let mut info = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                unsafe { CloseHandle(handle) };
+                return Err("SetInformationJobObject failed".into());
+            }
+            Ok(Job(handle as isize))
+        }
+
+        pub fn assign_child(&self, child: &Child) -> Result<(), String> {
+            let ok = unsafe {
+                AssignProcessToJobObject(self.0 as HANDLE, child.as_raw_handle() as HANDLE)
+            };
+            if ok == 0 {
+                Err("AssignProcessToJobObject failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // Closing the job handle kills any process still inside it.
+            unsafe { CloseHandle(self.0 as HANDLE) };
+        }
+    }
 }
 
 impl Default for AppState {
@@ -129,6 +193,8 @@ impl Default for AppState {
             connecting: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             operation: Mutex::new(()),
+            #[cfg(windows)]
+            job: Mutex::new(None),
         }
     }
 }
@@ -410,13 +476,25 @@ fn handle_engine_line(
 }
 
 fn emit_log(app: &AppHandle, line: String) {
-    let lower = line.to_ascii_lowercase();
-    let level = if lower.contains("error") || lower.contains("failed") {
+    // Engine stderr lines come from env_logger with an uppercase level token
+    // ("[ts LEVEL target] msg") — prefer that exact signal before falling back
+    // to the fuzzy substring heuristics, which misclassified benign lines
+    // containing the word "error" (e.g. "0 errors").
+    let upper_error = line.contains(" ERROR ") || line.starts_with("ERROR ");
+    let upper_warn = line.contains(" WARN ") || line.starts_with("WARN ");
+    let level = if upper_error {
         "error"
-    } else if lower.contains("warn") || lower.contains("[-]") {
+    } else if upper_warn {
         "warn"
     } else {
-        "info"
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("error") || lower.contains("failed") {
+            "error"
+        } else if lower.contains("warn") || lower.contains("[-]") {
+            "warn"
+        } else {
+            "info"
+        }
     };
     let _ = app.emit(
         "session://log",
@@ -464,16 +542,20 @@ fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-    if let Some(root) = app_root {
-        let root = root.canonicalize().unwrap_or(root);
-        if canon.starts_with(&root) {
-            return Ok(());
+    // M9 fix: the allowed roots are the exe's own directory and its PARENT
+    // (packaged resource layouts put binaries under install-dir/resources).
+    // The previous fallback accepted ANY path whose parent directory happened
+    // to be named "resources" or "engine", letting arbitrary user-chosen
+    // locations through the elevation-path trust check.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = &app_root {
+        roots.push(root.canonicalize().unwrap_or_else(|_| root.clone()));
+        if let Some(parent) = root.parent() {
+            roots.push(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()));
         }
     }
-    // Packaged Tauri resources often live under a sibling resources/ directory.
-    if let Some(parent) = path.parent() {
-        let name = parent.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if name.eq_ignore_ascii_case("resources") || name.eq_ignore_ascii_case("engine") {
+    for root in &roots {
+        if canon.starts_with(root) {
             return Ok(());
         }
     }
@@ -689,6 +771,11 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) {
         }
     }
     state.connected_once.store(false, Ordering::SeqCst);
+    // M8: drop the job object (closing its handle kills any surviving engine).
+    #[cfg(windows)]
+    {
+        state.job.lock().unwrap().take();
+    }
 }
 
 fn watch_child(app: AppHandle) {
@@ -874,7 +961,10 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .env("AETHER_SOCKS", format!("127.0.0.1:{}", settings.socks_port))
             .env("AETHER_HTTP", format!("127.0.0.1:{}", settings.http_port))
             .env("AETHER_CONFIG", dir.join("aether.toml"))
-            .env("AETHER_DANGEROUS_DISABLE_TLS_VERIFY", "1")
+            // TLS verification: intentionally NOT disabled here. The engine's SPKI
+            // pinning (consts::MASQUE_PINS) is the tunnel's server authentication;
+            // disabling it from the GUI would expose every user to MITM. Debug
+            // builds can still opt out by setting the env var themselves.
             .env(
                 "AETHER_MASQUE_HTTP2",
                 if settings.transport == "h2" { "1" } else { "0" },
@@ -934,6 +1024,20 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             .spawn()
             .map_err(|e| format!("Could not start aether.exe: {e}"))?;
         let pid = child.id();
+        // M8: put the engine into a kill-on-close job so it can never outlive us.
+        #[cfg(windows)]
+        match engine_job::Job::create().and_then(|j| {
+            let assigned = j.assign_child(&child);
+            if assigned.is_ok() {
+                *state.job.lock().unwrap() = Some(j);
+            }
+            assigned
+        }) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("engine job object unavailable ({error}); orphan protection disabled")
+            }
+        }
         let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let socks_seen = Arc::new(AtomicBool::new(false));
         let tunnel_seen = Arc::new(AtomicBool::new(false));
@@ -985,13 +1089,16 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
 
 #[tauri::command]
 fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // Invalidate readers first under lock, then wait outside lock so stdout can drain.
-    let mut child = {
-        let _operation = state.operation.lock().unwrap();
-        state.generation.fetch_add(1, Ordering::SeqCst);
-        state.connecting.store(false, Ordering::SeqCst);
-        state.child.lock().unwrap().take()
-    };
+    // M7 fix: hold the operation lock across the WHOLE teardown. The old code
+    // released it while waiting on the child, letting a concurrent connect slip
+    // in — after which cleanup_routing tore down the NEW session's system-proxy
+    // state and clobbered its UI status with "disconnected". Holding is safe:
+    // stream threads acquire the lock per-line only and observe the bumped
+    // generation as soon as we release.
+    let _operation = state.operation.lock().unwrap();
+    state.generation.fetch_add(1, Ordering::SeqCst);
+    state.connecting.store(false, Ordering::SeqCst);
+    let mut child = state.child.lock().unwrap().take();
     if let Some(child) = child.as_mut() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(b"shutdown\n");
@@ -1017,7 +1124,6 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
             }
         }
     }
-    let _operation = state.operation.lock().unwrap();
     cleanup_routing(&app, &state);
     emit_state(&app, &state, "disconnected", "Ready", None, None);
     Ok(())
@@ -1078,8 +1184,9 @@ fn scan(
         return Err("Disconnect before starting a scan.".into());
     }
     // Clamp scan parameters defensively: the UI clamps too, but a replayed/direct
-    // invoke could pass out-of-range values.
-    let concurrency = concurrency.clamp(1, 2000);
+    // invoke could pass out-of-range values. 500 keeps even cheap-mode (WireGuard)
+    // bursts sane; the engine additionally enforces its own expensive-mode ceiling.
+    let concurrency = concurrency.clamp(1, 500);
     let timeout_ms = timeout_ms.clamp(100, 30_000);
     // Gracefully stop any existing scan first (persist its best-so-far).
     stop_scan_child(&state.scan_child);
@@ -1106,7 +1213,6 @@ fn scan(
         .env("AETHER_SCAN_ONLY", "1")
         .env("AETHER_SCAN_CONCURRENCY", concurrency.to_string())
         .env("AETHER_SCAN_TIMEOUT_MS", timeout_ms.to_string())
-        .env("AETHER_DANGEROUS_DISABLE_TLS_VERIFY", "1")
         .env("AETHER_WG_NO_PROFILE_RETRY", "1")
         .env(
             "AETHER_MASQUE_HTTP2",

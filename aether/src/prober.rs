@@ -5,7 +5,7 @@
 //! - A [`ProbeConfig`] describing the IP pools, weights, seeds, and cache slot.
 //! - A verify closure that performs the transport-specific handshake.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -300,8 +300,8 @@ pub async fn hunt_best(
     SCAN_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
     let mut st = mode.strategy(&config.profile);
     // Expensive (QUIC/H3) verification needs a longer per-probe budget than the
-    // fast TCP/UDP defaults, or every probe times out mid-handshake. This models
-    // per-protocol verify cost instead of hard-coding a protocol check.
+    // fast TCP/UDP defaults, or every probe times out mid-handshake. This is the
+    // BASELINE applied before user overrides so an unconfigured scan behaves well.
     if config.verify_cost == VerifyCost::Expensive {
         st.per_probe_timeout = st.per_probe_timeout.max(EXPENSIVE_MIN_TIMEOUT);
         st.concurrency = st.concurrency.min(EXPENSIVE_DEFAULT_CONCURRENCY);
@@ -313,10 +313,16 @@ pub async fn hunt_best(
     if let Some(ms) = crate::runtime_env::usize("AETHER_SCAN_TIMEOUT_MS") {
         st.per_probe_timeout = Duration::from_millis(ms as u64);
     }
-    // Hard safety ceiling for expensive verifies: many concurrent BoringSSL
-    // handshakes abort the process (0xC0000409). Enforced AFTER env overrides so
-    // no user/GUI setting can crash an H3 scan.
+    // M4 fix: safety limits enforced AFTER env overrides, mirroring how the
+    // concurrency ceiling already worked. Previously only concurrency was
+    // re-clamped, so a GUI timeout of e.g. 3000ms silently pushed every H3 probe
+    // BELOW its 5s handshake floor and scans failed mid-handshake everywhere.
+    st.concurrency = st.concurrency.min(1000);
     if config.verify_cost == VerifyCost::Expensive {
+        st.per_probe_timeout = st.per_probe_timeout.max(EXPENSIVE_MIN_TIMEOUT);
+        // Hard safety ceiling for expensive verifies: many concurrent BoringSSL
+        // handshakes abort the process (0xC0000409). Enforced AFTER env overrides so
+        // no user/GUI setting can crash an H3 scan.
         st.concurrency = st.concurrency.min(EXPENSIVE_MAX_CONCURRENCY);
     }
     // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
@@ -344,7 +350,12 @@ pub async fn hunt_best(
         config.cache_kind.read_sorted(&config.config_path)
     };
     if !cached.is_empty() {
-        let tier0_timeout = Duration::from_millis(600);
+        // M3 fix: the tier-0 race used a hardcoded 600ms budget while expensive
+        // (H3) verification needs >=5s — every cached endpoint "failed" on any
+        // network with >600ms handshake time, evicting good entries and forcing
+        // a pointless full scan on every connect. Race with the same per-probe
+        // budget the strategy settled on (first-hit-wins is unchanged).
+        let tier0_timeout = st.per_probe_timeout;
         let race_count = cached.len().min(5); // Race top-5 by trust score.
         log::info!("[⚡] Tier-0 race: top {} cached {} endpoints (first-hit-wins)", race_count, label);
         let race_futures: Vec<_> = cached
@@ -470,6 +481,10 @@ pub async fn hunt_best(
                                 };
                                 if hot_subnets.insert(sub_key) {
                                     log::info!("[🔥] Hot subnet detected near {}! Launching Stage-2 drill-down...", pr.ip);
+                                    // Note: kept inline — the verify closure is not
+                                    // 'static, so this cannot be spawned off. Cost is
+                                    // bounded: drill-downs probe a small fixed
+                                    // neighbor list at min(concurrency,16).
                                     let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency).await;
                                     for h_pr in hot_hits {
                                         log::info!("[🔥] Hot subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
@@ -1119,6 +1134,37 @@ pub struct WgProbe {
     pub ip: IpScan,
     pub aethernoize: crate::aethernoize::AetherNoizeConfig,
     pub config_path: String,
+    /// M2 fix: sessions verified during the scan, keyed by endpoint. The tunnel
+    /// runner reuses the matching one instead of performing a SECOND handshake —
+    /// the exact double-handshake the session code documents Cloudflare edges
+    /// as rate-limiting/confusing. Capped small; entries live only seconds.
+    pub sessions: WgSessionCache,
+}
+
+/// Cache of handshakes established by the scanner, shared with the tunnel runner.
+#[derive(Clone)]
+pub struct WgSessionCache(Arc<std::sync::Mutex<HashMap<SocketAddr, crate::wireguard::EstablishedSession>>>);
+
+impl WgSessionCache {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(HashMap::new())))
+    }
+
+    pub fn insert_capped(
+        &self,
+        peer: SocketAddr,
+        session: crate::wireguard::EstablishedSession,
+    ) {
+        let mut map = self.0.lock().unwrap();
+        if map.len() >= 4 {
+            map.clear();
+        }
+        map.insert(peer, session);
+    }
+
+    pub fn take(&self, peer: &SocketAddr) -> Option<crate::wireguard::EstablishedSession> {
+        self.0.lock().unwrap().remove(peer)
+    }
 }
 
 impl WgProbe {
@@ -1169,6 +1215,9 @@ impl WgProbe {
                 };
 
                 if !ironclad {
+                    // M2 fix: keep the verified session for the tunnel runner
+                    // instead of discarding it (which forced a second handshake).
+                    self.sessions.insert_capped(peer, session);
                     return Some(ProbeResult { ip, port, rtt });
                 }
 

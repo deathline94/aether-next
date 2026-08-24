@@ -36,7 +36,47 @@ fn tunnel_mtu() -> usize {
 }
 
 fn inner_mtu() -> usize {
-    tunnel_mtu().saturating_sub(120).max(1200)
+    // M12 fix: the old `.max(1200)` could push the inner MTU *above* the safe
+    // budget (e.g. outer MTU 1280 -> inner 1200 > 1280-120=1160), causing
+    // double-encapsulation overflow drops. The floor can never exceed
+    // tunnel_mtu - 80 now.
+    let tm = tunnel_mtu();
+    let v = tm.saturating_sub(120);
+    v.max(1152.min(tm.saturating_sub(80)))
+}
+
+/// Detached-task guard (M12 fix): aborts its task on drop so leaked tunnels stop
+/// pinging the edge after their owner fails or unwinds.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Active readiness gate (M12 fix): replaces the blind 1.5s sleep before the
+/// gool inner tunnel. Any completed open_tcp outcome — success OR fast refusal —
+/// proves the data plane round-trips; only a timeout means the handshake never
+/// came up. Retries give boringtun time to finish under slow links.
+async fn wait_stack_alive(stack: &netstack::StackHandle, label: &str) -> Result<()> {
+    const ATTEMPTS: usize = 6;
+    let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+    for attempt in 1..=ATTEMPTS {
+        match tokio::time::timeout(Duration::from_secs(3), stack.open_tcp(dst)).await {
+            Ok(_) => {
+                log::info!("[+] {label} data plane alive (attempt {attempt})");
+                return Ok(());
+            }
+            Err(_) => {
+                log::warn!("[-] {label} data plane not ready (attempt {attempt}/{ATTEMPTS}); retrying");
+                tokio::time::sleep(Duration::from_millis(700)).await;
+            }
+        }
+    }
+    Err(AetherError::Other(format!(
+        "{label} WireGuard data plane did not come up"
+    )))
 }
 
 // ─── Protocol ───────────────────────────────────────────────────────────────
@@ -130,7 +170,14 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // If an H3 scan comes up empty (e.g. every port DPI-dropped in this
             // environment), fall back to the API-assigned endpoint / known anycast VIP
             // so we still attempt a connect rather than aborting the session.
-            let peer = match select_peer(&identity, protocol, &base_config).await {
+            let peer = match select_peer(
+                &identity,
+                protocol,
+                &base_config,
+                prober::WgSessionCache::new(),
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) if scan_only() => {
                     // Standalone scanner: finding nothing is a completed scan, not a
@@ -211,7 +258,14 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // a completed scan, not a session error, so emit a terminal ScanDone
             // either way and let the GUI stop cleanly.
             if scan_only() {
-                match select_peer(&identity, protocol, &base_config).await {
+                match select_peer(
+                    &identity,
+                    protocol,
+                    &base_config,
+                    prober::WgSessionCache::new(),
+                )
+                .await
+                {
                     Ok(peer) => session_event::emit(SessionEvent::ScanDone {
                         addr: peer.to_string(),
                         rtt: String::new(),
@@ -242,7 +296,13 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let peer = select_peer(&primary, Protocol::WireGuard, &base_config).await?;
+            let peer = select_peer(
+                &primary,
+                Protocol::WireGuard,
+                &base_config,
+                prober::WgSessionCache::new(),
+            )
+            .await?;
             log::info!("[+] using cloudflare edge {peer} (outer)");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
@@ -383,6 +443,7 @@ async fn select_peer(
     identity: &account::Identity,
     protocol: Protocol,
     base_config: &str,
+    wg_sessions: prober::WgSessionCache,
 ) -> Result<SocketAddr> {
     let force_peer = match protocol {
         Protocol::Masque => std::env::var("AETHER_PEER").ok(),
@@ -504,6 +565,7 @@ async fn select_peer(
                 ports: wireguard::WG_PORTS.to_vec(),
                 ip,
                 config_path: base_config.to_string(),
+                sessions: wg_sessions,
             };
 
             let best = prober::hunt_best_wg_endpoint(&probe, mode).await?;
@@ -668,7 +730,7 @@ async fn run_masque_tunnel(
     )
     .await?;
 
-    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(8);
+    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(64);
     if let Some(bridge_stack) = stack.clone() {
         tokio::spawn(async move {
             while let Some(a) = addr_rx.recv().await {
@@ -852,6 +914,8 @@ async fn run_wireguard(
         runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| "balanced".to_string());
     let profile = obfuscation::aethernoize_from_name(&primary_profile);
 
+    let wg_sessions = prober::WgSessionCache::new();
+
     let peer = if let Some(p) = forced {
         let p_addr: SocketAddr = p
             .parse()
@@ -878,6 +942,7 @@ async fn run_wireguard(
             ports: wireguard::WG_PORTS.to_vec(),
             ip,
             config_path: base_config.to_string(),
+            sessions: wg_sessions.clone(),
         };
 
         let best = prober::hunt_best_wg_endpoint(&probe, mode).await?;
@@ -895,7 +960,19 @@ async fn run_wireguard(
         addr: peer.to_string(),
         protocol: "wireguard".into(),
     });
-    run_wireguard_tunnel(identity, peer, profile, listen, http_listen).await
+    // M2 fix: reuse the handshake the scanner already established for this peer
+    // instead of performing a second one (Cloudflare edges punish double
+    // handshakes — see the comment in run_wireguard_tunnel).
+    let established = wg_sessions.take(&peer);
+    run_wireguard_tunnel(
+        identity,
+        peer,
+        profile,
+        listen,
+        http_listen,
+        established,
+    )
+    .await
 }
 
 async fn run_wireguard_tunnel(
@@ -904,6 +981,7 @@ async fn run_wireguard_tunnel(
     aethernoize: aethernoize::AetherNoizeConfig,
     listen: SocketAddr,
     http_listen: SocketAddr,
+    established: Option<wireguard::EstablishedSession>,
 ) -> Result<()> {
     // Critical: do NOT open a separate verify session then a second Tunn.
     // Cloudflare edges rate-limit / confuse double handshakes; the old path
@@ -920,11 +998,20 @@ async fn run_wireguard_tunnel(
         client_id: identity.client_id,
         preshared_key: None,
         persistent_keepalive: Some(wg_keepalive_secs()),
-        aethernoize: std::sync::Arc::new(aethernoize),
+        aethernoize: std::sync::Arc::new(aethernoize.clone()),
     };
 
     let (tchans, tints) = tunnel::channels();
-    let wg_tunnel = wireguard::WgTunnel::new(cfg, tints.inbound_tx).await?;
+    let wg_tunnel = if let Some(session) = established {
+        log::info!("[+] reusing scan-verified WireGuard session (no second handshake)");
+        wireguard::WgTunnel::from_established(
+            session,
+            std::sync::Arc::new(aethernoize),
+            tints.inbound_tx,
+        )
+    } else {
+        wireguard::WgTunnel::new(cfg, tints.inbound_tx).await?
+    };
 
     session_event::emit(SessionEvent::TunnelReady {
         transport: "wireguard".into(),
@@ -1001,7 +1088,7 @@ async fn establish_wg(
     obfuscate: bool,
     keepalive: u16,
     label: &'static str,
-) -> Result<netstack::StackHandle> {
+) -> Result<(netstack::StackHandle, AbortOnDrop<()>)> {
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
 
@@ -1028,19 +1115,30 @@ async fn establish_wg(
 
     let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
 
-    tokio::spawn(async move {
+    // M12 fix: the tunnel task used to be spawned detached, so a failed inner
+    // establishment leaked the OUTER tunnel — still handshaking/pinging the edge
+    // — on every retry. The AbortOnDrop guard ties its lifetime to the caller.
+    let handle = tokio::spawn(async move {
         if let Err(e) = wg_tunnel.run(outbound_rx).await {
             log::error!("[{label}] wireguard tunnel exited: {e}");
         }
     });
 
-    Ok(stack)
+    Ok((stack, AbortOnDrop(handle)))
+}
+
+struct UdpForwarderGuard {
+    // Fields exist purely for their Drop side effects (abort on teardown).
+    #[allow(dead_code)]
+    up: AbortOnDrop<()>,
+    #[allow(dead_code)]
+    down: AbortOnDrop<()>,
 }
 
 async fn spawn_udp_forwarder(
     outer: &netstack::StackHandle,
     remote: SocketAddr,
-) -> Result<SocketAddr> {
+) -> Result<(SocketAddr, UdpForwarderGuard)> {
     let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
     let local = sock.local_addr()?;
 
@@ -1052,7 +1150,7 @@ async fn spawn_udp_forwarder(
 
     let up_sock = sock.clone();
     let up_peer = inner_peer.clone();
-    tokio::spawn(async move {
+    let up_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         while let Ok((n, from)) = up_sock.recv_from(&mut buf).await {
             *up_peer.lock().await = Some(from);
@@ -1064,7 +1162,7 @@ async fn spawn_udp_forwarder(
 
     let down_sock = sock.clone();
     let down_peer = inner_peer.clone();
-    tokio::spawn(async move {
+    let down_task = tokio::spawn(async move {
         while let Some((_src, data)) = udp_rx.recv().await {
             let dst = *down_peer.lock().await;
             if let Some(dst) = dst {
@@ -1073,7 +1171,13 @@ async fn spawn_udp_forwarder(
         }
     });
 
-    Ok(local)
+    Ok((
+        local,
+        UdpForwarderGuard {
+            up: AbortOnDrop(up_task),
+            down: AbortOnDrop(down_task),
+        },
+    ))
 }
 
 async fn run_warp_in_warp(
@@ -1085,16 +1189,22 @@ async fn run_warp_in_warp(
 ) -> Result<()> {
     let _ = mtu::resolve_mtu("wireguard").await;
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
-    let outer_stack = establish_wg(&primary, peer, tunnel_mtu(), true, 5, "outer").await?;
+    let (outer_stack, _outer_guard) =
+        establish_wg(&primary, peer, tunnel_mtu(), true, 5, "outer").await?;
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // M12 fix: active data-plane gate instead of a fixed 1.5s hope-the-handshake-
+    // finished sleep. Slow links used to start the inner tunnel against an outer
+    // path that was still handshaking.
+    wait_stack_alive(&outer_stack, "outer WARP").await?;
 
-    let forwarder = spawn_udp_forwarder(&outer_stack, peer).await?;
+    let (forwarder, _forwarder_guard) = spawn_udp_forwarder(&outer_stack, peer).await?;
     log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
 
     log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
-    let inner_stack =
+    let (inner_stack, _inner_guard) =
         establish_wg(&secondary, forwarder, inner_mtu(), false, 20, "inner").await?;
+    // Same gate for the inner leg before proxies accept traffic.
+    wait_stack_alive(&inner_stack, "inner WARP").await?;
 
     let socks_listener = socks::bind(listen).await?;
     let http_listener = http_proxy::bind(http_listen).await?;

@@ -209,7 +209,7 @@ fn interface_index(name: &str) -> Result<u32> {
     Ok(idx)
 }
 
-fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<Ipv4Addr> {
+fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<(Ipv4Addr, u32, u32)> {
     let peer_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => {
@@ -292,25 +292,69 @@ Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -jo
             );
         }
     }
-    Ok(gw)
+    Ok((gw, if_index, physical_if_index))
 }
 
-fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
+fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr, tun_if: u32, phys_if: u32) {
     let _ = ipv4;
     let peer_s = match peer.ip() {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(_) => return,
     };
     let gw_s = gateway.to_string();
-    let script = format!(
+    // M1 fix: scope every deletion to the interfaces WE touched instead of
+    // ripping 0/1+128/1 split defaults from ALL interfaces (which killed any
+    // coexisting VPN's routes). Legacy state files without recorded indexes
+    // fall back to the old global behavior rather than leaking routes.
+    let scope_ps = if tun_if != 0 || phys_if != 0 {
+        let mut conds = Vec::new();
+        if tun_if != 0 {
+            conds.push(format!("$_.InterfaceIndex -eq {tun_if}"));
+        }
+        if phys_if != 0 {
+            conds.push(format!("$_.InterfaceIndex -eq {phys_if}"));
+        }
+        format!("| Where-Object {{ {} }}", conds.join(" -or "))
+    } else {
+        String::new()
+    };
+    let mut script = format!(
         r#"
 foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','{peer_s}/32')) {{
-  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
+  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue{scope_ps} |
     Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 }}
-route delete {peer_s} mask 255.255.255.255 {gw_s} 2>$null
-route delete 0.0.0.0 mask 128.0.0.0 2>$null
-route delete 128.0.0.0 mask 128.0.0.0 2>$null
+"#
+    );
+    script.push_str(&format!(
+        "\nroute delete {peer_s} mask 255.255.255.255 {gw_s}"
+    ));
+    if tun_if != 0 {
+        script.push_str(&format!(" IF {tun_if}"));
+    }
+    script.push_str(" 2>$null\n");
+    for dest in ["0.0.0.0", "128.0.0.0"] {
+        script.push_str(&format!("\nroute delete {dest} mask 128.0.0.0"));
+        if tun_if != 0 {
+            script.push_str(&format!(" IF {tun_if}"));
+        }
+        script.push_str(" 2>$null");
+    }
+    let _ = ps(&script);
+}
+
+/// M1 fix (continued): undo what configure_adapter_ip set on the tunnel NIC —
+/// pinned DNS servers (1.1.1.1/1.0.0.1) and InterfaceMetric=1 used to persist
+/// after disconnect/crash while the adapter lingered, degrading or breaking name
+/// resolution via a now-dead path. Called on drop and on stale-state recovery.
+fn reset_adapter_config(name: &str) {
+    if !ps_literal_is_safe(name) {
+        return;
+    }
+    let script = format!(
+        r#"
+Set-DnsClientServerAddress -InterfaceAlias '{name}' -ResetServerAddresses -ErrorAction SilentlyContinue
+Set-NetIPInterface -InterfaceAlias '{name}' -AutomaticMetric Enabled -ErrorAction SilentlyContinue
 "#
     );
     let _ = ps(&script);
@@ -330,9 +374,21 @@ struct RouteState {
     gateway: String,
     /// Process id that installed routes (stale if dead).
     pid: u32,
+    /// Interface indexes the routes were installed on, so cleanup can be scoped
+    /// (0 = unknown / legacy state file → global removal fallback).
+    #[serde(default)]
+    tun_if: u32,
+    #[serde(default)]
+    phys_if: u32,
 }
 
-fn persist_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
+fn persist_routes(
+    peer: SocketAddr,
+    ipv4: Ipv4Addr,
+    gateway: Ipv4Addr,
+    tun_if: u32,
+    phys_if: u32,
+) {
     let Some(path) = route_state_path() else {
         return;
     };
@@ -344,6 +400,8 @@ fn persist_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr) {
         ipv4: ipv4.to_string(),
         gateway: gateway.to_string(),
         pid: std::process::id(),
+        tun_if,
+        phys_if,
     };
     if let Ok(body) = serde_json::to_vec_pretty(&state) {
         let tmp = path.with_extension("json.tmp");
@@ -380,7 +438,16 @@ pub fn recover_stale_routes() {
     let gateway = state.gateway.parse::<Ipv4Addr>().ok();
     if let (Some(IpAddr::V4(peer_ip)), Some(ipv4), Some(gateway)) = (peer_ip, ipv4, gateway) {
         log::warn!("[tun] recovering stale routes from previous session");
-        remove_routes(SocketAddr::new(IpAddr::V4(peer_ip), 0), ipv4, gateway);
+        remove_routes(
+            SocketAddr::new(IpAddr::V4(peer_ip), 0),
+            ipv4,
+            gateway,
+            state.tun_if,
+            state.phys_if,
+        );
+        // M1 fix: the crashed session also left pinned DNS + metric=1 on the
+        // adapter; reset those too or name resolution limps through a dead NIC.
+        reset_adapter_config(ADAPTER_NAME);
     }
     let _ = std::fs::remove_file(path);
 }
@@ -416,14 +483,25 @@ pub struct TunHandle {
     peer: SocketAddr,
     ipv4: Ipv4Addr,
     gateway: Ipv4Addr,
+    tun_if: u32,
+    phys_if: u32,
 }
 
 impl Drop for TunHandle {
     fn drop(&mut self) {
-        remove_routes(self.peer, self.ipv4, self.gateway);
+        remove_routes(
+            self.peer,
+            self.ipv4,
+            self.gateway,
+            self.tun_if,
+            self.phys_if,
+        );
         clear_persisted_routes();
+        // M1 fix: restore adapter DNS + metric so the lingering NIC cannot keep
+        // hijacking name resolution after disconnect.
+        reset_adapter_config(ADAPTER_NAME);
         let _ = self.session.shutdown();
-        log::info!("[tun] cleaned routes and session");
+        log::info!("[tun] cleaned routes, adapter config, and session");
     }
 }
 
@@ -461,10 +539,10 @@ pub async fn spawn(
         .start_session(MAX_RING_CAPACITY)
         .map_err(|e| AetherError::Other(format!("start session: {e}")))?;
     recover_stale_routes();
-    let gateway = match install_routes(peer, ipv4) {
-        Ok(gateway) => {
-            persist_routes(peer, ipv4, gateway);
-            gateway
+    let (gateway, tun_if, phys_if) = match install_routes(peer, ipv4) {
+        Ok(result) => {
+            persist_routes(peer, ipv4, result.0, result.1, result.2);
+            result
         }
         Err(error) => {
             let _ = session.shutdown();
@@ -479,6 +557,8 @@ pub async fn spawn(
         peer,
         ipv4,
         gateway,
+        tun_if,
+        phys_if,
     };
 
     // High-throughput path: dedicated OS thread reads WinTUN ring (kernel packets)
@@ -548,7 +628,15 @@ pub async fn spawn(
                                 // Drop IPv6 — tunnel is currently IPv4 only.
                             } else {
                                 // Sometimes Netstack adds ethernet header? Strip it if so.
-                                if pkt.len() > 14 && pkt[14] >> 4 == 4 {
+                                // L7 fix: require the actual IPv4 ethertype (0x0800) at
+                                // bytes 12-13, not just "byte 14 looks like version 4" —
+                                // the old heuristic could forward ARP/garbage frames
+                                // whose 15th byte happened to start with 0x4.
+                                if pkt.len() > 14
+                                    && pkt[12] == 0x08
+                                    && pkt[13] == 0x00
+                                    && pkt[14] >> 4 == 4
+                                {
                                     let ip_len = pkt.len() - 14;
                                     if let Ok(mut packet) = session.allocate_send_packet(ip_len as u16) {
                                         packet.bytes_mut()[..ip_len].copy_from_slice(&pkt[14..]);

@@ -194,6 +194,41 @@ fn dns_prefer_order() -> Vec<u16> {
     }
 }
 
+/// M11 fix: resolvers are configurable (`AETHER_DNS=ip[,ip...]`, bare IP or
+/// `ip:port`; IPv6 literals must use `[..]:port` form) instead of a hardcoded
+/// 1.1.1.1 that some tunnel paths cannot reach.
+fn configured_dns_servers() -> Vec<SocketAddr> {
+    let raw = crate::runtime_env::var("AETHER_DNS").unwrap_or_default();
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let cand = if p.contains(':') {
+            p.to_string()
+        } else {
+            format!("{p}:53")
+        };
+        if let Ok(a) = cand.parse::<SocketAddr>() {
+            out.push(a);
+        } else {
+            log::warn!("[socks-dns] ignoring unparseable AETHER_DNS entry {p:?}");
+        }
+    }
+    if out.is_empty() {
+        out.push("1.1.1.1:53".parse().unwrap());
+        out.push("1.0.0.1:53".parse().unwrap());
+    }
+    out
+}
+
+fn valid_dns_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+}
+
 pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let key = name.to_ascii_lowercase();
     if let Ok(guard) = dns_cache().lock() {
@@ -203,39 +238,53 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
             }
         }
     }
+    if !valid_dns_name(&key) {
+        return Err(AetherError::Other(format!("invalid domain name {name:?}")));
+    }
 
+    // The UdpSender's Drop now closes the netstack socket (H1 fix), so every
+    // return path below frees the socket + buffers instead of leaking them
+    // until MAX_UDP_CONNECTIONS permanently broke resolution.
     let udp = stack.open_udp().await?;
-    let server: SocketAddr = "1.1.1.1:53".parse().unwrap();
     let (sender, mut from_stack) = udp.into_split();
 
     let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
-    for qtype in dns_prefer_order() {
-        let (qid, query) = build_dns_query(name, qtype);
-        if let Err(e) = sender.send_to(server, query).await {
-            last_err = e;
-            continue;
-        }
-        let resp = match tokio::time::timeout(Duration::from_secs(3), from_stack.recv()).await {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                last_err = AetherError::Other("dns channel closed".into());
+    for server in configured_dns_servers() {
+        for qtype in dns_prefer_order() {
+            let (qid, query) = build_dns_query(name, qtype);
+            if let Err(e) = sender.send_to(server, query).await {
+                last_err = e;
+                break; // server unreachable; try the next one
+            }
+            let (src, resp) =
+                match tokio::time::timeout(Duration::from_secs(3), from_stack.recv()).await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        last_err = AetherError::Other("dns channel closed".into());
+                        continue;
+                    }
+                    Err(_) => {
+                        last_err = AetherError::Other("dns timeout".into());
+                        continue;
+                    }
+                };
+            // M11 fix: only accept replies from the resolver we actually asked.
+            if src != server {
+                log::debug!("[socks-dns] dropping reply from {src} (asked {server})");
+                last_err = AetherError::Other("dns reply from unexpected source".into());
                 continue;
             }
-            Err(_) => {
-                last_err = AetherError::Other("dns timeout".into());
-                continue;
-            }
-        };
-        if let Some(ip) = parse_dns_answer_id(&resp.1, qtype, Some(qid)) {
-            if let Ok(mut guard) = dns_cache().lock() {
-                guard.map.insert(key, (ip, Instant::now()));
-                if guard.map.len() > 2048 {
-                    guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
+            if let Some(ip) = parse_dns_answer_id(&resp, qtype, Some(qid), Some(&key)) {
+                if let Ok(mut guard) = dns_cache().lock() {
+                    guard.map.insert(key, (ip, Instant::now()));
+                    if guard.map.len() > 2048 {
+                        guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
+                    }
                 }
+                return Ok(ip);
             }
-            return Ok(ip);
+            last_err = AetherError::Other(format!("no type-{qtype} record for {name}"));
         }
-        last_err = AetherError::Other(format!("no type-{qtype} record for {name}"));
     }
     Err(last_err)
 }
@@ -267,13 +316,27 @@ fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     (id, q)
 }
 
-fn parse_dns_answer_id(resp: &[u8], want_type: u16, expect_id: Option<u16>) -> Option<IpAddr> {
+fn parse_dns_answer_id(
+    resp: &[u8],
+    want_type: u16,
+    expect_id: Option<u16>,
+    expect_name: Option<&str>,
+) -> Option<IpAddr> {
     if resp.len() < 12 {
         return None;
     }
     if let Some(id) = expect_id {
         let got = u16::from_be_bytes([resp[0], resp[1]]);
         if got != id {
+            return None;
+        }
+    }
+    // M11 fix: the response's question name must echo what we asked. Without
+    // this, a same-socket stray/mismatched reply (only qid was checked before)
+    // could be parsed as an answer for a different domain.
+    if let Some(want) = expect_name {
+        let got = decode_qname(resp, 12)?;
+        if got.as_str() != want.trim_end_matches('.') {
             return None;
         }
     }
@@ -332,6 +395,44 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+/// Decode a DNS name starting at `pos`, following compression pointers (bounded).
+/// Returns the lowercase dotted name without a trailing dot.
+fn decode_qname(buf: &[u8], mut pos: usize) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut jumps = 0usize;
+    loop {
+        let len = *buf.get(pos)?;
+        if len & 0xc0 == 0xc0 {
+            let lo = *buf.get(pos + 1)?;
+            let ptr = (((len & 0x3f) as usize) << 8) | lo as usize;
+            jumps += 1;
+            if jumps > 4 || ptr >= buf.len() {
+                return None;
+            }
+            pos = ptr;
+            continue;
+        }
+        if len == 0 {
+            if labels.is_empty() || labels.len() > 16 {
+                return None;
+            }
+            let mut s = labels.join(".");
+            s.make_ascii_lowercase();
+            return Some(s);
+        }
+        let end = pos + 1 + len as usize;
+        let slc = buf.get(pos + 1..end)?;
+        if !slc
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return None;
+        }
+        labels.push(String::from_utf8_lossy(slc).to_string());
+        pos = end;
+    }
+}
+
 async fn handle_connect(
     mut sock: TcpStream,
     stack: StackHandle,
@@ -347,11 +448,18 @@ async fn handle_connect(
     };
 
     let dst = SocketAddr::new(ip, port);
-    let conn = match stack.open_tcp(dst).await {
-        Ok(c) => c,
-        Err(e) => {
+    // Belt-and-braces around the smoltcp socket connect-timeout (netstack): a
+    // caller-side bound guarantees the client gets a SOCKS error reply instead
+    // of hanging even if some other stall keeps the socket from resolving.
+    let conn = match tokio::time::timeout(Duration::from_secs(20), stack.open_tcp(dst)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             let _ = reply(&mut sock, REP_GENERAL).await;
             return Err(e);
+        }
+        Err(_) => {
+            let _ = reply(&mut sock, REP_GENERAL).await;
+            return Err(AetherError::Other("upstream connect timed out".into()));
         }
     };
 
@@ -420,6 +528,24 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
 
+    // M6 fix: domain destinations used to be resolved inline in the select loop,
+    // stalling ALL relay traffic for up to ~6s per lookup. Hostname sends are now
+    // handed to a dedicated resolver task so the data path never blocks on DNS.
+    let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<(String, u16, Vec<u8>)>(64);
+    let resolver_sender = sender.clone();
+    tokio::spawn(async move {
+        while let Some((name, port, payload)) = res_rx.recv().await {
+            match tokio::time::timeout(Duration::from_secs(4), dns_resolve(&stack, &name)).await {
+                Ok(Ok(ip)) => {
+                    let _ = resolver_sender
+                        .send_to(SocketAddr::new(ip, port), payload)
+                        .await;
+                }
+                _ => log::debug!("[socks-udp] resolve failed for {name}; dropping datagram"),
+            }
+        }
+    });
+
     // First UDP packet pins the authorized client; later packets from others are dropped.
     let mut client: Option<SocketAddr> = None;
     let mut cbuf = vec![0u8; 65535];
@@ -443,17 +569,17 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                     }
                     Some(_) => continue, // reject any other source
                 }
-                if let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) {
-                    let dst = match dst {
-                        Target::Ip(ip) => SocketAddr::new(ip, payload.0),
-                        Target::Domain(name) => {
-                            match dns_resolve(&stack, &name).await {
-                                Ok(ip) => SocketAddr::new(ip, payload.0),
-                                Err(_) => continue,
-                            }
+                let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) else { continue };
+                match dst {
+                    Target::Ip(ip) => {
+                        let dst = SocketAddr::new(ip, payload.0);
+                        let _ = sender.send_to(dst, payload.1).await;
+                    }
+                    Target::Domain(name) => {
+                        if res_tx.try_send((name, payload.0, payload.1)).is_err() {
+                            log::debug!("socks udp resolver backlog full; dropping datagram");
                         }
-                    };
-                    let _ = sender.send_to(dst, payload.1).await;
+                    }
                 }
             }
 
@@ -539,7 +665,7 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dns_answer_id, select_auth_method};
+    use super::{decode_qname, parse_dns_answer_id, select_auth_method};
 
     #[test]
     fn rejects_clients_without_no_auth_method() {
@@ -556,7 +682,7 @@ mod tests {
         resp.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
         // Answer: pointer to name + type A + class IN + ttl + rdlen 4 + 1.2.3.4
         resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
-        let ip = parse_dns_answer_id(&resp, 1, None).expect("A");
+        let ip = parse_dns_answer_id(&resp, 1, None, Some("a.com")).expect("A");
         assert_eq!(ip.to_string(), "1.2.3.4");
 
         let mut resp6 = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
@@ -564,7 +690,29 @@ mod tests {
         let mut ans = vec![0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16];
         ans.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         resp6.extend_from_slice(&ans);
-        let ip6 = parse_dns_answer_id(&resp6, 28, None).expect("AAAA");
+        let ip6 = parse_dns_answer_id(&resp6, 28, None, Some("a.com")).expect("AAAA");
         assert_eq!(ip6.to_string(), "2001:db8::1");
+    }
+
+    #[test]
+    fn rejects_reply_for_a_different_name() {
+        // Same wire shape as the A-answer test, but we asked for other.com —
+        // the question-name echo check must reject it.
+        let mut resp = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        resp.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
+        resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+        assert!(parse_dns_answer_id(&resp, 1, Some(1), Some("other.com")).is_none());
+    }
+
+    #[test]
+    fn decodes_compressed_qname() {
+        let mut buf = vec![0u8; 12];
+        buf.extend_from_slice(&[3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        // Pointer from elsewhere back to offset 12.
+        let with_ptr = [0xc0, 0x0c];
+        let mut full = buf.clone();
+        full.extend_from_slice(&with_ptr);
+        assert_eq!(decode_qname(&full, 12).as_deref(), Some("www.example.com"));
+        assert_eq!(decode_qname(&full, full.len() - 2).as_deref(), Some("www.example.com"));
     }
 }

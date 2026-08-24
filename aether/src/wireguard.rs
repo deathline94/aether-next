@@ -125,7 +125,7 @@ impl WgTunnel {
         let client_id = self.client_id;
         let peer = self.peer;
 
-        let recv_task = tokio::spawn(async move {
+        let mut recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
             let mut tmp = vec![0u8; MAX_PACKET];
             loop {
@@ -173,7 +173,7 @@ impl WgTunnel {
             }
         });
 
-        let send_task = tokio::spawn(async move {
+        let mut send_task = tokio::spawn(async move {
             while let Some(ip_packet) = outbound_rx.recv().await {
                 let mut tunn = tunn_w.lock().await;
                 let mut out_buf = vec![0u8; MAX_PACKET];
@@ -219,7 +219,7 @@ impl WgTunnel {
             }
         });
 
-        let timer_task = tokio::spawn(async move {
+        let mut timer_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TIMER_TICK);
             // #4: Adaptive keepalive — track idle time and send extra pings
             // when the tunnel goes quiet (mobile NATs drop idle UDP after ~5-30s).
@@ -281,11 +281,19 @@ impl WgTunnel {
             }
         });
 
+        // H4 fix: poll the handles by reference so they are not consumed, then
+        // abort the survivors. Previously whichever task ended first left the
+        // other two running detached forever — the timer task in particular
+        // loops on interval.tick() and kept sending orphaned keepalives (and
+        // pinning the socket + Tunn) after the tunnel was considered dead.
         tokio::select! {
-            _ = recv_task => log::info!("wireguard recv task ended"),
-            _ = send_task => log::info!("wireguard send task ended"),
-            _ = timer_task => log::info!("wireguard timer task ended"),
+            _ = &mut recv_task => log::info!("wireguard recv task ended"),
+            _ = &mut send_task => log::info!("wireguard send task ended"),
+            _ = &mut timer_task => log::info!("wireguard timer task ended"),
         }
+        recv_task.abort();
+        send_task.abort();
+        timer_task.abort();
 
         Ok(())
     }

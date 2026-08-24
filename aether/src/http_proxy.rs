@@ -58,26 +58,53 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     } else if let Some(authority) = target.strip_prefix("http://") {
         parse_authority(authority.split('/').next().unwrap_or(""), 80)?
     } else {
+        // HTTP header names are case-insensitive (RFC 9110); match any spelling
+        // of Host instead of only the two common capitalizations.
         let host = text
             .lines()
             .find_map(|line| {
-                line.strip_prefix("Host:")
-                    .or_else(|| line.strip_prefix("host:"))
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("host") {
+                    Some(value.trim().to_string())
+                } else {
+                    None
+                }
             })
-            .map(str::trim)
             .ok_or_else(|| AetherError::Other("HTTP Host header missing".into()))?;
-        parse_authority(host, 80)?
+        parse_authority(&host, 80)?
     };
 
-    let ip = socks::resolve_host(&stack, &host).await?;
-    let upstream = stack.open_tcp(SocketAddr::new(ip, port)).await;
-    let upstream = match upstream {
-        Ok(value) => value,
+    let ip = match socks::resolve_host(&stack, &host).await {
+        Ok(ip) => ip,
         Err(error) => {
+            // Consistency fix: resolution failures previously dropped the
+            // connection with no HTTP response at all while upstream-connect
+            // failures returned a 502. Answer 502 for both.
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                 .await;
             return Err(error);
+        }
+    };
+    let dst = SocketAddr::new(ip, port);
+    let upstream = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        stack.open_tcp(dst),
+    )
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = client
+                .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(AetherError::Other("upstream connect timed out".into()));
         }
     };
 
@@ -86,10 +113,28 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         if header_end < header.len() {
-            upstream.send(header[header_end..].to_vec()).await?;
+            // The 200 is already on the wire, so a failure to forward pipelined
+            // early data must not surface as a command error — just close.
+            if upstream.send(header[header_end..].to_vec()).await.is_err() {
+                let _ = client.shutdown().await;
+                return Ok(());
+            }
         }
     } else {
-        upstream.send(rewrite_absolute_uri(header)?).await?;
+        match rewrite_absolute_uri(header) {
+            Ok(rewritten) => {
+                if upstream.send(rewritten).await.is_err() {
+                    let _ = client.shutdown().await;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                let _ = client
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                    .await;
+                return Err(e);
+            }
+        }
     }
     relay(client, upstream).await
 }
@@ -130,27 +175,41 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
     if let Ok(addr) = value.parse::<SocketAddr>() {
         return Ok((addr.ip().to_string(), addr.port()));
     }
+    // RFC 3986: an empty port after ':' is equivalent to the default port.
+    fn port_after(rest: &str, default_port: u16) -> Result<Option<u16>> {
+        let Some(port_str) = rest.strip_prefix(':') else {
+            return Ok(None);
+        };
+        if port_str.trim().is_empty() {
+            return Ok(Some(default_port));
+        }
+        port_str
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| AetherError::Other("invalid proxy port".into()))
+    }
     if value.starts_with('[') {
         if let Some(end) = value.find(']') {
             let host = &value[1..end];
             let rest = &value[end + 1..];
-            if let Some(port) = rest.strip_prefix(':') {
-                return Ok((
-                    host.to_string(),
-                    port.parse()
-                        .map_err(|_| AetherError::Other("invalid proxy port".into()))?,
-                ));
+            if let Some(port) = port_after(rest, default_port)? {
+                return Ok((host.to_string(), port));
             }
             return Ok((host.to_string(), default_port));
         }
     }
-    if let Some((host, port)) = value.rsplit_once(':') {
+    if let Some((host, port_str)) = value.rsplit_once(':') {
         if !host.contains(':') {
-            return Ok((
-                host.to_string(),
-                port.parse()
-                    .map_err(|_| AetherError::Other("invalid proxy port".into()))?,
-            ));
+            let port = if port_str.trim().is_empty() {
+                default_port
+            } else {
+                port_str
+                    .trim()
+                    .parse()
+                    .map_err(|_| AetherError::Other("invalid proxy port".into()))?
+            };
+            return Ok((host.to_string(), port));
         }
     }
     if value.is_empty() {

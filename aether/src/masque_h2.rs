@@ -516,40 +516,46 @@ pub async fn run(
     log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h2\"}}");
     let _ = ready_tx.send(());
 
-    // Shared last traffic timestamp for stall detection (send OR recv activity resets).
-    let last_traffic = std::sync::Arc::new(tokio::sync::Mutex::new(Instant::now()));
-    let last_send = last_traffic.clone();
-    let last_recv = last_traffic.clone();
+    // H3 fix: one shared "last traffic" stamp let a dead receive side be kept
+    // alive forever by the sender's own keepalives (zombie half-tunnel: proxies
+    // up, UI connected, all traffic black-holed). The stall detector now keys
+    // exclusively on RECEIVE activity — inbound data is the only proof the path
+    // actually works; successful sends alone prove nothing.
+    let last_recv = std::sync::Arc::new(tokio::sync::Mutex::new(Instant::now()));
+    let last_recv_send_watchdog = last_recv.clone();
     let probe_src_ka = probe_src;
 
     // CRITICAL: send and recv must not share one select. Waiting on H2 send capacity
     // used to block DATA recv + window updates → download collapsed under load.
     let send_task = tokio::spawn(async move {
+        let mut last_send = Instant::now();
         let mut idle = tokio::time::interval(Duration::from_secs(20));
         idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = idle.tick() => {
-                    let last = *last_send.lock().await;
-                    if last.elapsed() > Duration::from_secs(90) {
+                    // Zombie detection: if nothing has arrived for 90s the edge
+                    // side is gone regardless of how fresh our own sends are.
+                    let since_recv = last_recv_send_watchdog.lock().await.elapsed();
+                    if since_recv > Duration::from_secs(90) {
                         return Err(AetherError::Masque(
-                            "h2 stall: no traffic for 90s".into(),
+                            "h2 stall: no data from edge for 90s".into(),
                         ));
                     }
                     // Keep-alive: small DNS probe so half-open links fail fast.
-                    if last.elapsed() > Duration::from_secs(25) {
+                    if last_send.elapsed() > Duration::from_secs(25) {
                         let probe = crate::dns::build_dataplane_probe(probe_src_ka, std::net::Ipv4Addr::new(8, 8, 8, 8));
                         if let Err(e) = send_ip_batch(&mut send_stream, vec![probe]).await {
                             log::debug!("[h2] keepalive: {e}");
                             return Err(e);
                         }
-                        *last_send.lock().await = Instant::now();
+                        last_send = Instant::now();
                     }
                 }
                 pkt = outbound_rx.recv() => {
                     match pkt {
                         Some(ip_packet) => {
-                            *last_send.lock().await = Instant::now();
+                            last_send = Instant::now();
                             let mut batch = Vec::with_capacity(64);
                             batch.push(ip_packet);
                             while batch.len() < 128 {
@@ -596,8 +602,8 @@ pub async fn run(
                     return Ok::<(), AetherError>(());
                 }
                 Err(_) => {
-                    let last = *last_recv.lock().await;
-                    if last.elapsed() > Duration::from_secs(90) {
+                    let since_recv = last_recv.lock().await.elapsed();
+                    if since_recv > Duration::from_secs(90) {
                         return Err(AetherError::Masque(
                             "h2 stall: no data from edge for 90s".into(),
                         ));
@@ -607,22 +613,30 @@ pub async fn run(
         }
     });
 
-    tokio::select! {
-        r = send_task => {
+    // Hold the handles by reference so they survive the select, then abort both:
+    // whichever task ends first must take its sibling down with it instead of
+    // leaving a detached half-tunnel behind.
+    let mut send_task = send_task;
+    let mut recv_task = recv_task;
+    let result = tokio::select! {
+        r = &mut send_task => {
             match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(AetherError::Masque(format!("h2 send task: {e}"))),
             }
         }
-        r = recv_task => {
+        r = &mut recv_task => {
             match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(AetherError::Masque(format!("h2 recv task: {e}"))),
             }
         }
-    }
+    };
+    send_task.abort();
+    recv_task.abort();
+    result
 }
 
 

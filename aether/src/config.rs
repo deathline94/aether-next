@@ -124,29 +124,72 @@ fn read_text(path: &str) -> Result<String> {
     } else { raw };
     String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))
 }
-fn private_atomic_write(path: &str, data: &[u8]) -> Result<()> {
-    if let Some(parent)=Path::new(path).parent() { std::fs::create_dir_all(parent)?; }
-    let tmp=format!("{path}.tmp");
-    #[cfg(unix)] {
-        use std::fs::OpenOptions; use std::io::Write; use std::os::unix::fs::OpenOptionsExt;
-        let mut f=OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
-        f.write_all(data)?; f.sync_all()?;
-    }
-    #[cfg(not(unix))] std::fs::write(&tmp,data)?;
-    if Path::new(path).exists() { std::fs::remove_file(path)?; }
-    std::fs::rename(&tmp,path)?;
-    #[cfg(windows)] if let Ok(user)=std::env::var("USERNAME") {
-        // Lock the identity file (keys/token) to the current user. Surface a warning
-        // if icacls fails so a world-readable config is not left silently.
-        match std::process::Command::new("icacls").args([path,"/inheritance:r","/grant:r",&format!("{user}:F")]).output() {
+#[cfg(windows)]
+fn restrict_windows_acl(path: &str) {
+    if let Ok(user) = std::env::var("USERNAME") {
+        match std::process::Command::new("icacls")
+            .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .output()
+        {
             Ok(out) if !out.status.success() => log::warn!(
-                "[config] icacls could not restrict {path} permissions (identity file may be readable by other users): {}",
+                "[config] icacls could not restrict {path} (file may be readable by other users): {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
-            Err(e) => log::warn!("[config] failed to run icacls on {path} (identity file may be readable by other users): {e}"),
+            Err(e) => log::warn!("[config] failed to run icacls on {path}: {e}"),
             _ => {}
         }
     }
+}
+
+/// H5 fix: atomic + locked-down write for secret files (identity TOML, session
+/// tickets). The Windows path previously wrote full secret content to a
+/// DEFAULT-ACL temp file and only restricted permissions after renaming into
+/// place — leaving the WG private key / access token world-readable for the
+/// icacls process spawn window (~100ms+) or forever if icacls failed. Now the
+/// temp file is created EMPTY, its ACL is restricted BEFORE any secret byte hits
+/// disk, and the final file is re-restricted as belt-and-braces.
+pub(crate) fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        {
+            let _ = std::fs::File::create(&tmp)?;
+        }
+        restrict_windows_acl(&tmp);
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    // Replace the destination. Direct rename first; remove+rename fallback for
+    // transient destination locks (AV/indexer).
+    if std::fs::rename(&tmp, path).is_err() {
+        if Path::new(path).exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::rename(&tmp, path)?;
+    }
+    #[cfg(windows)]
+    restrict_windows_acl(path);
     Ok(())
 }
 
@@ -171,6 +214,6 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
     let text = toml::to_string_pretty(&persisted)
         .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    let data=encode(text.as_bytes())?;
-    private_atomic_write(path, &data)
+    let data = encode(text.as_bytes())?;
+    write_private_file(path, &data)
 }

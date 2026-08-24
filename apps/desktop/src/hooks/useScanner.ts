@@ -11,7 +11,9 @@ export function useScanner(
   const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
   const [concurrency, setConcurrency] = useState(250);
-  const [timeoutMs, setTimeoutMs] = useState(3000);
+  // 6s: at or above the engine's expensive-mode (H3/BoringSSL) per-probe floor so
+  // the UI default never silently under-budgets QUIC handshake probes.
+  const [timeoutMs, setTimeoutMs] = useState(6000);
   const [noize, setNoize] = useState("off");
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
   const [scanState, setScanState] = useState<ScanState>(initialScanState);

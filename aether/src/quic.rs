@@ -344,7 +344,7 @@ pub async fn run(
     let mut out_buf = vec![0u8; 65535];
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
     keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let started = Instant::now();
+    let mut started = Instant::now();
 
     loop {
         // Fast-fail on a QUIC-hostile path: instead of burning the session's full
@@ -377,18 +377,29 @@ pub async fn run(
                 }
             }
 
-            Some((to_local, from, mut data)) = net_rx.recv() => {
-                if !udp_seen {
-                    udp_seen = true;
-                    h3_stage("udp_first_reply", &format!("from {from} bytes {}", data.len()));
-                }
-                let mut hdr_buf = data.clone();
-                if let Ok(hdr) = quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
-                    log::debug!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
-                }
-                let info = quiche::RecvInfo { from, to: to_local };
-                if let Err(e) = conn.recv(&mut data, info) {
-                    log::debug!("recv error: {e}");
+            maybe = net_rx.recv() => {
+                // L6 fix: this arm previously used a `Some(..)` pattern, which
+                // silently disabled it once all UDP readers died and left the
+                // loop spinning between PTO wakes forever. Reader death means
+                // the socket is gone — close cleanly so run() returns.
+                match maybe {
+                    Some((to_local, from, mut data)) => {
+                        if !udp_seen {
+                            udp_seen = true;
+                            h3_stage("udp_first_reply", &format!("from {from} bytes {}", data.len()));
+                        }
+                        let mut hdr_buf = data.clone();
+                        if let Ok(hdr) = quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
+                            log::debug!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
+                        }
+                        let info = quiche::RecvInfo { from, to: to_local };
+                        if let Err(e) = conn.recv(&mut data, info) {
+                            log::debug!("recv error: {e}");
+                        }
+                    }
+                    None => {
+                        let _ = conn.close(true, 0x00, b"udp readers gone");
+                    }
                 }
             }
 
@@ -544,6 +555,15 @@ pub async fn run(
                     if let Some(ref ech) = current_ech {
                         tls::inject_ech(&mut conn, ech)?;
                     }
+
+                    // L4 fix: reset the fast-fail clock for the retry handshake —
+                    // the old code kept the ORIGINAL `started`/`udp_seen` state, so
+                    // the retry inherited whatever budget the failed attempt had
+                    // already burned and could fast-fail before its own handshake
+                    // got a fair chance.
+                    started = Instant::now();
+                    udp_seen = false;
+                    established_ever = false;
 
                     h3_conn = None;
                     req_stream = None;

@@ -43,29 +43,41 @@ async fn http_probe(stack: &netstack::StackHandle) -> Result<()> {
     );
     sender.send(request.into_bytes()).await?;
 
-    let mut buf = Vec::new();
-    loop {
+    // M5 fix: read until the full status line (CRLF-terminated) arrives, then
+    // parse the actual 3-digit status code. The old check — `buffer.contains("204")`
+    // on the first ≥12 bytes — accepted captive-portal redirects like
+    // "HTTP/1.1 302 Found\r\nLocation: /generate_204..." and counted them as
+    // verified-working endpoints.
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let eol = loop {
         match tokio::time::timeout(Duration::from_secs(6), from_stack.recv()).await {
             Ok(Some(chunk)) => {
                 buf.extend_from_slice(&chunk);
-                if buf.len() >= 12 {
-                    break;
+                if let Some(at) = buf.windows(2).position(|w| w == b"\r\n") {
+                    break at;
+                }
+                if buf.len() > 8192 {
+                    return Err(AetherError::Other("http probe: oversized response".into()));
                 }
             }
-            Ok(None) => break,
+            Ok(None) => return Err(AetherError::Other("http probe: connection closed".into())),
             Err(_) => return Err(AetherError::Other("http probe response timeout".into())),
         }
-    }
+    };
 
     sender.close().await;
 
-    let status_line = String::from_utf8_lossy(&buf);
-    if status_line.contains("204") {
+    let status_line = String::from_utf8_lossy(&buf[..eol]);
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| AetherError::Other(format!("http probe: bad status line {status_line:?}")))?;
+    if code == 204 {
         Ok(())
     } else {
-        let first_line = status_line.lines().next().unwrap_or("").trim();
         Err(AetherError::Other(format!(
-            "unexpected http probe response: {first_line}"
+            "http probe: unexpected status {code} ({status_line})"
         )))
     }
 }

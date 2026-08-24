@@ -130,6 +130,15 @@ pub struct TcpSender {
     data_in: mpsc::Sender<DataIn>,
 }
 
+impl Clone for TcpSender {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            data_in: self.data_in.clone(),
+        }
+    }
+}
+
 impl TcpSender {
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         self.data_in
@@ -161,6 +170,7 @@ impl UdpConn {
     }
 }
 
+#[derive(Clone)]
 pub struct UdpSender {
     id: usize,
     data_in: mpsc::Sender<DataIn>,
@@ -176,6 +186,17 @@ impl UdpSender {
 
     pub async fn close(&self) {
         let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
+    }
+}
+
+impl Drop for UdpSender {
+    fn drop(&mut self) {
+        // Safety net for the socket-leak class of bugs (H1): the netstack only
+        // frees a UDP socket on an explicit UdpClose, so a sender dropped
+        // without close() used to leak the socket + its buffers until the
+        // MAX_UDP_CONNECTIONS cap permanently broke DNS/proxying. try_send so
+        // we never block in drop; explicit close() calls remain authoritative.
+        let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
     }
 }
 
@@ -396,6 +417,35 @@ fn alloc_port(p: &mut u16) -> u16 {
     port
 }
 
+/// L-fix: pick the next ephemeral port that no live TCP/UDP socket is bound to.
+/// The old wrap-around counter could hand a duplicate local port to a second
+/// socket once ~16k flows opened, silently breaking both flows (responses became
+/// ambiguous inside smoltcp).
+fn alloc_unique_port(s: &NetStack) -> Option<u16> {
+    let mut cursor = s.next_port;
+    for _ in 0..16000 {
+        let cand = alloc_port(&mut cursor);
+        let tcp_taken = s.tcp_conns.values().any(|st| {
+            matches!(
+                s.sockets.get::<tcp::Socket>(st.handle).local_endpoint(),
+                Some(ep) if ep.port == cand
+            )
+        });
+        if tcp_taken {
+            continue;
+        }
+        let udp_taken = s
+            .udp_conns
+            .values()
+            .any(|st| s.sockets.get::<udp::Socket>(st.handle).endpoint().port == cand);
+        if udp_taken {
+            continue;
+        }
+        return Some(cand);
+    }
+    None
+}
+
 async fn run(
     mut s: NetStack,
     mut cmd_rx: mpsc::Receiver<Cmd>,
@@ -417,9 +467,28 @@ async fn run(
             s.device.rx.clear();
             s.device.tx.clear();
         }
-        service_tcp(&mut s).await;
-        service_udp(&mut s).await;
-        flush_tx(&mut s, &outbound_tx).await;
+        for (name, svc) in [
+            ("service_tcp", 0u8),
+            ("service_udp", 1),
+            ("flush_tx", 2),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match svc {
+                0 => {
+                    service_tcp(&mut s);
+                }
+                1 => {
+                    service_udp(&mut s);
+                }
+                _ => {
+                    flush_tx(&mut s, &outbound_tx);
+                }
+            }));
+            if outcome.is_err() {
+                log::error!("[netstack] {name} panicked; dropping in-flight rx/tx buffers and continuing");
+                s.device.rx.clear();
+                s.device.tx.clear();
+            }
+        }
 
         let delay = s
             .iface
@@ -484,8 +553,24 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket.set_nagle_enabled(false);
+            // H2 fix: without a connect timeout a SYN to a black-holed address
+            // sits in SynSent forever (smoltcp retransmits indefinitely), leaking
+            // 1MB of buffers + a connection slot per attempt until
+            // MAX_TCP_CONNECTIONS exhausts and the proxy dies permanently.
+            // On expiry smoltcp aborts the socket -> State::Closed, which the
+            // service loop already maps to "connection refused" for the caller.
+            socket.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
 
-            let local_port = alloc_port(&mut s.next_port);
+            let local_port = match alloc_unique_port(s) {
+                Some(p) => {
+                    s.next_port = if p >= 65000 { 49152 } else { p + 1 };
+                    p
+                }
+                None => {
+                    let _ = resp.send(Err("no free local ports".into()));
+                    return;
+                }
+            };
             let remote = to_ip_endpoint(dst);
 
             if let Err(e) = socket.connect(s.iface.context(), remote, local_port) {
@@ -523,7 +608,16 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             let tx_buf = udp::PacketBuffer::new(tx_meta, vec![0u8; UDP_BUF]);
             let mut socket = udp::Socket::new(rx_buf, tx_buf);
 
-            let local_port = alloc_port(&mut s.next_port);
+            let local_port = match alloc_unique_port(s) {
+                Some(p) => {
+                    s.next_port = if p >= 65000 { 49152 } else { p + 1 };
+                    p
+                }
+                None => {
+                    let _ = resp.send(Err("no free local ports".into()));
+                    return;
+                }
+            };
             if let Err(e) = socket.bind(local_port) {
                 let _ = resp.send(Err(format!("bind: {e:?}")));
                 return;
@@ -581,7 +675,7 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
     }
 }
 
-async fn service_tcp(s: &mut NetStack) {
+fn service_tcp(s: &mut NetStack) {
     let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
 
     for id in ids {
@@ -688,7 +782,7 @@ async fn service_tcp(s: &mut NetStack) {
     }
 }
 
-async fn service_udp(s: &mut NetStack) {
+fn service_udp(s: &mut NetStack) {
     let ids: Vec<usize> = s.udp_conns.keys().copied().collect();
 
     for id in ids {
@@ -720,7 +814,7 @@ async fn service_udp(s: &mut NetStack) {
     }
 }
 
-async fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
+fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
     // Prefer small packets (TCP ACKs ~40-80B). If data fills the tunnel queue first,
     // ACKs starve and download collapses — classic userspace-tunnel failure mode.
     const ACKISH: usize = 128;
