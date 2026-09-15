@@ -35,14 +35,18 @@ class SessionController(
         context = context,
         onLine = { line -> handleEngineLine(line) },
         onExit = { code ->
+            val wasConnected = connectedOnce.get()
             connectedOnce.set(false)
             socksSeen.set(false)
             tunnelSeen.set(false)
             vpnStarted.set(false)
             vpnEstablished.set(false)
+            val isError = code != null && code != 0 && !wasConnected
             setRuntime(
-                "disconnected",
-                if (code == 0 || code == null) "Engine stopped" else "Engine exited ($code)",
+                if (isError) "error" else "disconnected",
+                if (isError) "Could not find a working gateway"
+                else if (code == 0 || code == null) "Engine stopped"
+                else "Engine exited ($code)",
                 null,
                 null,
             )
@@ -208,7 +212,14 @@ class SessionController(
                         tunnelSeen.set(true)
                         maybeStartVpn()
                     }
-                    "error" -> emitLog("engine error: ${json.optString("message")}")
+                    "error" -> {
+                        val msg = json.optString("message", "Connection failed")
+                        emitLog("engine error: $msg")
+                        setRuntime("error", msg, null, runtime.endpoint)
+                        runner.stop()
+                        context.stopService(Intent(context, EngineService::class.java))
+                        stopVpnService()
+                    }
                     // Forward structured scan telemetry to the webview (scan://event),
                     // mirroring the desktop Tauri bridge. The UI consumes these instead
                     // of regex-parsing log lines.
@@ -216,6 +227,13 @@ class SessionController(
                 }
             } catch (_: Exception) {
             }
+        }
+        if (line.contains("[-] session failed:")) {
+            val msg = line.substringAfter("[-] session failed:").trim()
+            setRuntime("error", msg, null, runtime.endpoint)
+            runner.stop()
+            context.stopService(Intent(context, EngineService::class.java))
+            stopVpnService()
         }
         if (line.contains("socks5 server listening") || line.contains("http proxy listening")) {
             socksSeen.set(true)

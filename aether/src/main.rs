@@ -62,7 +62,11 @@ async fn main() -> Result<()> {
         };
         log::error!("[-] session failed: {message}");
         session_event::emit(SessionEvent::Error { message });
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        std::process::exit(1);
     }
     // Scan-only sessions finish on their own, but the control-stdin reader parks a
     // tokio::io::stdin() blocking read that blocks tokio's runtime shutdown and

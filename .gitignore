@@ -99,6 +99,10 @@ aether*.json
 
 # ── Qoder / AI tooling artifacts ─────────────────────────────
 .qoder/
+.agents/
+.opencode/
+.specify/
+specs/
 PRODUCT.md
 architecture-review-*.html
 test_engine.log

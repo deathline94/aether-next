@@ -72,12 +72,12 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
         {settings.noize === "custom" && (
           <div className="setting-stack" style={{ gap: 10, marginTop: 8 }}>
             <div className="setting-row">
-              <div><strong>Junk count</strong><span>Packets before handshake (0–64)</span></div>
+              <div><strong>Junk count</strong><span>Packets before handshake (recommended: 5)</span></div>
               <NumberField label="Junk count" min={0} max={64} disabled={settingsLocked}
                 value={settings.noizeJc} onCommit={(noizeJc) => patchSettings({ noizeJc })} />
             </div>
             <div className="setting-row">
-              <div><strong>Min size</strong><span>Bytes (≤ max)</span></div>
+              <div><strong>Min size</strong><span>Bytes (≤ max, recommended: 50)</span></div>
               <NumberField label="Junk minimum size in bytes" min={0} max={2048} disabled={settingsLocked}
                 value={settings.noizeJmin}
                 onCommit={(noizeJmin) => patchSettings({
@@ -87,7 +87,7 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
                 })} />
             </div>
             <div className="setting-row">
-              <div><strong>Max size</strong><span>Bytes (≥ min)</span></div>
+              <div><strong>Max size</strong><span>Bytes (≥ min, recommended: 128)</span></div>
               <NumberField label="Junk maximum size in bytes" min={0} max={2048} disabled={settingsLocked}
                 value={settings.noizeJmax}
                 onCommit={(noizeJmax) => patchSettings({
@@ -96,7 +96,7 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
                 })} />
             </div>
             <div className="setting-row">
-              <div><strong>Interval</strong><span>Milliseconds between junk</span></div>
+              <div><strong>Interval</strong><span>Milliseconds between junk (recommended: 0)</span></div>
               <NumberField label="Junk interval in milliseconds" min={0} max={5000} disabled={settingsLocked}
                 value={settings.noizeIntervalMs} onCommit={(noizeIntervalMs) => patchSettings({ noizeIntervalMs })} />
             </div>

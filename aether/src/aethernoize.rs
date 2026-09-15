@@ -51,14 +51,14 @@ impl AetherNoizeConfig {
             i3: None,
             i4: None,
             i5: None,
-            jc: 4,
-            jc_before_hs: 2,
-            jc_after_i1: 1,
-            jc_after_hs: 1,
-            jmin: 48,
-            jmax: 190,
-            junk_interval: Duration::from_millis(3),
-            handshake_delay: Duration::from_millis(5),
+            jc: 5,
+            jc_before_hs: 5,
+            jc_after_i1: 0,
+            jc_after_hs: 0,
+            jmin: 50,
+            jmax: 128,
+            junk_interval: Duration::ZERO,
+            handshake_delay: Duration::ZERO,
             allow_zero_size: false,
         }
     }
@@ -70,14 +70,14 @@ impl AetherNoizeConfig {
             i3: Some("<r 30-50>".to_string()),
             i4: None,
             i5: None,
-            jc: 6,
-            jc_before_hs: 3,
-            jc_after_i1: 2,
-            jc_after_hs: 1,
-            jmin: 64,
-            jmax: 256,
-            junk_interval: Duration::from_millis(2),
-            handshake_delay: Duration::from_millis(8),
+            jc: 5,
+            jc_before_hs: 5,
+            jc_after_i1: 0,
+            jc_after_hs: 0,
+            jmin: 50,
+            jmax: 128,
+            junk_interval: Duration::ZERO,
+            handshake_delay: Duration::ZERO,
             allow_zero_size: false,
         }
     }
@@ -89,14 +89,14 @@ impl AetherNoizeConfig {
             i3: Some("<b 474554><rc 40-60>".to_string()),
             i4: Some("<r 60-100>".to_string()),
             i5: Some("<c><rd 20-40>".to_string()),
-            jc: 10,
-            jc_before_hs: 4,
-            jc_after_i1: 3,
-            jc_after_hs: 3,
-            jmin: 80,
-            jmax: 384,
-            junk_interval: Duration::from_millis(1),
-            handshake_delay: Duration::from_millis(12),
+            jc: 5,
+            jc_before_hs: 5,
+            jc_after_i1: 0,
+            jc_after_hs: 0,
+            jmin: 50,
+            jmax: 128,
+            junk_interval: Duration::ZERO,
+            handshake_delay: Duration::ZERO,
             allow_zero_size: false,
         }
     }
@@ -195,6 +195,9 @@ async fn jitter(lo: u64, hi: u64) {
 /// Jitter derived from the config's junk_interval: uses the configured interval
 /// as a base and adds 0-4ms random noise on top.
 async fn jitter_from_cfg(cfg: &AetherNoizeConfig) {
+    if cfg.junk_interval.is_zero() {
+        return;
+    }
     let base = cfg.junk_interval.as_millis() as u64;
     let extra = rand::thread_rng().gen_range(0..=4);
     let total = base + extra;
@@ -213,8 +216,10 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         if !payload.is_empty() {
             let framed = wrap_ikev2(&payload);
             send_connected(sock, &framed).await;
-            // Jitter: 2-8ms random delay breaks timing correlation.
-            jitter(2, 8).await;
+            if !cfg.junk_interval.is_zero() {
+                // Jitter: 2-8ms random delay breaks timing correlation.
+                jitter(2, 8).await;
+            }
         }
     }
 
@@ -237,7 +242,9 @@ pub async fn apply_obfuscation(sock: &UdpSocket, _peer: SocketAddr, cfg: &Aether
         let pkt = parse_cps(s);
         if !pkt.is_empty() {
             send_connected(sock, &pkt).await;
-            jitter(2, 6).await;
+            if !cfg.junk_interval.is_zero() {
+                jitter(2, 6).await;
+            }
         }
     }
 
@@ -283,3 +290,43 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         tokio::time::sleep(Duration::from_millis(gap_ms)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aethernoize_profiles() {
+        let b = AetherNoizeConfig::balanced();
+        assert_eq!(b.jc, 5);
+        assert_eq!(b.jc_before_hs, 5);
+        assert_eq!(b.jmin, 50);
+        assert_eq!(b.jmax, 128);
+        assert!(b.junk_interval.is_zero());
+        assert!(b.handshake_delay.is_zero());
+
+        let l = AetherNoizeConfig::light();
+        assert_eq!(l.jc, 5);
+        assert_eq!(l.jc_before_hs, 5);
+        assert_eq!(l.jmin, 50);
+        assert_eq!(l.jmax, 128);
+        assert!(l.junk_interval.is_zero());
+
+        let a = AetherNoizeConfig::aggressive();
+        assert_eq!(a.jc, 5);
+        assert_eq!(a.jc_before_hs, 5);
+        assert_eq!(a.jmin, 50);
+        assert_eq!(a.jmax, 128);
+        assert!(a.junk_interval.is_zero());
+    }
+
+    #[test]
+    fn test_aethernoize_generate_junk_bounds() {
+        let cfg = AetherNoizeConfig::balanced();
+        for _ in 0..100 {
+            let junk = generate_junk(&cfg);
+            assert!(junk.len() >= 50 && junk.len() <= 128, "junk len {} out of bounds", junk.len());
+        }
+    }
+}
+

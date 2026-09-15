@@ -33,25 +33,25 @@ impl NoizeConfig {
 
     pub fn firewall() -> Self {
         Self {
-            jc_before_hs: 2,
-            jc_after_i1: 2,
-            jmin: 48,
-            jmax: 190,
+            jc_before_hs: 5,
+            jc_after_i1: 0,
+            jmin: 50,
+            jmax: 128,
             i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
             i2: Some("<r 48>".to_string()),
-            junk_interval: Duration::from_millis(4),
+            junk_interval: Duration::ZERO,
         }
     }
 
     pub fn gfw() -> Self {
         Self {
-            jc_before_hs: 2,
-            jc_after_i1: 1,
-            jmin: 64,
-            jmax: 256,
+            jc_before_hs: 5,
+            jc_after_i1: 0,
+            jmin: 50,
+            jmax: 128,
             i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
             i2: Some("<r 32>".to_string()),
-            junk_interval: Duration::from_millis(5),
+            junk_interval: Duration::ZERO,
         }
     }
 
@@ -65,7 +65,7 @@ fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
     let (lo, hi) = if cfg.jmax > cfg.jmin && cfg.jmin > 0 {
         (cfg.jmin, cfg.jmax)
     } else {
-        (40, 90)
+        (50, 128)
     };
     let size = rng.gen_range(lo..=hi);
     let mut buf = vec![0u8; size];
@@ -125,3 +125,33 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
     
     log::debug!("obfuscation pre-handshake complete");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_masque_noise_profiles() {
+        let fw = NoizeConfig::firewall();
+        assert_eq!(fw.jc_before_hs, 5);
+        assert_eq!(fw.jmin, 50);
+        assert_eq!(fw.jmax, 128);
+        assert!(fw.junk_interval.is_zero());
+
+        let gfw = NoizeConfig::gfw();
+        assert_eq!(gfw.jc_before_hs, 5);
+        assert_eq!(gfw.jmin, 50);
+        assert_eq!(gfw.jmax, 128);
+        assert!(gfw.junk_interval.is_zero());
+    }
+
+    #[test]
+    fn test_masque_junk_packet_size_bounds() {
+        let fw = NoizeConfig::firewall();
+        for _ in 0..100 {
+            let pkt = junk_packet(&fw);
+            assert!(pkt.len() >= 50 && pkt.len() <= 128, "packet len {} out of bounds", pkt.len());
+        }
+    }
+}
+

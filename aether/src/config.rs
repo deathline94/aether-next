@@ -217,3 +217,58 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let data = encode(text.as_bytes())?;
     write_private_file(path, &data)
 }
+
+/// Format WireGuard client configuration with AmneziaWG obfuscation parameters.
+#[allow(dead_code)]
+pub fn format_amnezia_wg_config(
+    identity: &Identity,
+    peer_endpoint: &str,
+    dns: Option<&str>,
+) -> String {
+    let priv_key = base64::engine::general_purpose::STANDARD.encode(identity.wg_private_key);
+    let peer_key = base64::engine::general_purpose::STANDARD.encode(identity.wg_peer_public_key);
+    let dns_line = dns.unwrap_or("1.1.1.1");
+    format!(
+        "[Interface]\n\
+         PrivateKey = {priv_key}\n\
+         Address = {}/32, {}/128\n\
+         DNS = {dns_line}\n\
+         Jc = 5\n\
+         Jmin = 50\n\
+         Jmax = 128\n\
+         \n\
+         [Peer]\n\
+         PublicKey = {peer_key}\n\
+         Endpoint = {peer_endpoint}\n\
+         AllowedIPs = 0.0.0.0/0, ::/0\n",
+        identity.ipv4, identity.ipv6
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_amnezia_wg_config_format() {
+        let id = Identity {
+            device_id: "test-device".into(),
+            access_token: "test-token".into(),
+            cert_pem: vec![],
+            key_pem: vec![],
+            ipv4: "172.16.0.2".into(),
+            ipv6: "2606:4700::1".into(),
+            wg_private_key: [1u8; 32],
+            wg_peer_public_key: [2u8; 32],
+            client_id: [0u8; 3],
+            masque_endpoint: None,
+        };
+        let cfg = format_amnezia_wg_config(&id, "162.159.193.1:2408", None);
+        assert!(cfg.contains("Jc = 5"));
+        assert!(cfg.contains("Jmin = 50"));
+        assert!(cfg.contains("Jmax = 128"));
+        assert!(cfg.contains("PrivateKey = "));
+    }
+}
+
+

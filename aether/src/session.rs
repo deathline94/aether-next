@@ -191,21 +191,6 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                     });
                     return Ok(());
                 }
-                Err(e) if !masque_h2::enabled() => {
-                    let ep = identity
-                        .masque_endpoint
-                        .clone()
-                        .unwrap_or_else(|| consts::MASQUE_H3_ENDPOINT.to_string());
-                    match ep.parse::<SocketAddr>() {
-                        Ok(a) => {
-                            log::warn!(
-                                "[-] MASQUE H3 scan found no endpoint ({e}); falling back to {a}"
-                            );
-                            a
-                        }
-                        Err(_) => return Err(e),
-                    }
-                }
                 Err(e) => return Err(e),
             };
             log::info!("[+] using cloudflare edge {peer}");

@@ -9,6 +9,7 @@ pub const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 /// tunnel_ready h3 + curl). Used as the H3 peer when the identity has no captured
 /// endpoint and no peer is forced -- the generic CDN scan does not reliably hit the
 /// MASQUE VIP (most edges are generic HTTP/3, ext_connect=false).
+#[allow(dead_code)]
 pub const MASQUE_H3_ENDPOINT: &str = "162.159.198.2:443";
 
 /// SHA-256 SPKI hashes of Cloudflare MASQUE edge certificates.

@@ -59,7 +59,7 @@ fn env_usize(key: &str) -> Option<usize> {
 fn apply_custom_noize(mut cfg: NoizeConfig) -> NoizeConfig {
     if let Some(v) = env_usize("AETHER_NOIZE_JC") {
         cfg.jc_before_hs = v;
-        cfg.jc_after_i1 = v.saturating_div(2).max(if v > 0 { 1 } else { 0 });
+        cfg.jc_after_i1 = 0;
     }
     if let Some(v) = env_usize("AETHER_NOIZE_JMIN") {
         cfg.jmin = v;
@@ -77,8 +77,8 @@ fn apply_custom_aethernoize(mut cfg: AetherNoizeConfig) -> AetherNoizeConfig {
     if let Some(v) = env_usize("AETHER_NOIZE_JC") {
         cfg.jc = v;
         cfg.jc_before_hs = v;
-        cfg.jc_after_i1 = v.saturating_div(2).max(if v > 0 { 1 } else { 0 });
-        cfg.jc_after_hs = v.saturating_div(3).max(if v > 0 { 1 } else { 0 });
+        cfg.jc_after_i1 = 0;
+        cfg.jc_after_hs = 0;
     }
     if let Some(v) = env_usize("AETHER_NOIZE_JMIN") {
         cfg.jmin = v;

@@ -65,10 +65,10 @@ impl Default for Settings {
             scan_mode: "balanced".into(),
             ip_version: "v4".into(),
             noize: "off".into(),
-            noize_jc: 4,
-            noize_jmin: 48,
-            noize_jmax: 190,
-            noize_interval_ms: 4,
+            noize_jc: 5,
+            noize_jmin: 50,
+            noize_jmax: 128,
+            noize_interval_ms: 0,
             routing_mode: "system-proxy".into(),
             socks_port: 1819,
             http_port: 1820,
@@ -442,6 +442,20 @@ fn handle_engine_line(
     }
 
     // Legacy log markers — only strong readiness signals (not CONNECT/handshake alone).
+    if line.contains("[-] session failed:") {
+        let msg = line
+            .split("[-] session failed:")
+            .nth(1)
+            .map(|s| s.trim())
+            .unwrap_or("Connection failed");
+        let state = app.state::<AppState>();
+        if !state.runtime.lock().unwrap().status.eq_ignore_ascii_case("error") {
+            emit_state(app, &state, "error", msg, None, None);
+            state.generation.fetch_add(1, Ordering::SeqCst);
+            state.connecting.store(false, Ordering::SeqCst);
+            cleanup_routing(app, &state);
+        }
+    }
     if line.contains("socks5 server listening") || line.contains("http proxy listening") {
         socks_seen.store(true, Ordering::SeqCst);
     }
