@@ -123,7 +123,7 @@ jobs:
         with:
           ndk-version: r27d
           link-to-sdk: true
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - run: cargo install cargo-ndk --locked
       - name: Engine + stage
         working-directory: aether
