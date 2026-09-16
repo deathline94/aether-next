@@ -456,7 +456,7 @@ fn handle_engine_line(
             cleanup_routing(app, &state);
         }
     }
-    if line.contains("socks5 server listening") || line.contains("http proxy listening") {
+    if line.contains("socks5 listening on") || line.contains("socks5 server listening") || line.contains("http proxy listening") {
         socks_seen.store(true, Ordering::SeqCst);
     }
     if line.contains("data-plane verified") {

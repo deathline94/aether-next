@@ -234,13 +234,13 @@ $peer = '{peer_s}/32'
 $gw = '{gw_s}'
 $via = '{via}'
 $physIf = {physical_if_index}
-# Drop stale split defaults
+# Drop stale split defaults on our tunnel interface only
 foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')) {{
-  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue |
+  Get-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
     Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 }}
 # Peer exclude: force edge traffic out physical gateway
-Get-NetRoute -DestinationPrefix $peer -ErrorAction SilentlyContinue |
+Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 # Pin the outer transport to the selected physical interface.
 New-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
@@ -281,7 +281,7 @@ Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -jo
                 &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1"],
             );
             for dest in ["0.0.0.0", "128.0.0.0"] {
-                let _ = run_cmd("route", &["delete", dest, "mask", "128.0.0.0"]);
+                let _ = run_cmd("route", &["delete", dest, "mask", "128.0.0.0", "IF", &ifs]);
                 run_cmd(
                     "route",
                     &["add", dest, "mask", "128.0.0.0", &via, "metric", "1", "IF", &ifs],

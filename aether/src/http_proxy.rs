@@ -229,8 +229,19 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("HTTP/1.1");
-    if let Some(rest) = target.strip_prefix("http://") {
-        let path = rest.find('/').map(|at| &rest[at..]).unwrap_or("/");
+    if target.len() >= 7 && target[..7].eq_ignore_ascii_case("http://") {
+        let rest = &target[7..];
+        let authority_end = match (rest.find('/'), rest.find('?')) {
+            (Some(slash), Some(q)) => Some(slash.min(q)),
+            (Some(slash), None) => Some(slash),
+            (None, Some(q)) => Some(q),
+            (None, None) => None,
+        };
+        let path = match authority_end {
+            Some(idx) if rest.as_bytes()[idx] == b'?' => format!("/{}", &rest[idx..]),
+            Some(idx) => rest[idx..].to_string(),
+            None => "/".to_string(),
+        };
         let replacement = format!("{method} {path} {version}");
         header.splice(..end, replacement.bytes());
     }
@@ -273,12 +284,40 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_header_end;
+    use super::{find_header_end, rewrite_absolute_uri};
 
     #[test]
     fn separates_pipelined_connect_payload() {
         let request = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLS";
         let end = find_header_end(request).unwrap();
         assert_eq!(&request[end..], b"TLS");
+    }
+
+    #[test]
+    fn rewrite_absolute_uri_preserves_query_string() {
+        // Path with query
+        let req1 = b"GET http://example.com/api/test?foo=bar&baz=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let res1 = rewrite_absolute_uri(req1).unwrap();
+        assert!(res1.starts_with(b"GET /api/test?foo=bar&baz=1 HTTP/1.1\r\n"));
+
+        // Bare domain with query (no path slash before query)
+        let req2 = b"GET http://example.com?foo=bar HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let res2 = rewrite_absolute_uri(req2).unwrap();
+        assert!(res2.starts_with(b"GET /?foo=bar HTTP/1.1\r\n"));
+
+        // Domain with port and query containing a slash (no path slash before query)
+        let req3 = b"GET http://example.com:8080?filter=/root/dir HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
+        let res3 = rewrite_absolute_uri(req3).unwrap();
+        assert!(res3.starts_with(b"GET /?filter=/root/dir HTTP/1.1\r\n"));
+
+        // Bare domain without query or slash
+        let req4 = b"GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let res4 = rewrite_absolute_uri(req4).unwrap();
+        assert!(res4.starts_with(b"GET / HTTP/1.1\r\n"));
+
+        // Standard origin form is untouched
+        let req5 = b"GET /already/origin?foo=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let res5 = rewrite_absolute_uri(req5.clone()).unwrap();
+        assert_eq!(res5, req5);
     }
 }

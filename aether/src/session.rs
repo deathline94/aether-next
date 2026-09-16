@@ -128,7 +128,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
     let http_listen = cfg.http;
     let base_config = cfg.config_path.clone();
 
-    let protocol = if cfg.has_forced_peer() || std::env::var("AETHER_PROTOCOL").is_ok() {
+    let protocol = if cfg.has_forced_peer() || runtime_env::var("AETHER_PROTOCOL").is_some() {
         Protocol::parse(&cfg.protocol)
     } else {
         select_protocol().await
@@ -324,14 +324,14 @@ fn aethernoize_config() -> aethernoize::AetherNoizeConfig {
 }
 
 fn warp_config_path(base: &str) -> String {
-    if let Ok(p) = std::env::var("AETHER_WG_CONFIG") {
+    if let Some(p) = runtime_env::var("AETHER_WG_CONFIG") {
         return p;
     }
     base.to_string()
 }
 
 fn masque_config_path(base: &str) -> String {
-    if let Ok(p) = std::env::var("AETHER_MASQUE_CONFIG") {
+    if let Some(p) = runtime_env::var("AETHER_MASQUE_CONFIG") {
         return p;
     }
     derive_sibling_path(base, "masque")
@@ -431,10 +431,9 @@ async fn select_peer(
     wg_sessions: prober::WgSessionCache,
 ) -> Result<SocketAddr> {
     let force_peer = match protocol {
-        Protocol::Masque => std::env::var("AETHER_PEER").ok(),
-        Protocol::WireGuard | Protocol::WarpInWarp => std::env::var("AETHER_WG_PEER")
-            .ok()
-            .or_else(|| std::env::var("AETHER_PEER").ok()),
+        Protocol::Masque => runtime_env::var("AETHER_PEER"),
+        Protocol::WireGuard | Protocol::WarpInWarp => runtime_env::var("AETHER_WG_PEER")
+            .or_else(|| runtime_env::var("AETHER_PEER")),
     };
 
     if let Some(p) = force_peer {
@@ -884,9 +883,8 @@ async fn run_wireguard(
     http_listen: SocketAddr,
     base_config: &str,
 ) -> Result<()> {
-    let forced = std::env::var("AETHER_WG_PEER")
-        .ok()
-        .or_else(|| std::env::var("AETHER_PEER").ok());
+    let forced = runtime_env::var("AETHER_WG_PEER")
+        .or_else(|| runtime_env::var("AETHER_PEER"));
 
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;

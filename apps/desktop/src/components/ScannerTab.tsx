@@ -121,6 +121,7 @@ export function ScannerTab({
             <option value="medium">Medium — default</option>
             <option value="high">High — stronger</option>
             <option value="max">Max — highest noise</option>
+            <option value="custom">Custom — manual values</option>
           </select>
         </div>
 

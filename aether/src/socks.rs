@@ -194,23 +194,33 @@ fn dns_prefer_order() -> Vec<u16> {
     }
 }
 
-/// M11 fix: resolvers are configurable (`AETHER_DNS=ip[,ip...]`, bare IP or
-/// `ip:port`; IPv6 literals must use `[..]:port` form) instead of a hardcoded
-/// 1.1.1.1 that some tunnel paths cannot reach.
-fn configured_dns_servers() -> Vec<SocketAddr> {
-    let raw = crate::runtime_env::var("AETHER_DNS").unwrap_or_default();
+pub fn parse_dns_server_entry(entry: &str) -> Option<SocketAddr> {
+    let p = entry.trim();
+    if p.is_empty() {
+        return None;
+    }
+    // 1. Bare IP (IPv4 or bare unbracketed IPv6 like "2606:4700:4700::1111")
+    if let Ok(ip) = p.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, 53));
+    }
+    // 2. Bracketed IPv6 without port: "[2606:4700:4700::1111]"
+    if p.starts_with('[') && p.ends_with(']') {
+        if let Ok(ip) = p[1..p.len() - 1].parse::<IpAddr>() {
+            return Some(SocketAddr::new(ip, 53));
+        }
+    }
+    // 3. SocketAddr with explicit port: "1.1.1.1:5353" or "[2606:4700:4700::1111]:5353"
+    p.parse::<SocketAddr>().ok()
+}
+
+pub fn parse_dns_servers(raw: &str) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for part in raw.split(',') {
         let p = part.trim();
         if p.is_empty() {
             continue;
         }
-        let cand = if p.contains(':') {
-            p.to_string()
-        } else {
-            format!("{p}:53")
-        };
-        if let Ok(a) = cand.parse::<SocketAddr>() {
+        if let Some(a) = parse_dns_server_entry(p) {
             out.push(a);
         } else {
             log::warn!("[socks-dns] ignoring unparseable AETHER_DNS entry {p:?}");
@@ -221,6 +231,13 @@ fn configured_dns_servers() -> Vec<SocketAddr> {
         out.push("1.0.0.1:53".parse().unwrap());
     }
     out
+}
+
+/// Resolvers are configurable (`AETHER_DNS=ip[,ip...]`, bare IP or
+/// `ip:port`; bare IPv6 literals are accepted and paired with port 53).
+fn configured_dns_servers() -> Vec<SocketAddr> {
+    let raw = crate::runtime_env::var("AETHER_DNS").unwrap_or_default();
+    parse_dns_servers(&raw)
 }
 
 fn valid_dns_name(name: &str) -> bool {
@@ -531,14 +548,23 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     // M6 fix: domain destinations used to be resolved inline in the select loop,
     // stalling ALL relay traffic for up to ~6s per lookup. Hostname sends are now
     // handed to a dedicated resolver task so the data path never blocks on DNS.
-    let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<(String, u16, Vec<u8>)>(64);
+    let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<(String, u16, Vec<u8>, SocketAddr)>(64);
     let resolver_sender = sender.clone();
+    let routes: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    let resolver_routes = routes.clone();
     tokio::spawn(async move {
-        while let Some((name, port, payload)) = res_rx.recv().await {
+        while let Some((name, port, payload, from)) = res_rx.recv().await {
             match tokio::time::timeout(Duration::from_secs(4), dns_resolve(&stack, &name)).await {
                 Ok(Ok(ip)) => {
+                    let dst = SocketAddr::new(ip, port);
+                    if let Ok(mut map) = resolver_routes.lock() {
+                        map.insert(dst, from);
+                        if map.len() > 2048 {
+                            map.clear();
+                        }
+                    }
                     let _ = resolver_sender
-                        .send_to(SocketAddr::new(ip, port), payload)
+                        .send_to(dst, payload)
                         .await;
                 }
                 _ => log::debug!("[socks-udp] resolve failed for {name}; dropping datagram"),
@@ -573,10 +599,16 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                 match dst {
                     Target::Ip(ip) => {
                         let dst = SocketAddr::new(ip, payload.0);
+                        if let Ok(mut map) = routes.lock() {
+                            map.insert(dst, from);
+                            if map.len() > 2048 {
+                                map.clear();
+                            }
+                        }
                         let _ = sender.send_to(dst, payload.1).await;
                     }
                     Target::Domain(name) => {
-                        if res_tx.try_send((name, payload.0, payload.1)).is_err() {
+                        if res_tx.try_send((name, payload.0, payload.1, from)).is_err() {
                             log::debug!("socks udp resolver backlog full; dropping datagram");
                         }
                     }
@@ -585,7 +617,10 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
 
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
-                if let Some(c) = client {
+                let target_client = {
+                    routes.lock().ok().and_then(|map| map.get(&src).copied()).or(client)
+                };
+                if let Some(c) = target_client {
                     let pkt = build_udp_reply(src, &data);
                     let _ = relay.send_to(&pkt, c).await;
                 }
@@ -666,6 +701,46 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{decode_qname, parse_dns_answer_id, select_auth_method};
+
+    #[test]
+    fn parses_dns_servers_handles_bare_and_bracketed_ipv6_and_ports() {
+        use super::{parse_dns_server_entry, parse_dns_servers};
+
+        assert_eq!(
+            parse_dns_server_entry("1.1.1.1"),
+            Some("1.1.1.1:53".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dns_server_entry("8.8.8.8:5353"),
+            Some("8.8.8.8:5353".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dns_server_entry("2606:4700:4700::1111"),
+            Some("[2606:4700:4700::1111]:53".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dns_server_entry("[2606:4700:4700::1111]"),
+            Some("[2606:4700:4700::1111]:53".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dns_server_entry("[2606:4700:4700::1111]:5353"),
+            Some("[2606:4700:4700::1111]:5353".parse().unwrap())
+        );
+        assert_eq!(parse_dns_server_entry("   "), None);
+        assert_eq!(parse_dns_server_entry("invalid:domain.com"), None);
+
+        let servers = parse_dns_servers("2606:4700:4700::1111, 8.8.8.8:5353, [::1]");
+        assert_eq!(servers.len(), 3);
+        assert_eq!(servers[0], "[2606:4700:4700::1111]:53".parse().unwrap());
+        assert_eq!(servers[1], "8.8.8.8:5353".parse().unwrap());
+        assert_eq!(servers[2], "[::1]:53".parse().unwrap());
+
+        // Fallback default
+        let default_servers = parse_dns_servers("");
+        assert_eq!(default_servers.len(), 2);
+        assert_eq!(default_servers[0], "1.1.1.1:53".parse().unwrap());
+        assert_eq!(default_servers[1], "1.0.0.1:53".parse().unwrap());
+    }
 
     #[test]
     fn rejects_clients_without_no_auth_method() {

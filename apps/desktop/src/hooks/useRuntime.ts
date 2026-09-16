@@ -113,6 +113,14 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     saveDebounceRef.current = setTimeout(async () => {
       const toSave = pendingSaveRef.current;
       if (!toSave) return;
+      // Skip auto-saving intermediate typing states that violate port invariants
+      if (
+        toSave.socksPort === toSave.httpPort ||
+        toSave.socksPort < 1024 || toSave.socksPort > 65535 ||
+        toSave.httpPort < 1024 || toSave.httpPort > 65535
+      ) {
+        return;
+      }
       try {
         await invoke("save_settings", { settings: toSave });
         setSaved(true);
@@ -172,7 +180,9 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
       setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
-      appendLog({ level: "error", message: `Direct connect error: ${String(error)}` });
+      const detail = String(error);
+      setRuntime({ status: "error", detail, pid: null, endpoint: null });
+      appendLog({ level: "error", message: `Direct connect error: ${detail}` });
     } finally {
       setBusy(false);
     }

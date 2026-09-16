@@ -840,7 +840,7 @@ fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
         match outbound_tx.try_send(pkt) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
-                s.device.tx.push_front(pkt);
+                deferred.push_front(pkt);
                 while let Some(d) = deferred.pop_back() {
                     s.device.tx.push_front(d);
                 }
@@ -848,5 +848,71 @@ fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn netstack_queue_preserves_fifo_order_on_congestion() {
+        // Channel with capacity 1 to simulate buffer backpressure
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let mut device = StackDevice::new(1500);
+        // Push 4 large packets (> 128 bytes) in known order
+        let p1 = vec![1u8; 200];
+        let p2 = vec![2u8; 200];
+        let p3 = vec![3u8; 200];
+        let p4 = vec![4u8; 200];
+
+        device.tx.push_back(p1.clone());
+        device.tx.push_back(p2.clone());
+        device.tx.push_back(p3.clone());
+        device.tx.push_back(p4.clone());
+
+        let config = Config::new(HardwareAddress::Ip);
+        let iface = Interface::new(config, &mut device, Instant::now());
+        let (data_in_tx, _data_in_rx) = mpsc::channel(1);
+
+        let mut stack = NetStack {
+            iface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            tcp_conns: HashMap::new(),
+            udp_conns: HashMap::new(),
+            next_id: 1,
+            next_port: 49152,
+            data_in_tx,
+        };
+
+        // First flush: tx has capacity 1, so p1 is sent, p2 encounters Full.
+        // p2, p3, p4 must be re-queued in s.device.tx in EXACT order [p2, p3, p4].
+        flush_tx(&mut stack, &tx);
+
+        assert_eq!(rx.recv().await, Some(p1));
+        assert_eq!(stack.device.tx.len(), 3);
+        assert_eq!(stack.device.tx[0], p2);
+        assert_eq!(stack.device.tx[1], p3);
+        assert_eq!(stack.device.tx[2], p4);
+
+        // Second flush: now channel is empty, p2 is sent, p3 hits full
+        flush_tx(&mut stack, &tx);
+        assert_eq!(rx.recv().await, Some(p2));
+        assert_eq!(stack.device.tx.len(), 2);
+        assert_eq!(stack.device.tx[0], p3);
+        assert_eq!(stack.device.tx[1], p4);
+
+        // Third flush
+        flush_tx(&mut stack, &tx);
+        assert_eq!(rx.recv().await, Some(p3));
+        assert_eq!(stack.device.tx.len(), 1);
+        assert_eq!(stack.device.tx[0], p4);
+
+        // Fourth flush
+        flush_tx(&mut stack, &tx);
+        assert_eq!(rx.recv().await, Some(p4));
+        assert!(stack.device.tx.is_empty());
     }
 }

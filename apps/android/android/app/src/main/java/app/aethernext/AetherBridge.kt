@@ -48,7 +48,7 @@ class AetherBridge(
                     val protocol = args.optString("protocol", "masque-h3")
                     val ipVersion = args.optString("ipVersion", "v4")
                     val concurrency = args.optInt("concurrency", 250).coerceIn(1, 2000)
-                    val timeoutMs = args.optInt("timeoutMs", 3000).coerceIn(100, 30000)
+                    val timeoutMs = args.optInt("timeoutMs", 6000).coerceIn(100, 30000)
                     val noize = args.optString("noize", "off")
                     val err = session.scan(protocol, ipVersion, concurrency, timeoutMs, noize)
                     if (err != null) throw IllegalStateException(err)
