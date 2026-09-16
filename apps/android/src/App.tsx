@@ -59,51 +59,79 @@ function App() {
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
-  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Unprotected";
+  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Standby";
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark"><ShieldCheck size={22} strokeWidth={1.8} /></div>
-          <div><strong>Aether Next</strong><span>by deathline94</span></div>
+          <div className="brand-mark">
+            <ShieldCheck size={20} strokeWidth={2.2} />
+            <span className="brand-ambient-glow" aria-hidden="true" />
+          </div>
+          <div className="brand-text">
+            <strong>AETHER</strong>
+            <span>CYBER-TACTICAL NODE</span>
+          </div>
         </div>
 
-        <nav aria-label="Main">
+        <nav aria-label="Main" className="nav-group">
           {navigation.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
-              className={view === id ? "active" : ""}
+              className={`nav-pill ${view === id ? "active" : ""}`}
               aria-current={view === id ? "page" : undefined}
               onClick={() => setView(id)}
             >
-              <Icon size={18} aria-hidden="true" />
-              <span>{label}</span>
-              {id === "logs" && logs.length > 0 && (
-                <small aria-label={`${logs.length} log entries`}>{logs.length > 99 ? "99+" : logs.length}</small>
-              )}
+              <div className="nav-pill-icon">
+                <Icon size={18} strokeWidth={2} aria-hidden="true" />
+              </div>
+              <span className="nav-pill-label">{label}</span>
+              <div className="nav-pill-trailing">
+                {id === "logs" && logs.length > 0 && (
+                  <span className="log-count-badge" aria-label={`${logs.length} log entries`}>
+                    {logs.length > 99 ? "99+" : logs.length}
+                  </span>
+                )}
+              </div>
+              {view === id && <span className="nav-active-pill" aria-hidden="true" />}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-bottom">
-          <div className={`mini-status ${runtime.status}`} role="status" aria-live="polite">
-            <span className="status-dot" aria-hidden="true" />
-            <div>
-              <strong>{statusText}</strong>
-              <span title={runtime.detail}>{runtime.detail}</span>
+          <div className={`connection-beacon ${runtime.status}`} role="status" aria-live="polite">
+            <div className="beacon-radar">
+              <span className="beacon-ring ring-1" aria-hidden="true" />
+              <span className="beacon-ring ring-2" aria-hidden="true" />
+              <span className="beacon-core" aria-hidden="true" />
+            </div>
+            <div className="beacon-info">
+              <div className="beacon-header">
+                <strong className="beacon-status-text">{statusText}</strong>
+                <span className="beacon-tag">{connected ? "ACTIVE" : running ? "HANDSHAKE" : runtime.status === "error" ? "ALERT" : "STANDBY"}</span>
+              </div>
+              <span className="beacon-detail" title={runtime.detail}>{runtime.detail || "System Ready"}</span>
             </div>
           </div>
-          <div className="version">AETHER NEXT <span>v{appVersion}</span></div>
+          <div className="version-bar">
+            <span>AETHER ANDROID</span>
+            <span className="version-tag">v{appVersion}</span>
+          </div>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <div><p>{activeNav.eyebrow}</p><h1>{activeNav.label}</h1></div>
-          <div className={`header-status ${runtime.status}`} title={runtime.detail}>
-            <span className="status-dot" aria-hidden="true" />
-            {runtime.status}
+          <div className="topbar-titles">
+            <p className="topbar-eyebrow">{activeNav.eyebrow}</p>
+            <h1 className="topbar-heading">{activeNav.label}</h1>
+          </div>
+          <div className="topbar-actions">
+            <div className={`header-status ${runtime.status}`} title={runtime.detail}>
+              <span className="status-dot" aria-hidden="true" />
+              <span className="status-text">{runtime.status}</span>
+            </div>
           </div>
         </header>
 
