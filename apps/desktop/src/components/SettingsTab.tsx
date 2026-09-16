@@ -1,4 +1,15 @@
-import { Check, ChevronRight, Radio, Settings2, Wifi, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  FolderGit2,
+  HardDrive,
+  Lock,
+  Radio,
+  Shield,
+  SlidersHorizontal,
+  Wifi,
+  X,
+} from "lucide-react";
 import type { Settings } from "../types";
 import { NumberField, Segmented, Toggle } from "./ui";
 
@@ -10,195 +21,474 @@ interface SettingsTabProps {
   patchSettings: (patch: Partial<Settings>) => void;
 }
 
-export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, patchSettings }: SettingsTabProps) {
+export function SettingsTab({
+  settings,
+  settingsLocked,
+  settingsLoaded,
+  saved,
+  patchSettings,
+}: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
 
   return (
     <div className="settings-view">
       {settingsLocked && (
-        <div className="lock-banner" role="status">
-          {settingsLoaded
-            ? "Settings locked while connected. Disconnect to change tunnel options."
-            : "Loading saved settings…"}
+        <div className="lock-banner tactical-lock-banner" role="status">
+          <div className="lock-banner-icon">
+            <Lock size={16} aria-hidden="true" />
+          </div>
+          <div className="lock-banner-text">
+            <strong>TUNNEL OPERATIONAL — CONFIGURATION LOCKED</strong>
+            <span>
+              {settingsLoaded
+                ? "Active egress route is protected. Disconnect the tunnel to modify network protocols or port bindings."
+                : "Synchronizing engine daemon parameters…"}
+            </span>
+          </div>
         </div>
       )}
 
-      <section className="settings-section">
+      {/* ─── Panel 1: Transport & Carrier Engine ─────────────────────────── */}
+      <section className="settings-section tactical-panel">
         <div className="section-heading">
-          <div><p>TRANSPORT</p><h3>Tunnel behavior</h3></div>
-          <Wifi size={20} aria-hidden="true" />
+          <div>
+            <p className="panel-eyebrow">CARRIER PROTOCOL & ANTI-DPI</p>
+            <h3>Transport Engine</h3>
+          </div>
+          <Wifi size={20} className="panel-head-icon" aria-hidden="true" />
         </div>
-        <div className="setting-row">
-          <div><strong>Protocol</strong><span>Carrier used to reach Cloudflare</span></div>
-          <Segmented label="Protocol" disabled={settingsLocked} value={settings.protocol}
-            options={[{ value: "masque", label: "MASQUE" }, { value: "wireguard", label: "WireGuard" }, { value: "gool", label: "Gool" }]}
-            onChange={(protocol) => patchSettings({ protocol })} />
-        </div>
-        {settings.protocol === "masque" && (
-          <div className="setting-row">
-            <div><strong>MASQUE transport</strong><span>HTTP/2 works on networks blocking QUIC</span></div>
-            <Segmented label="MASQUE transport" disabled={settingsLocked} value={settings.transport}
-              options={[{ value: "h2", label: "HTTP/2" }, { value: "h3", label: "HTTP/3" }]}
-              onChange={(transport) => patchSettings({ transport })} />
-          </div>
-        )}
-        {settings.protocol === "masque" && settings.transport === "h3" && (
-          <div className="setting-row">
-            <div><strong>QUIC Initial fragmentation</strong><span>Split the H3 ClientHello across datagrams (anti-DPI)</span></div>
-            <Toggle label="QUIC Initial fragmentation" checked={settings.quicInitialFrag} disabled={settingsLocked}
-              onChange={(quicInitialFrag) => patchSettings({ quicInitialFrag })} />
-          </div>
-        )}
-        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
-          <div className="setting-row">
-            <div><strong>First fragment size</strong><span>Bytes of ClientHello in the first Initial (16–512)</span></div>
-            <NumberField label="QUIC Initial first fragment size" min={16} max={512} disabled={settingsLocked}
-              value={settings.quicInitialFragSize} onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })} />
-          </div>
-        )}
+
         <div className="setting-row">
           <div>
-            <strong>Obfuscation</strong>
+            <div className="setting-label-row">
+              <strong>Carrier Protocol</strong>
+              <span className="tactical-chip">EGRESS LAYER</span>
+            </div>
+            <span>Underlying network protocol used to bridge outbound traffic</span>
+          </div>
+          <Segmented
+            label="Carrier protocol"
+            disabled={settingsLocked}
+            value={settings.protocol}
+            options={[
+              { value: "masque", label: "MASQUE" },
+              { value: "wireguard", label: "WireGuard" },
+              { value: "gool", label: "Gool" },
+            ]}
+            onChange={(protocol) => patchSettings({ protocol })}
+          />
+        </div>
+
+        {settings.protocol === "masque" && (
+          <div className="setting-row">
+            <div>
+              <div className="setting-label-row">
+                <strong>MASQUE Transport Framing</strong>
+                <span className="tactical-chip cyan">HTTP/3 / H2</span>
+              </div>
+              <span>HTTP/2 provides reliable fallback on restricted networks that block UDP/QUIC</span>
+            </div>
+            <Segmented
+              label="MASQUE transport"
+              disabled={settingsLocked}
+              value={settings.transport}
+              options={[
+                { value: "h3", label: "HTTP/3 (QUIC)" },
+                { value: "h2", label: "HTTP/2 (TCP)" },
+              ]}
+              onChange={(transport) => patchSettings({ transport })}
+            />
+          </div>
+        )}
+
+        {settings.protocol === "masque" && settings.transport === "h3" && (
+          <div className="setting-row">
+            <div>
+              <div className="setting-label-row">
+                <strong>QUIC Initial Fragmentation</strong>
+                <span className="tactical-chip emerald">ANTI-DPI</span>
+              </div>
+              <span>Split the TLS ClientHello across fragmented datagrams to bypass SNI inspect filters</span>
+            </div>
+            <Toggle
+              label="QUIC Initial fragmentation"
+              checked={settings.quicInitialFrag}
+              disabled={settingsLocked}
+              onChange={(quicInitialFrag) => patchSettings({ quicInitialFrag })}
+            />
+          </div>
+        )}
+
+        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
+          <div className="setting-row">
+            <div>
+              <div className="setting-label-row">
+                <strong>Initial Fragment Length</strong>
+                <span className="tactical-chip">16–512 BYTES</span>
+              </div>
+              <span>Exact size of the ClientHello packet dispatched in the first datagram</span>
+            </div>
+            <NumberField
+              label="QUIC Initial first fragment size"
+              min={16}
+              max={512}
+              step={16}
+              suffix="B"
+              disabled={settingsLocked}
+              value={settings.quicInitialFragSize}
+              onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })}
+            />
+          </div>
+        )}
+
+        <div className="setting-row">
+          <div>
+            <div className="setting-label-row">
+              <strong>Handshake Obfuscation</strong>
+              {settings.noize !== "off" && <span className="tactical-chip amber">ACTIVE JUNK</span>}
+            </div>
             <span>
               {settings.protocol === "masque" && settings.transport === "h2"
-                ? "UDP noise is not applicable for H2 (TCP)"
-                : "Noise before handshake (low → high)"}
+                ? "UDP junk frames are not applicable for HTTP/2 TCP streams"
+                : "Inject randomized pre-handshake padding to prevent active protocol fingerprinting"}
             </span>
           </div>
-          <select disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")} aria-label="Obfuscation noise profile"
+          <select
+            disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")}
+            aria-label="Obfuscation noise profile"
+            className="tactical-select"
             value={["off", "light", "medium", "high", "max", "custom"].includes(settings.noize) ? settings.noize : "medium"}
-            onChange={(e) => patchSettings({ noize: e.target.value })}>
-            <option value="off">Off — no noise</option>
-            <option value="light">Light — low noise</option>
-            <option value="medium">Medium — default</option>
-            <option value="high">High — stronger</option>
-            <option value="max">Max — highest noise</option>
-            <option value="custom">Custom — manual values</option>
+            onChange={(e) => patchSettings({ noize: e.target.value })}
+          >
+            <option value="off">Off — Zero Noise</option>
+            <option value="light">Light — Subtle Disruption</option>
+            <option value="medium">Medium — Standard Defense</option>
+            <option value="high">High — Heavy Resistance</option>
+            <option value="max">Max — Maximum Entropy</option>
+            <option value="custom">Custom — Parameter Matrix</option>
           </select>
         </div>
+
         {settings.noize === "custom" && settings.transport !== "h2" && (
-          <div className="setting-stack" style={{ gap: 10, marginTop: 8 }}>
-            <div className="setting-row">
-              <div><strong>Junk count</strong><span>Packets before handshake (recommended: 5)</span></div>
-              <NumberField label="Junk count" min={0} max={64} disabled={settingsLocked}
-                value={settings.noizeJc} onCommit={(noizeJc) => patchSettings({ noizeJc })} />
+          <div className="custom-noise-matrix">
+            <div className="matrix-title">
+              <SlidersHorizontal size={14} aria-hidden="true" />
+              <span>CUSTOM NOISE PARAMETERS</span>
             </div>
-            <div className="setting-row">
-              <div><strong>Min size</strong><span>Bytes (≤ max, recommended: 50)</span></div>
-              <NumberField label="Junk minimum size in bytes" min={0} max={2048} disabled={settingsLocked}
-                value={settings.noizeJmin}
-                onCommit={(noizeJmin) => patchSettings({
-                  noizeJmin,
-                  // Keep the invariant min ≤ max instead of just documenting it.
-                  ...(noizeJmin > settings.noizeJmax ? { noizeJmax: noizeJmin } : {}),
-                })} />
-            </div>
-            <div className="setting-row">
-              <div><strong>Max size</strong><span>Bytes (≥ min, recommended: 128)</span></div>
-              <NumberField label="Junk maximum size in bytes" min={0} max={2048} disabled={settingsLocked}
-                value={settings.noizeJmax}
-                onCommit={(noizeJmax) => patchSettings({
-                  noizeJmax,
-                  ...(noizeJmax < settings.noizeJmin ? { noizeJmin: noizeJmax } : {}),
-                })} />
-            </div>
-            <div className="setting-row">
-              <div><strong>Interval</strong><span>Milliseconds between junk (recommended: 0)</span></div>
-              <NumberField label="Junk interval in milliseconds" min={0} max={5000} disabled={settingsLocked}
-                value={settings.noizeIntervalMs} onCommit={(noizeIntervalMs) => patchSettings({ noizeIntervalMs })} />
+            <div className="matrix-grid">
+              <div className="matrix-cell">
+                <label>
+                  <span>Junk Packet Count</span>
+                  <NumberField
+                    label="Junk count"
+                    min={0}
+                    max={64}
+                    step={1}
+                    suffix="pkts"
+                    disabled={settingsLocked}
+                    value={settings.noizeJc}
+                    onCommit={(noizeJc) => patchSettings({ noizeJc })}
+                  />
+                </label>
+              </div>
+
+              <div className="matrix-cell">
+                <label>
+                  <span>Min Payload Size</span>
+                  <NumberField
+                    label="Junk minimum size in bytes"
+                    min={0}
+                    max={2048}
+                    step={16}
+                    suffix="B"
+                    disabled={settingsLocked}
+                    value={settings.noizeJmin}
+                    onCommit={(noizeJmin) =>
+                      patchSettings({
+                        noizeJmin,
+                        ...(noizeJmin > settings.noizeJmax ? { noizeJmax: noizeJmin } : {}),
+                      })
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="matrix-cell">
+                <label>
+                  <span>Max Payload Size</span>
+                  <NumberField
+                    label="Junk maximum size in bytes"
+                    min={0}
+                    max={2048}
+                    step={16}
+                    suffix="B"
+                    disabled={settingsLocked}
+                    value={settings.noizeJmax}
+                    onCommit={(noizeJmax) =>
+                      patchSettings({
+                        noizeJmax,
+                        ...(noizeJmax < settings.noizeJmin ? { noizeJmin: noizeJmax } : {}),
+                      })
+                    }
+                  />
+                </label>
+              </div>
+
+              <div className="matrix-cell">
+                <label>
+                  <span>Burst Interval</span>
+                  <NumberField
+                    label="Junk interval in milliseconds"
+                    min={0}
+                    max={5000}
+                    step={10}
+                    suffix="ms"
+                    disabled={settingsLocked}
+                    value={settings.noizeIntervalMs}
+                    onCommit={(noizeIntervalMs) => patchSettings({ noizeIntervalMs })}
+                  />
+                </label>
+              </div>
             </div>
           </div>
         )}
       </section>
 
-      <section className="settings-section">
+      {/* ─── Panel 2: Discovery & Topology ───────────────────────────────── */}
+      <section className="settings-section tactical-panel">
         <div className="section-heading">
-          <div><p>DISCOVERY</p><h3>Endpoint scanning</h3></div>
-          <Radio size={20} aria-hidden="true" />
+          <div>
+            <p className="panel-eyebrow">AUTO-DISCOVERY & LATENCY SEARCH</p>
+            <h3>Topology Scanner</h3>
+          </div>
+          <Radio size={20} className="panel-head-icon" aria-hidden="true" />
         </div>
+
         <div className="setting-row">
-          <div><strong>Scan mode</strong><span>Balance startup time and route quality</span></div>
-          <select disabled={settingsLocked} aria-label="Scan mode" value={settings.scanMode}
-            onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}>
-            <option value="turbo">Turbo</option>
-            <option value="balanced">Balanced</option>
-            <option value="thorough">Thorough</option>
-            <option value="stealth">Stealth</option>
+          <div>
+            <div className="setting-label-row">
+              <strong>Probe Velocity Profile</strong>
+              <span className="tactical-chip cyan">{settings.scanMode.toUpperCase()}</span>
+            </div>
+            <span>Dictates worker concurrency and RTT probe thoroughness during edge search</span>
+          </div>
+          <select
+            disabled={settingsLocked}
+            aria-label="Scan mode"
+            className="tactical-select"
+            value={settings.scanMode}
+            onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}
+          >
+            <option value="turbo">Turbo (Fastest startup, high concurrency)</option>
+            <option value="balanced">Balanced (Optimal speed and route fidelity)</option>
+            <option value="thorough">Thorough (Deep probe across extensive pools)</option>
+            <option value="stealth">Stealth (Low rate to minimize traffic anomaly)</option>
           </select>
         </div>
+
         <div className="setting-row">
-          <div><strong>IP version</strong><span>Address families included in search</span></div>
-          <Segmented label="IP version" disabled={settingsLocked} value={settings.ipVersion}
-            options={[{ value: "v4", label: "IPv4" }, { value: "v6", label: "IPv6" }, { value: "both", label: "Both" }]}
-            onChange={(ipVersion) => patchSettings({ ipVersion })} />
+          <div>
+            <div className="setting-label-row">
+              <strong>IP Pool Family</strong>
+              <span className="tactical-chip">NETWORK TARGET</span>
+            </div>
+            <span>IP address versions scanned and benchmarked for edge ingress</span>
+          </div>
+          <Segmented
+            label="IP version"
+            disabled={settingsLocked}
+            value={settings.ipVersion}
+            options={[
+              { value: "v4", label: "IPv4 Only" },
+              { value: "v6", label: "IPv6 Only" },
+              { value: "both", label: "Dual-Stack" },
+            ]}
+            onChange={(ipVersion) => patchSettings({ ipVersion })}
+          />
         </div>
       </section>
 
-      <section className="settings-section">
+      {/* ─── Panel 3: Windows Integration & Routing Policy ───────────────── */}
+      <section className="settings-section tactical-panel">
         <div className="section-heading">
-          <div><p>WINDOWS</p><h3>Routing and startup</h3></div>
-          <Settings2 size={20} aria-hidden="true" />
+          <div>
+            <p className="panel-eyebrow">PLATFORM & OS INTEGRATION</p>
+            <h3>Routing & Startup</h3>
+          </div>
+          <Shield size={20} className="panel-head-icon" aria-hidden="true" />
         </div>
+
         <div className="setting-row">
-          <div><strong>Routing mode</strong><span>System proxy covers proxy-aware Windows apps</span></div>
-          <select disabled={settingsLocked} aria-label="Routing mode" value={settings.routingMode}
-            onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}>
-            <option value="system-proxy">System proxy</option>
-            <option value="proxy-only">Proxy only</option>
-            <option value="tun">TUN (admin)</option>
+          <div>
+            <div className="setting-label-row">
+              <strong>Routing Pipeline</strong>
+              <span className={`tactical-chip ${settings.routingMode === "tun" ? "coral" : "emerald"}`}>
+                {settings.routingMode === "tun" ? "ADMIN TUN" : "USER-SPACE"}
+              </span>
+            </div>
+            <span>
+              {settings.routingMode === "system-proxy"
+                ? "Directs Windows system proxy settings so all browser and standard applications route transparently"
+                : settings.routingMode === "tun"
+                ? "Installs a virtual Wintun network adapter for universal, system-wide packet routing (requires admin)"
+                : "Keeps ports listening locally without altering global Windows network proxy settings"}
+            </span>
+          </div>
+          <select
+            disabled={settingsLocked}
+            aria-label="Routing mode"
+            className="tactical-select"
+            value={settings.routingMode}
+            onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
+          >
+            <option value="system-proxy">System Proxy (Standard Windows Proxy)</option>
+            <option value="proxy-only">Proxy Only (Local Listeners Only)</option>
+            <option value="tun">TUN Virtual Device (Elevated System-Wide)</option>
           </select>
         </div>
+
         <div className="setting-row">
-          <div><strong>Launch at login</strong><span>Start Aether Next with Windows</span></div>
-          <Toggle label="Launch at login" checked={settings.launchAtLogin} disabled={settingsLocked} onChange={(launchAtLogin) => patchSettings({ launchAtLogin })} />
+          <div>
+            <strong>Launch at Login</strong>
+            <span>Automatically initialize Aether daemon when Windows boots</span>
+          </div>
+          <Toggle
+            label="Launch at login"
+            checked={settings.launchAtLogin}
+            disabled={settingsLocked}
+            onChange={(launchAtLogin) => patchSettings({ launchAtLogin })}
+          />
         </div>
+
         <div className="setting-row">
-          <div><strong>Start minimized</strong><span>Open directly in system tray</span></div>
-          <Toggle label="Start minimized" checked={settings.startMinimized} disabled={settingsLocked} onChange={(startMinimized) => patchSettings({ startMinimized })} />
+          <div>
+            <strong>Start Minimized to Tray</strong>
+            <span>Launch silently into the Windows system tray without popping the window</span>
+          </div>
+          <Toggle
+            label="Start minimized"
+            checked={settings.startMinimized}
+            disabled={settingsLocked}
+            onChange={(startMinimized) => patchSettings({ startMinimized })}
+          />
         </div>
       </section>
 
-      <section className="settings-section advanced">
+      {/* ─── Panel 4: Local Ports & Daemon Binary ────────────────────────── */}
+      <section className="settings-section tactical-panel advanced">
         <div className="section-heading">
-          <div><p>ADVANCED</p><h3>Local services</h3></div>
-          <ChevronRight size={20} aria-hidden="true" />
+          <div>
+            <p className="panel-eyebrow">LOCAL LISTENERS & BINARY HOOKS</p>
+            <h3>Proxy Endpoints</h3>
+          </div>
+          <HardDrive size={20} className="panel-head-icon" aria-hidden="true" />
         </div>
+
         <div className="setting-row input-row">
-          <label><span>HTTP port (1024–65535)</span>
-            <NumberField label="HTTP proxy port" min={1024} max={65535} disabled={settingsLocked}
-              value={settings.httpPort} onCommit={(httpPort) => patchSettings({ httpPort })} />
-          </label>
-          <label><span>SOCKS5 port (1024–65535)</span>
-            <NumberField label="SOCKS5 proxy port" min={1024} max={65535} disabled={settingsLocked}
-              value={settings.socksPort} onCommit={(socksPort) => patchSettings({ socksPort })} />
-          </label>
+          <div className="port-field-block">
+            <label>
+              <div className="field-meta">
+                <strong>HTTP Proxy Port</strong>
+                <span className="field-hint">1024–65535</span>
+              </div>
+              <NumberField
+                label="HTTP proxy port"
+                min={1024}
+                max={65535}
+                step={1}
+                disabled={settingsLocked}
+                value={settings.httpPort}
+                onCommit={(httpPort) => patchSettings({ httpPort })}
+              />
+            </label>
+          </div>
+
+          <div className="port-field-block">
+            <label>
+              <div className="field-meta">
+                <strong>SOCKS5 Proxy Port</strong>
+                <span className="field-hint">1024–65535</span>
+              </div>
+              <NumberField
+                label="SOCKS5 proxy port"
+                min={1024}
+                max={65535}
+                step={1}
+                disabled={settingsLocked}
+                value={settings.socksPort}
+                onCommit={(socksPort) => patchSettings({ socksPort })}
+              />
+            </label>
+          </div>
         </div>
+
         {portsCollide && (
-          <p className="setting-error" role="alert">HTTP and SOCKS5 ports must be different — both services cannot bind the same port.</p>
+          <div className="port-collision-alert" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <div>
+              <strong>Port Collision Detected</strong>
+              <p>HTTP and SOCKS5 listeners cannot bind to the identical port ({settings.httpPort}). Modify one port to re-enable saving.</p>
+            </div>
+          </div>
         )}
+
         <div className="setting-row path-row">
-          <div><strong>Engine path</strong><span>Optional path to aether.exe</span></div>
-          <input disabled={settingsLocked} aria-label="Engine path" placeholder="Auto-detect" value={settings.enginePath}
-            onChange={(e) => patchSettings({ enginePath: e.target.value })} />
+          <div>
+            <div className="setting-label-row">
+              <strong>Engine Binary Path</strong>
+              <span className="tactical-chip">OVERRIDE</span>
+            </div>
+            <span>Custom executable path to aether.exe (leave blank for bundled auto-detection)</span>
+          </div>
+          <div className="tactical-input-wrapper">
+            <FolderGit2 size={16} className="input-affix-icon" aria-hidden="true" />
+            <input
+              disabled={settingsLocked}
+              aria-label="Engine path"
+              placeholder="Auto-detect bundled binary"
+              className="tactical-text-input"
+              value={settings.enginePath}
+              onChange={(e) => patchSettings({ enginePath: e.target.value })}
+            />
+          </div>
         </div>
       </section>
 
-      <div className="save-bar">
-        <span role="status" aria-live="polite">
-          {!settingsLoaded
-            ? "Loading settings…"
-            : settingsLocked
-              ? "Locked while connected"
+      {/* ─── Save Dock ───────────────────────────────────────────────────── */}
+      <div className="save-bar tactical-save-dock">
+        <div className="save-bar-status" role="status" aria-live="polite">
+          <span className="save-status-indicator-dot" />
+          <span className="save-status-text">
+            {!settingsLoaded
+              ? "Reading configuration profile from disk…"
+              : settingsLocked
+              ? "Interface locked — disconnect tunnel to commit changes"
               : portsCollide
-                ? "Save blocked: fix port collision"
-                : saved
-                  ? "Saved"
-                  : "Changes save automatically"}
-        </span>
-        <span className={`save-indicator ${portsCollide ? "blocked" : ""}`}>
-          {portsCollide ? <X size={17} aria-hidden="true" /> : saved && <Check size={17} aria-hidden="true" />}
-          {portsCollide ? "Save blocked" : saved ? "Saved" : "Auto-save on"}
-        </span>
+              ? "Save blocked — resolve HTTP/SOCKS port collision"
+              : saved
+              ? "All parameters synchronized with runtime daemon"
+              : "Synchronizing changes…"}
+          </span>
+        </div>
+
+        <div className={`save-indicator ${portsCollide ? "blocked" : ""}`}>
+          {portsCollide ? (
+            <>
+              <X size={15} aria-hidden="true" />
+              <span>Collision Conflict</span>
+            </>
+          ) : saved ? (
+            <>
+              <Check size={15} aria-hidden="true" />
+              <span>Synchronized</span>
+            </>
+          ) : (
+            <>
+              <div className="save-sync-pulse" aria-hidden="true" />
+              <span>Auto-Saving</span>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

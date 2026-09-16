@@ -52,61 +52,113 @@ export function Toggle({
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
-      className={`toggle ${checked ? "on" : ""}`}
+      className={`toggle tactile-toggle ${checked ? "on" : ""}`}
       onClick={() => !disabled && onChange(!checked)}
     >
-      <span />
+      <span className="toggle-slider" />
     </button>
   );
 }
 
 /**
- * Number input with draft state: free typing (including clearing the field),
- * clamped + committed on blur/Enter. Avoids the "type 8, get 1024" trap of
- * clamping on every keystroke.
+ * Tactical Number input with draft state and stepper controls:
+ * eliminates ugly browser spinner arrows, supports free typing and
+ * tactile +/- click adjustments. Clamped on blur/Enter.
  */
 export function NumberField({
   value,
   min,
   max,
+  step = 1,
   onCommit,
   disabled,
   label,
   id,
+  suffix,
 }: {
   value: number;
   min: number;
   max: number;
+  step?: number;
   onCommit: (value: number) => void;
   disabled?: boolean;
   label: string;
   id?: string;
+  suffix?: string;
 }) {
   const [draft, setDraft] = useState(String(value));
 
   // Sync external changes (profile presets, settings hydration).
   useEffect(() => { setDraft(String(value)); }, [value]);
 
-  const commit = () => {
-    const parsed = Number.parseInt(draft, 10);
+  const commit = (override?: number) => {
+    const parsed = override !== undefined ? override : Number.parseInt(draft, 10);
     const next = Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : value;
     setDraft(String(next));
     if (next !== value) onCommit(next);
   };
 
+  const handleStep = (delta: number) => {
+    if (disabled) return;
+    const current = Number.parseInt(draft, 10) || value;
+    commit(current + delta);
+  };
+
   return (
-    <input
-      id={id}
-      type="number"
-      inputMode="numeric"
-      min={min}
-      max={max}
-      value={draft}
-      disabled={disabled}
-      aria-label={label}
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
-    />
+    <div className={`stepper-input-wrapper ${disabled ? "disabled" : ""}`}>
+      <button
+        type="button"
+        className="stepper-btn dec"
+        onClick={() => handleStep(-step)}
+        disabled={disabled || (Number.parseInt(draft, 10) || value) <= min}
+        aria-label={`Decrease ${label}`}
+        tabIndex={-1}
+      >
+        −
+      </button>
+      <input
+        id={id}
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        step={step}
+        value={draft}
+        disabled={disabled}
+        aria-label={label}
+        className="clean-number-input"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => commit()}
+        onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+      />
+      {suffix && <span className="stepper-suffix">{suffix}</span>}
+      <button
+        type="button"
+        className="stepper-btn inc"
+        onClick={() => handleStep(step)}
+        disabled={disabled || (Number.parseInt(draft, 10) || value) >= max}
+        aria-label={`Increase ${label}`}
+        tabIndex={-1}
+      >
+        +
+      </button>
+    </div>
   );
 }
+
+export function Badge({
+  children,
+  variant = "emerald",
+  className = "",
+}: {
+  children: React.ReactNode;
+  variant?: "emerald" | "cyan" | "amber" | "coral" | "violet" | "muted";
+  className?: string;
+}) {
+  return (
+    <span className={`tactile-badge badge-${variant} ${className}`}>
+      {children}
+    </span>
+  );
+}
+

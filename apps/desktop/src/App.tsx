@@ -1,5 +1,5 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 import { ActivityTab } from "./components/ActivityTab";
 import { ConnectionTab } from "./components/ConnectionTab";
@@ -12,11 +12,11 @@ import type { DiscoveredEndpoint, View } from "./types";
 
 // Single definition per view — label + heading copy live together so they
 // can't drift apart.
-const navigation: { id: View; label: string; eyebrow: string; icon: typeof Radio }[] = [
-  { id: "home", label: "Connection", eyebrow: "SECURE ROUTING", icon: Radio },
-  { id: "scanner", label: "Scanner", eyebrow: "ENDPOINT DISCOVERY", icon: Search },
-  { id: "settings", label: "Settings", eyebrow: "CONFIGURATION", icon: SlidersHorizontal },
-  { id: "logs", label: "Activity", eyebrow: "LIVE ENGINE OUTPUT", icon: ScrollText },
+const navigation: { id: View; label: string; eyebrow: string; shortcut: string; icon: typeof Radio }[] = [
+  { id: "home", label: "Connection", eyebrow: "SECURE ROUTING", shortcut: "1", icon: Radio },
+  { id: "scanner", label: "Scanner", eyebrow: "ENDPOINT DISCOVERY", shortcut: "2", icon: Search },
+  { id: "settings", label: "Settings", eyebrow: "CONFIGURATION", shortcut: "3", icon: SlidersHorizontal },
+  { id: "logs", label: "Activity", eyebrow: "LIVE ENGINE OUTPUT", shortcut: "4", icon: ScrollText },
 ];
 
 function App() {
@@ -34,6 +34,22 @@ function App() {
   } = useRuntime(appendLog);
 
   const scanner = useScanner(appendLog, running);
+
+  // Global keyboard shortcuts for navigation (1-4 when not inside input elements)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeTag = (document.activeElement?.tagName || "").toLowerCase();
+      if (activeTag === "input" || activeTag === "textarea" || activeTag === "select") {
+        return;
+      }
+      if (e.key === "1") setView("home");
+      else if (e.key === "2") setView("scanner");
+      else if (e.key === "3") setView("settings");
+      else if (e.key === "4") setView("logs");
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   const connectDirect = useCallback((item: DiscoveredEndpoint) => {
     // Case-insensitive: the engine reports strings like "MASQUE H3" or
@@ -61,53 +77,80 @@ function App() {
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
-  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Unprotected";
+  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Standby";
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark"><ShieldCheck size={22} strokeWidth={1.8} /></div>
-          <div><strong>Aether Next</strong><span>by deathline94</span></div>
+          <div className="brand-mark">
+            <ShieldCheck size={20} strokeWidth={2.2} />
+            <span className="brand-ambient-glow" aria-hidden="true" />
+          </div>
+          <div className="brand-text">
+            <strong>AETHER</strong>
+            <span>CYBER-TACTICAL NODE</span>
+          </div>
         </div>
 
-        <nav aria-label="Main">
-          {navigation.map(({ id, label, icon: Icon }) => (
+        <nav aria-label="Main" className="nav-group">
+          {navigation.map(({ id, label, shortcut, icon: Icon }) => (
             <button
               key={id}
-              className={view === id ? "active" : ""}
+              className={`nav-pill ${view === id ? "active" : ""}`}
               aria-current={view === id ? "page" : undefined}
               onClick={() => setView(id)}
             >
-              <Icon size={18} aria-hidden="true" />
-              <span>{label}</span>
-              {id === "logs" && logs.length > 0 && (
-                <small aria-label={`${logs.length} log entries`}>
-                  {logs.length > 99 ? "99+" : logs.length}
-                </small>
-              )}
+              <div className="nav-pill-icon">
+                <Icon size={16} strokeWidth={2} aria-hidden="true" />
+              </div>
+              <span className="nav-pill-label">{label}</span>
+              <div className="nav-pill-trailing">
+                {id === "logs" && logs.length > 0 && (
+                  <span className="log-count-badge" aria-label={`${logs.length} log entries`}>
+                    {logs.length > 99 ? "99+" : logs.length}
+                  </span>
+                )}
+                <kbd className="nav-shortcut">{shortcut}</kbd>
+              </div>
+              {view === id && <span className="nav-active-pill" aria-hidden="true" />}
             </button>
           ))}
         </nav>
 
         <div className="sidebar-bottom">
-          <div className={`mini-status ${runtime.status}`} role="status" aria-live="polite">
-            <span className="status-dot" aria-hidden="true" />
-            <div>
-              <strong>{statusText}</strong>
-              <span title={runtime.detail}>{runtime.detail}</span>
+          <div className={`connection-beacon ${runtime.status}`} role="status" aria-live="polite">
+            <div className="beacon-radar">
+              <span className="beacon-ring ring-1" aria-hidden="true" />
+              <span className="beacon-ring ring-2" aria-hidden="true" />
+              <span className="beacon-core" aria-hidden="true" />
+            </div>
+            <div className="beacon-info">
+              <div className="beacon-header">
+                <strong className="beacon-status-text">{statusText}</strong>
+                <span className="beacon-tag">{connected ? "ACTIVE" : running ? "HANDSHAKE" : runtime.status === "error" ? "ALERT" : "STANDBY"}</span>
+              </div>
+              <span className="beacon-detail" title={runtime.detail}>{runtime.detail || "System Ready"}</span>
             </div>
           </div>
-          <div className="version">AETHER NEXT <span>v{appVersion}</span></div>
+          <div className="version-bar">
+            <span>AETHER PROTOCOL</span>
+            <span className="version-tag">v{appVersion}</span>
+          </div>
         </div>
       </aside>
 
       <section className="workspace">
         <header className="topbar">
-          <div><p>{activeNav.eyebrow}</p><h1>{activeNav.label}</h1></div>
-          <div className={`header-status ${runtime.status}`} title={runtime.detail}>
-            <span className="status-dot" aria-hidden="true" />
-            {runtime.status}
+          <div className="topbar-titles">
+            <p className="topbar-eyebrow">{activeNav.eyebrow}</p>
+            <h1 className="topbar-heading">{activeNav.label}</h1>
+          </div>
+          <div className="topbar-actions">
+            <div className={`header-status ${runtime.status}`} title={runtime.detail}>
+              <span className="status-dot" aria-hidden="true" />
+              <span className="status-text">{runtime.status}</span>
+            </div>
           </div>
         </header>
 

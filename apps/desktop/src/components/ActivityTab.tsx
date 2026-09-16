@@ -1,4 +1,12 @@
-import { ArrowDown, Ban, Copy, Check, ScrollText, Sparkles, TerminalSquare } from "lucide-react";
+import {
+  ArrowDown,
+  Ban,
+  Check,
+  Copy,
+  ScrollText,
+  Sparkles,
+  Terminal,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { RENDER_CAP } from "../hooks/useLogs";
 import { formatLogTime } from "../types";
@@ -26,12 +34,42 @@ const FILTERS: { id: LogFilter; label: string }[] = [
   { id: "raw", label: "Raw" },
 ];
 
+function getLogCategory(entry: LogEntry): "info" | "warn" | "error" | "debug" {
+  if (entry.level === "error") return "error";
+  if (entry.level === "warn") return "warn";
+  const msg = entry.message.toLowerCase();
+  if (
+    msg.includes("debug") ||
+    msg.includes("trace") ||
+    msg.includes("probe src") ||
+    msg.includes("candidate rejected") ||
+    msg.includes("probe timeout")
+  ) {
+    return "debug";
+  }
+  return "info";
+}
+
+const LEVEL_LABELS: Record<"info" | "warn" | "error" | "debug", string> = {
+  info: "INFO",
+  warn: "WARN",
+  error: "ERR",
+  debug: "DEBUG",
+};
+
 export function ActivityTab({
-  visibleLogs, hasMore, filterCounts,
-  logFilter, setLogFilter,
-  logEndRef, autoScroll, setAutoScroll,
-  exportLogs, clearLogs,
-  scanState, status,
+  visibleLogs,
+  hasMore,
+  filterCounts,
+  logFilter,
+  setLogFilter,
+  logEndRef,
+  autoScroll,
+  setAutoScroll,
+  exportLogs,
+  clearLogs,
+  scanState,
+  status,
 }: ActivityTabProps) {
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -43,7 +81,9 @@ export function ActivityTab({
     if (autoScroll) logEndRef.current?.scrollIntoView({ behavior: "auto" });
   }, [visibleLogs, autoScroll, logEndRef]);
 
-  useEffect(() => () => { if (copyTimer.current) clearTimeout(copyTimer.current); }, []);
+  useEffect(() => () => {
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+  }, []);
 
   // Pause auto-scroll on any gesture away from the bottom; resume at the bottom.
   const handleScroll = () => {
@@ -63,12 +103,15 @@ export function ActivityTab({
   };
 
   const empty = filterCounts.raw === 0;
-  const pct = scanState.total > 0 ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100)) : 0;
+  const pct =
+    scanState.total > 0
+      ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
+      : 0;
 
   return (
-    <div className="activity-view">
+    <div className="activity-view tactical-activity-view">
       {scanState.active && (
-        <div className="scan-card">
+        <div className="scan-card tactical-scan-card">
           <div className="scan-card-header">
             <div className="scan-title">
               <Sparkles size={15} className="spin-icon" aria-hidden="true" />
@@ -89,78 +132,137 @@ export function ActivityTab({
             aria-valuemax={scanState.total}
             aria-valuenow={scanState.scanned}
           >
-            <div className="scan-progress-bar-fill" style={{ width: `${pct}%` }} />
+            <div className="scan-progress-bar-fill active-glow" style={{ width: `${pct}%` }} />
           </div>
           <div className="scan-card-footer">
-            <small>Probed {scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} candidates</small>
-            <small>{pct}%</small>
+            <small className="tabular-nums">
+              Probed {scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} candidates
+            </small>
+            <small className="tabular-nums">{pct}%</small>
           </div>
         </div>
       )}
 
-      <section className="activity-panel">
-        <header className="activity-head">
-          <div className="activity-head-title">
-            <span className={`status-dot ${status}`} aria-hidden="true" />
-            <div>
-              <strong>Activity feed</strong>
-              <small>{filterCounts[logFilter].toLocaleString()} shown · {filterCounts.raw.toLocaleString()} total</small>
-            </div>
+      <section className="activity-panel tactical-terminal-chassis">
+        {/* Terminal Window Header Chrome */}
+        <header className="terminal-header-chrome">
+          <div className="terminal-window-controls">
+            <span className="win-dot red" aria-hidden="true" />
+            <span className="win-dot yellow" aria-hidden="true" />
+            <span className="win-dot green" aria-hidden="true" />
+            <span className="terminal-title-text font-mono">aether@daemon:~# session-log</span>
           </div>
-          <div className="activity-actions">
+
+          <div className="terminal-center-telemetry">
+            <span className={`status-dot ${status}`} aria-hidden="true" />
+            <span className="stream-count tabular-nums">
+              {filterCounts[logFilter].toLocaleString()} shown / {filterCounts.raw.toLocaleString()} buffer
+            </span>
+          </div>
+
+          <div className="terminal-action-buttons">
             {!autoScroll && (
-              <button type="button" className="ghost-btn" onClick={() => setAutoScroll(true)} title="Resume auto-scroll" aria-label="Resume auto-scroll">
-                <ArrowDown size={14} aria-hidden="true" />
+              <button
+                type="button"
+                className="tactile-terminal-btn follow-btn"
+                onClick={() => setAutoScroll(true)}
+                title="Resume auto-scroll"
+                aria-label="Resume auto-scroll"
+              >
+                <ArrowDown size={13} aria-hidden="true" />
                 <span>Follow</span>
               </button>
             )}
-            <button type="button" className="ghost-btn" onClick={handleCopy} disabled={empty}>
-              {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
-              <span>{copied ? "Copied" : "Copy"}</span>
+            <button
+              type="button"
+              className={`tactile-terminal-btn ${copied ? "copied" : ""}`}
+              onClick={handleCopy}
+              disabled={empty}
+              title="Copy visible or complete logs to clipboard"
+            >
+              {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
+              <span>{copied ? "Copied" : "Copy Buffer"}</span>
             </button>
-            <button type="button" className="ghost-btn danger" onClick={clearLogs} disabled={empty}>
-              <Ban size={14} aria-hidden="true" />
+            <button
+              type="button"
+              className="tactile-terminal-btn danger"
+              onClick={clearLogs}
+              disabled={empty}
+              title="Flush current session logs"
+            >
+              <Ban size={13} aria-hidden="true" />
               <span>Clear</span>
             </button>
           </div>
         </header>
 
-        <div className="activity-filters" role="radiogroup" aria-label="Log filter">
-          {FILTERS.map((f) => (
-            <button
-              key={f.id}
-              type="button"
-              role="radio"
-              aria-checked={logFilter === f.id}
-              className={`filter-chip ${logFilter === f.id ? "active" : ""}`}
-              onClick={() => setLogFilter(f.id)}
-            >
-              {f.label}
-              <span className="chip-count">{filterCounts[f.id].toLocaleString()}</span>
-            </button>
-          ))}
+        {/* Sticky Filter Pill Bar */}
+        <div className="activity-filters tactical-filter-dock" role="radiogroup" aria-label="Log filter">
+          <div className="filter-pill-group">
+            {FILTERS.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                role="radio"
+                aria-checked={logFilter === f.id}
+                className={`filter-chip ${logFilter === f.id ? "active" : ""}`}
+                onClick={() => setLogFilter(f.id)}
+              >
+                <span className="filter-chip-label">{f.label}</span>
+                <span className="chip-count tabular-nums">{filterCounts[f.id].toLocaleString()}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="terminal-mode-indicator">
+            <span className="mode-tag font-mono">TTY: LIVE</span>
+          </div>
         </div>
 
-        <section ref={consoleRef} className="activity-console" onScroll={handleScroll} aria-label="Engine log output">
+        {/* Terminal Screen Console */}
+        <section
+          ref={consoleRef}
+          className="activity-console tactical-terminal-screen font-mono"
+          onScroll={handleScroll}
+          aria-label="Engine log output"
+        >
           {hasMore && (
             <div className="log-more-hint">
-              <small>Showing the last {RENDER_CAP} matching entries — use Copy to export the full buffer</small>
+              <small className="tabular-nums">
+                Buffer truncated for display: showing the last {RENDER_CAP} matching entries. Use "Copy Buffer" for full export.
+              </small>
             </div>
           )}
+
           {visibleLogs.length === 0 ? (
             <div className="empty-logs">
-              <TerminalSquare size={26} aria-hidden="true" />
-              <strong>{empty ? "No activity yet" : "Nothing matches this filter"}</strong>
-              <span>{empty ? "Engine events appear here after you connect or scan." : "Try the Raw filter to see every line."}</span>
+              <Terminal size={32} className="empty-term-icon" aria-hidden="true" />
+              <strong>{empty ? "Awaiting Daemon Output" : "No Records In Selected Filter"}</strong>
+              <span>
+                {empty
+                  ? "Carrier daemon and probe events will stream here automatically upon execution."
+                  : "Switch to 'Raw' to inspect unfiltered packet and probe streams."}
+              </span>
             </div>
           ) : (
-            visibleLogs.map((entry) => (
-              <div className={`log-line ${entry.level}`} key={entry.id} title={entry.level}>
-                <span className="log-dot" aria-hidden="true" />
-                <time dateTime={new Date(entry.ts).toISOString()}>{formatLogTime(entry.ts)}</time>
-                <p>{entry.message}</p>
-              </div>
-            ))
+            visibleLogs.map((entry) => {
+              const category = getLogCategory(entry);
+              const label = LEVEL_LABELS[category];
+              return (
+                <div className={`terminal-log-row ${category}`} key={entry.id} title={category.toUpperCase()}>
+                  <span className="row-gutter">
+                    <span className="gutter-dot" aria-hidden="true" />
+                  </span>
+                  <time className="tabular-nums font-mono" dateTime={new Date(entry.ts).toISOString()}>
+                    {formatLogTime(entry.ts)}
+                  </time>
+                  <span className={`log-level-badge ${category} font-mono`}>
+                    [{label}]
+                  </span>
+                  <p className="log-message-body font-mono">{entry.message}</p>
+                </div>
+              );
+            })
           )}
           <div ref={logEndRef} />
         </section>
@@ -169,7 +271,7 @@ export function ActivityTab({
       {empty && !scanState.active && (
         <div className="activity-hint">
           <ScrollText size={13} aria-hidden="true" />
-          <span>Milestones hides progress spam. Switch to Raw for the unfiltered stream.</span>
+          <span>Milestones hides high-frequency network packets. Select "Raw" to inspect full socket traces.</span>
         </div>
       )}
     </div>

@@ -1,4 +1,5 @@
-import { Search, X, Zap, Radio } from "lucide-react";
+import { Check, Copy, Network, Radio, Search, X, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
 
@@ -23,6 +24,40 @@ interface ScannerTabProps {
   connectBusy: boolean;
 }
 
+function getRttTier(rttMs: number): { tierClass: string; badgeText: string } {
+  if (rttMs < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST" };
+  if (rttMs <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL" };
+  if (rttMs <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL" };
+  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY" };
+}
+
+function CopyIpButton({ addr }: { addr: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  return (
+    <button
+      type="button"
+      className="tactile-copy-btn"
+      title={copied ? "Copied" : "Copy IP address"}
+      aria-label={copied ? "Copied" : "Copy IP address"}
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(addr);
+          setCopied(true);
+          if (timer.current) clearTimeout(timer.current);
+          timer.current = setTimeout(() => setCopied(false), 1500);
+        } catch {
+          // Fallback
+        }
+      }}
+    >
+      {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+    </button>
+  );
+}
+
 export function ScannerTab({
   protocol, setProtocol,
   ipScan, setIpScan,
@@ -33,21 +68,52 @@ export function ScannerTab({
   startScan, stopScan,
   connectDirect, connectBusy,
 }: ScannerTabProps) {
+  const progressPct = scanState.total > 0
+    ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
+    : 0;
+
   return (
     <div className="scanner-view">
-      <section className="settings-section">
+      {/* ─── Scanner Radar HUD Panel ───────────────────────────────────────── */}
+      <section className="settings-section radar-hud-container">
         <div className="section-heading">
           <div>
             <p>STANDALONE ENGINE PROBER</p>
-            <h3>Custom IP Scanner</h3>
+            <h3>Cloudflare Edge Scanner</h3>
           </div>
-          <Search size={20} aria-hidden="true" />
+          <Radio size={20} className={active ? "spin-icon" : ""} aria-hidden="true" />
         </div>
 
+        {/* Tactical HUD Header */}
+        <div className="radar-telemetry-banner">
+          <div className="radar-radar-scope" aria-hidden="true">
+            <div className={`radar-sweep-reticle ${active ? "active-sweep" : ""}`}>
+              <div className="radar-crosshair-h" />
+              <div className="radar-crosshair-v" />
+              <div className="radar-circle circle-1" />
+              <div className="radar-circle circle-2" />
+              {active && <div className="radar-sweep-beam" />}
+            </div>
+          </div>
+          <div className="radar-scope-meta">
+            <div className="scope-status-line">
+              <span className={`scope-led ${active ? "active" : ""}`} />
+              <strong>{active ? `PROBING POOL (${scanState.mode.toUpperCase()})` : "RADAR ENGINE DORMANT"}</strong>
+              <span className="scope-phase-tag">{scanState.phase}</span>
+            </div>
+            <p>
+              {active
+                ? `Dispatching concurrent datagram probes across Cloudflare ${ipScan.toUpperCase()} edge ranges.`
+                : "Probe Cloudflare IP pools directly to find zero-loss, low-latency edge endpoints before establishing the tunnel."}
+            </p>
+          </div>
+        </div>
+
+        {/* Configuration Controls */}
         <div className="setting-row">
           <div>
             <strong>Target Protocol</strong>
-            <span>Service engine to probe Cloudflare edge IPs for</span>
+            <span>Service carrier used for probing edge handshakes</span>
           </div>
           <Segmented
             label="Target protocol"
@@ -65,7 +131,7 @@ export function ScannerTab({
         <div className="setting-row">
           <div>
             <strong>IP Family</strong>
-            <span>Address family pool to enumerate &amp; sample</span>
+            <span>Address family pool to enumerate and probe</span>
           </div>
           <Segmented
             label="IP family"
@@ -82,22 +148,24 @@ export function ScannerTab({
 
         <div className="setting-row input-row">
           <label>
-            <span>Concurrency (Probes)</span>
+            <span>Concurrency (Workers)</span>
             <NumberField
               label="Scan concurrency"
               min={1}
               max={2000}
+              step={10}
               value={concurrency}
               disabled={active}
               onCommit={setConcurrency}
             />
           </label>
           <label>
-            <span>Per-Probe Timeout (ms)</span>
+            <span>Timeout (ms)</span>
             <NumberField
               label="Per-probe timeout in milliseconds"
               min={100}
               max={30000}
+              step={100}
               value={timeoutMs}
               disabled={active}
               onCommit={setTimeoutMs}
@@ -107,8 +175,8 @@ export function ScannerTab({
 
         <div className="setting-row">
           <div>
-            <strong>Obfuscation</strong>
-            <span>{protocol === "masque-h2" ? "Not applicable for H2 (TCP)" : "Noise profile applied to probe handshakes"}</span>
+            <strong>Handshake Obfuscation</strong>
+            <span>{protocol === "masque-h2" ? "UDP noise is not applicable for H2 (TCP)" : "Anti-DPI noise profile injected during probe"}</span>
           </div>
           <select
             aria-label="Obfuscation noise profile for probes"
@@ -125,9 +193,13 @@ export function ScannerTab({
           </select>
         </div>
 
-        {/* Scan progress bar */}
+        {/* Scan Progress Bar & Live Telemetry */}
         {(scanState.active || scanState.scanned > 0) && (
           <div className="scan-inline-progress">
+            <div className="scan-progress-header">
+              <span className="progress-label">PROBE PROGRESS</span>
+              <span className="progress-metric tabular-nums">{progressPct}% ({scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()})</span>
+            </div>
             <div
               className="scan-progress-bar-bg"
               role="progressbar"
@@ -137,23 +209,19 @@ export function ScannerTab({
               aria-valuenow={scanState.scanned}
             >
               <div
-                className="scan-progress-bar-fill"
-                style={{
-                  width: scanState.total > 0
-                    ? `${Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))}%`
-                    : "0%",
-                }}
+                className={`scan-progress-bar-fill ${active ? "active-glow" : ""}`}
+                style={{ width: `${progressPct}%` }}
               />
             </div>
             <div className="scan-inline-stats">
-              <span>{scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} probed</span>
-              <span>{scanState.working} working</span>
-              {scanState.bestRtt && <span>best: {scanState.bestRtt}</span>}
-              {!scanState.active && <span className="scan-phase-badge">{scanState.phase}</span>}
+              <span className="stat-chip-pill workers">{scanState.concurrency} Workers Active</span>
+              <span className="stat-chip-pill hits">{scanState.working} Healthy Gateways</span>
+              {scanState.bestRtt && <span className="stat-chip-pill best">Best: {scanState.bestRtt}</span>}
             </div>
           </div>
         )}
 
+        {/* Master Scan CTA Button */}
         <div className="scanner-action-bar">
           {!active ? (
             <button
@@ -163,7 +231,7 @@ export function ScannerTab({
               disabled={busy}
             >
               <Zap size={18} aria-hidden="true" />
-              <span>{busy ? "Starting…" : "Start Standalone Scan"}</span>
+              <span>{busy ? "Engaging Scanner Engine…" : "Start Standalone Edge Scan"}</span>
             </button>
           ) : (
             <button
@@ -172,54 +240,62 @@ export function ScannerTab({
               onClick={stopScan}
             >
               <X size={18} aria-hidden="true" />
-              <span>Stop Scan</span>
+              <span>Halt Active Probe</span>
             </button>
           )}
         </div>
       </section>
 
+      {/* ─── Discovered Endpoints Section ─────────────────────────────────── */}
       <section className="discovered-panel">
         <div className="section-heading">
           <div>
-            <p>DISCOVERED ENDPOINTS</p>
-            <h3>Healthy Gateways ({endpoints.length})</h3>
+            <p>TELEMETRY RESULTS</p>
+            <h3>Discovered Gateways ({endpoints.length})</h3>
           </div>
-          <Radio size={20} aria-hidden="true" />
+          <Network size={20} aria-hidden="true" />
         </div>
 
         {endpoints.length === 0 ? (
           <div className="empty-logs">
-            <Search size={26} aria-hidden="true" />
-            <strong>No endpoints discovered yet</strong>
-            <span>Click "Start Standalone Scan" to probe healthy edge IPs.</span>
+            <Search size={28} aria-hidden="true" />
+            <strong>No edge gateways discovered yet</strong>
+            <span>Launch a standalone scan above to locate the fastest Cloudflare IP candidates.</span>
           </div>
         ) : (
           <div className="discovered-list">
-            {endpoints.map((item) => (
-              <div className="discovered-row" key={item.addr}>
-                <div className="discovered-info">
-                  <code>{item.addr}</code>
-                  <span className="discovered-proto">{item.protocol}</span>
+            {endpoints.map((item) => {
+              const { tierClass, badgeText } = getRttTier(item.rttMs);
+              return (
+                <div className="discovered-row" key={item.addr}>
+                  <div className="discovered-info">
+                    <CopyIpButton addr={item.addr} />
+                    <code className="tabular-nums">{item.addr}</code>
+                    <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
+                  </div>
+
+                  <div className="discovered-actions">
+                    <span className={`rtt-badge ${tierClass}`} title={badgeText}>
+                      <span className="rtt-dot" />
+                      <span className="rtt-val tabular-nums">{item.rtt}</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="connect-direct-btn"
+                      disabled={connectBusy || active}
+                      title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
+                      onClick={() => connectDirect(item)}
+                    >
+                      Connect Direct
+                    </button>
+                  </div>
                 </div>
-                <div className="discovered-actions">
-                  <span className={`rtt-badge ${item.rttMs <= 50 ? "fast" : item.rttMs <= 120 ? "mid" : "slow"}`}>
-                    {item.rtt}
-                  </span>
-                  <button
-                    type="button"
-                    className="connect-direct-btn"
-                    disabled={connectBusy || active}
-                    title={active ? "Stop the scan before connecting" : undefined}
-                    onClick={() => connectDirect(item)}
-                  >
-                    Connect Direct
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
     </div>
   );
 }
+
