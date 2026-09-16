@@ -107,5 +107,5 @@ export type ScanEvent =
   | { type: "scan_start"; mode: string; total: number; concurrency: number }
   | { type: "scan_progress"; scanned: number; total: number; working: number }
   | { type: "scan_hit"; addr: string; rtt: string; rttMs: number; protocol: string }
-  | { type: "scan_done"; addr: string; rtt: string; protocol: string }
+  | { type: "scan_done"; addr: string; rtt: string; protocol: string; working?: number }
   | { type: "scan_failed"; message: string };

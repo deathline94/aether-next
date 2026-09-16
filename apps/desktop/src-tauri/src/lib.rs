@@ -1156,16 +1156,26 @@ fn app_info() -> serde_json::Value {
 #[tauri::command]
 fn test_connection(settings: Settings) -> Result<String, String> {
     validate_settings(&settings)?;
-    let proxy = format!("http://127.0.0.1:{}", settings.http_port);
     let url = "https://www.cloudflare.com/cdn-cgi/trace";
-    let client = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(12))
-        .proxy(ureq::Proxy::new(&proxy).map_err(|e| e.to_string())?)
-        .build();
+
+    let (client, via_desc) = if settings.routing_mode == "tun" {
+        let client = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(12))
+            .build();
+        (client, "TUN".to_string())
+    } else {
+        let proxy = format!("http://127.0.0.1:{}", settings.http_port);
+        let client = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(12))
+            .proxy(ureq::Proxy::new(&proxy).map_err(|e| e.to_string())?)
+            .build();
+        (client, proxy)
+    };
+
     let body = client
         .get(url)
         .call()
-        .map_err(|e| format!("proxy test failed: {e}"))?
+        .map_err(|e| format!("connection test failed: {e}"))?
         .into_string()
         .map_err(|e| e.to_string())?;
     let ip = body
@@ -1176,7 +1186,7 @@ fn test_connection(settings: Settings) -> Result<String, String> {
         .lines()
         .find_map(|l| l.strip_prefix("loc="))
         .unwrap_or("?");
-    Ok(format!("OK via {proxy} · ip={ip} loc={loc}"))
+    Ok(format!("OK via {via_desc} · ip={ip} loc={loc}"))
 }
 
 #[tauri::command]

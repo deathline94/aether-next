@@ -1,4 +1,4 @@
-import { Check, ChevronRight, Radio, Settings2, Wifi } from "lucide-react";
+import { Check, ChevronRight, Radio, Settings2, Wifi, X } from "lucide-react";
 import type { Settings } from "../types";
 import { NumberField, Segmented, Toggle } from "./ui";
 
@@ -57,8 +57,15 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
           </div>
         )}
         <div className="setting-row">
-          <div><strong>Obfuscation</strong><span>Noise before handshake (low → high)</span></div>
-          <select disabled={settingsLocked} aria-label="Obfuscation noise profile"
+          <div>
+            <strong>Obfuscation</strong>
+            <span>
+              {settings.protocol === "masque" && settings.transport === "h2"
+                ? "UDP noise is not applicable for H2 (TCP)"
+                : "Noise before handshake (low → high)"}
+            </span>
+          </div>
+          <select disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")} aria-label="Obfuscation noise profile"
             value={["off", "light", "medium", "high", "max", "custom"].includes(settings.noize) ? settings.noize : "medium"}
             onChange={(e) => patchSettings({ noize: e.target.value })}>
             <option value="off">Off — no noise</option>
@@ -69,7 +76,7 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
             <option value="custom">Custom — manual values</option>
           </select>
         </div>
-        {settings.noize === "custom" && (
+        {settings.noize === "custom" && settings.transport !== "h2" && (
           <div className="setting-stack" style={{ gap: 10, marginTop: 8 }}>
             <div className="setting-row">
               <div><strong>Junk count</strong><span>Packets before handshake (recommended: 5)</span></div>
@@ -178,9 +185,20 @@ export function SettingsTab({ settings, settingsLocked, settingsLoaded, saved, p
 
       <div className="save-bar">
         <span role="status" aria-live="polite">
-          {!settingsLoaded ? "Loading settings…" : settingsLocked ? "Locked while connected" : saved ? "Saved" : "Changes save automatically"}
+          {!settingsLoaded
+            ? "Loading settings…"
+            : settingsLocked
+              ? "Locked while connected"
+              : portsCollide
+                ? "Save blocked: fix port collision"
+                : saved
+                  ? "Saved"
+                  : "Changes save automatically"}
         </span>
-        <span className="save-indicator">{saved && <Check size={17} aria-hidden="true" />}{saved ? "Saved" : "Auto-save on"}</span>
+        <span className={`save-indicator ${portsCollide ? "blocked" : ""}`}>
+          {portsCollide ? <X size={17} aria-hidden="true" /> : saved && <Check size={17} aria-hidden="true" />}
+          {portsCollide ? "Save blocked" : saved ? "Saved" : "Auto-save on"}
+        </span>
       </div>
     </div>
   );

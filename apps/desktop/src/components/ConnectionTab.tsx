@@ -140,7 +140,7 @@ export function ConnectionTab({
                 disabled={settingsLocked} aria-pressed={active}
                 onClick={() => {
                   if (settingsLocked || active) return;
-                  patchSettings(profile.patch);
+                  patchSettings({ ...profile.patch, peer: "" });
                   appendLog({ level: "info", message: `Applied profile: ${profile.label} — ${profile.hint}` });
                 }}>
                 <strong>{profile.label}</strong>
@@ -150,8 +150,15 @@ export function ConnectionTab({
             );
           })}
         </div>
-        {!admin && <p className="profile-note">Max (TUN) needs Run as administrator and wintun.dll. Use Speed for everyday proxy mode.</p>}
+        {!admin && <p className="profile-note">TUN routing requires running Aether as administrator and wintun.dll. Standard proxy mode is available without elevation.</p>}
       </section>
+
+      {settings.peer && (
+        <div className="pinned-peer-bar">
+          <span>Targeting forced endpoint: <code>{settings.peer}</code></span>
+          <button type="button" onClick={() => patchSettings({ peer: "" })}>Clear (Scan dynamically)</button>
+        </div>
+      )}
 
       <section className="metrics-grid">
         <article>
@@ -176,7 +183,7 @@ export function ConnectionTab({
           <div className="metric-icon yellow"><Activity size={19} aria-hidden="true" /></div>
           <span>Process</span>
           <strong>{runtime.pid ? `PID ${runtime.pid}` : "Standby"}</strong>
-          <small>{connected ? "Healthy" : "Not running"}</small>
+          <small>{connected ? "Healthy" : running ? "Starting" : "Not running"}</small>
         </article>
       </section>
 
@@ -206,7 +213,11 @@ export function ConnectionTab({
           <span>{connected ? "Hits Cloudflare via local HTTP proxy" : "Connect first, then verify the path"}</span>
           <button onClick={runTest} disabled={testBusy || busy || !connected}>{testBusy ? "Testing…" : "Test connection"}</button>
         </div>
-        {testResult && <code className="test-result">{testResult}</code>}
+        {testResult && (
+          <code className={`test-result ${testResult.startsWith("OK") ? "ok" : "err"}`}>
+            {testResult}
+          </code>
+        )}
       </section>
 
       <section className="about-panel">

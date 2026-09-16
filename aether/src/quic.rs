@@ -238,6 +238,88 @@ fn random_scid() -> [u8; 16] {
     scid
 }
 
+pub const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
+pub const QUIC_V2_BAIT_LEN: usize = 1200;
+pub const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
+
+pub fn quic_v2_bait_enabled() -> bool {
+    let val = crate::runtime_env::var("AETHER_QUIC_V2")
+        .or_else(|| std::env::var("AETHER_QUIC_V2").ok());
+    !matches!(
+        val.as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+fn quic_varint2(value: u64) -> [u8; 2] {
+    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
+}
+
+pub fn build_version_bait() -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let mut dcid = [0u8; 8];
+    let mut scid = [0u8; 8];
+    rng.fill_bytes(&mut dcid);
+    rng.fill_bytes(&mut scid);
+
+    let mut pkt = Vec::with_capacity(QUIC_V2_BAIT_LEN);
+    pkt.push(0xc3);
+    pkt.extend_from_slice(&consts::QUIC_V2_VERSION.to_be_bytes());
+    pkt.push(dcid.len() as u8);
+    pkt.extend_from_slice(&dcid);
+    pkt.push(scid.len() as u8);
+    pkt.extend_from_slice(&scid);
+    pkt.push(0x00);
+
+    let remaining = QUIC_V2_BAIT_LEN - pkt.len() - 2;
+    pkt.extend_from_slice(&quic_varint2(remaining as u64));
+    let mut pn = [0u8; 4];
+    rng.fill_bytes(&mut pn);
+    pkt.extend_from_slice(&pn);
+    pkt.resize(QUIC_V2_BAIT_LEN, 0);
+    pkt
+}
+
+pub async fn send_version_bait(sock: &UdpSocket, target: SocketAddr, wait: Duration, tries: usize) {
+    let bait = build_version_bait();
+    let connected = sock.peer_addr().is_ok();
+    let mut buf = [0u8; 2048];
+
+    for attempt in 0..tries.max(1) {
+        let sent = if connected {
+            sock.send(&bait).await
+        } else {
+            sock.send_to(&bait, target).await
+        };
+        if sent.is_err() {
+            return;
+        }
+
+        let answered = tokio::time::timeout(wait, async {
+            if connected {
+                sock.recv(&mut buf).await
+            } else {
+                sock.recv_from(&mut buf).await.map(|(n, _)| n)
+            }
+        })
+        .await;
+
+        match answered {
+            Ok(Ok(n)) => {
+                log::debug!(
+                    "[quic] version-negotiation bait answered with {n} bytes; path is open for v1"
+                );
+                return;
+            }
+            Ok(Err(_)) => return,
+            Err(_) => log::trace!(
+                "[quic] version-negotiation bait attempt {} went unanswered",
+                attempt + 1
+            ),
+        }
+    }
+}
+
 fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -282,6 +364,10 @@ pub async fn run(
     let init_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
     let local = init_sock.local_addr()?;
     let init_sock = Arc::new(init_sock);
+
+    if quic_v2_bait_enabled() {
+        send_version_bait(&init_sock, peer, QUIC_V2_BAIT_WAIT, 2).await;
+    }
 
     let (net_tx, mut net_rx) = mpsc::channel::<NetPacket>(NET_QUEUE);
 
@@ -620,12 +706,17 @@ fn poll_h3(
 
     loop {
         match h3c.poll(conn) {
-            Ok((_stream_id, h3::Event::Headers { list, .. })) => {
+            Ok((stream_id, h3::Event::Headers { list, .. })) => {
                 for h in &list {
                     if h.name() == b":status" {
-                        let status = String::from_utf8_lossy(h.value());
+                        let status = String::from_utf8_lossy(h.value()).to_string();
                         log::info!("connect-ip status: {status}");
                         h3_stage("connect_ip_status", &format!("code={status}"));
+                        if stream_id == req_stream && !status.starts_with('2') {
+                            return Err(AetherError::Masque(format!(
+                                "the edge refused connect-ip with status {status}"
+                            )));
+                        }
                         if h.value() == b"200" {
                             *h3_ready = true;
                         }
@@ -646,8 +737,16 @@ fn poll_h3(
                 drain_capsules(capsules, addr_tx, probe_src, inbound_tx, dataplane_ok, addr_assigned);
             }
 
-            Ok((_stream_id, h3::Event::Finished)) => {}
-            Ok((_stream_id, h3::Event::Reset(_))) => {}
+            Ok((stream_id, h3::Event::Finished)) if stream_id == req_stream => {
+                return Err(AetherError::Masque(
+                    "the edge closed the connect-ip stream".into(),
+                ));
+            }
+            Ok((stream_id, h3::Event::Reset(code))) if stream_id == req_stream => {
+                return Err(AetherError::Masque(format!(
+                    "the edge reset the connect-ip stream (code 0x{code:x})"
+                )));
+            }
             Ok(_) => {}
 
             Err(h3::Error::Done) => break,
@@ -968,6 +1067,11 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let start = Instant::now();
     let deadline = start + p.timeout;
 
+    // Pre-handshake QUIC v2 version negotiation bait
+    if quic_v2_bait_enabled() {
+        send_version_bait(&sock, p.peer, Duration::from_millis(500), 1).await;
+    }
+
     // Obfuscation noise before QUIC Initial (same as run() — works with Cloudflare).
     noize::pre_handshake(&sock, p.peer, &p.noize).await;
 
@@ -1075,6 +1179,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                     flush_to(&mut conn, &sock, p.peer).await?;
                                     // Wait for data-plane reply (up to 2s).
                                     let dp_deadline = Instant::now() + Duration::from_secs(2).min(remaining(deadline));
+                                    let mut dp_successes: u32 = 0;
                                     loop {
                                         if Instant::now() >= dp_deadline {
                                             // Data-plane timeout — endpoint accepts control but drops traffic.
@@ -1090,14 +1195,16 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                     let _ = conn.recv(&mut buf[..n], info);
                                                     // Check for a QUIC DATAGRAM reply.
                                                     let mut dgram_buf = vec![0u8; 65535];
+                                                    let mut got_reply = false;
                                                     loop {
                                                         match conn.dgram_recv(&mut dgram_buf) {
                                                             Ok(dn) => {
                                                                 if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..dn], sid) {
                                                                     if trace {
-                                                                        h3_stage("first_inbound_datagram", "quic datagram confirmed");
+                                                                        h3_stage("inbound_datagram", "quic datagram confirmed");
                                                                     }
-                                                                    return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
+                                                                    got_reply = true;
+                                                                    break;
                                                                 }
                                                             }
                                                             Err(quiche::Error::Done) => break,
@@ -1105,29 +1212,39 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                         }
                                                     }
                                                     // Also accept a DATAGRAM capsule on the stream (RFC 9297 fallback).
-                                                    loop {
-                                                        match h3c.poll(&mut conn) {
-                                                            Ok((s, h3::Event::Data)) if s == sid => {
-                                                                while let Ok(bn) = h3c.recv_body(&mut conn, sid, &mut dp_body) {
-                                                                    if bn == 0 { break; }
-                                                                    dp_capsules.push(&dp_body[..bn]);
+                                                    if !got_reply {
+                                                        loop {
+                                                            match h3c.poll(&mut conn) {
+                                                                Ok((s, h3::Event::Data)) if s == sid => {
+                                                                    while let Ok(bn) = h3c.recv_body(&mut conn, sid, &mut dp_body) {
+                                                                        if bn == 0 { break; }
+                                                                        dp_capsules.push(&dp_body[..bn]);
+                                                                    }
                                                                 }
+                                                                Ok(_) => {}
+                                                                Err(_) => break,
                                                             }
-                                                            Ok(_) => {}
-                                                            Err(_) => break,
+                                                        }
+                                                        loop {
+                                                            match dp_capsules.next() {
+                                                                Ok(Some(masque::Capsule::Datagram(_))) => {
+                                                                    if trace {
+                                                                        h3_stage("inbound_datagram", "capsule datagram confirmed");
+                                                                    }
+                                                                    got_reply = true;
+                                                                    break;
+                                                                }
+                                                                Ok(Some(_)) => {}
+                                                                Ok(None) | Err(_) => break,
+                                                            }
                                                         }
                                                     }
-                                                    loop {
-                                                        match dp_capsules.next() {
-                                                            Ok(Some(masque::Capsule::Datagram(_))) => {
-                                                                if trace {
-                                                                    h3_stage("first_inbound_datagram", "capsule datagram confirmed");
-                                                                }
-                                                                return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
-                                                            }
-                                                            Ok(Some(_)) => {}
-                                                            Ok(None) | Err(_) => break,
+                                                    if got_reply {
+                                                        dp_successes += 1;
+                                                        if dp_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
+                                                            return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
                                                         }
+                                                        send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
                                                     }
                                                 }
                                             }
@@ -1233,5 +1350,40 @@ mod tests {
             "b.example"
         );
         assert_eq!(resolve_h3_sni_from(Some(String::new()), None), consts::CONNECT_SNI);
+    }
+
+    #[test]
+    fn the_bait_is_a_v2_versioned_long_header_of_the_minimum_size() {
+        let pkt = build_version_bait();
+        assert_eq!(pkt.len(), QUIC_V2_BAIT_LEN);
+        assert_eq!(pkt[0] & 0x80, 0x80, "long header form bit must be set");
+        assert_eq!(pkt[0] & 0x40, 0x40, "fixed bit must be set");
+        assert_eq!(
+            u32::from_be_bytes([pkt[1], pkt[2], pkt[3], pkt[4]]),
+            consts::QUIC_V2_VERSION,
+            "the version field must be QUIC v2 so the filter treats the flow as v2"
+        );
+        assert_eq!(pkt[5], 8, "destination connection id length");
+        assert_eq!(pkt[14], 8, "source connection id length");
+    }
+
+    #[test]
+    fn two_baits_do_not_share_connection_ids() {
+        let a = build_version_bait();
+        let b = build_version_bait();
+        assert_ne!(a[6..14], b[6..14], "each bait must use a fresh dcid");
+    }
+
+    #[test]
+    fn the_bait_is_on_unless_it_is_turned_off() {
+        std::env::remove_var("AETHER_QUIC_V2");
+        assert!(quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "0");
+        assert!(!quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "off");
+        assert!(!quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "1");
+        assert!(quic_v2_bait_enabled());
+        std::env::remove_var("AETHER_QUIC_V2");
     }
 }

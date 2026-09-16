@@ -14,9 +14,13 @@ const isHit = (l: LogEntry) =>
   l.message.includes("EndpointSelected") ||
   l.message.includes("scan_hit");
 const isError = (l: LogEntry) => l.level === "error" || l.level === "warn";
-// milestones: exclude noisy progress lines
+// milestones: exclude noisy progress and probe error lines so high-level transitions stand out
 const isMilestone = (l: LogEntry) =>
-  !l.message.includes("scanning...") && !l.message.includes("probe src");
+  !l.message.includes("scanning...") &&
+  !l.message.includes("probe src") &&
+  !l.message.includes("probe candidate failed") &&
+  !l.message.includes("probe timeout") &&
+  !l.message.includes("candidate rejected");
 
 const predicates: Record<LogFilter, (l: LogEntry) => boolean> = {
   milestones: isMilestone,

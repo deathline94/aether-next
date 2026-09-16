@@ -32,12 +32,19 @@ pub const CF_CLIENT_VERSION: &str = "a-6.35-4471";
 
 pub const ALPN_H3: &[u8] = b"h3";
 
+pub const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
+#[allow(dead_code)]
+pub const H3_DATAGRAM_00: u64 = 0x276;
+
 pub const CF_CONNECT_PROTOCOL: &str = "cf-connect-ip";
 
 /// Cloudflare-custom request headers observed on the working H2 CONNECT-IP path.
 /// The H3 path can mirror these instead of standards-style extended CONNECT.
+#[allow(dead_code)]
 pub const CF_CONNECT_PROTO_HEADER: &str = "cf-connect-proto";
+#[allow(dead_code)]
 pub const CF_PQ_ENABLED_HEADER: &str = "pq-enabled";
+#[allow(dead_code)]
 pub const CF_PQ_ENABLED_VALUE: &str = "false";
 
 pub const CONNECT_IP_CONTEXT_ID: u64 = 0;

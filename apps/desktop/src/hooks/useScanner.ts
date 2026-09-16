@@ -62,10 +62,20 @@ export function useScanner(
             );
           });
           break;
-        case "scan_done":
-          setScanState((prev) => ({ ...prev, active: false, phase: "Verified" }));
-          appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
+        case "scan_done": {
+          const hasHits = (ev.working ?? 0) > 0 || Boolean(ev.addr);
+          setScanState((prev) => ({
+            ...prev,
+            active: false,
+            phase: hasHits ? "Verified" : "Completed (0 found)",
+          }));
+          if (ev.addr) {
+            appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
+          } else {
+            appendLog({ level: "info", message: "Scan complete — no working endpoints found." });
+          }
           break;
+        }
         case "scan_failed":
           setScanState((prev) => ({ ...prev, active: false, phase: "Failed" }));
           appendLog({ level: "error", message: `Scan failed: ${ev.message}` });

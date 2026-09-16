@@ -125,7 +125,7 @@ export function ScannerTab({
         </div>
 
         {/* Scan progress bar */}
-        {scanState.active && (
+        {(scanState.active || scanState.scanned > 0) && (
           <div className="scan-inline-progress">
             <div
               className="scan-progress-bar-bg"
@@ -148,6 +148,7 @@ export function ScannerTab({
               <span>{scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} probed</span>
               <span>{scanState.working} working</span>
               {scanState.bestRtt && <span>best: {scanState.bestRtt}</span>}
+              {!scanState.active && <span className="scan-phase-badge">{scanState.phase}</span>}
             </div>
           </div>
         )}

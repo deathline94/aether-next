@@ -100,11 +100,9 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_curves_list(groups)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let mut alpn = Vec::new();
+    let mut alpn = Vec::with_capacity(consts::ALPN_H3.len() + 1);
     alpn.push(consts::ALPN_H3.len() as u8);
     alpn.extend_from_slice(consts::ALPN_H3);
-    alpn.push(5);
-    alpn.extend_from_slice(b"h3-29");
     builder
         .set_alpn_protos(&alpn)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -151,53 +149,38 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     // carries the correct verify mode for both the pinned and opt-out paths.
 
     config
-        .set_application_protos(&[consts::ALPN_H3, b"h3-29"])
+        .set_application_protos(&[consts::ALPN_H3])
         .map_err(AetherError::Quic)?;
 
     config.set_max_idle_timeout(120_000);
     // UDP payload size (QUIC `max_udp_payload_size` transport param + our send cap).
-    // Default 1350 suits ~1420-MTU tunnels; on smaller-MTU paths (e.g. a 1280-MTU
-    // WireGuard/WARP tunnel) advertising 1350 makes the peer send handshake packets
-    // that exceed the path and get dropped inbound -> "no UDP reply". Env-tunable so
-    // small-MTU networks can lower it (floor 1200 = QUIC Initial minimum).
     let max_udp = crate::runtime_env::usize("AETHER_QUIC_MAX_UDP_PAYLOAD")
         .unwrap_or(1350)
         .clamp(1200, 1452);
     config.set_max_recv_udp_payload_size(max_udp);
     config.set_max_send_udp_payload_size(max_udp);
+
     // Aether anti-DPI: optionally split the client ClientHello across two QUIC
     // Initial datagrams so on-path DPI that decrypts the first Initial (its keys
-    // derive from the clear DCID) can't read the SNI. Off unless
-    // AETHER_QUIC_INITIAL_FRAG is set to the first-fragment size in bytes; a
-    // small value (~64-128) makes the SNI straddle the datagram boundary. The
-    // server reassembles multi-packet CRYPTO transparently.
+    // derive from the clear DCID) can't read the SNI.
     if let Some(frag) = crate::runtime_env::usize("AETHER_QUIC_INITIAL_FRAG") {
         if frag > 0 {
             config.set_initial_crypto_fragment(frag);
-            // Log once per process, not once per probe: build_config runs for
-            // every scan candidate, so an unconditional info! here floods the
-            // scan output with hundreds of identical lines.
             static FRAG_LOG: std::sync::Once = std::sync::Once::new();
             FRAG_LOG.call_once(|| {
                 log::info!("[tls] QUIC Initial fragmentation ON: first CRYPTO fragment = {frag} bytes");
             });
         }
     }
-    // CONNECT-IP rides on H3 DATAGRAMS; still raise stream/conn FC for control plane
-    // and any non-dgram path. 100MB conn window avoids artificial throttling.
-    config.set_initial_max_data(100_000_000);
-    config.set_initial_max_stream_data_bidi_local(16_000_000);
-    config.set_initial_max_stream_data_bidi_remote(16_000_000);
-    config.set_initial_max_stream_data_uni(8_000_000);
+
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(2_000_000);
+    config.set_initial_max_stream_data_bidi_remote(2_000_000);
+    config.set_initial_max_stream_data_uni(2_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
-    // #6: Enable active migration so QUIC can survive network changes
-    // (WiFi→mobile, IP rotation) without a full reconnect.
-    config.set_disable_active_migration(false);
-    // Larger dgram queues so bulk IP traffic is not dropped under load.
-    config.enable_dgram(true, 256_000, 256_000);
-    // #1: Enable 0-RTT (early data) for session resumption on reconnect.
-    config.enable_early_data();
+    config.set_disable_active_migration(true);
+    config.enable_dgram(true, 65536, 65536);
 
     Ok(config)
 }

@@ -42,6 +42,7 @@ function App() {
     const proto = protoLower.includes("wireguard") ? "wireguard" : "masque";
     const trans = protoLower.includes("h3") ? "h3" : "h2";
     appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
+    setView("home");
     void connectToPeer(item.addr, proto, trans);
   }, [connectToPeer, appendLog]);
 

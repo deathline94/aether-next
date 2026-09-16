@@ -50,6 +50,7 @@ pub enum H3HeaderMode {
 
 impl H3HeaderMode {
     /// Resolve from `AETHER_MASQUE_H3_HEADERS` (default: `standard`).
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         match crate::runtime_env::var("AETHER_MASQUE_H3_HEADERS")
             .unwrap_or_default()
@@ -115,48 +116,50 @@ impl H3DgramMode {
 }
 
 pub fn connect_ip_request(authority: &str, path: &str) -> Vec<h3::Header> {
-    connect_ip_request_mode(authority, path, H3HeaderMode::from_env())
+    vec![
+        h3::Header::new(b":method", b"CONNECT"),
+        h3::Header::new(b":protocol", consts::CF_CONNECT_PROTOCOL.as_bytes()),
+        h3::Header::new(b":scheme", b"https"),
+        h3::Header::new(b":authority", authority.as_bytes()),
+        h3::Header::new(b":path", path.as_bytes()),
+        h3::Header::new(b"user-agent", b""),
+        h3::Header::new(b"capsule-protocol", b"?1"),
+    ]
 }
 
-/// Build the CONNECT-IP request headers for a given recipe (pure; used by tests).
+/// Build the CONNECT-IP request headers for a given recipe (used by test harnesses).
+#[allow(dead_code)]
 pub fn connect_ip_request_mode(authority: &str, path: &str, mode: H3HeaderMode) -> Vec<h3::Header> {
-    let want_ext = matches!(mode, H3HeaderMode::Standard | H3HeaderMode::Both);
-    let want_cf = matches!(mode, H3HeaderMode::Cf | H3HeaderMode::Both);
-
-    let mut h = vec![h3::Header::new(b":method", b"CONNECT")];
-    if want_ext {
-        // RFC 9220/9484 extended CONNECT requires :protocol, :scheme, :path.
-        // Cloudflare's MASQUE H3 requires `:protocol: cf-connect-ip` (its custom
-        // value, NOT the RFC 9484 `connect-ip` which Cloudflare answers with 403).
-        // Proven live: cf-connect-ip -> 200 + data-plane; connect-ip -> 403.
-        // Override via env for diagnostics.
-        let proto = crate::runtime_env::var("AETHER_MASQUE_H3_PROTOCOL")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| consts::CF_CONNECT_PROTOCOL.to_string());
-        h.push(h3::Header::new(b":protocol", proto.as_bytes()));
-        h.push(h3::Header::new(b":scheme", b"https"));
-        h.push(h3::Header::new(b":authority", authority.as_bytes()));
-        h.push(h3::Header::new(b":path", path.as_bytes()));
-    } else {
-        // Classic CONNECT authority-form: only :method + :authority (matches H2).
-        h.push(h3::Header::new(b":authority", authority.as_bytes()));
+    match mode {
+        H3HeaderMode::Standard => connect_ip_request(authority, path),
+        H3HeaderMode::Cf => {
+            vec![
+                h3::Header::new(b":method", b"CONNECT"),
+                h3::Header::new(b":authority", authority.as_bytes()),
+                h3::Header::new(b"user-agent", b""),
+                h3::Header::new(
+                    consts::CF_CONNECT_PROTO_HEADER.as_bytes(),
+                    consts::CF_CONNECT_PROTOCOL.as_bytes(),
+                ),
+                h3::Header::new(
+                    consts::CF_PQ_ENABLED_HEADER.as_bytes(),
+                    consts::CF_PQ_ENABLED_VALUE.as_bytes(),
+                ),
+            ]
+        }
+        H3HeaderMode::Both => {
+            let mut h = connect_ip_request(authority, path);
+            h.push(h3::Header::new(
+                consts::CF_CONNECT_PROTO_HEADER.as_bytes(),
+                consts::CF_CONNECT_PROTOCOL.as_bytes(),
+            ));
+            h.push(h3::Header::new(
+                consts::CF_PQ_ENABLED_HEADER.as_bytes(),
+                consts::CF_PQ_ENABLED_VALUE.as_bytes(),
+            ));
+            h
+        }
     }
-    h.push(h3::Header::new(b"user-agent", b""));
-    if want_cf {
-        h.push(h3::Header::new(
-            consts::CF_CONNECT_PROTO_HEADER.as_bytes(),
-            consts::CF_CONNECT_PROTOCOL.as_bytes(),
-        ));
-        h.push(h3::Header::new(
-            consts::CF_PQ_ENABLED_HEADER.as_bytes(),
-            consts::CF_PQ_ENABLED_VALUE.as_bytes(),
-        ));
-    }
-    if want_ext {
-        h.push(h3::Header::new(b"capsule-protocol", b"?1"));
-    }
-    h
 }
 
 pub fn quarter_stream_id(stream_id: u64) -> u64 {
