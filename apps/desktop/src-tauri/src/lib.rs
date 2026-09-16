@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -598,7 +598,7 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
     ok.then(|| host.to_string())
 }
 
-fn file_sha256_hex(path: &PathBuf) -> Result<String, String> {
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
     #[cfg(windows)]
     {
         let out = Command::new("certutil")
@@ -889,7 +889,7 @@ fn get_state(state: State<'_, AppState>) -> RuntimeState {
 fn is_admin() -> bool {
     #[cfg(windows)]
     {
-        return elevation::is_elevated();
+        elevation::is_elevated()
     }
     #[cfg(not(windows))]
     {
