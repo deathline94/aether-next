@@ -1242,6 +1242,14 @@ fn scan(
             "AETHER_MASQUE_HTTP2",
             if protocol == "masque-h2" { "1" } else { "0" },
         )
+        .env(
+            "AETHER_QUIC_INITIAL_FRAG",
+            if settings.quic_initial_frag {
+                settings.quic_initial_frag_size.clamp(16, 512).to_string()
+            } else {
+                "0".to_string()
+            },
+        )
         // Control channel so Stop can cooperatively cancel (persist best-so-far)
         // instead of SIGKILL mid cache-write.
         .env("AETHER_CONTROL_STDIN", "1")

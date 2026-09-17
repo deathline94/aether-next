@@ -172,18 +172,22 @@ export function ConnectionTab({
       {/* ─── Banners ──────────────────────────────────────────────────────── */}
       {runtime.status === "error" && (
         <div className="error-banner" role="alert">
-          <CircleAlert size={18} aria-hidden="true" />
-          <span>{runtime.detail}</span>
-          <button type="button" onClick={() => void dismissError()} aria-label="Dismiss error">
-            <X size={17} aria-hidden="true" />
+          <div className="error-banner-content">
+            <CircleAlert size={17} aria-hidden="true" />
+            <span>{runtime.detail}</span>
+          </div>
+          <button type="button" className="error-banner-dismiss" onClick={() => void dismissError()} aria-label="Dismiss error">
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
       )}
 
       {updateAvailable && (
         <div className="update-banner">
-          <Sparkles size={18} aria-hidden="true" />
-          <span>Aether {updateAvailable.version} is ready. Restart or click to update!</span>
+          <div className="error-banner-content">
+            <Sparkles size={17} aria-hidden="true" />
+            <span>Aether {updateAvailable.version} is ready. Restart or click to update!</span>
+          </div>
           <button
             type="button"
             onClick={() => invoke("plugin:opener|open_url", { url: updateAvailable.url }).catch(() => window.open(updateAvailable.url, "_blank"))}
@@ -198,8 +202,14 @@ export function ConnectionTab({
 
       {settings.peer && (
         <div className="pinned-peer-bar">
-          <span>Targeting forced endpoint: <code>{settings.peer}</code></span>
-          <button type="button" onClick={() => patchSettings({ peer: "" })}>Clear (Scan dynamically)</button>
+          <div className="pinned-peer-info">
+            <Sparkles size={15} aria-hidden="true" />
+            <span>Targeting forced endpoint:</span>
+            <code>{settings.peer}</code>
+          </div>
+          <button type="button" className="pinned-peer-clear-btn" onClick={() => patchSettings({ peer: "" })}>
+            Clear (Scan dynamically)
+          </button>
         </div>
       )}
 

@@ -165,6 +165,7 @@ class EngineRunner(
 
             val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
             val isH2 = protocol == "masque-h2"
+            val settings = SettingsStore.load(context)
 
             val pb = ProcessBuilder(binary.absolutePath).apply {
                 directory(context.filesDir)
@@ -181,6 +182,10 @@ class EngineRunner(
                     put("AETHER_CONFIG", configPath)
                     put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
                     put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
+                    put(
+                        "AETHER_QUIC_INITIAL_FRAG",
+                        if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0",
+                    )
                     put("AETHER_TUN", "0")
                     put("AETHER_WG_NO_PROFILE_RETRY", "1")
                     // Control channel so stop() can cancel the scan gracefully.

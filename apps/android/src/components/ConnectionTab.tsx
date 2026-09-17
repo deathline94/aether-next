@@ -1,7 +1,7 @@
 import {
   Activity, Cable, Check, CircleAlert, Copy, Cpu,
   FlaskConical, Gauge, Globe2, ListRestart, LockKeyhole, Network,
-  Power, Route, ShieldCheck, TerminalSquare, WifiOff, X,
+  Power, Route, ShieldCheck, Sparkles, TerminalSquare, WifiOff, X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { platformLabel } from "../bridge";
@@ -170,18 +170,26 @@ export function ConnectionTab({
       {/* ─── Error Banner ─────────────────────────────────────────────────── */}
       {runtime.status === "error" && (
         <div className="error-banner" role="alert">
-          <CircleAlert size={18} aria-hidden="true" />
-          <span>{runtime.detail}</span>
-          <button type="button" onClick={() => void dismissError()} aria-label="Dismiss error">
-            <X size={17} aria-hidden="true" />
+          <div className="error-banner-content">
+            <CircleAlert size={17} aria-hidden="true" />
+            <span>{runtime.detail}</span>
+          </div>
+          <button type="button" className="error-banner-dismiss" onClick={() => void dismissError()} aria-label="Dismiss error">
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
       )}
 
       {settings.peer && (
         <div className="pinned-peer-bar">
-          <span>Targeting forced endpoint: <code>{settings.peer}</code></span>
-          <button type="button" onClick={() => patchSettings({ peer: "" })}>Clear (Scan dynamically)</button>
+          <div className="pinned-peer-info">
+            <Sparkles size={15} aria-hidden="true" />
+            <span>Targeting forced endpoint:</span>
+            <code>{settings.peer}</code>
+          </div>
+          <button type="button" className="pinned-peer-clear-btn" onClick={() => patchSettings({ peer: "" })}>
+            Clear (Scan dynamically)
+          </button>
         </div>
       )}
 

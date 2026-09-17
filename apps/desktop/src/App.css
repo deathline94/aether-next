@@ -1775,11 +1775,14 @@ code, kbd, pre {
 .stepper-input-wrapper {
   display: inline-flex;
   align-items: center;
+  justify-content: space-between;
   background: #07090b;
   border: 1px solid var(--border-card);
   border-radius: 7px;
   overflow: hidden;
   height: 36px;
+  width: 140px;
+  box-sizing: border-box;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 .stepper-input-wrapper:focus-within {
@@ -1791,18 +1794,19 @@ code, kbd, pre {
   cursor: not-allowed;
 }
 .stepper-btn {
-  width: 28px;
+  width: 32px;
   height: 100%;
   display: grid;
   place-items: center;
   background: rgba(255, 255, 255, 0.03);
   border: 0;
   color: var(--muted);
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 700;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, transform 0.1s;
   padding: 0;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s, transform 0.1s;
 }
 .stepper-btn:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.08);
@@ -1822,10 +1826,11 @@ code, kbd, pre {
   background: transparent;
   color: #ffffff;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
   text-align: center;
-  width: 62px;
+  flex: 1;
+  min-width: 0;
   padding: 0 4px;
 }
 .clean-number-input::-webkit-inner-spin-button,
@@ -2333,6 +2338,145 @@ code, kbd, pre {
   box-shadow: 0 0 14px rgba(0, 240, 138, 0.25);
 }
 .connect-direct-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ─── Connection Banners ─────────────────────────────────────────────────── */
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 16px;
+  border-radius: 9px;
+  background: rgba(255, 92, 92, 0.08);
+  border: 1px solid var(--coral-border);
+  color: #ff8585;
+  font-size: 12.5px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35), var(--inner-highlight);
+}
+.error-banner-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+.error-banner-content svg {
+  flex-shrink: 0;
+  color: #ff5c5c;
+}
+.error-banner-content span {
+  line-height: 1.45;
+  word-break: break-word;
+}
+.error-banner-dismiss {
+  background: transparent;
+  border: 0;
+  color: #ff8585;
+  cursor: pointer;
+  padding: 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  opacity: 0.75;
+  flex-shrink: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.error-banner-dismiss:hover {
+  opacity: 1;
+  background: rgba(255, 92, 92, 0.18);
+}
+.pinned-peer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  border-radius: 9px;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  color: #e0f2fe;
+  font-size: 12px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35), var(--inner-highlight);
+}
+.pinned-peer-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.pinned-peer-info svg {
+  color: #38bdf8;
+  flex-shrink: 0;
+}
+.pinned-peer-info code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  color: #38bdf8;
+  letter-spacing: 0.02em;
+}
+.pinned-peer-clear-btn {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+.pinned-peer-clear-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 9px;
+  background: var(--emerald-dim);
+  border: 1px solid var(--emerald-border);
+  color: var(--emerald);
+  font-size: 12.5px;
+  margin-top: 4px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.update-banner button:not(.banner-dismiss) {
+  background: var(--emerald);
+  color: #05140d;
+  font-weight: 700;
+  font-size: 11.5px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  border: 0;
+  cursor: pointer;
+}
+.banner-dismiss {
+  background: transparent;
+  border: 0;
+  color: var(--emerald);
+  cursor: pointer;
+  padding: 4px;
+  opacity: 0.75;
+}
+.banner-dismiss:hover {
+  opacity: 1;
+}
 
 /* ─── Activity Tab (Terminal Console) ─────────────────────────────────────── */
 .tactical-activity-view {

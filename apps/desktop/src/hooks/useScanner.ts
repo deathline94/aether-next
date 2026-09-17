@@ -4,6 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 
+function isProtocolMatch(endpointProtocol: string, scanProtocol: string): boolean {
+  const norm = (endpointProtocol || "").toLowerCase();
+  if (scanProtocol === "masque-h3") return norm.includes("h3");
+  if (scanProtocol === "masque-h2") return norm.includes("h2");
+  if (scanProtocol === "wireguard") return norm.includes("wireguard") || norm.includes("wg");
+  return false;
+}
+
 export function useScanner(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
   running: boolean,
@@ -95,7 +103,7 @@ export function useScanner(
     if (busy || active) return;
     clearLogs?.();
     setBusy(true);
-    setEndpoints([]);
+    setEndpoints((prev) => prev.filter((e) => !isProtocolMatch(e.protocol, protocol)));
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
       level: "info",

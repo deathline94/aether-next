@@ -122,7 +122,7 @@ export function NumberField({
         inputMode="numeric"
         min={min}
         max={max}
-        step={step}
+        step="any"
         value={draft}
         disabled={disabled}
         aria-label={label}
@@ -147,12 +147,12 @@ export function NumberField({
 }
 
 export function Badge({
-  variant = "emerald",
   children,
+  variant = "emerald",
   className = "",
 }: {
-  variant?: "emerald" | "cyan" | "amber" | "coral" | "violet" | "muted";
   children: React.ReactNode;
+  variant?: "emerald" | "cyan" | "amber" | "coral" | "violet" | "muted";
   className?: string;
 }) {
   return (

@@ -122,7 +122,7 @@ export function NumberField({
         inputMode="numeric"
         min={min}
         max={max}
-        step={step}
+        step="any"
         value={draft}
         disabled={disabled}
         aria-label={label}

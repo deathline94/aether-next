@@ -240,7 +240,7 @@ fn random_scid() -> [u8; 16] {
 
 pub const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
 pub const QUIC_V2_BAIT_LEN: usize = 1200;
-pub const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
+pub const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 1;
 
 pub fn quic_v2_bait_enabled() -> bool {
     let val = crate::runtime_env::var("AETHER_QUIC_V2")
@@ -1177,8 +1177,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                     let mut dp_body = vec![0u8; 65535];
                                     send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
                                     flush_to(&mut conn, &sock, p.peer).await?;
-                                    // Wait for data-plane reply (up to 2s).
-                                    let dp_deadline = Instant::now() + Duration::from_secs(2).min(remaining(deadline));
+                                    // Wait for data-plane reply (up to 3.5s).
+                                    let dp_deadline = Instant::now() + Duration::from_millis(3500).min(remaining(deadline));
                                     let mut dp_successes: u32 = 0;
                                     loop {
                                         if Instant::now() >= dp_deadline {
