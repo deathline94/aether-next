@@ -23,7 +23,7 @@ function App() {
   const [view, setView] = useState<View>("home");
 
   const {
-    logs, setLogs, logFilter, setLogFilter, appendLog,
+    logs, setLogs, clearLogs, logFilter, setLogFilter, appendLog,
     visibleLogs, hasMore, filterCounts, logEndRef, autoScroll, setAutoScroll,
   } = useLogs();
 
@@ -31,9 +31,9 @@ function App() {
     settings, runtime, busy, testBusy, saved, admin, testResult, appVersion, updateAvailable,
     connected, running, settingsLocked, settingsLoaded,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
-  } = useRuntime(appendLog);
+  } = useRuntime(appendLog, clearLogs);
 
-  const scanner = useScanner(appendLog, running);
+  const scanner = useScanner(appendLog, running, clearLogs);
 
   // Global keyboard shortcuts for navigation (1-4 when not inside input elements)
   useEffect(() => {

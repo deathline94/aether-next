@@ -7,7 +7,10 @@ import type { RuntimeState, Settings } from "../types";
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
 
-export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void) {
+export function useRuntime(
+  appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
+  clearLogs?: () => void,
+) {
   const [settings, setSettings] = useState<Settings>(defaults);
   // Settings must not be editable until hydrated from disk — otherwise a
   // patch during that window persists `defaults` over the user's config.
@@ -147,6 +150,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
 
   const toggleConnection = useCallback(async () => {
     if (busy) return;
+    clearLogs?.();
     setBusy(true);
     setTestResult(null);
     try {
@@ -163,10 +167,11 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog]);
+  }, [busy, running, settings, appendLog, clearLogs]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busy) return;
+    clearLogs?.();
     setBusy(true);
     try {
       if (running) {
@@ -186,9 +191,10 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog]);
+  }, [busy, running, settings, appendLog, clearLogs]);
 
   const runTest = useCallback(async () => {
+    clearLogs?.();
     setTestBusy(true);
     setTestResult(null);
     try {
@@ -202,7 +208,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setTestBusy(false);
     }
-  }, [settings, appendLog]);
+  }, [settings, appendLog, clearLogs]);
 
   const dismissError = useCallback(async () => {
     try { await invoke("disconnect"); } catch { /* already stopped */ }

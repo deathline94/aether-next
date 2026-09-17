@@ -32,9 +32,9 @@ function App() {
     settings, runtime, busy, testBusy, saved, admin, testResult, appVersion,
     connected, running, settingsLocked, settingsLoaded,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
-  } = useRuntime(appendLog);
+  } = useRuntime(appendLog, clearLogs);
 
-  const scanner = useScanner(appendLog, running);
+  const scanner = useScanner(appendLog, running, clearLogs);
 
   const connectDirect = useCallback((item: DiscoveredEndpoint) => {
     // Case-insensitive: the engine reports "MASQUE H3", "masque-h3", etc.

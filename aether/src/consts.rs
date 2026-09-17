@@ -48,3 +48,31 @@ pub const CF_PQ_ENABLED_HEADER: &str = "pq-enabled";
 pub const CF_PQ_ENABLED_VALUE: &str = "false";
 
 pub const CONNECT_IP_CONTEXT_ID: u64 = 0;
+
+#[allow(dead_code)]
+pub const CDN_ANYCAST_POOL: &[&str] = &[
+    "104.16.0.0",
+    "104.17.0.0",
+    "104.18.0.0",
+    "104.19.0.0",
+    "104.20.0.0",
+    "104.21.0.0",
+    "104.22.0.0",
+    "104.24.0.0",
+    "104.25.0.0",
+    "104.26.0.0",
+    "104.27.0.0",
+    "104.28.0.0",
+    "172.64.0.0",
+    "172.65.0.0",
+    "172.66.0.0",
+    "172.67.0.0",
+    "188.114.96.0",
+    "188.114.97.0",
+    "188.114.98.0",
+    "188.114.99.0",
+];
+
+#[allow(dead_code)]
+pub const QUIC_PORT: u16 = 443;
+

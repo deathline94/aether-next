@@ -1,7 +1,9 @@
-import { Check, Copy, Network, Radio, Search, X, Zap } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
+
+type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
 
 interface ScannerTabProps {
   protocol: "masque-h3" | "masque-h2" | "wireguard";
@@ -68,6 +70,36 @@ export function ScannerTab({
   startScan, stopScan,
   connectDirect, connectBusy,
 }: ScannerTabProps) {
+  const [protoFilter, setProtoFilter] = useState<ProtoFilter>("all");
+
+  const filteredEndpoints = useMemo(() => {
+    if (protoFilter === "all") return endpoints;
+    return endpoints.filter((e) => {
+      const p = e.protocol.toLowerCase();
+      if (protoFilter === "wireguard") return p.includes("wireguard") || p.includes("wg");
+      if (protoFilter === "masque-h3") return p.includes("h3");
+      if (protoFilter === "masque-h2") return p.includes("h2");
+      return false;
+    });
+  }, [endpoints, protoFilter]);
+
+  const h3Count = useMemo(
+    () => endpoints.filter((e) => e.protocol.toLowerCase().includes("h3")).length,
+    [endpoints]
+  );
+  const h2Count = useMemo(
+    () => endpoints.filter((e) => e.protocol.toLowerCase().includes("h2")).length,
+    [endpoints]
+  );
+  const wgCount = useMemo(
+    () =>
+      endpoints.filter((e) => {
+        const p = e.protocol.toLowerCase();
+        return p.includes("wireguard") || p.includes("wg");
+      }).length,
+    [endpoints]
+  );
+
   const progressPct = scanState.total > 0
     ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
     : 0;
@@ -75,10 +107,10 @@ export function ScannerTab({
   return (
     <div className="scanner-view">
       {/* ─── Scanner Radar HUD Panel ───────────────────────────────────────── */}
-      <section className="settings-section radar-hud-container">
+      <section className="settings-section radar-hud-container" aria-label="Edge Radar Prober">
         <div className="section-heading">
           <div>
-            <p>STANDALONE ENGINE PROBER</p>
+            <p className="panel-eyebrow">STANDALONE ENGINE PROBER</p>
             <h3>Cloudflare Edge Scanner</h3>
           </div>
           <Radio size={20} className={active ? "spin-icon" : ""} aria-hidden="true" />
@@ -107,91 +139,6 @@ export function ScannerTab({
                 : "Probe Cloudflare IP pools directly to find zero-loss, low-latency edge endpoints before establishing the tunnel."}
             </p>
           </div>
-        </div>
-
-        {/* Configuration Controls */}
-        <div className="setting-row">
-          <div>
-            <strong>Target Protocol</strong>
-            <span>Service carrier used for probing edge handshakes</span>
-          </div>
-          <Segmented
-            label="Target protocol"
-            value={protocol}
-            options={[
-              { value: "masque-h3", label: "MASQUE H3" },
-              { value: "masque-h2", label: "MASQUE H2" },
-              { value: "wireguard", label: "WireGuard" },
-            ]}
-            onChange={setProtocol}
-            disabled={active}
-          />
-        </div>
-
-        <div className="setting-row">
-          <div>
-            <strong>IP Family</strong>
-            <span>Address family pool to enumerate and probe</span>
-          </div>
-          <Segmented
-            label="IP family"
-            value={ipScan}
-            options={[
-              { value: "v4", label: "IPv4 Only" },
-              { value: "v6", label: "IPv6 Only" },
-              { value: "both", label: "Dual-Stack" },
-            ]}
-            onChange={setIpScan}
-            disabled={active}
-          />
-        </div>
-
-        <div className="setting-row input-row">
-          <label>
-            <span>Concurrency (Workers)</span>
-            <NumberField
-              label="Scan concurrency"
-              min={1}
-              max={2000}
-              step={10}
-              value={concurrency}
-              disabled={active}
-              onCommit={setConcurrency}
-            />
-          </label>
-          <label>
-            <span>Timeout (ms)</span>
-            <NumberField
-              label="Per-probe timeout in milliseconds"
-              min={100}
-              max={30000}
-              step={100}
-              value={timeoutMs}
-              disabled={active}
-              onCommit={setTimeoutMs}
-            />
-          </label>
-        </div>
-
-        <div className="setting-row">
-          <div>
-            <strong>Handshake Obfuscation</strong>
-            <span>{protocol === "masque-h2" ? "UDP noise is not applicable for H2 (TCP)" : "Anti-DPI noise profile injected during probe"}</span>
-          </div>
-          <select
-            aria-label="Obfuscation noise profile for probes"
-            className="tactical-select"
-            value={protocol === "masque-h2" ? "off" : noize}
-            disabled={active || protocol === "masque-h2"}
-            onChange={(e) => setNoize(e.target.value)}
-          >
-            <option value="off">Off — no noise</option>
-            <option value="light">Light — low noise</option>
-            <option value="medium">Medium — default</option>
-            <option value="high">High — stronger</option>
-            <option value="max">Max — highest noise</option>
-            <option value="custom">Custom — manual values</option>
-          </select>
         </div>
 
         {/* Scan Progress Bar & Live Telemetry */}
@@ -247,6 +194,112 @@ export function ScannerTab({
         </div>
       </section>
 
+      {/* ─── Probe Parameters Configuration Card ───────────────────────────── */}
+      <section className="settings-section tactical-panel" aria-label="Probe Parameters">
+        <div className="section-heading">
+          <div>
+            <p className="panel-eyebrow">PROBE PARAMETERS</p>
+            <h3>Engine Handshake Configuration</h3>
+          </div>
+          <SlidersHorizontal size={20} className="panel-head-icon" aria-hidden="true" />
+        </div>
+
+        {/* Configuration Controls */}
+        <div className="setting-row">
+          <div>
+            <strong>Target Protocol</strong>
+            <span>Service carrier used for probing edge handshakes</span>
+          </div>
+          <Segmented
+            label="Target protocol"
+            value={protocol}
+            options={[
+              { value: "masque-h3", label: "MASQUE H3" },
+              { value: "masque-h2", label: "MASQUE H2" },
+              { value: "wireguard", label: "WireGuard" },
+            ]}
+            onChange={setProtocol}
+            disabled={active}
+          />
+        </div>
+
+        <div className="setting-row">
+          <div>
+            <strong>IP Family</strong>
+            <span>Address family pool to enumerate and probe</span>
+          </div>
+          <Segmented
+            label="IP family"
+            value={ipScan}
+            options={[
+              { value: "v4", label: "IPv4 Only" },
+              { value: "v6", label: "IPv6 Only" },
+              { value: "both", label: "Dual-Stack" },
+            ]}
+            onChange={setIpScan}
+            disabled={active}
+          />
+        </div>
+
+        <div className="setting-row input-row">
+          <div className="param-field-block">
+            <label>
+              <div className="field-meta">
+                <strong>Concurrency (Workers)</strong>
+                <span className="field-hint">1–2000 active</span>
+              </div>
+              <NumberField
+                label="Scan concurrency"
+                min={1}
+                max={2000}
+                step={10}
+                value={concurrency}
+                disabled={active}
+                onCommit={setConcurrency}
+              />
+            </label>
+          </div>
+          <div className="param-field-block">
+            <label>
+              <div className="field-meta">
+                <strong>Timeout (ms)</strong>
+                <span className="field-hint">100–30000 ms</span>
+              </div>
+              <NumberField
+                label="Per-probe timeout in milliseconds"
+                min={100}
+                max={30000}
+                step={100}
+                value={timeoutMs}
+                disabled={active}
+                onCommit={setTimeoutMs}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div className="setting-row">
+          <div>
+            <strong>Handshake Obfuscation</strong>
+            <span>{protocol === "masque-h2" ? "UDP noise is not applicable for H2 (TCP)" : "Anti-DPI noise profile injected during probe"}</span>
+          </div>
+          <select
+            aria-label="Obfuscation noise profile for probes"
+            className="tactical-select"
+            value={protocol === "masque-h2" ? "off" : noize}
+            disabled={active || protocol === "masque-h2"}
+            onChange={(e) => setNoize(e.target.value)}
+          >
+            <option value="off">Off — no noise</option>
+            <option value="light">Light — low noise</option>
+            <option value="medium">Medium — default</option>
+            <option value="high">High — stronger</option>
+            <option value="max">Max — highest noise</option>
+            <option value="custom">Custom — manual values</option>
+          </select>
+        </div>
+      </section>
+
       {/* ─── Discovered Endpoints Section ─────────────────────────────────── */}
       <section className="discovered-panel">
         <div className="section-heading">
@@ -257,15 +310,66 @@ export function ScannerTab({
           <Network size={20} aria-hidden="true" />
         </div>
 
-        {endpoints.length === 0 ? (
+        {endpoints.length > 0 && (
+          <div className="discovered-proto-dock" role="tablist" aria-label="Filter by protocol">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={protoFilter === "all"}
+              className={`proto-tab ${protoFilter === "all" ? "active" : ""}`}
+              onClick={() => setProtoFilter("all")}
+            >
+              <span>All Protocols</span>
+              <span className="chip-count tabular-nums">{endpoints.length}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={protoFilter === "masque-h3"}
+              className={`proto-tab ${protoFilter === "masque-h3" ? "active" : ""}`}
+              onClick={() => setProtoFilter("masque-h3")}
+            >
+              <span>MASQUE H3</span>
+              <span className="chip-count tabular-nums">{h3Count}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={protoFilter === "masque-h2"}
+              className={`proto-tab ${protoFilter === "masque-h2" ? "active" : ""}`}
+              onClick={() => setProtoFilter("masque-h2")}
+            >
+              <span>MASQUE H2</span>
+              <span className="chip-count tabular-nums">{h2Count}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={protoFilter === "wireguard"}
+              className={`proto-tab ${protoFilter === "wireguard" ? "active" : ""}`}
+              onClick={() => setProtoFilter("wireguard")}
+            >
+              <span>WireGuard</span>
+              <span className="chip-count tabular-nums">{wgCount}</span>
+            </button>
+          </div>
+        )}
+
+        {filteredEndpoints.length === 0 ? (
           <div className="empty-logs">
             <Search size={28} aria-hidden="true" />
-            <strong>No edge gateways discovered yet</strong>
-            <span>Launch a standalone scan above to locate the fastest Cloudflare IP candidates.</span>
+            <strong>
+              {endpoints.length === 0 ? "No edge gateways discovered yet" : "No endpoints found for this protocol"}
+            </strong>
+            <span>
+              {endpoints.length === 0
+                ? "Launch a standalone scan above to locate the fastest Cloudflare IP candidates."
+                : "Select another protocol filter or launch a new scan."}
+            </span>
           </div>
         ) : (
           <div className="discovered-list">
-            {endpoints.map((item) => {
+            {filteredEndpoints.map((item) => {
               const { tierClass, badgeText } = getRttTier(item.rttMs);
               return (
                 <div className="discovered-row" key={item.addr}>

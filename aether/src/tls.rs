@@ -38,10 +38,9 @@ pub fn install_pin_verification(
         let Some(hash) = spki_sha256(leaf) else { return false };
         let matched = pins.iter().any(|pin| pin.as_slice() == hash.as_slice());
         if !matched {
-            log::warn!(
-                "[tls] SPKI pin mismatch: {:02x?} — refusing connection. If Cloudflare rotated \
-                 their edge certificate, update consts::MASQUE_PINS. Debug-only escape hatch: \
-                 set AETHER_MASQUE_DISABLE_SPKI_PINS=1",
+            log::debug!(
+                "[tls] SPKI pin mismatch: {:02x?} — rejecting candidate. If Cloudflare rotated \
+                 their edge certificate, update consts::MASQUE_PINS.",
                 &hash[..8]
             );
         }

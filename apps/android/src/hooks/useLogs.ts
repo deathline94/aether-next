@@ -5,18 +5,30 @@ const MAX_LOGS = 1000;
 /** Cap rendered entries for performance; full buffer is still exportable. */
 export const RENDER_CAP = 200;
 
+const IP_SOCKET_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b|\[?[0-9a-fA-F:]{4,}\]?(?::\d+)?/;
+
 // Single source of truth for filter predicates — tab counts and the visible
 // list must always agree.
-const isHit = (l: LogEntry) =>
-  l.message.includes("candidate ok") ||
-  l.message.includes("Tier-0") ||
-  l.message.includes("gateway") ||
-  l.message.includes("EndpointSelected") ||
-  l.message.includes("scan_hit");
+const isHit = (l: LogEntry) => {
+  if (!IP_SOCKET_REGEX.test(l.message)) return false;
+  return (
+    l.message.includes("candidate ok") ||
+    l.message.includes("Tier-0") ||
+    l.message.includes("scan_hit") ||
+    l.message.includes("EndpointSelected") ||
+    l.message.includes("verified") ||
+    l.message.includes("Selected edge") ||
+    l.message.includes("best:")
+  );
+};
 const isError = (l: LogEntry) => l.level === "error" || l.level === "warn";
 // milestones: hide noisy progress lines
 const isMilestone = (l: LogEntry) =>
-  !l.message.includes("scanning...") && !l.message.includes("probe src");
+  !l.message.includes("scanning...") &&
+  !l.message.includes("probe src") &&
+  !l.message.includes("probe candidate failed") &&
+  !l.message.includes("probe timeout") &&
+  !l.message.includes("candidate rejected");
 
 const predicates: Record<LogFilter, (l: LogEntry) => boolean> = {
   milestones: isMilestone,
@@ -38,7 +50,10 @@ export function useLogs() {
     setLogs((current) => [...current.slice(-(MAX_LOGS - 1)), full]);
   }, []);
 
-  const clearLogs = useCallback(() => setLogs([]), []);
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+    nextIdRef.current = 0;
+  }, []);
 
   const filteredLogs = useMemo(() => logs.filter(predicates[logFilter]), [logs, logFilter]);
 

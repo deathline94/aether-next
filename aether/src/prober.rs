@@ -639,9 +639,10 @@ fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpSc
         if deduped.is_empty() { vec![443] } else { deduped }
     };
 
+    let is_masque = config.label.contains("gateway");
+
     // ── Port tiering: split ports into T1 (first), T2 (next), T3 (last) ──
     let (t1_ports, t2_ports, t3_ports): (Vec<u16>, Vec<u16>, Vec<u16>) = {
-        let is_masque = config.label.contains("gateway");
         if is_masque {
             let t1: Vec<u16> = dedup_ports.iter().copied().filter(|p| MASQUE_PORTS_T1.contains(p)).collect();
             let t2: Vec<u16> = dedup_ports.iter().copied().filter(|p| MASQUE_PORTS_T2.contains(p)).collect();
@@ -697,13 +698,16 @@ fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpSc
         }
     }
 
-    // CIDR sweep per tier (443-first for MASQUE, then T2, then T3). Runs AFTER the
-    // seed pairing so the shared `seen` set already holds the seeds; the sweep then
-    // naturally skips them and fills the tiers with fresh hosts. Extracted to a free
-    // fn — no more captured-closure borrow gymnastics over `seen`.
+    // CIDR sweep per tier.
+    // For MASQUE, standard Cloudflare CDN edges only listen on 443;
+    // the known-good seed VIPs (already queued above across all ports) handle alternate ports.
+    // Sweeping non-443 ports on thousands of generic CDN hosts causes futile timeouts.
+    // WireGuard uses multiple ports across all its prefixes.
     cidr_pool(config, st, ip, &t1_ports, &mut seen, &mut tier1_out);
-    cidr_pool(config, st, ip, &t2_ports, &mut seen, &mut tier2_out);
-    cidr_pool(config, st, ip, &t3_ports, &mut seen, &mut tier3_out);
+    if !is_masque {
+        cidr_pool(config, st, ip, &t2_ports, &mut seen, &mut tier2_out);
+        cidr_pool(config, st, ip, &t3_ports, &mut seen, &mut tier3_out);
+    }
 
     cap_and_order(seeds_out, tier1_out, tier2_out, tier3_out)
 }
@@ -895,68 +899,53 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const MASQUE_CIDRS_V4: &[&str] = &[
-    "162.159.36.0/24",
-    "162.159.46.0/24",
+    "162.159.196.0/24",
+    "162.159.195.0/24",
     "162.159.192.0/24",
     "162.159.193.0/24",
-    "162.159.195.0/24",
-    "162.159.196.0/24",
+    "162.159.204.0/24",
     "162.159.197.0/24",
     "162.159.198.0/24",
-    "162.159.204.0/24",
     "172.65.251.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
     "188.114.98.0/24",
     "188.114.99.0/24",
-    "8.34.146.0/24",
-    "8.39.214.0/24",
-    "8.39.204.0/24",
-    "8.6.112.0/24",
-    "8.35.211.0/24",
-    "8.39.125.0/24",
-    "8.47.69.0/24",
+    "162.159.36.0/24",
+    "162.159.46.0/24",
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
+    "162.159.196.1",
+    "162.159.195.1",
+    "162.159.192.1",
+    "162.159.197.3",
+    "162.159.197.1",
     "162.159.198.2",
     "162.159.198.1",
-    "162.159.192.1",
     "162.159.193.1",
-    "162.159.195.1",
-    "162.159.196.1",
-    "8.34.146.1",
-    "8.39.214.1",
-    "8.6.112.1",
 ];
 
 /// Ports ordered by priority: primary web TLS first, then secondary, then legacy.
-pub const MASQUE_PORTS: &[u16] = &[443, 8443, 4443, 8095, 2408, 500, 1701, 4500];
+pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
 /// MASQUE port tiers: Tier 1 scanned first, Tier 2 next, Tier 3 last.
 const MASQUE_PORTS_T1: &[u16] = &[443];
-const MASQUE_PORTS_T2: &[u16] = &[8443, 4443, 8095];
+const MASQUE_PORTS_T2: &[u16] = &[500, 1701, 4500];
 
 const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("162.159.198.0/24", 10),
-    ("162.159.192.0/24", 10),
+    ("162.159.197.0/24", 10),
+    ("162.159.192.0/24", 9),
     ("162.159.193.0/24", 9),
     ("162.159.195.0/24", 9),
     ("162.159.196.0/24", 8),
-    ("162.159.197.0/24", 8),
     ("188.114.96.0/24", 7),
     ("188.114.97.0/24", 7),
     ("188.114.98.0/24", 6),
     ("188.114.99.0/24", 6),
     ("162.159.204.0/24", 5),
     ("172.65.251.0/24", 4),
-    ("8.34.146.0/24", 3),
-    ("8.39.214.0/24", 3),
-    ("8.39.204.0/24", 3),
-    ("8.6.112.0/24", 2),
-    ("8.35.211.0/24", 2),
-    ("8.39.125.0/24", 2),
-    ("8.47.69.0/24", 2),
     // 162.159.36/46.0/24 are Cloudflare's 1.1.1.1 DNS-over-HTTPS ranges: they never
     // answer a MASQUE handshake, so weight them lowest (swept last) rather than
     // mid-pack where they waste probe budget ahead of ranges that actually work.

@@ -8,7 +8,10 @@ const SAVE_DEBOUNCE_MS = 400;
 /** If the engine stays "connecting" past this, surface a timeout instead of hanging forever. */
 const CONNECT_WATCHDOG_MS = 90_000;
 
-export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void) {
+export function useRuntime(
+  appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
+  clearLogs?: () => void,
+) {
   const [settings, setSettings] = useState<Settings>(defaults);
   // Settings must not be editable until hydrated from disk — otherwise a patch
   // during that window persists `defaults` over the user's real config.
@@ -137,6 +140,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
 
   const toggleConnection = useCallback(async () => {
     if (busy) return;
+    clearLogs?.();
     setBusy(true);
     setTestResult(null);
     try {
@@ -157,10 +161,11 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog]);
+  }, [busy, running, settings, appendLog, clearLogs]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: Settings["protocol"], transport: Settings["transport"]) => {
     if (busy) return;
+    clearLogs?.();
     setBusy(true);
     setTestResult(null);
     try {
@@ -180,9 +185,10 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog]);
+  }, [busy, running, settings, appendLog, clearLogs]);
 
   const runTest = useCallback(async () => {
+    clearLogs?.();
     setTestBusy(true);
     setTestResult(null);
     try {
@@ -196,7 +202,7 @@ export function useRuntime(appendLog: (entry: { level: "info" | "warn" | "error"
     } finally {
       setTestBusy(false);
     }
-  }, [settings, appendLog]);
+  }, [settings, appendLog, clearLogs]);
 
   const dismissError = useCallback(async () => {
     try { await invoke("disconnect"); } catch { /* already stopped */ }

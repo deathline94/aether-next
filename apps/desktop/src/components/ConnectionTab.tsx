@@ -203,6 +203,44 @@ export function ConnectionTab({
         </div>
       )}
 
+      {/* ─── Speed Profile Presets ────────────────────────────────────────── */}
+      <section className="profiles-panel" aria-label="Speed Profile Presets">
+        <div className="section-heading">
+          <div><p>PRESETS</p><h3>Speed Profiles</h3></div>
+          <Gauge size={20} aria-hidden="true" />
+        </div>
+        <div className="profile-grid">
+          {speedProfiles.map((profile) => {
+            const active = settingsLoaded && profileActive(settings, profile.patch);
+            return (
+              <button
+                key={profile.id}
+                type="button"
+                className={`profile-card ${active ? "active" : ""}`}
+                disabled={settingsLocked}
+                aria-pressed={active}
+                onClick={() => {
+                  if (settingsLocked || active) return;
+                  patchSettings({ ...profile.patch, peer: "" });
+                  appendLog({ level: "info", message: `Applied profile: ${profile.label} — ${profile.hint}` });
+                }}
+              >
+                <div className="profile-card-top">
+                  <strong>{profile.label}</strong>
+                  {active && <small className="profile-active-tag">ACTIVE</small>}
+                </div>
+                <span>{profile.hint}</span>
+              </button>
+            );
+          })}
+        </div>
+        {!admin && (
+          <p className="profile-note">
+            TUN routing requires running Aether as administrator and wintun.dll. Standard proxy mode is available without elevation.
+          </p>
+        )}
+      </section>
+
       {/* ─── Telemetry & Metrics Bento Grid (12-Column Asymmetric) ────────── */}
       <section className="telemetry-bento" aria-label="Tunnel Telemetry and Subsystem Status">
         {/* Card 1 (Span 7): Gateway Edge Route & Live Sparkline */}
@@ -381,44 +419,6 @@ export function ConnectionTab({
             <small className="bento-subtext">RUNTIME: <strong>RUST EMBEDDED ENGINE</strong></small>
           </div>
         </article>
-      </section>
-
-      {/* ─── Speed Profile Presets ────────────────────────────────────────── */}
-      <section className="profiles-panel">
-        <div className="section-heading">
-          <div><p>PRESETS</p><h3>Speed Profiles</h3></div>
-          <Gauge size={20} aria-hidden="true" />
-        </div>
-        <div className="profile-grid">
-          {speedProfiles.map((profile) => {
-            const active = settingsLoaded && profileActive(settings, profile.patch);
-            return (
-              <button
-                key={profile.id}
-                type="button"
-                className={`profile-card ${active ? "active" : ""}`}
-                disabled={settingsLocked}
-                aria-pressed={active}
-                onClick={() => {
-                  if (settingsLocked || active) return;
-                  patchSettings({ ...profile.patch, peer: "" });
-                  appendLog({ level: "info", message: `Applied profile: ${profile.label} — ${profile.hint}` });
-                }}
-              >
-                <div className="profile-card-top">
-                  <strong>{profile.label}</strong>
-                  {active && <small className="profile-active-tag">ACTIVE</small>}
-                </div>
-                <span>{profile.hint}</span>
-              </button>
-            );
-          })}
-        </div>
-        {!admin && (
-          <p className="profile-note">
-            TUN routing requires running Aether as administrator and wintun.dll. Standard proxy mode is available without elevation.
-          </p>
-        )}
       </section>
 
       {/* ─── Local Access Proxy Endpoints ──────────────────────────────────── */}

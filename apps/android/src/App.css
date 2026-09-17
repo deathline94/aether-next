@@ -1132,12 +1132,75 @@ code, kbd, pre {
   background: var(--emerald-dim);
 }
 
+/* ─── Speed Profile Presets ────────────────────────────────────────── */
+.profiles-panel {
+  margin-top: 16px;
+  border: 1px solid var(--border-card);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25), var(--inner-highlight);
+  overflow: hidden;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  padding: 18px 22px;
+}
+
+.profile-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  text-align: left;
+  gap: 6px;
+  min-height: 84px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #0d131a;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.18s var(--ease-spring);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.profile-card:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.28);
+  background: #131c26;
+  transform: translateY(-1px);
+}
+
+.profile-card:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.profile-card:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.profile-card.active {
+  border-color: var(--emerald);
+  background: linear-gradient(135deg, rgba(0, 240, 138, 0.1) 0%, #0d131a 100%);
+  box-shadow: 0 0 18px rgba(0, 240, 138, 0.16), inset 0 1px 1px rgba(0, 240, 138, 0.28);
+}
+
 .profile-card-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
+
+.profile-card-top strong {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.01em;
+}
+
 .profile-active-tag {
   padding: 1px 6px;
   border-radius: 4px;
@@ -1147,11 +1210,31 @@ code, kbd, pre {
   font-size: 9px;
   font-weight: 750;
   letter-spacing: 0.06em;
+  font-family: var(--font-mono);
 }
 
+.profile-card span,
+.profile-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--muted-light);
+  line-height: 1.45;
+  font-family: var(--font-mono);
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.profile-note {
+  margin: 0;
+  padding: 12px 22px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 11px;
+  color: var(--muted-dark);
+  line-height: 1.5;
+}
 
 /* ─── Proxy & Verification Panels ─────────────────────────────────────────── */
-.proxy-panel, .settings-section, .test-panel {
+.proxy-panel, .settings-section, .test-panel, .profiles-panel {
   margin-top: 16px;
   border: 1px solid var(--border-card);
   border-radius: 14px;
@@ -1515,18 +1598,23 @@ code, kbd, pre {
   font-weight: 600;
 }
 
-/* Port configuration row */
-.port-field-block {
+/* Port & Parameter configuration fields */
+.port-field-block,
+.param-field-block {
   flex: 1 1 200px;
+  min-width: 0;
 }
-.port-field-block label {
+.port-field-block label,
+.param-field-block label {
   display: grid;
   gap: 6px;
+  width: 100%;
 }
 .field-meta {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
+  gap: 8px;
 }
 .field-meta strong {
   font-size: 12px;
@@ -2065,6 +2153,56 @@ code, kbd, pre {
   overflow: hidden;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25), var(--inner-highlight);
 }
+.discovered-proto-dock {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.discovered-proto-dock::-webkit-scrollbar {
+  display: none;
+}
+.proto-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--border-card);
+  background: var(--panel-nested);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.16s var(--ease-spring);
+}
+.proto-tab:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  background: var(--panel-hover);
+}
+.proto-tab.active {
+  border-color: var(--emerald-border);
+  background: var(--emerald-dim);
+  color: var(--emerald);
+}
+.proto-tab .chip-count {
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted-light);
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.proto-tab.active .chip-count {
+  background: rgba(0, 240, 138, 0.2);
+  color: var(--emerald);
+}
 .discovered-list {
   padding: 14px 20px;
   display: flex;
@@ -2217,6 +2355,86 @@ code, kbd, pre {
   flex-direction: column;
   gap: 10px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4), var(--inner-highlight);
+}
+
+.scan-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.scan-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #fff;
+}
+
+.scan-title strong {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.phase-pill {
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--emerald-dim);
+  border: 1px solid var(--emerald-border);
+  color: var(--emerald);
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.scan-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scan-badges .badge {
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-card);
+  background: var(--panel-nested);
+  color: var(--muted-light);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.scan-badges .badge.concurrency {
+  border-color: rgba(56, 189, 248, 0.25);
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.scan-badges .badge.working {
+  border-color: var(--emerald-border);
+  color: var(--emerald);
+  background: var(--emerald-dim);
+}
+
+.scan-badges .badge.rtt {
+  border-color: rgba(250, 204, 21, 0.3);
+  color: #facc15;
+  background: rgba(250, 204, 21, 0.1);
+}
+
+.scan-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--font-mono);
 }
 
 .tactical-terminal-chassis {
@@ -2642,6 +2860,28 @@ code, kbd, pre {
   .telemetry-figures { grid-template-columns: 1fr; }
   .cipher-specs-grid, .daemon-metrics-row { grid-template-columns: 1fr; }
   
+  .profile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    padding: 14px 16px;
+  }
+  .param-field-block {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  .setting-row.input-row {
+    flex-direction: column;
+    gap: 14px;
+  }
+  .radar-telemetry-banner {
+    grid-template-columns: 72px 1fr;
+    gap: 14px;
+    padding: 14px 16px;
+  }
+  .radar-radar-scope {
+    width: 72px;
+    height: 72px;
+  }
   .endpoint-row { grid-template-columns: 1fr 36px; gap: 10px; }
   .endpoint-row code { grid-column: 1; grid-row: 2; max-width: 100%; min-width: 0; }
   .endpoint-row button { grid-column: 2; grid-row: 2; }
@@ -2654,6 +2894,17 @@ code, kbd, pre {
   .activity-actions { justify-content: flex-end; }
   .filter-chip { flex: 1 1 auto; justify-content: center; }
   .save-bar { flex-direction: column; gap: 8px; align-items: stretch; }
+}
+
+@media (max-width: 380px) {
+  .profile-grid {
+    grid-template-columns: 1fr;
+  }
+  .radar-telemetry-banner {
+    grid-template-columns: 1fr;
+    text-align: center;
+    justify-items: center;
+  }
 }
 
 

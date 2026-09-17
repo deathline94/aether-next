@@ -92,10 +92,11 @@ class AetherVpnService : VpnService() {
                 .setSession("Aether Next")
                 .setMtu(MTU)
                 .setBlocking(false)
-                // Same address scheme as SocksTun / hev defaults.
-                .addAddress(TUN_ADDR, 32)
+                // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
+                .addAddress(TUN_ADDR, 24)
                 .addDnsServer(MAPPED_DNS)
                 .addRoute("0.0.0.0", 0)
+                .addRoute("198.18.0.0", 15)
                 // IPv6 tunnel not implemented: blackhole IPv6 so traffic cannot bypass full VPN.
                 // Apps needing real IPv6 fail closed (no silent leak).
                 .addAddress(TUN_ADDR_V6, 128)
@@ -113,6 +114,14 @@ class AetherVpnService : VpnService() {
             }
             tun = established
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                try {
+                    setUnderlyingNetworks(null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "setUnderlyingNetworks failed: ${e.message}")
+                }
+            }
+
             val configPath = writeHevConfig(socksPort)
             Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")
             TProxyStartService(configPath, established.fd)
@@ -125,6 +134,7 @@ class AetherVpnService : VpnService() {
         val conf = File(noBackupFilesDir, "hev-socks5-tunnel.yml")
         // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
         // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
+        // network: 198.18.0.0/16 — RFC 2544 benchmark unicast space (valid routeable unicast, unlike 240.0.0.0/4).
         // icmp drop — avoid NTP/oracle side-channels from reply mode.
         val yaml = """
             |tunnel:
@@ -138,8 +148,8 @@ class AetherVpnService : VpnService() {
             |mapdns:
             |  address: $MAPPED_DNS
             |  port: 53
-            |  network: 240.0.0.0
-            |  netmask: 240.0.0.0
+            |  network: 198.18.0.0
+            |  netmask: 255.255.0.0
             |  cache-size: 10000
             |misc:
             |  task-stack-size: 81920

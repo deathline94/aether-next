@@ -11,6 +11,7 @@ import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 export function useScanner(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
   running: boolean,
+  clearLogs?: () => void,
 ) {
   const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
@@ -78,6 +79,7 @@ export function useScanner(
 
   const startScan = useCallback(async () => {
     if (busy || active) return;
+    clearLogs?.();
     setBusy(true);
     setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });

@@ -75,23 +75,36 @@ export function ActivityTab({
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const consoleRef = useRef<HTMLElement | null>(null);
 
+  const isProgrammaticScrollRef = useRef(false);
+
   useEffect(() => {
-    // "auto" not "smooth": queued smooth scrolls fight each other at scan-time
-    // log rates and jank the console.
-    if (autoScroll) logEndRef.current?.scrollIntoView({ behavior: "auto" });
+    // Direct container scroll lock + programmatic scroll guard so daemon log rates
+    // never trigger an accidental auto-scroll pause.
+    if (autoScroll && consoleRef.current) {
+      isProgrammaticScrollRef.current = true;
+      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
+      logEndRef.current?.scrollIntoView({ behavior: "auto" });
+      requestAnimationFrame(() => {
+        isProgrammaticScrollRef.current = false;
+      });
+    }
   }, [visibleLogs, autoScroll, logEndRef]);
 
   useEffect(() => () => {
     if (copyTimer.current) clearTimeout(copyTimer.current);
   }, []);
 
-  // Pause auto-scroll on any gesture away from the bottom; resume at the bottom.
+  // Pause auto-scroll on any user gesture away from the bottom; resume at the bottom.
   const handleScroll = () => {
+    if (isProgrammaticScrollRef.current) return;
     const el = consoleRef.current;
     if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    if (autoScroll && !atBottom) setAutoScroll(false);
-    else if (!autoScroll && atBottom) setAutoScroll(true);
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (autoScroll && distanceFromBottom > 60) {
+      setAutoScroll(false);
+    } else if (!autoScroll && distanceFromBottom <= 20) {
+      setAutoScroll(true);
+    }
   };
 
   const handleCopy = async () => {
@@ -165,7 +178,12 @@ export function ActivityTab({
               <button
                 type="button"
                 className="tactile-terminal-btn follow-btn"
-                onClick={() => setAutoScroll(true)}
+                onClick={() => {
+                  setAutoScroll(true);
+                  if (consoleRef.current) {
+                    consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
+                  }
+                }}
                 title="Resume auto-scroll"
                 aria-label="Resume auto-scroll"
               >
