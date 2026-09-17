@@ -116,5 +116,7 @@ class SettingsStore(context: Context) {
 
     companion object {
         private const val KEY_DEFAULTS_V102 = "defaults_v102"
+
+        fun load(context: Context): Settings = SettingsStore(context).load()
     }
 }

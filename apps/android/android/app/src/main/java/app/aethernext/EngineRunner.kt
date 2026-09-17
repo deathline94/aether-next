@@ -165,7 +165,7 @@ class EngineRunner(
 
             val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
             val isH2 = protocol == "masque-h2"
-            val settings = SettingsStore.load(context)
+            val settings = SettingsStore(context).load()
 
             val pb = ProcessBuilder(binary.absolutePath).apply {
                 directory(context.filesDir)
