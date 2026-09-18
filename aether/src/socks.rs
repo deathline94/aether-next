@@ -180,6 +180,17 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
     }
 }
 
+fn is_ipv4_only() -> bool {
+    matches!(
+        crate::runtime_env::var("AETHER_IP")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "4" | "v4" | "ipv4"
+    )
+}
+
 fn dns_prefer_order() -> Vec<u16> {
     // 1=A, 28=AAAA. Respect AETHER_IP when set.
     match crate::runtime_env::var("AETHER_IP")
@@ -464,11 +475,22 @@ async fn handle_connect(
         }
     };
 
+    if ip.is_ipv6() && is_ipv4_only() {
+        let _ = reply(&mut sock, REP_NOT_SUPPORTED).await;
+        return Err(AetherError::Other("IPv6 target rejected in IPv4-only mode".into()));
+    }
+
     let dst = SocketAddr::new(ip, port);
     // Belt-and-braces around the smoltcp socket connect-timeout (netstack): a
     // caller-side bound guarantees the client gets a SOCKS error reply instead
     // of hanging even if some other stall keeps the socket from resolving.
-    let conn = match tokio::time::timeout(Duration::from_secs(20), stack.open_tcp(dst)).await {
+    // IPv6 connections use a tighter 3s bound to avoid stalling Happy Eyeballs.
+    let connect_deadline = if ip.is_ipv6() {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(20)
+    };
+    let conn = match tokio::time::timeout(connect_deadline, stack.open_tcp(dst)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             let _ = reply(&mut sock, REP_GENERAL).await;
@@ -598,6 +620,9 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                 let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) else { continue };
                 match dst {
                     Target::Ip(ip) => {
+                        if ip.is_ipv6() && is_ipv4_only() {
+                            continue;
+                        }
                         let dst = SocketAddr::new(ip, payload.0);
                         if let Ok(mut map) = routes.lock() {
                             map.insert(dst, from);

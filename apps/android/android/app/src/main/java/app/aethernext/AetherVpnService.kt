@@ -4,8 +4,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -33,6 +37,8 @@ class AetherVpnService : VpnService() {
     private var hevStarted = false
     private var stopRequested = false
     private val lifecycleLock = Any()
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -94,18 +100,16 @@ class AetherVpnService : VpnService() {
                 .setBlocking(false)
                 // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
                 .addAddress(TUN_ADDR, 24)
+                // Exclusively advertise MAPPED_DNS so all lookups hit mapdns fake-IP synthesis (and NODATA on AAAA).
+                // Do NOT add public resolvers (1.1.1.1, 2606:4700:4700::1111) which cause netd to leak queries
+                // or return real IPv6 addresses that bypass the tunnel on mobile data.
                 .addDnsServer(MAPPED_DNS)
-                // Upstream resolvers satisfy Android Private DNS (DoT port 853) validation via the tunnel,
-                // preventing netd from falling back to cellular carrier DNS.
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
                 .addRoute("0.0.0.0", 0)
                 // /15 covers both 198.18.0.0/16 (interface & DNS) and 198.19.0.0/16 (mapdns fake-IP range)
                 .addRoute("198.18.0.0", 15)
-                // Dual-stack IPv6 tunnel support handled by hev-socks5-tunnel
-                .addAddress(TUN_ADDR_V6, 64)
+                // Trap all IPv6 inside the TUN interface with point-to-point host prefix 128 (prevent carrier bypass)
+                .addAddress(TUN_ADDR_V6, 128)
                 .addRoute("::", 0)
-                .addDnsServer("2606:4700:4700::1111")
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
@@ -127,7 +131,53 @@ class AetherVpnService : VpnService() {
             }
             tun = established
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            // Dynamically track active underlying network (Wi-Fi vs Cellular)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                try {
+                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                    connectivityManager = cm
+                    val callback = object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) {
+                            Log.i(TAG, "underlying network available: $network")
+                            try {
+                                setUnderlyingNetworks(arrayOf(network))
+                            } catch (e: Exception) {
+                                Log.w(TAG, "setUnderlyingNetworks onAvailable failed: ${e.message}")
+                            }
+                        }
+
+                        override fun onLost(network: Network) {
+                            Log.i(TAG, "underlying network lost: $network")
+                            try {
+                                setUnderlyingNetworks(null)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "setUnderlyingNetworks onLost failed: ${e.message}")
+                            }
+                        }
+
+                        override fun onCapabilitiesChanged(
+                            network: Network,
+                            networkCapabilities: NetworkCapabilities,
+                        ) {
+                            try {
+                                setUnderlyingNetworks(arrayOf(network))
+                            } catch (e: Exception) {
+                                Log.w(TAG, "setUnderlyingNetworks onCapabilitiesChanged failed: ${e.message}")
+                            }
+                        }
+                    }
+                    networkCallback = callback
+                    cm?.registerDefaultNetworkCallback(callback)
+                } catch (e: Exception) {
+                    Log.w(TAG, "registerDefaultNetworkCallback failed: ${e.message}")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                        try {
+                            setUnderlyingNetworks(null)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                 try {
                     setUnderlyingNetworks(null)
                 } catch (e: Exception) {
@@ -148,13 +198,13 @@ class AetherVpnService : VpnService() {
         // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
         // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
         // network: 198.19.0.0/16 — RFC 2544 benchmark unicast space, non-overlapping with TUN_ADDR (198.18.0.1) and MAPPED_DNS (198.18.0.2).
-        // icmp drop — avoid NTP/oracle side-channels from reply mode.
+        // icmp: reject — immediately reject unrouteable / IPv6 flows with ECONNREFUSED/RST so Happy Eyeballs fails fast to IPv4.
         val yaml = """
             |tunnel:
             |  mtu: $MTU
             |  ipv4: $TUN_ADDR
             |  ipv6: '$TUN_ADDR_V6'
-            |  icmp: 'drop'
+            |  icmp: 'reject'
             |socks5:
             |  port: $socksPort
             |  address: 127.0.0.1
@@ -167,7 +217,7 @@ class AetherVpnService : VpnService() {
             |  cache-size: 10000
             |misc:
             |  task-stack-size: 81920
-            |  connect-timeout: 10000
+            |  connect-timeout: 5000
             |  log-level: warn
             |""".trimMargin()
         FileOutputStream(conf, false).use { it.write(yaml.toByteArray(Charsets.UTF_8)) }
@@ -235,6 +285,16 @@ class AetherVpnService : VpnService() {
             } catch (_: Exception) {
             }
             tun = null
+
+            try {
+                networkCallback?.let { cb ->
+                    connectivityManager?.unregisterNetworkCallback(cb)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "unregisterNetworkCallback failed: ${e.message}")
+            }
+            networkCallback = null
+            connectivityManager = null
         }
     }
 
