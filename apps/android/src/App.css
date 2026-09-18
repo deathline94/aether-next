@@ -496,6 +496,15 @@ code, kbd, pre {
   margin: 0 auto;
   padding: 32px clamp(20px, 3.5vw, 44px) 48px;
 }
+.home-view {
+  display: grid;
+  gap: 16px;
+}
+.home-view > *,
+.settings-view > *,
+.scanner-view > * {
+  margin-top: 0;
+}
 
 /* ─── Hero Connection Centerpiece Stage ────────────────────────────────────── */
 .connection-stage {
@@ -2983,8 +2992,24 @@ code, kbd, pre {
   .nav-pill-label { display: block; font-size: 9px; }
   .nav-active-pill { display: none; }
   .workspace { height: auto; min-height: calc(100vh - 60px); }
-  .topbar { height: auto; min-height: 72px; padding: 14px 18px; }
-  .home-view, .settings-view, .logs-view, .scanner-view { padding: 20px 16px 32px; }
+  .topbar {
+    height: auto;
+    min-height: 56px;
+    padding: 10px 16px;
+    background: #07090b !important;
+    border-bottom: 1px solid var(--border-card);
+  }
+  .home-view, .settings-view, .logs-view, .scanner-view {
+    padding: 14px 14px 24px;
+    gap: 12px;
+  }
+  .section-heading {
+    min-height: 48px;
+    padding: 12px 16px;
+  }
+  .section-heading h3 {
+    font-size: 15px;
+  }
   
   .connection-stage {
     min-height: 380px;
@@ -3009,13 +3034,15 @@ code, kbd, pre {
     gap: 10px;
     padding: 14px 16px;
   }
+  .port-field-block,
   .param-field-block {
-    flex: 1 1 100%;
+    flex: 1 1 auto;
     width: 100%;
+    min-width: 0;
   }
   .setting-row.input-row {
     flex-direction: column;
-    gap: 14px;
+    gap: 12px;
   }
   .radar-telemetry-banner {
     grid-template-columns: 72px 1fr;
@@ -3029,7 +3056,48 @@ code, kbd, pre {
   .endpoint-row { grid-template-columns: 1fr 36px; gap: 10px; }
   .endpoint-row code { grid-column: 1; grid-row: 2; max-width: 100%; min-width: 0; }
   .endpoint-row button { grid-column: 2; grid-row: 2; }
-  .setting-row { align-items: flex-start; flex-direction: column; }
+  .setting-row {
+    align-items: stretch;
+    flex-direction: column;
+    justify-content: flex-start;
+    gap: 10px;
+    min-height: auto;
+    padding: 14px 16px;
+  }
+  .setting-row > div:first-child {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+  }
+  .tactical-select {
+    width: 100%;
+    min-width: 0;
+  }
+  .segmented {
+    width: 100%;
+  }
+  .segmented button {
+    flex: 1 1 0;
+    min-width: 0;
+    text-align: center;
+    justify-content: center;
+    padding: 0 8px;
+  }
+  .tactical-input-wrapper {
+    width: 100%;
+    max-width: 100%;
+  }
+  .custom-noise-matrix {
+    margin: 10px 14px 14px;
+    padding: 12px 14px;
+  }
+  .scanner-action-bar {
+    width: 100%;
+  }
+  .scanner-action-bar .primary-cta {
+    width: 100%;
+    justify-content: center;
+  }
   .path-row input, .input-row input { width: 100%; }
   .test-row { flex-direction: column; align-items: stretch; }
   .activity-view { height: auto; min-height: calc(100vh - 134px); padding: 16px 14px 26px; }
@@ -3038,6 +3106,15 @@ code, kbd, pre {
   .activity-actions { justify-content: flex-end; }
   .filter-chip { flex: 1 1 auto; justify-content: center; }
   .save-bar { flex-direction: column; gap: 8px; align-items: stretch; }
+  .tactical-save-dock {
+    position: sticky;
+    bottom: 8px;
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: rgba(9, 12, 15, 0.96);
+    border: 1px solid var(--border-card);
+  }
 }
 
 @media (max-width: 380px) {
@@ -3122,7 +3199,9 @@ code, kbd, pre {
     padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px)) !important;
   }
   .topbar {
-    padding-top: calc(14px + env(safe-area-inset-top, 0px)) !important;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px)) !important;
+    padding-bottom: 10px !important;
+    background: #07090b !important;
   }
   .tactical-activity-view {
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)) !important;
