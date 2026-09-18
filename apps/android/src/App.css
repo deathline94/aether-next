@@ -2246,13 +2246,15 @@ code, kbd, pre {
   align-items: center;
   gap: 12px;
   min-width: 0;
-  overflow-wrap: anywhere;
 }
 .discovered-info code {
   font-size: 12.5px;
   color: #ffffff;
   font-family: var(--font-mono);
   font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .discovered-proto {
   font-size: 10px;
@@ -3205,5 +3207,36 @@ code, kbd, pre {
   }
   .tactical-activity-view {
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)) !important;
+  }
+  .discovered-list {
+    padding: 10px 14px;
+    gap: 8px;
+  }
+  .discovered-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+  .discovered-info {
+    width: 100%;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .discovered-info code {
+    font-size: 13px;
+    flex: 1;
+    min-width: 0;
+  }
+  .discovered-actions {
+    width: 100%;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .connect-direct-btn {
+    flex: 1;
+    height: 34px;
+    min-height: 34px;
+    font-size: 12px;
   }
 }

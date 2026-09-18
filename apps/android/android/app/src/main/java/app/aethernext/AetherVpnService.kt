@@ -95,12 +95,25 @@ class AetherVpnService : VpnService() {
                 // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
                 .addAddress(TUN_ADDR, 24)
                 .addDnsServer(MAPPED_DNS)
+                // Upstream resolvers satisfy Android Private DNS (DoT port 853) validation via the tunnel,
+                // preventing netd from falling back to cellular carrier DNS.
+                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
                 .addRoute("0.0.0.0", 0)
+                // /15 covers both 198.18.0.0/16 (interface & DNS) and 198.19.0.0/16 (mapdns fake-IP range)
                 .addRoute("198.18.0.0", 15)
-                // IPv6 tunnel not implemented: blackhole IPv6 so traffic cannot bypass full VPN.
-                // Apps needing real IPv6 fail closed (no silent leak).
-                .addAddress(TUN_ADDR_V6, 128)
+                // Dual-stack IPv6 tunnel support handled by hev-socks5-tunnel
+                .addAddress(TUN_ADDR_V6, 64)
                 .addRoute("::", 0)
+                .addDnsServer("2606:4700:4700::1111")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    builder.setMetered(false)
+                } catch (e: Exception) {
+                    Log.w(TAG, "setMetered failed: ${e.message}")
+                }
+            }
 
             // Keep engine + hev sockets off the TUN (otherwise infinite loop).
             try {
@@ -134,12 +147,13 @@ class AetherVpnService : VpnService() {
         val conf = File(noBackupFilesDir, "hev-socks5-tunnel.yml")
         // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
         // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
-        // network: 198.18.0.0/16 — RFC 2544 benchmark unicast space (valid routeable unicast, unlike 240.0.0.0/4).
+        // network: 198.19.0.0/16 — RFC 2544 benchmark unicast space, non-overlapping with TUN_ADDR (198.18.0.1) and MAPPED_DNS (198.18.0.2).
         // icmp drop — avoid NTP/oracle side-channels from reply mode.
         val yaml = """
             |tunnel:
             |  mtu: $MTU
             |  ipv4: $TUN_ADDR
+            |  ipv6: '$TUN_ADDR_V6'
             |  icmp: 'drop'
             |socks5:
             |  port: $socksPort
@@ -148,7 +162,7 @@ class AetherVpnService : VpnService() {
             |mapdns:
             |  address: $MAPPED_DNS
             |  port: 53
-            |  network: 198.18.0.0
+            |  network: $MAPPED_NETWORK
             |  netmask: 255.255.0.0
             |  cache-size: 10000
             |misc:
@@ -247,9 +261,11 @@ class AetherVpnService : VpnService() {
         private const val NOTIF_ID = 43
         private const val MTU = 1280
         private const val TUN_ADDR = "198.18.0.1"
-        // Unique local address for blackhole IPv6 route (no real IPv6 tunnel yet).
+        // Unique local address for dual-stack IPv6 tunnel.
         private const val TUN_ADDR_V6 = "fd00:ae::1"
         private const val MAPPED_DNS = "198.18.0.2"
+        // RFC 2544 benchmark range isolated from TUN_ADDR (198.18.0.1) and MAPPED_DNS (198.18.0.2)
+        private const val MAPPED_NETWORK = "198.19.0.0"
         @Volatile
         private var nativeLoaded = false
         private val worker = Executors.newSingleThreadExecutor { r ->
