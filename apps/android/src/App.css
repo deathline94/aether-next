@@ -2634,6 +2634,9 @@ code, kbd, pre {
   color: var(--muted);
   font-weight: 550;
   letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .terminal-center-telemetry {
@@ -2642,12 +2645,14 @@ code, kbd, pre {
   gap: 8px;
   font-size: 11px;
   color: var(--muted-light);
+  white-space: nowrap;
 }
 .terminal-center-telemetry .status-dot { margin: 0; }
 .stream-count {
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--muted);
+  white-space: nowrap;
 }
 
 .terminal-action-buttons {
@@ -3238,5 +3243,49 @@ code, kbd, pre {
     height: 34px;
     min-height: 34px;
     font-size: 12px;
+  }
+
+  /* ─── Tactical Terminal Header Mobile Layout ─── */
+  .terminal-header-chrome {
+    display: grid !important;
+    grid-template-columns: 1fr auto !important;
+    grid-template-areas:
+      "controls telemetry"
+      "actions actions" !important;
+    gap: 10px 12px !important;
+    padding: 10px 14px !important;
+  }
+  .terminal-window-controls {
+    grid-area: controls;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .terminal-title-text {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .terminal-center-telemetry {
+    grid-area: telemetry;
+    white-space: nowrap;
+    justify-self: end;
+    flex-shrink: 0;
+  }
+  .stream-count {
+    white-space: nowrap;
+  }
+  .terminal-action-buttons {
+    grid-area: actions;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+  }
+  .tactile-terminal-btn {
+    height: 32px;
+    min-height: 32px;
+    padding: 0 12px;
+    font-size: 11.5px;
   }
 }

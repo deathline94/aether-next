@@ -326,12 +326,12 @@ pub async fn hunt_best(
         st.concurrency = st.concurrency.min(EXPENSIVE_MAX_CONCURRENCY);
     }
     // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
-    // No target_successes limit, no early exit, extended deadline.
+    // No target_successes limit, no early exit, unbounded deadline (user stops via UI).
     let exhaustive = crate::runtime_env::flag("AETHER_SCAN_EXHAUSTIVE");
     if exhaustive {
         st.target_successes = 0;
         st.early_exit_first = false;
-        st.overall_deadline = Duration::from_secs(600); // 10 min hard cap (user stops via UI)
+        st.overall_deadline = Duration::ZERO;
         st.quiet_after_first = Duration::ZERO;
     }
     let timeout = st.per_probe_timeout;
@@ -418,7 +418,11 @@ pub async fn hunt_best(
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
 
-    let deadline = Instant::now() + st.overall_deadline;
+    let deadline: Option<Instant> = if exhaustive {
+        None
+    } else {
+        Some(Instant::now() + st.overall_deadline)
+    };
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut scanned = 0usize;
@@ -426,22 +430,25 @@ pub async fn hunt_best(
     let mut hot_subnets = HashSet::<u128>::new();
 
     loop {
-        let effective = match quiet_until {
-            Some(q) => q.min(deadline),
-            None => deadline,
+        let effective = match (quiet_until, deadline) {
+            (Some(q), Some(d)) => Some(q.min(d)),
+            (Some(q), None) => Some(q),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
         };
-        let remaining = effective.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            if best.is_some() {
-                if quiet_until.is_some() {
-                    log::info!("[+] no new {} recently, finalizing selection", label);
+        if let Some(eff) = effective {
+            if eff.saturating_duration_since(Instant::now()).is_zero() {
+                if best.is_some() {
+                    if quiet_until.is_some() {
+                        log::info!("[+] no new {} recently, finalizing selection", label);
+                    } else {
+                        log::info!("[-] scan deadline reached, finalizing selection");
+                    }
                 } else {
-                    log::info!("[-] scan deadline reached, finalizing selection");
+                    log::error!("[-] scan deadline reached with no {}", label);
                 }
-            } else {
-                log::error!("[-] scan deadline reached with no {}", label);
+                break;
             }
-            break;
         }
 
         if scan_cancelled() {
@@ -517,7 +524,12 @@ pub async fn hunt_best(
                     }
                 }
             }
-            _ = tokio::time::sleep(remaining) => {
+            _ = async {
+                match effective {
+                    Some(eff) => tokio::time::sleep(eff.saturating_duration_since(Instant::now())).await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 if best.is_some() {
                     if quiet_until.is_some() {
                         log::info!("[+] no new {} recently, finalizing selection", label);

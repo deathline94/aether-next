@@ -34,7 +34,18 @@ class SessionController(
     private val runner = EngineRunner(
         context = context,
         onLine = { line -> handleEngineLine(line) },
-        onExit = { code ->
+        onExit = { code, isScan ->
+            if (isScan) {
+                // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
+                emit(
+                    "scan://event",
+                    JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
+                )
+                if (runtime.status != "connected") {
+                    setRuntime("disconnected", "Ready", null, null)
+                }
+                return@EngineRunner
+            }
             val wasConnected = connectedOnce.get()
             connectedOnce.set(false)
             socksSeen.set(false)
@@ -121,13 +132,12 @@ class SessionController(
             runner.stop()
             Thread.sleep(300)
         }
-        setRuntime("connecting", "Standalone scan", null, null)
         val err = runner.startScan(protocol, ipVersion, concurrency, timeoutMs, noize)
         if (err != null) {
-            setRuntime("error", err, null, null)
+            emitLog("scan error: $err")
+            emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
             return err
         }
-        setRuntime("connecting", "Scanning IP pool", runner.pid(), null)
         return null
     }
 
@@ -194,15 +204,17 @@ class SessionController(
                 val json = JSONObject(line.substring(idx + "AETHER_EVENT ".length).trim())
                 when (json.optString("type")) {
                     "endpoint_selected" -> {
-                        runtime.endpoint = json.optString("addr").ifEmpty { null }
-                        emitState()
-                        // The connect path emits no scan_done — close the live scan card
-                        // once a gateway is chosen so it does not linger during the tunnel.
-                        emit(
-                            "scan://event",
-                            JSONObject().put("type", "scan_done")
-                                .put("addr", json.optString("addr")).put("rtt", "").put("protocol", ""),
-                        )
+                        if (!runner.isScanMode()) {
+                            runtime.endpoint = json.optString("addr").ifEmpty { null }
+                            emitState()
+                            // The connect path emits no scan_done — close the live scan card
+                            // once a gateway is chosen so it does not linger during the tunnel.
+                            emit(
+                                "scan://event",
+                                JSONObject().put("type", "scan_done")
+                                    .put("addr", json.optString("addr")).put("rtt", "").put("protocol", ""),
+                            )
+                        }
                     }
                     "proxy_ready" -> {
                         socksSeen.set(true)
@@ -215,10 +227,14 @@ class SessionController(
                     "error" -> {
                         val msg = json.optString("message", "Connection failed")
                         emitLog("engine error: $msg")
-                        setRuntime("error", msg, null, runtime.endpoint)
-                        runner.stop()
-                        context.stopService(Intent(context, EngineService::class.java))
-                        stopVpnService()
+                        if (!runner.isScanMode()) {
+                            setRuntime("error", msg, null, runtime.endpoint)
+                            runner.stop()
+                            context.stopService(Intent(context, EngineService::class.java))
+                            stopVpnService()
+                        } else {
+                            emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
+                        }
                     }
                     // Forward structured scan telemetry to the webview (scan://event),
                     // mirroring the desktop Tauri bridge. The UI consumes these instead
@@ -230,10 +246,14 @@ class SessionController(
         }
         if (line.contains("[-] session failed:")) {
             val msg = line.substringAfter("[-] session failed:").trim()
-            setRuntime("error", msg, null, runtime.endpoint)
-            runner.stop()
-            context.stopService(Intent(context, EngineService::class.java))
-            stopVpnService()
+            if (!runner.isScanMode()) {
+                setRuntime("error", msg, null, runtime.endpoint)
+                runner.stop()
+                context.stopService(Intent(context, EngineService::class.java))
+                stopVpnService()
+            } else {
+                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
+            }
         }
         if (line.contains("socks5 server listening") || line.contains("http proxy listening")) {
             socksSeen.set(true)

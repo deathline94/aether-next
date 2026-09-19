@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicReference
 class EngineRunner(
     private val context: Context,
     private val onLine: (String) -> Unit,
-    private val onExit: (Int?) -> Unit,
+    private val onExit: (Int?, Boolean) -> Unit,
 ) {
     private val processRef = AtomicReference<Process?>(null)
     private val running = AtomicBoolean(false)
@@ -27,6 +27,8 @@ class EngineRunner(
     private val scanMode = AtomicBoolean(false)
 
     fun isRunning(): Boolean = running.get()
+
+    fun isScanMode(): Boolean = scanMode.get()
 
     fun pid(): Int? {
         val p = processRef.get() ?: return null
@@ -127,7 +129,7 @@ class EngineRunner(
                     if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
                         processRef.compareAndSet(proc, null)
-                        onExit(code)
+                        onExit(code, false)
                     }
                 }
             }, "aether-engine-io").start()
@@ -213,7 +215,7 @@ class EngineRunner(
                     if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
                         processRef.compareAndSet(proc, null)
-                        onExit(code)
+                        onExit(code, true)
                     }
                 }
             }, "aether-scan-io").start()
