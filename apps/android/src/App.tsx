@@ -36,15 +36,19 @@ function App() {
 
   const scanner = useScanner(appendLog, running, clearLogs);
 
-  const connectDirect = useCallback((item: DiscoveredEndpoint) => {
+  const connectDirect = useCallback(async (item: DiscoveredEndpoint) => {
     // Case-insensitive: the engine reports "MASQUE H3", "masque-h3", etc.
     const proto = item.protocol.toLowerCase();
     const protocol = proto.includes("wireguard") || proto.includes("wg") ? "wireguard" : "masque";
     const transport = proto.includes("h3") ? "h3" : "h2";
     appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
+    if (scanner.active || scanner.busy) {
+      await scanner.stopScan();
+      await new Promise((r) => setTimeout(r, 200));
+    }
     void connectToPeer(item.addr, protocol, transport);
     setView("home");
-  }, [connectToPeer, appendLog]);
+  }, [connectToPeer, appendLog, scanner.active, scanner.busy, scanner.stopScan]);
 
   const exportLogs = useCallback(async (): Promise<boolean> => {
     if (logs.length === 0) return false;

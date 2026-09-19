@@ -1,13 +1,14 @@
 {
   "name": "aether",
   "private": true,
-  "version": "1.2.7",
+  "version": "1.2.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "stage-engine": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/stage-engine.ps1",
+    "test": "vitest run",
     "tauri": "tauri",
     "dist": "npm run stage-engine && npm run tauri build"
   },
@@ -26,6 +27,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "tailwindcss": "^4.3.2",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^3.0.0"
   }
 }

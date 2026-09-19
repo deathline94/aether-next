@@ -20,19 +20,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Automated test gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+      - uses: lukka/get-cmake@v3.31.5
+      - uses: ilammy/setup-nasm@v1
+      - name: Run engine tests
+        working-directory: aether
+        run: cargo test
+      - name: Run desktop backend tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --test dpapi_key_test --test elevation_trust_test
+      - name: Run desktop frontend tests
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm test
+      - name: Run android frontend tests
+        working-directory: apps/android
+        run: |
+          npm ci
+          npm test
+      - name: Run android unit tests
+        working-directory: apps/android/android
+        run: ./gradlew testDebugUnitTest
+
   windows-app:
     name: Windows x64
+    needs: [test]
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
           cache: false
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v3.31.5
       - uses: ilammy/setup-nasm@v1
       - uses: actions/setup-node@v4
         with:
@@ -97,21 +137,23 @@ jobs:
 
   android-apk:
     name: Android APKs
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.88.0"
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
           cache: false
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v3.31.5
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -125,7 +167,7 @@ jobs:
           link-to-sdk: true
       - name: Accept Android licenses
         run: yes | sdkmanager --licenses || true
-      - run: cargo install cargo-ndk --locked
+      - run: cargo install cargo-ndk --version 3.6.4 --locked
       - name: Engine + stage
         working-directory: aether
         env:
@@ -215,8 +257,8 @@ jobs:
   # - push tag v1.2.3 → updates that versioned release
   publish:
     name: Publish downloads
-    needs: [windows-app, android-apk]
-    if: ${{ always() && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
+    needs: [test, windows-app, android-apk]
+    if: ${{ always() && needs.test.result == 'success' && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

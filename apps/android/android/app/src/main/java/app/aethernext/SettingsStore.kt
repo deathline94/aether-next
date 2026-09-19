@@ -86,10 +86,11 @@ class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("aether_settings", Context.MODE_PRIVATE)
 
     fun load(): Settings {
-        // One-shot: 1.0.2 switches default routing to full VPN (tun).
+        // One-shot: 1.0.2 migration flag. Preserve existing user preference if already set.
         if (!prefs.getBoolean(KEY_DEFAULTS_V102, false)) {
+            val hadSaved = prefs.contains("json")
             val s = readRaw()
-            if (s.routingMode == "proxy-only" || s.routingMode == "system-proxy") {
+            if (!hadSaved && (s.routingMode == "proxy-only" || s.routingMode == "system-proxy")) {
                 s.routingMode = "tun"
             }
             prefs.edit()

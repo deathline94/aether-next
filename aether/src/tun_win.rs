@@ -276,19 +276,34 @@ Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -jo
         Err(e) => {
             log::warn!("[tun] New-NetRoute failed ({e}); falling back to route.exe");
             let ifs = if_index.to_string();
-            let _ = run_cmd(
+            let phys_s = physical_if_index.to_string();
+            // 1. Mandatory peer escape route pinned to physical interface
+            run_cmd(
                 "route",
-                &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1"],
-            );
+                &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1", "IF", &phys_s],
+            ).map_err(|err| {
+                AetherError::Other(format!("failed to install physical peer escape route: {err}"))
+            })?;
+
+            // 2. Transactional split-default installation with rollback on failure
+            let mut installed_splits = Vec::new();
             for dest in ["0.0.0.0", "128.0.0.0"] {
                 let _ = run_cmd("route", &["delete", dest, "mask", "128.0.0.0", "IF", &ifs]);
-                run_cmd(
+                if let Err(add_err) = run_cmd(
                     "route",
                     &["add", dest, "mask", "128.0.0.0", &via, "metric", "1", "IF", &ifs],
-                )?;
+                ) {
+                    log::error!("[tun] failed to add split route {dest} ({add_err}); rolling back routes");
+                    for installed in installed_splits {
+                        let _ = run_cmd("route", &["delete", installed, "mask", "128.0.0.0", "IF", &ifs]);
+                    }
+                    let _ = run_cmd("route", &["delete", &peer_s, "mask", "255.255.255.255", "IF", &phys_s]);
+                    return Err(add_err);
+                }
+                installed_splits.push(dest);
             }
             log::info!(
-                "[tun] routes installed (route.exe): peer via {gw_s}, split-default {via} IF={if_index}"
+                "[tun] routes installed (route.exe): peer via {gw_s} IF={physical_if_index}, split-default {via} IF={if_index}"
             );
         }
     }

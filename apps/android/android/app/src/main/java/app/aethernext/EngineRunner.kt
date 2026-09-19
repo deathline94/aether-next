@@ -8,6 +8,14 @@ import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+enum class SupervisorState {
+    IDLE,
+    SCANNING,
+    CONNECTING,
+    CONNECTED,
+    STOPPING,
+}
+
 /**
  * Spawns the packaged engine binary.
  *
@@ -21,7 +29,9 @@ class EngineRunner(
 ) {
     private val processRef = AtomicReference<Process?>(null)
     private val running = AtomicBoolean(false)
+    private val supervisorState = AtomicReference(SupervisorState.IDLE)
     private val generation = java.util.concurrent.atomic.AtomicLong(0)
+    private val lifecycleLock = Any()
     // True when the current process was launched as a scan, so stop() sends the
     // cooperative "cancel" (persist best-so-far) rather than "shutdown".
     private val scanMode = AtomicBoolean(false)
@@ -30,23 +40,35 @@ class EngineRunner(
 
     fun isScanMode(): Boolean = scanMode.get()
 
+    fun getState(): SupervisorState = supervisorState.get()
+
+    fun getGeneration(): Long = generation.get()
+
+    fun setConnected() {
+        if (supervisorState.get() == SupervisorState.CONNECTING) {
+            supervisorState.set(SupervisorState.CONNECTED)
+        }
+    }
+
     fun pid(): Int? {
         val p = processRef.get() ?: return null
         return try {
             val m = p.javaClass.getMethod("pid")
-            (m.invoke(p) as? Int)
+            (m.invoke(p) as? Number)?.toInt()
         } catch (_: Exception) {
             null
         }
     }
 
-    fun start(settings: Settings): String? {
+    fun start(settings: Settings): String? = synchronized(lifecycleLock) {
+        if (running.get() || supervisorState.get() != SupervisorState.IDLE) {
+            return "Aether is already running"
+        }
         val binary = resolveEngine(settings.enginePath)
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
         scanMode.set(false)
-        if (!running.compareAndSet(false, true)) {
-            return "Aether is already running"
-        }
+        running.set(true)
+        supervisorState.set(SupervisorState.CONNECTING)
         val currentGeneration = generation.incrementAndGet()
         return try {
             Log.i(TAG, "starting engine: ${binary.absolutePath} exists=${binary.exists()} canExec=${binary.canExecute()} len=${binary.length()}")
@@ -58,9 +80,11 @@ class EngineRunner(
             // Map UI protocol names to engine env values.
             val protocolEnv = when (settings.protocol.lowercase()) {
                 "wireguard", "wg" -> "wg"
-                "gool", "wiw", "warp-in-warp" -> "gool"
+                "masque-h2" -> "masque"
+                "masque", "masque-h3" -> "masque"
                 else -> "masque"
             }
+            val isH2 = settings.protocol.lowercase() == "masque-h2" || settings.transport.lowercase() == "h2"
 
             val pb = ProcessBuilder(binary.absolutePath).apply {
                 // Work from a writable app dir (config/logs), not the lib folder.
@@ -69,7 +93,9 @@ class EngineRunner(
                 environment().apply {
                     put("AETHER_PROTOCOL", protocolEnv)
                     // Forced endpoint from Scanner "Connect Direct"; empty = auto-scan.
-                    if (settings.peer.isNotBlank()) put("AETHER_PEER", settings.peer)
+                    if (settings.peer.isNotBlank()) {
+                        put("AETHER_PEER", settings.peer.trim())
+                    }
                     put("AETHER_SCAN", settings.scanMode)
                     put("AETHER_IP", settings.ipVersion)
                     put("AETHER_NOIZE", settings.noize)
@@ -77,7 +103,7 @@ class EngineRunner(
                     put("AETHER_HTTP", "127.0.0.1:${settings.httpPort}")
                     put("AETHER_CONFIG", configPath)
                     put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
-                    put("AETHER_MASQUE_HTTP2", if (settings.transport == "h2") "1" else "0")
+                    put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
                     // H3 anti-DPI: split the QUIC Initial ClientHello across two
                     // datagrams (only meaningful on SNI-filtering networks).
                     put(
@@ -128,6 +154,7 @@ class EngineRunner(
                     }
                     if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
+                        supervisorState.set(SupervisorState.IDLE)
                         processRef.compareAndSet(proc, null)
                         onExit(code, false)
                     }
@@ -136,6 +163,7 @@ class EngineRunner(
             null
         } catch (e: Exception) {
             running.set(false)
+            supervisorState.set(SupervisorState.IDLE)
             processRef.set(null)
             Log.e(TAG, "start failed", e)
             "Could not start engine: ${e.message}"
@@ -152,13 +180,15 @@ class EngineRunner(
         concurrency: Int,
         timeoutMs: Int,
         noize: String,
-    ): String? {
+    ): String? = synchronized(lifecycleLock) {
+        if (running.get() || supervisorState.get() != SupervisorState.IDLE) {
+            return "Aether is already running"
+        }
         val binary = resolveEngine("")
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
         scanMode.set(true)
-        if (!running.compareAndSet(false, true)) {
-            return "Aether is already running"
-        }
+        running.set(true)
+        supervisorState.set(SupervisorState.SCANNING)
         val currentGeneration = generation.incrementAndGet()
         return try {
             val configDir = File(context.filesDir, "config").apply { mkdirs() }
@@ -214,6 +244,7 @@ class EngineRunner(
                     val code = try { proc.waitFor() } catch (_: Exception) { null }
                     if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
+                        supervisorState.set(SupervisorState.IDLE)
                         processRef.compareAndSet(proc, null)
                         onExit(code, true)
                     }
@@ -222,43 +253,52 @@ class EngineRunner(
             null
         } catch (e: Exception) {
             running.set(false)
+            supervisorState.set(SupervisorState.IDLE)
             processRef.set(null)
             "Could not start scan: ${e.message}"
         }
     }
 
-    fun stop() {
+    fun stopAndWait(timeoutMs: Long = 5000): Boolean = synchronized(lifecycleLock) {
         generation.incrementAndGet()
-        val p = processRef.getAndSet(null) ?: run {
+        val p = processRef.get() ?: run {
             running.set(false)
-            return
+            supervisorState.set(SupervisorState.IDLE)
+            return true
         }
-        // Graceful teardown over the engine's control channel instead of an
-        // immediate SIGKILL that can interrupt a cache write: a scan gets "cancel"
-        // (persist best-so-far), a tunnel gets "shutdown" (end the session).
+        supervisorState.set(SupervisorState.STOPPING)
         try {
             val cmd = if (scanMode.get()) "cancel\n" else "shutdown\n"
             p.outputStream.write(cmd.toByteArray())
             p.outputStream.flush()
         } catch (_: Exception) {
         }
-        Thread({
-            try {
-                // Wait for a clean exit, then escalate: SIGTERM, then SIGKILL.
-                val graceful = System.currentTimeMillis() + 3000
-                while (p.isAlive && System.currentTimeMillis() < graceful) Thread.sleep(50)
-                if (p.isAlive) {
-                    p.destroy()
-                    val hard = System.currentTimeMillis() + 2000
-                    while (p.isAlive && System.currentTimeMillis() < hard) Thread.sleep(50)
-                    if (p.isAlive) p.destroyForcibly()
-                }
-            } catch (_: Exception) {
-                try { p.destroyForcibly() } catch (_: Exception) {
+        val graceful = System.currentTimeMillis() + (timeoutMs * 3 / 5).coerceAtLeast(1000)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (p.isAlive && System.currentTimeMillis() < graceful) {
+            Thread.sleep(50)
+        }
+        if (p.isAlive) {
+            p.destroy()
+            while (p.isAlive && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50)
+            }
+            if (p.isAlive) {
+                p.destroyForcibly()
+                val hard = System.currentTimeMillis() + 1000
+                while (p.isAlive && System.currentTimeMillis() < hard) {
+                    Thread.sleep(20)
                 }
             }
-        }, "aether-engine-stop").start()
+        }
         running.set(false)
+        supervisorState.set(SupervisorState.IDLE)
+        processRef.compareAndSet(p, null)
+        !p.isAlive
+    }
+
+    fun stop() {
+        stopAndWait(5000)
     }
 
     private fun resolveEngine(configured: String): File? {

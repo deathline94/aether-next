@@ -358,7 +358,7 @@ async fn load_or_provision_warp(config_path: &str) -> Result<account::Identity> 
 
     // Serialize provisioning across processes: a concurrent scan + connect must not
     // both register a device (device churn) or race the shared identity file.
-    let _provision = crate::cache::provision_lock(config_path);
+    let _provision = crate::cache::provision_lock(config_path)?;
     if let Some(identity) = config::load(config_path)? {
         log::info!("[+] warp identity provisioned by a concurrent process; reusing");
         return Ok(identity);
@@ -387,7 +387,7 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
     // Provisioning or enrollment is needed — serialize across processes so a
     // concurrent scan + connect don't both register a device (device churn) or
     // race the shared identity file.
-    let _provision = crate::cache::provision_lock(config_path);
+    let _provision = crate::cache::provision_lock(config_path)?;
 
     // Re-check after acquiring the lock: another process may have just finished.
     if let Some(identity) = config::load(config_path)? {

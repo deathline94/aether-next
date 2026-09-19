@@ -17,6 +17,204 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
+use zeroize::Zeroize;
+
+#[cfg(windows)]
+pub fn restrict_directory_acl(path: &Path) -> Result<(), String> {
+    if let Ok(user) = std::env::var("USERNAME") {
+        let is_dir = path.is_dir();
+        let user_perm = if is_dir {
+            format!("{user}:(OI)(CI)F")
+        } else {
+            format!("{user}:F")
+        };
+        let sys_perm = if is_dir {
+            "SYSTEM:(OI)(CI)F"
+        } else {
+            "SYSTEM:F"
+        };
+        let output = std::process::Command::new("icacls")
+            .arg(path.as_os_str())
+            .arg("/inheritance:r")
+            .arg("/grant:r")
+            .arg(&user_perm)
+            .arg("/grant:r")
+            .arg(sys_perm)
+            .output()
+            .map_err(|e| format!("failed to execute icacls on {}: {e}", path.display()))?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "icacls failed to restrict permissions on {}: {}",
+                path.display(),
+                err.trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn restrict_directory_acl(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+pub mod dpapi {
+    use std::path::Path;
+    use zeroize::Zeroize;
+
+    #[cfg(windows)]
+    use std::ptr;
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::LocalFree;
+    #[cfg(windows)]
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+    };
+
+    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        {
+            let mut in_blob = CRYPT_INTEGER_BLOB {
+                cbData: data.len() as u32,
+                pbData: data.as_ptr() as *mut u8,
+            };
+            let mut out_blob = CRYPT_INTEGER_BLOB {
+                cbData: 0,
+                pbData: ptr::null_mut(),
+            };
+
+            let res = unsafe {
+                CryptProtectData(
+                    &mut in_blob,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut out_blob,
+                )
+            };
+
+            if res == 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!("CryptProtectData failed: {err}"));
+            }
+
+            let encrypted = unsafe {
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+            };
+
+            unsafe {
+                LocalFree(out_blob.pbData as _);
+            }
+
+            Ok(encrypted)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(data.to_vec())
+        }
+    }
+
+    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        {
+            let mut in_blob = CRYPT_INTEGER_BLOB {
+                cbData: data.len() as u32,
+                pbData: data.as_ptr() as *mut u8,
+            };
+            let mut out_blob = CRYPT_INTEGER_BLOB {
+                cbData: 0,
+                pbData: ptr::null_mut(),
+            };
+
+            let res = unsafe {
+                CryptUnprotectData(
+                    &mut in_blob,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut out_blob,
+                )
+            };
+
+            if res == 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!("CryptUnprotectData failed: {err}"));
+            }
+
+            let decrypted = unsafe {
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+            };
+
+            unsafe {
+                if !out_blob.pbData.is_null() && out_blob.cbData > 0 {
+                    let slice = std::slice::from_raw_parts_mut(out_blob.pbData, out_blob.cbData as usize);
+                    slice.zeroize();
+                }
+                LocalFree(out_blob.pbData as _);
+            }
+
+            Ok(decrypted)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(data.to_vec())
+        }
+    }
+
+    const DPAPI_MAGIC: &[u8] = b"DP01";
+
+    /// Derives or retrieves the 32-byte DPAPI-protected configuration master key.
+    /// Returns the base64-encoded string representation for `AETHER_CONFIG_KEY`.
+    pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, String> {
+        use base64::Engine;
+        let key_file = app_data_dir.join("config_key.dpapi");
+        if key_file.exists() {
+            let raw = std::fs::read(&key_file)
+                .map_err(|e| format!("failed reading {}: {e}", key_file.display()))?;
+            if !raw.starts_with(DPAPI_MAGIC) {
+                return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()));
+            }
+            let mut decrypted = decrypt(&raw[DPAPI_MAGIC.len()..])?;
+            if decrypted.len() != 32 {
+                decrypted.zeroize();
+                return Err("decrypted master key must be 32 bytes".into());
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&decrypted);
+            decrypted.zeroize();
+            return Ok(b64);
+        }
+
+        // Generate new 32-byte key
+        let mut raw_key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw_key);
+
+        let ciphertext = encrypt(&raw_key)?;
+        let mut envelope = Vec::with_capacity(DPAPI_MAGIC.len() + ciphertext.len());
+        envelope.extend_from_slice(DPAPI_MAGIC);
+        envelope.extend_from_slice(&ciphertext);
+
+        let tmp_file = app_data_dir.join(format!("config_key.dpapi.{}.tmp", std::process::id()));
+        std::fs::create_dir_all(app_data_dir)
+            .map_err(|e| format!("cannot create dir {}: {e}", app_data_dir.display()))?;
+        std::fs::write(&tmp_file, &envelope)
+            .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+
+        // Restrict ACL on the tmp file
+        let _ = super::restrict_directory_acl(&tmp_file);
+
+        std::fs::rename(&tmp_file, &key_file)
+            .map_err(|e| format!("cannot rename to {}: {e}", key_file.display()))?;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_key);
+        raw_key.zeroize();
+        Ok(b64)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -237,7 +435,9 @@ fn load_settings_file(app: &AppHandle) -> Settings {
 
 fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), String> {
     let path = settings_path(app)?;
-    fs::create_dir_all(path.parent().ok_or("invalid config path")?).map_err(|e| e.to_string())?;
+    let parent = path.parent().ok_or("invalid config path")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    restrict_directory_acl(parent)?;
     let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, json).map_err(|e| e.to_string())?;
@@ -527,7 +727,7 @@ fn resolve_resource(app: &AppHandle, name: &str) -> Option<PathBuf> {
 }
 
 /// TUN runs elevated: only load regular files under the app install / portable root.
-fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
+pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
     let meta = fs::metadata(path).map_err(|e| format!("{label}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{label} is not a regular file"));
@@ -598,27 +798,211 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
     ok.then(|| host.to_string())
 }
 
-fn file_sha256_hex(path: &Path) -> Result<String, String> {
-    #[cfg(windows)]
-    {
-        let out = Command::new("certutil")
-            .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let t = line.trim().replace(' ', "").to_ascii_lowercase();
-            if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Ok(t);
+pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let res = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in res {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    Ok(s)
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustedBinaryPolicy {
+    pub allow_unsigned_in_debug: bool,
+    pub expected_publisher_cn: &'static str,
+    pub embedded_hashes: &'static [(&'static str, &'static str)],
+}
+
+impl Default for TrustedBinaryPolicy {
+    fn default() -> Self {
+        Self {
+            allow_unsigned_in_debug: true,
+            expected_publisher_cn: "deathline94",
+            embedded_hashes: &[],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum BinaryTrustError {
+    Validation(String),
+    Authenticode(i32, String),
+    PublisherMismatch { expected: String, found: String },
+    HashMismatch { filename: String, expected: String, actual: String },
+}
+
+impl std::fmt::Display for BinaryTrustError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(s) => write!(f, "Binary validation failed: {s}"),
+            Self::Authenticode(code, msg) => {
+                write!(f, "Authenticode verification failed (0x{code:08x}): {msg}")
+            }
+            Self::PublisherMismatch { expected, found } => {
+                write!(f, "Publisher mismatch: expected '{expected}', found '{found}'")
+            }
+            Self::HashMismatch { filename, expected, actual } => {
+                write!(
+                    f,
+                    "Hash mismatch for {filename}: expected {expected}, actual {actual}"
+                )
             }
         }
-        Err("could not parse certutil SHA256 output".into())
     }
-    #[cfg(not(windows))]
+}
+
+impl std::error::Error for BinaryTrustError {}
+
+#[cfg(windows)]
+pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(), BinaryTrustError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
+    };
+
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide_path.as_ptr(),
+        hFile: 0 as _,
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+
+    const WINTRUST_ACTION_GENERIC_VERIFY_V2: windows_sys::core::GUID = windows_sys::core::GUID {
+        data1: 0x00aac56b,
+        data2: 0xcd44,
+        data3: 0x11d0,
+        data4: [0x8c, 0xeb, 0x00, 0xc0, 0x4f, 0xc2, 0xaa, 0xe5],
+    };
+
+    let mut trust_data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        pPolicyCallbackData: std::ptr::null_mut(),
+        pSIPClientData: std::ptr::null_mut(),
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_IGNORE,
+        hWVTStateData: 0 as _,
+        pwszURLReference: std::ptr::null_mut(),
+        dwProvFlags: 0x00000080, // WTD_REVOCATION_CHECK_NONE
+        dwUIContext: 0,
+        pSignatureSettings: std::ptr::null_mut(),
+    };
+
+    let mut action_id = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let status = unsafe {
+        WinVerifyTrust(
+            0 as _,
+            &mut action_id,
+            &mut trust_data as *mut _ as *mut std::ffi::c_void,
+        )
+    };
+
+    if status != 0 {
+        return Err(BinaryTrustError::Authenticode(
+            status,
+            format!("WinVerifyTrust returned error code: 0x{status:08x}"),
+        ));
+    }
+
+    if !expected_cn.is_empty() {
+        let ps_cmd = format!(
+            "(Get-AuthenticodeSignature -LiteralPath '{}').SignerCertificate.Subject",
+            path.to_string_lossy().replace('\'', "''")
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+            .output()
+            .map_err(|e| BinaryTrustError::Validation(format!("failed to query signer certificate: {e}")))?;
+        
+        if !out.status.success() {
+            return Err(BinaryTrustError::Validation(format!(
+                "failed to read signer certificate: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+
+        let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let expected_needle = format!("CN={expected_cn}");
+        if !subject.contains(&expected_needle) && !subject.eq_ignore_ascii_case(expected_cn) {
+            return Err(BinaryTrustError::PublisherMismatch {
+                expected: expected_cn.to_string(),
+                found: subject,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn verify_authenticode_signature(_path: &Path, _expected_cn: &str) -> Result<(), BinaryTrustError> {
+    Ok(())
+}
+
+pub fn verify_elevated_binary(
+    path: &Path,
+    label: &str,
+    policy: &TrustedBinaryPolicy,
+) -> Result<(), BinaryTrustError> {
+    let path_buf = path.to_path_buf();
+    validate_trusted_binary(&path_buf, label)
+        .map_err(BinaryTrustError::Validation)?;
+
+    let filename = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(label);
+
+    let actual_hash = file_sha256_hex(path)
+        .map_err(BinaryTrustError::Validation)?;
+
+    for &(expected_name, expected_hash) in policy.embedded_hashes {
+        if expected_name.eq_ignore_ascii_case(filename) || expected_name.eq_ignore_ascii_case(label) {
+            if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+                return Err(BinaryTrustError::HashMismatch {
+                    filename: filename.to_string(),
+                    expected: expected_hash.to_string(),
+                    actual: actual_hash,
+                });
+            }
+        }
+    }
+
+    #[cfg(windows)]
     {
-        let _ = path;
-        Err("hash check unsupported on this platform".into())
+        let auth_res = verify_authenticode_signature(path, policy.expected_publisher_cn);
+        match auth_res {
+            Ok(()) => {}
+            Err(e) => {
+                if policy.allow_unsigned_in_debug && cfg!(debug_assertions) {
+                    eprintln!("[warn] Authenticode check skipped in debug mode: {e}");
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     }
+
+    Ok(())
 }
 
 fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> {
@@ -807,6 +1191,7 @@ fn watch_child(app: AppHandle) {
                 drop(child_slot);
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
+                let ever_connected = state.connected_once.load(Ordering::SeqCst);
                 cleanup_routing(&app, &state);
                 let already_error = state
                     .runtime
@@ -818,7 +1203,6 @@ fn watch_child(app: AppHandle) {
                     // Structured error event already set UI; keep it.
                     continue;
                 }
-                let ever_connected = state.connected_once.load(Ordering::SeqCst);
                 let (ui_status, detail) = if status.success() {
                     ("disconnected", "Engine stopped".to_string())
                 } else if !ever_connected {
@@ -838,6 +1222,7 @@ fn watch_child(app: AppHandle) {
                 drop(child_slot);
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
+                let ever_connected = state.connected_once.load(Ordering::SeqCst);
                 cleanup_routing(&app, &state);
                 let already_error = state
                     .runtime
@@ -848,7 +1233,6 @@ fn watch_child(app: AppHandle) {
                 if already_error {
                     continue;
                 }
-                let ever_connected = state.connected_once.load(Ordering::SeqCst);
                 if ever_connected {
                     emit_state(&app, &state, "disconnected", "Engine lost", None, None);
                 } else {
@@ -946,10 +1330,15 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         let executable = engine_path(&app, &settings)?;
         let dir = config_dir(&app)?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        restrict_directory_acl(&dir)?;
+
+        let policy = TrustedBinaryPolicy::default();
         if settings.routing_mode == "tun" {
-            validate_trusted_binary(&executable, "aether.exe")?;
+            verify_elevated_binary(&executable, "aether.exe", &policy)
+                .map_err(|e| e.to_string())?;
             if let Some(wintun) = wintun_path(&app) {
-                validate_trusted_binary(&wintun, "wintun.dll")?;
+                verify_elevated_binary(&wintun, "wintun.dll", &policy)
+                    .map_err(|e| e.to_string())?;
                 // Optional pin: set AETHER_WINTUN_SHA256 to require exact file hash.
                 if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
                     let expected = expected.trim().to_ascii_lowercase();
@@ -965,9 +1354,11 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             }
         }
 
+        let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
         let mut command = Command::new(&executable);
         command
             .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+            .env("AETHER_CONFIG_KEY", &dpapi_key)
             .env("AETHER_PROTOCOL", &settings.protocol)
             .env("AETHER_SCAN", &settings.scan_mode)
             .env("AETHER_IP", &settings.ip_version)
@@ -1036,7 +1427,11 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
 
         let mut child = command
             .spawn()
-            .map_err(|e| format!("Could not start aether.exe: {e}"))?;
+            .map_err(|e| {
+                dpapi_key.zeroize();
+                format!("Could not start aether.exe: {e}")
+            })?;
+        dpapi_key.zeroize();
         let pid = child.id();
         // M8: put the engine into a kill-on-close job so it can never outlive us.
         #[cfg(windows)]
@@ -1211,7 +1606,7 @@ fn scan(
     // invoke could pass out-of-range values. 500 keeps even cheap-mode (WireGuard)
     // bursts sane; the engine additionally enforces its own expensive-mode ceiling.
     let concurrency = concurrency.clamp(1, 500);
-    let timeout_ms = timeout_ms.clamp(100, 30_000);
+    let timeout_ms = timeout_ms.clamp(3_000, 30_000);
     // Gracefully stop any existing scan first (persist its best-so-far).
     stop_scan_child(&state.scan_child);
 
@@ -1219,15 +1614,18 @@ fn scan(
     let executable = engine_path(&app, &settings)?;
     let dir = config_dir(&app)?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    restrict_directory_acl(&dir)?;
 
     let engine_protocol = match protocol.as_str() {
         "wireguard" => "wireguard",
         _ => "masque",
     };
 
+    let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
     let mut command = Command::new(&executable);
     command
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+        .env("AETHER_CONFIG_KEY", &dpapi_key)
         .env("AETHER_PROTOCOL", engine_protocol)
         .env("AETHER_SCAN", "balanced")
         .env("AETHER_SCAN_EXHAUSTIVE", "1")
@@ -1265,7 +1663,11 @@ fn scan(
 
     let mut child = command
         .spawn()
-        .map_err(|e| format!("Could not start scan: {e}"))?;
+        .map_err(|e| {
+            dpapi_key.zeroize();
+            format!("Could not start scan: {e}")
+        })?;
+    dpapi_key.zeroize();
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1550,24 +1952,43 @@ mod windows_proxy {
 
     pub fn restore(snapshot: ProxySnapshot) -> Result<(), String> {
         let key = key().map_err(|e| e.to_string())?;
-        match snapshot.server {
+        match snapshot.server.as_ref() {
             Some(value) => key
-                .set_value("ProxyServer", &value)
+                .set_value("ProxyServer", value)
                 .map_err(|e| e.to_string())?,
-            None => {
-                let _ = key.delete_value("ProxyServer");
-            }
+            None => match key.delete_value("ProxyServer") {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("delete ProxyServer: {e}")),
+            },
         }
-        match snapshot.bypass {
+        match snapshot.bypass.as_ref() {
             Some(value) => key
-                .set_value("ProxyOverride", &value)
+                .set_value("ProxyOverride", value)
                 .map_err(|e| e.to_string())?,
-            None => {
-                let _ = key.delete_value("ProxyOverride");
-            }
+            None => match key.delete_value("ProxyOverride") {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("delete ProxyOverride: {e}")),
+            },
         }
         key.set_value("ProxyEnable", &snapshot.enabled)
             .map_err(|e| e.to_string())?;
+
+        // Read-back verification
+        let current_enabled: u32 = key
+            .get_value("ProxyEnable")
+            .map_err(|e| format!("verify ProxyEnable: {e}"))?;
+        if current_enabled != snapshot.enabled {
+            return Err(format!(
+                "ProxyEnable read-back mismatch: expected {}, got {}",
+                snapshot.enabled, current_enabled
+            ));
+        }
+        if snapshot.server.is_none() && key.get_value::<String, _>("ProxyServer").is_ok() {
+            return Err("ProxyServer read-back check failed: value still present".into());
+        }
+
         refresh();
         Ok(())
     }
@@ -1597,6 +2018,16 @@ pub fn run() {
         }))
         .manage(AppState::default())
         .setup(|app| {
+            let dir = config_dir(app.handle())
+                .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
+            fs::create_dir_all(&dir)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            restrict_directory_acl(&dir)
+                .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
+            #[cfg(windows)]
+            {
+                let _ = dpapi::get_or_create_dpapi_config_key(&dir);
+            }
             #[cfg(windows)]
             if let Ok(path) = proxy_recovery_path(app.handle()) {
                 match windows_proxy::recover(&path) {

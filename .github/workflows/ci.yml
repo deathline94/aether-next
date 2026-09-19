@@ -1,8 +1,9 @@
-# Light checks on pull requests only (full installers run in "Build apps" on main).
 name: CI
 
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 concurrency:
@@ -15,10 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.88.0"
           components: rustfmt, clippy
-      - uses: lukka/get-cmake@latest
+      - uses: lukka/get-cmake@v3.31.5
       - uses: ilammy/setup-nasm@v1
       - run: cargo check --manifest-path aether/Cargo.toml
       - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -D warnings
@@ -45,7 +47,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 
   android-ui:
@@ -86,3 +90,18 @@ jobs:
               fi
             done
           done
+
+  android-unit-tests:
+    name: Android unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/android/android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon

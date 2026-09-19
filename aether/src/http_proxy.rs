@@ -7,7 +7,7 @@ use crate::error::{AetherError, Result};
 use crate::netstack::{StackHandle, TcpConn};
 use crate::socks;
 
-const MAX_HEADER: usize = 16 * 1024;
+pub const MAX_HEADER: usize = 16 * 1024;
 const MAX_CLIENTS: usize = 256;
 const MAX_REQUEST_LINE: usize = 4096;
 const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
@@ -146,20 +146,32 @@ fn find_header_end(header: &[u8]) -> Option<usize> {
         .map(|at| at + 4)
 }
 
-async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut header = Vec::with_capacity(2048);
     let mut buf = [0u8; 2048];
     loop {
-        let count = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf))
-            .await
-            .map_err(|_| AetherError::Other("HTTP header read timeout".into()))??;
+        let remaining = MAX_HEADER.saturating_sub(header.len());
+        if remaining == 0 {
+            return Err(AetherError::Other("HTTP header too large".into()));
+        }
+        let to_read = buf.len().min(remaining);
+        let count = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read(&mut buf[..to_read]),
+        )
+        .await
+        .map_err(|_| AetherError::Other("HTTP header read timeout".into()))??;
+
         if count == 0 {
             return Err(AetherError::Other(
                 "client closed before HTTP header".into(),
             ));
         }
         header.extend_from_slice(&buf[..count]);
-        if header.windows(4).any(|window| window == b"\r\n\r\n") {
+        if let Some(pos) = header.windows(4).position(|window| window == b"\r\n\r\n") {
+            if pos + 4 > MAX_HEADER {
+                return Err(AetherError::Other("HTTP header too large".into()));
+            }
             return Ok(header);
         }
         if header.len() >= MAX_HEADER {

@@ -86,7 +86,12 @@ class SessionController(
     }
 
     fun connect(s: Settings): String? {
-        if (runner.isRunning()) return "Aether is already running"
+        if (runner.isRunning()) {
+            if (runner.getState() == SupervisorState.SCANNING) {
+                runner.stopAndWait(3000)
+            }
+            if (runner.isRunning()) return "Aether is already running"
+        }
         validate(s)
         store.save(s)
         settings = s
@@ -111,7 +116,14 @@ class SessionController(
         }
         
         val svc = Intent(context, EngineService::class.java)
-        context.startForegroundService(svc)
+        try {
+            context.startForegroundService(svc)
+        } catch (e: Exception) {
+            Log.e(TAG, "startForegroundService failed: ${e.message}", e)
+            runner.stopAndWait(3000)
+            setRuntime("error", "Service start failed: ${e.message}", null, null)
+            return e.message ?: "Service start failed"
+        }
         
         setRuntime("connecting", "Scanning reachable routes", runner.pid(), null)
         // VPN (hev) starts once local SOCKS is listening — see maybeStartVpn().
@@ -129,8 +141,13 @@ class SessionController(
         noize: String,
     ): String? {
         if (runner.isRunning()) {
-            runner.stop()
-            Thread.sleep(300)
+            runner.stopAndWait(3000)
+            if (runner.isRunning()) {
+                val err = "Engine could not be stopped for scan"
+                emitLog("scan error: $err")
+                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
+                return err
+            }
         }
         val err = runner.startScan(protocol, ipVersion, concurrency, timeoutMs, noize)
         if (err != null) {
@@ -187,13 +204,8 @@ class SessionController(
         }
     }
 
-    private fun validate(s: Settings) {
-        if (s.socksPort !in 1024..65535 || s.httpPort !in 1024..65535) {
-            throw IllegalArgumentException("Ports must be 1024-65535")
-        }
-        if (s.socksPort == s.httpPort) {
-            throw IllegalArgumentException("HTTP and SOCKS5 ports must differ")
-        }
+    fun validate(s: Settings) {
+        validateSettings(s)
     }
 
     private fun handleEngineLine(line: String) {
@@ -428,6 +440,45 @@ class SessionController(
 
         @Volatile
         private var instance: SessionController? = null
+
+        fun validateSettings(s: Settings) {
+            val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg")
+            if (s.protocol.lowercase() !in validProtocols) {
+                throw IllegalArgumentException("Invalid protocol '${s.protocol}'. Allowed: $validProtocols")
+            }
+            val validTransports = setOf("h2", "h3")
+            if (s.transport.lowercase() !in validTransports) {
+                throw IllegalArgumentException("Invalid transport '${s.transport}'. Allowed: $validTransports")
+            }
+            val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "thorough", "ironclad")
+            if (s.scanMode.lowercase() !in validScanModes) {
+                throw IllegalArgumentException("Invalid scanMode '${s.scanMode}'. Allowed: $validScanModes")
+            }
+            val validIpVersions = setOf("v4", "v6", "dual", "both")
+            if (s.ipVersion.lowercase() !in validIpVersions) {
+                throw IllegalArgumentException("Invalid ipVersion '${s.ipVersion}'. Allowed: $validIpVersions")
+            }
+            val validRoutingModes = setOf("tun", "proxy-only", "system-proxy")
+            if (s.routingMode.lowercase() !in validRoutingModes) {
+                throw IllegalArgumentException("Invalid routingMode '${s.routingMode}'. Allowed: $validRoutingModes")
+            }
+            val validNoize = setOf("off", "on", "random", "m1", "m2")
+            if (s.noize.lowercase() !in validNoize) {
+                throw IllegalArgumentException("Invalid noize mode '${s.noize}'. Allowed: $validNoize")
+            }
+            if (s.socksPort !in 1024..65535 || s.httpPort !in 1024..65535) {
+                throw IllegalArgumentException("Ports must be 1024-65535")
+            }
+            if (s.socksPort == s.httpPort) {
+                throw IllegalArgumentException("HTTP and SOCKS5 ports must differ")
+            }
+            if (s.quicInitialFragSize !in 16..512) {
+                throw IllegalArgumentException("quicInitialFragSize must be between 16 and 512")
+            }
+            if (s.noizeJc < 0 || s.noizeJmin < 0 || s.noizeJmax < s.noizeJmin) {
+                throw IllegalArgumentException("Invalid noize jitter bounds")
+            }
+        }
 
         fun get(context: Context, emit: (String, JSONObject) -> Unit): SessionController {
             return synchronized(this) {

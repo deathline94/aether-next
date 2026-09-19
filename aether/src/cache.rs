@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use fs2::FileExt;
+
+use crate::error::{AetherError, Result};
 
 /// Maximum cached endpoints per protocol.
 const MAX_CACHED: usize = 10;
@@ -27,6 +30,7 @@ const LOCK_STALE: Duration = Duration::from_secs(5);
 /// Cloudflare that can take several seconds, so its cross-process lock waits much
 /// longer and treats the holder as stale much later than the fast cache lock.
 const PROVISION_LOCK_WAIT: Duration = Duration::from_secs(20);
+#[allow(dead_code)]
 const PROVISION_LOCK_STALE: Duration = Duration::from_secs(60);
 
 #[derive(Serialize, Deserialize, Default)]
@@ -102,7 +106,7 @@ fn decay_stale(endpoints: &mut Vec<CachedEndpoint>) {
     endpoints.retain(|e| now.saturating_sub(e.timestamp) < STALE_THRESHOLD_SECS);
 }
 
-fn cache_path(base_config: &str) -> PathBuf {
+pub fn cache_path(base_config: &str) -> PathBuf {
     let base = Path::new(base_config);
     if base.is_dir() {
         base.join("aether-endpoints.json")
@@ -195,20 +199,67 @@ fn lock_path(cache_file: &Path) -> PathBuf {
 /// A held cross-process lock serializing one-time work that must not run twice
 /// concurrently — specifically account provisioning / MASQUE enrollment, so a
 /// scan process and a connect process don't both register a device (device churn)
-/// or race writes to the shared identity file. Released on drop.
-pub struct ProvisionGuard(#[allow(dead_code)] CacheLock);
+/// or race writes to the shared identity file. Never fails open. Released on drop.
+pub struct ProvisionGuard {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl ProvisionGuard {
+    pub fn try_acquire(lock_file_path: &Path, wait: Duration) -> Result<Self> {
+        if let Some(parent) = lock_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let start = Instant::now();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_file_path)
+            .map_err(|e| AetherError::Other(format!("open provision lock {}: {e}", lock_file_path.display())))?;
+
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    use std::io::{Seek, SeekFrom, Write as _};
+                    let mut f = &file;
+                    let _ = f.seek(SeekFrom::Start(0));
+                    let _ = f.set_len(0);
+                    let _ = writeln!(f, "pid={}", std::process::id());
+                    return Ok(Self {
+                        file,
+                        path: lock_file_path.to_path_buf(),
+                    });
+                }
+                Err(_) => {
+                    if start.elapsed() >= wait {
+                        return Err(AetherError::Other(format!(
+                            "provisioning lock acquisition timed out after {:?} on {}",
+                            wait,
+                            lock_file_path.display()
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ProvisionGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 /// Acquire the provisioning lock, sited next to the endpoint cache. Held until
-/// the returned guard is dropped. Best-effort with a longer budget than the cache
-/// lock because provisioning waits on network round-trips.
-pub fn provision_lock(base_config: &str) -> ProvisionGuard {
+/// the returned guard is dropped. Never fails open.
+pub fn provision_lock(base_config: &str) -> Result<ProvisionGuard> {
     let mut p = cache_path(base_config).into_os_string();
-    p.push(".provision");
-    ProvisionGuard(CacheLock::acquire_with(
-        &PathBuf::from(p),
-        PROVISION_LOCK_WAIT,
-        PROVISION_LOCK_STALE,
-    ))
+    p.push(".provision.lock");
+    ProvisionGuard::try_acquire(&PathBuf::from(p), PROVISION_LOCK_WAIT)
 }
 
 /// Write `data` to `path` atomically (temp file + rename) so a crash or a

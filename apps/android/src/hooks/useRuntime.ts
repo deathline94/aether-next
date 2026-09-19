@@ -59,23 +59,26 @@ export function useRuntime(
         appendLog({ level: "warn", message: String(error) });
       }
 
-      // Each fetch fails independently — one backend hiccup must not strand
-      // settings on defaults or leave admin/version unknown.
-      const [loadedSettings, state, isAdmin, info] = await Promise.all([
-        invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${String(e)}` }); return null; }),
-        invoke<RuntimeState>("get_state").catch(() => null),
-        invoke<boolean>("is_admin").catch(() => false),
-        invoke<{ version?: string }>("app_info").catch(() => null),
-      ]);
-      if (disposed) return;
-      if (loadedSettings) {
-        settingsRef.current = { ...defaults, ...loadedSettings };
-        setSettings(settingsRef.current);
-        setSettingsLoaded(true);
+      try {
+        const [loadedSettings, state, isAdmin, info] = await Promise.all([
+          invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${String(e)}` }); return null; }),
+          invoke<RuntimeState>("get_state").catch(() => null),
+          invoke<boolean>("is_admin").catch(() => false),
+          invoke<{ version?: string }>("app_info").catch(() => null),
+        ]);
+        if (disposed) return;
+        if (loadedSettings) {
+          settingsRef.current = { ...defaults, ...loadedSettings };
+          setSettings(settingsRef.current);
+        }
+        if (state && !receivedRuntimeEvent.current) setRuntime(state);
+        setAdmin(Boolean(isAdmin));
+        setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
+      } finally {
+        if (!disposed) {
+          setSettingsLoaded(true);
+        }
       }
-      if (state && !receivedRuntimeEvent.current) setRuntime(state);
-      setAdmin(Boolean(isAdmin));
-      setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
     }
     void initialize();
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
@@ -169,6 +172,9 @@ export function useRuntime(
     setBusy(true);
     setTestResult(null);
     try {
+      try {
+        await invoke("stop_scan");
+      } catch (_) {}
       if (running) {
         await invoke("disconnect");
         await new Promise((r) => setTimeout(r, 400));

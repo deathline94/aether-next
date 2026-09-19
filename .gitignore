@@ -102,7 +102,7 @@ aether*.json
 .agents/
 .opencode/
 .specify/
-specs/
+# Keep specs visible to codebase-memory indexing.
 PRODUCT.md
 architecture-review-*.html
 test_engine.log

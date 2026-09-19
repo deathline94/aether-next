@@ -148,7 +148,7 @@ fn restrict_windows_acl(path: &str) {
 /// icacls process spawn window (~100ms+) or forever if icacls failed. Now the
 /// temp file is created EMPTY, its ACL is restricted BEFORE any secret byte hits
 /// disk, and the final file is re-restricted as belt-and-braces.
-pub(crate) fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
+pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -180,34 +180,105 @@ pub(crate) fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
         f.write_all(data)?;
         f.sync_all()?;
     }
-    // Replace the destination. Direct rename first; remove+rename fallback for
-    // transient destination locks (AV/indexer).
-    if std::fs::rename(&tmp, path).is_err() {
+    #[cfg(windows)]
+    {
         if Path::new(path).exists() {
-            let _ = std::fs::remove_file(path);
+            let bak = format!("{path}.bak");
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+                REPLACEFILE_WRITE_THROUGH,
+            };
+
+            let target_wide: Vec<u16> = Path::new(path)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let tmp_wide: Vec<u16> = Path::new(&tmp)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let bak_wide: Vec<u16> = Path::new(&bak)
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+
+            let ret = unsafe {
+                ReplaceFileW(
+                    target_wide.as_ptr(),
+                    tmp_wide.as_ptr(),
+                    bak_wide.as_ptr(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ret == 0 {
+                let _ = std::fs::copy(path, &bak);
+                let ret2 = unsafe {
+                    MoveFileExW(
+                        tmp_wide.as_ptr(),
+                        target_wide.as_ptr(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                    )
+                };
+                if ret2 == 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(AetherError::Other(format!("atomic replace failed: {err}")));
+                }
+            }
+            let _ = std::fs::remove_file(&bak);
+        } else {
+            std::fs::rename(&tmp, path)?;
         }
+        restrict_windows_acl(path);
+    }
+    #[cfg(not(windows))]
+    {
         std::fs::rename(&tmp, path)?;
     }
-    #[cfg(windows)]
-    restrict_windows_acl(path);
     Ok(())
 }
 
 pub fn load(path: &str) -> Result<Option<Identity>> {
-    if !Path::new(path).exists() {
-        return Ok(None);
-    }
-    let meta = std::fs::metadata(path)?;
+    let resolved_path = if !Path::new(path).exists() {
+        let bak = format!("{path}.bak");
+        if Path::new(&bak).exists() {
+            log::warn!("[config] Primary config missing, recovering from backup: {bak}");
+            let _ = std::fs::copy(&bak, path);
+            path
+        } else {
+            return Ok(None);
+        }
+    } else {
+        path
+    };
+
+    let meta = std::fs::metadata(resolved_path)?;
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(AetherError::Other(format!(
             "config too large ({} bytes)",
             meta.len()
         )));
     }
-    let text = read_text(path)?;
+    let raw = std::fs::read(resolved_path)?;
+    let is_plaintext = !raw.starts_with(MAGIC);
+    let text = read_text(resolved_path)?;
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
-    Ok(Some(Identity::try_from(persisted)?))
+    let identity = Identity::try_from(persisted)?;
+
+    if is_plaintext && key()?.is_some() {
+        log::info!("[config] Migrating plaintext config to encrypted format at {resolved_path}");
+        if let Err(e) = save(resolved_path, &identity) {
+            log::warn!("[config] Failed to migrate plaintext config to encrypted format: {e}");
+        }
+    }
+
+    Ok(Some(identity))
 }
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {

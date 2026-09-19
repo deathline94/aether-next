@@ -211,6 +211,30 @@ pub struct ProbeConfig {
     profile: StrategyProfile,
 }
 
+#[allow(dead_code)]
+impl ProbeConfig {
+    pub fn for_test() -> Self {
+        Self {
+            verify_cost: VerifyCost::Cheap,
+            cidrs_v4: &["10.0.0.0/24"],
+            cidrs_v6: &[],
+            cidr_weights_v4: &[("10.0.0.0/24", 1)],
+            seeds_v4: &["10.0.0.1", "10.0.0.2"],
+            seeds_v6: &[],
+            cache_kind: CacheKind::Masque,
+            label: "test",
+            config_path: String::new(),
+            profile: StrategyProfile {
+                turbo_sample: 2,
+                balanced_target: 1,
+                balanced_sample: 2,
+                stealth_target: 1,
+                stealth_sample: 2,
+            },
+        }
+    }
+}
+
 impl CacheKind {
     fn read_sorted(&self, config_path: &str) -> Vec<(SocketAddr, u32)> {
         match self {
@@ -277,16 +301,68 @@ fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration) {
 /// probing with hot-subnet drill-down → deadline/quiet-period management.
 /// Cooperative scan cancellation. `hunt_best` checks this each iteration and
 /// stops gracefully (returning the best endpoint found so far), so a scan can be
+/// Cooperative scan cancellation. `hunt_best` checks this each iteration and
+/// stops gracefully (returning the best endpoint found so far), so a scan can be
 /// stopped without killing the process mid-work. Wire `request_scan_cancel` to a
 /// Ctrl-C / SIGTERM handler or an IPC "stop" command.
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct ScanCancellationToken {
+    inner: CancellationToken,
+}
+
+#[allow(dead_code)]
+impl ScanCancellationToken {
+    pub fn new() -> Self {
+        Self {
+            inner: CancellationToken::new(),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    pub fn child_token(&self) -> CancellationToken {
+        self.inner.child_token()
+    }
+
+    pub async fn cancelled(&self) {
+        self.inner.cancelled().await;
+    }
+}
+
 static SCAN_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static GLOBAL_CANCEL: parking_lot::RwLock<Option<CancellationToken>> = parking_lot::RwLock::new(None);
 
 pub fn request_scan_cancel() {
     SCAN_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
+        token.cancel();
+    }
+}
+
+pub fn current_cancel_token() -> CancellationToken {
+    let mut w = GLOBAL_CANCEL.write();
+    let token = CancellationToken::new();
+    *w = Some(token.clone());
+    token
 }
 
 fn scan_cancelled() -> bool {
-    SCAN_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
+    if SCAN_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
+        return token.is_cancelled();
+    }
+    false
 }
 
 pub async fn hunt_best(
@@ -298,6 +374,7 @@ pub async fn hunt_best(
 ) -> Result<ProbeResult> {
     // Clear any stale cancellation from a previous scan before starting a new one.
     SCAN_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    let cancel_token = current_cancel_token();
     let mut st = mode.strategy(&config.profile);
     // Expensive (QUIC/H3) verification needs a longer per-probe budget than the
     // fast TCP/UDP defaults, or every probe times out mid-handshake. This is the
@@ -357,11 +434,19 @@ pub async fn hunt_best(
         // budget the strategy settled on (first-hit-wins is unchanged).
         let tier0_timeout = st.per_probe_timeout;
         let race_count = cached.len().min(5); // Race top-5 by trust score.
-        log::info!("[⚡] Tier-0 race: top {} cached {} endpoints (first-hit-wins)", race_count, label);
+        let race_child = cancel_token.clone();
         let race_futures: Vec<_> = cached
             .into_iter()
             .take(race_count)
-            .map(|(addr, _rtt)| verify(addr.ip(), addr.port(), tier0_timeout, false))
+            .map(|(addr, _rtt)| {
+                let tok = race_child.clone();
+                async move {
+                    tokio::select! {
+                        _ = tok.cancelled() => None,
+                        res = verify(addr.ip(), addr.port(), tier0_timeout, false) => res,
+                    }
+                }
+            })
             .collect();
 
         // Race: return the first successful result.
@@ -370,12 +455,24 @@ pub async fn hunt_best(
             set.push(fut);
         }
         use futures::StreamExt;
-        while let Some(res) = set.next().await {
-            if let Some(pr) = res {
-                log::info!("[⚡] Tier-0 race winner {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                let rtt_ms = pr.rtt.as_millis() as u32;
-                config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
-                return Ok(pr);
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    log::info!("[*] scan cancelled during Tier-0 race");
+                    return Err(AetherError::NoCleanEndpoint);
+                }
+                res = set.next() => {
+                    match res {
+                        Some(Some(pr)) => {
+                            log::info!("[⚡] Tier-0 race winner {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                            let rtt_ms = pr.rtt.as_millis() as u32;
+                            config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
+                            return Ok(pr);
+                        }
+                        Some(None) => continue,
+                        None => break,
+                    }
+                }
             }
         }
         log::info!("[-] Tier-0 race: all cached endpoints failed, falling back to full scan");
@@ -410,10 +507,19 @@ pub async fn hunt_best(
         total: total_candidates,
         concurrency: st.concurrency,
     });
+    let cancel_child = cancel_token.clone();
     let stream = futures::stream::iter(
         candidates
             .into_iter()
-            .map(|(ip, port)| verify(ip, port, timeout, ironclad)),
+            .map(|(ip, port)| {
+                let tok = cancel_child.clone();
+                async move {
+                    tokio::select! {
+                        _ = tok.cancelled() => None,
+                        res = verify(ip, port, timeout, ironclad) => res,
+                    }
+                }
+            }),
     )
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
@@ -457,6 +563,10 @@ pub async fn hunt_best(
         }
 
         tokio::select! {
+            _ = cancel_token.cancelled() => {
+                log::info!("[*] scan cancelled by request; finalizing with best so far");
+                break;
+            }
             item = stream.next() => {
                 match item {
                     None => break,
@@ -492,7 +602,7 @@ pub async fn hunt_best(
                                     // 'static, so this cannot be spawned off. Cost is
                                     // bounded: drill-downs probe a small fixed
                                     // neighbor list at min(concurrency,16).
-                                    let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency).await;
+                                    let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency, cancel_token.clone()).await;
                                     for h_pr in hot_hits {
                                         log::info!("[🔥] Hot subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
                                         emit_scan_hit(label, h_pr.ip, h_pr.port, h_pr.rtt);
@@ -581,6 +691,7 @@ async fn drill_down_hot_subnet(
     timeout: Duration,
     ironclad: bool,
     concurrency: usize,
+    cancel_token: CancellationToken,
 ) -> Vec<ProbeResult> {
     let mut neighbors = Vec::new();
     match ip {
@@ -619,18 +730,34 @@ async fn drill_down_hot_subnet(
         return Vec::new();
     }
 
+    let cancel_child = cancel_token.clone();
     let stream = futures::stream::iter(
         neighbors
             .into_iter()
-            .map(|(nip, nport)| verify(nip, nport, timeout, ironclad)),
+            .map(|(nip, nport)| {
+                let tok = cancel_child.clone();
+                async move {
+                    tokio::select! {
+                        _ = tok.cancelled() => None,
+                        res = verify(nip, nport, timeout, ironclad) => res,
+                    }
+                }
+            }),
     )
     .buffer_unordered(concurrency.min(16));
     tokio::pin!(stream);
 
     let mut results = Vec::new();
-    while let Some(res) = stream.next().await {
-        if let Some(pr) = res {
-            results.push(pr);
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            res = stream.next() => {
+                match res {
+                    Some(Some(pr)) => results.push(pr),
+                    Some(None) => continue,
+                    None => break,
+                }
+            }
         }
     }
     results

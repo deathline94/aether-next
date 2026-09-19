@@ -37,11 +37,15 @@ class AetherVpnService : VpnService() {
     private var hevStarted = false
     private var stopRequested = false
     private val lifecycleLock = Any()
+    private val vpnGeneration = java.util.concurrent.atomic.AtomicLong(0)
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    internal fun getVpnGeneration(): Long = vpnGeneration.get()
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            vpnGeneration.incrementAndGet()
             stopRequested = true
             // Do not call startForeground on STOP — just tear down.
             worker.execute {
@@ -60,26 +64,35 @@ class AetherVpnService : VpnService() {
         }
         if (tun == null) {
             val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, -1) ?: -1
+            val currentGen = vpnGeneration.incrementAndGet()
             worker.execute {
                 try {
                     check(socksPort in 1024..65535) { "VPN start missing valid SOCKS port" }
                     check(nativeLoaded) { "hev-socks5-tunnel native library unavailable" }
-                    establishTun(socksPort)
-                    mainHandler.post {
-                        SessionController.getOrNull()?.onVpnEstablished()
+                    val established = establishTun(socksPort, currentGen)
+                    if (established && currentGen == vpnGeneration.get() && !stopRequested) {
+                        mainHandler.post {
+                            if (currentGen == vpnGeneration.get() && !stopRequested) {
+                                SessionController.getOrNull()?.onVpnEstablished()
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "VPN establish failed: ${e.message}", e)
                     stopTunnel()
                     mainHandler.post {
-                        SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
+                        if (currentGen == vpnGeneration.get()) {
+                            SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
+                        }
                         stopSelf()
                     }
                 } catch (e: UnsatisfiedLinkError) {
                     Log.e(TAG, "VPN native call failed: ${e.message}", e)
                     stopTunnel()
                     mainHandler.post {
-                        SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
+                        if (currentGen == vpnGeneration.get()) {
+                            SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
+                        }
                         stopSelf()
                     }
                 }
@@ -88,12 +101,12 @@ class AetherVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    private fun establishTun(socksPort: Int) {
+    private fun establishTun(socksPort: Int, gen: Long): Boolean {
         synchronized(lifecycleLock) {
-            if (stopRequested) return
+            if (stopRequested || gen != vpnGeneration.get()) return false
             // Idempotent: two onStartCommands can both observe tun == null before this
             // runs on the single worker thread; establishing twice would leak the first fd.
-            if (tun != null) return
+            if (tun != null) return true
             val builder = Builder()
                 .setSession("Aether Next")
                 .setMtu(MTU)
@@ -128,6 +141,10 @@ class AetherVpnService : VpnService() {
             val established = builder.establish()
             if (established == null) {
                 throw IllegalStateException("VpnService.Builder.establish() returned null")
+            }
+            if (stopRequested || gen != vpnGeneration.get()) {
+                try { established.close() } catch (_: Exception) {}
+                return false
             }
             tun = established
 
@@ -190,6 +207,7 @@ class AetherVpnService : VpnService() {
             TProxyStartService(configPath, established.fd)
             hevStarted = true
             Log.i(TAG, "VPN + hev-socks5-tunnel active")
+            return true
         }
     }
 
@@ -265,6 +283,7 @@ class AetherVpnService : VpnService() {
 
     private fun stopTunnel() {
         synchronized(lifecycleLock) {
+            vpnGeneration.incrementAndGet()
             if (hevStarted) {
                 try {
                     TProxyStopService()
