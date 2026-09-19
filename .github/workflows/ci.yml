@@ -104,4 +104,6 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --no-daemon
+        run: |
+          chmod +x ./gradlew
+          ./gradlew testDebugUnitTest --no-daemon
