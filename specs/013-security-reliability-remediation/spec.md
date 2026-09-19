@@ -151,45 +151,45 @@ A software maintainer or release engineer requires that all claimed bug fixes, s
 ### Functional Requirements
 
 #### Privileged Execution & Desktop Security
-- **FR-001**: System MUST verify Authenticode digital signatures, certificate publisher identity, and full certificate chain on `aether.exe` and `wintun.dll` before executing with Administrator privileges.
-- **FR-002**: System MUST verify embedded cryptographic release hashes for privileged binaries prior to launch as a secondary tamper check.
+- **FR-001**: System MUST verify Authenticode digital signatures, certificate publisher identity (enforcing distinct publisher policies: `aether.exe` under `deathline94` and `wintun.dll` under `WireGuard LLC`), and full certificate chain before executing with Administrator privileges.
+- **FR-002**: System MUST verify embedded cryptographic release hashes for privileged binaries prior to launch as a secondary tamper check, failing closed if hashes are absent from embedded tables or mismatched.
 - **FR-003**: System MUST reject elevated execution if binary path validation, signature verification, or hash checks fail, logging an explicit security violation.
 - **FR-004**: System MUST encrypt desktop user identity credentials at rest using Windows Data Protection API (DPAPI) per-user key derivation.
 - **FR-005**: System MUST fail startup fatally if filesystem access control list (ACL) hardening fails on sensitive configuration directories.
-- **FR-006**: System MUST atomically migrate existing unencrypted identity files to encrypted storage on startup.
+- **FR-006**: System MUST atomically migrate existing unencrypted identity files to encrypted storage on startup, propagating any write failures as fatal errors.
 - **FR-007**: System MUST securely zero sensitive cryptographic key buffers in memory immediately after use.
 
 #### Core Engine Storage, Concurrency & Routing
 - **FR-008**: System MUST utilize an operating-system-backed, non-failing-open lock (`ProvisionGuard`) with process liveness tracking for device provisioning, preventing concurrent registrations.
 - **FR-009**: System MUST perform identity file writes using atomic filesystem replacement APIs (`ReplaceFileW`/`MoveFileExW`) and preserve backup copies until replacement succeeds.
-- **FR-010**: System MUST verify physical peer route creation before installing split-default routes in Windows TUN mode, and roll back all routes if any step fails.
+- **FR-010**: System MUST verify physical peer route creation before installing split-default routes in Windows TUN mode, and roll back all newly added routes in a self-cleaning `try/catch` block if any step fails.
 - **FR-011**: System MUST strictly enforce the 16 KiB HTTP proxy header limit at read chunk boundaries, terminating connections that exceed the maximum size.
 
 #### Android Lifecycle & Process Supervision
 - **FR-012**: System MUST maintain an explicit engine supervisor state machine with mutually exclusive states: `idle`, `scanning`, `connecting`, `connected`, and `stopping`.
-- **FR-013**: System MUST provide a blocking `stopAndWait(timeout)` completion barrier that awaits OS process exit confirmation before allowing new process launches.
+- **FR-013**: System MUST provide a blocking `stopAndWait(timeout)` completion barrier that awaits OS process exit confirmation before allowing new process launches, retaining `STOPPING` state and preserving process references if a process proves unkillable.
 - **FR-014**: System MUST automatically stop active scans and await confirmed process termination before executing "Connect Direct" or tunnel connection requests.
 - **FR-015**: System MUST roll back engine processes, VPN services, and runtime status if Android foreground service startup throws an exception.
 - **FR-016**: System MUST report VPN establishment success only when the virtual network interface is established for the current lifecycle generation.
 - **FR-017**: System MUST correctly extract and report the native engine operating system process ID (PID) as a numeric value.
 
 #### Responsive Scanner & Unified Timeouts
-- **FR-018**: System MUST integrate cooperative cancellation tokens into all asynchronous scan loops, waking immediately on abort signals without waiting for pending network socket timeouts.
+- **FR-018**: System MUST integrate cooperative cancellation tokens into all asynchronous scan loops, tracking monotonic scan generations so early cancellations are never cleared by scan startup, waking immediately on abort signals without waiting for pending network socket timeouts.
 - **FR-019**: System MUST enforce a unified, protocol-appropriate minimum probe timeout (minimum 6000 ms for QUIC/H3) across UI, native bridges, and engine configurations.
 
 #### Settings Integrity & Platform Resilience
-- **FR-020**: System MUST ensure settings hydration in UI runtime hooks completes in a `finally` block, preventing permanent settings lockout upon communication errors.
-- **FR-021**: System MUST verify Windows system proxy registry key deletions and maintain the recovery file until deletion is confirmed via registry read-back.
+- **FR-020**: System MUST ensure settings hydration in UI runtime hooks completes in a `finally` block, exposing a visible retry banner upon communication errors.
+- **FR-021**: System MUST verify all 3 Windows system proxy registry values (`ProxyEnable`, `ProxyServer`, and `ProxyOverride`) on read-back and maintain the recovery file until restoration is verified.
 - **FR-022**: System MUST track connection establishment history across process exits to distinguish normal session disconnects from pre-connection gateway failures.
-- **FR-023**: System MUST validate all configuration fields, enums, protocols, and ranges at the native Android bridge boundary before applying settings.
-- **FR-024**: System MUST provide automated recovery, key rotation, and reprovisioning when Android configuration key store corruption is detected.
+- **FR-023**: System MUST validate all configuration fields, enums (including `gool` preset and noise modes `off` through `custom`), protocols, and ranges at the native Android bridge boundary before applying settings.
+- **FR-024**: System MUST provide automated recovery, key rotation, corrupted configuration quarantine (`aether.toml.corrupted.<timestamp>`), and reprovisioning when Android configuration key store corruption is detected.
 - **FR-025**: System MUST preserve explicit user routing selections during Android settings migrations.
 - **FR-026**: System MUST post user-actionable notifications on Android 10+ boot events rather than attempting disallowed background activity launches.
 
 #### Testing & CI Quality Gates
 - **FR-027**: System MUST include automated tests verifying scanner cancellation, lifecycle transitions, atomic file writes, settings hydration, and process barriers.
 - **FR-028**: System MUST gate release packaging workflows upon successful completion of the full automated CI test suite.
-- **FR-029**: System MUST pin all compiler toolchains, SDKs, and build dependencies to deterministic versions.
+- **FR-029**: System MUST pin all compiler toolchains, SDKs, build dependencies, and CI third-party actions to immutable 40-character commit SHAs with inline version comments.
 
 ---
 

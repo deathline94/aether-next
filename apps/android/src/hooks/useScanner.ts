@@ -98,9 +98,9 @@ export function useScanner(
     try {
       if (running) {
         await invoke("disconnect");
-        await new Promise((r) => setTimeout(r, 400));
       }
-      await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs: Math.max(3000, timeoutMs), noize });
+      const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
+      await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${String(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));

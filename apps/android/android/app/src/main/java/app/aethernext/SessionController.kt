@@ -88,9 +88,17 @@ class SessionController(
     fun connect(s: Settings): String? {
         if (runner.isRunning()) {
             if (runner.getState() == SupervisorState.SCANNING) {
-                runner.stopAndWait(3000)
+                if (!runner.stopAndWait(3000)) {
+                    val err = "Previous engine process is still terminating; launch aborted"
+                    setRuntime("error", err, null, null)
+                    return err
+                }
             }
-            if (runner.isRunning()) return "Aether is already running"
+            if (runner.isRunning()) {
+                val err = "Aether is already running"
+                setRuntime("error", err, null, null)
+                return err
+            }
         }
         validate(s)
         store.save(s)
@@ -141,7 +149,12 @@ class SessionController(
         noize: String,
     ): String? {
         if (runner.isRunning()) {
-            runner.stopAndWait(3000)
+            if (!runner.stopAndWait(3000)) {
+                val err = "Previous engine process is still terminating; scan aborted"
+                emitLog("scan error: $err")
+                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
+                return err
+            }
             if (runner.isRunning()) {
                 val err = "Engine could not be stopped for scan"
                 emitLog("scan error: $err")
@@ -422,7 +435,7 @@ class SessionController(
         emit("scan://event", out)
     }
 
-    private fun emitLog(message: String) {
+    fun emitLog(message: String) {
         val lower = message.lowercase()
         val level = when {
             lower.contains("error") || lower.contains("failed") -> "error"
@@ -442,13 +455,17 @@ class SessionController(
         private var instance: SessionController? = null
 
         fun validateSettings(s: Settings) {
-            val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg")
+            val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg", "gool")
             if (s.protocol.lowercase() !in validProtocols) {
                 throw IllegalArgumentException("Invalid protocol '${s.protocol}'. Allowed: $validProtocols")
             }
             val validTransports = setOf("h2", "h3")
             if (s.transport.lowercase() !in validTransports) {
                 throw IllegalArgumentException("Invalid transport '${s.transport}'. Allowed: $validTransports")
+            }
+            val validPresets = setOf("warp", "gool")
+            if (s.endpointPreset.lowercase() !in validPresets) {
+                throw IllegalArgumentException("Invalid endpointPreset '${s.endpointPreset}'. Allowed: $validPresets")
             }
             val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "thorough", "ironclad")
             if (s.scanMode.lowercase() !in validScanModes) {
@@ -462,7 +479,7 @@ class SessionController(
             if (s.routingMode.lowercase() !in validRoutingModes) {
                 throw IllegalArgumentException("Invalid routingMode '${s.routingMode}'. Allowed: $validRoutingModes")
             }
-            val validNoize = setOf("off", "on", "random", "m1", "m2")
+            val validNoize = setOf("off", "on", "random", "m1", "m2", "light", "medium", "high", "max", "custom")
             if (s.noize.lowercase() !in validNoize) {
                 throw IllegalArgumentException("Invalid noize mode '${s.noize}'. Allowed: $validNoize")
             }

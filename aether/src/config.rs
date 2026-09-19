@@ -273,9 +273,11 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
 
     if is_plaintext && key()?.is_some() {
         log::info!("[config] Migrating plaintext config to encrypted format at {resolved_path}");
-        if let Err(e) = save(resolved_path, &identity) {
-            log::warn!("[config] Failed to migrate plaintext config to encrypted format: {e}");
-        }
+        save(resolved_path, &identity).map_err(|e| {
+            AetherError::Other(format!(
+                "Failed to migrate plaintext config to encrypted format at {resolved_path}: {e}"
+            ))
+        })?;
     }
 
     Ok(Some(identity))

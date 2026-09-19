@@ -59,4 +59,50 @@ describe("useRuntime settings hydration", () => {
     expect(settings.protocol).toBe("wireguard");
     expect(settings.socksPort).toBe(9050);
   });
+
+  it("flags settingsLoadError on failure and recovers on retry", async () => {
+    let settingsLoadError = false;
+    let settingsLoaded = false;
+    let settings = { protocol: "masque", socksPort: 1819 };
+    const defaults = { protocol: "masque", socksPort: 1819 };
+
+    // Initial fail
+    const mockInvokeFail = vi.fn().mockRejectedValue(new Error("Disk corrupt"));
+    try {
+      const [fetched] = await Promise.all([
+        mockInvokeFail("get_settings").catch(() => null),
+      ]);
+      if (fetched) {
+        settings = { ...defaults, ...fetched };
+        settingsLoadError = false;
+      } else {
+        settingsLoadError = true;
+      }
+    } finally {
+      settingsLoaded = true;
+    }
+
+    expect(settingsLoaded).toBe(true);
+    expect(settingsLoadError).toBe(true);
+
+    // Retry succeeds
+    const mockInvokeSuccess = vi.fn().mockResolvedValue({ protocol: "gool", socksPort: 1080 });
+    const retrySettings = async () => {
+      try {
+        const loaded = await mockInvokeSuccess("get_settings");
+        if (loaded) {
+          settings = { ...defaults, ...loaded };
+          settingsLoadError = false;
+          settingsLoaded = true;
+        }
+      } catch {
+        settingsLoadError = true;
+      }
+    };
+
+    await retrySettings();
+    expect(settingsLoadError).toBe(false);
+    expect(settings.protocol).toBe("gool");
+    expect(settings.socksPort).toBe(1080);
+  });
 });

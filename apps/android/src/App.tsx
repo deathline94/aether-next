@@ -30,7 +30,7 @@ function App() {
 
   const {
     settings, runtime, busy, testBusy, saved, admin, testResult, appVersion,
-    connected, running, settingsLocked, settingsLoaded,
+    connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   } = useRuntime(appendLog, clearLogs);
 
@@ -167,7 +167,10 @@ function App() {
         {view === "settings" && (
           <SettingsTab
             settings={settings} settingsLocked={settingsLocked}
-            settingsLoaded={settingsLoaded} saved={saved} admin={admin}
+            settingsLoaded={settingsLoaded}
+            settingsLoadError={settingsLoadError}
+            retrySettings={retrySettings}
+            saved={saved} admin={admin}
             patchSettings={patchSettings}
           />
         )}

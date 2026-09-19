@@ -242,26 +242,36 @@ foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1')) {{
 # Peer exclude: force edge traffic out physical gateway
 Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-# Pin the outer transport to the selected physical interface.
-New-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-# Split default ON-LINK on WinTUN (this is what WireGuard uses)
-foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
-  New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -NextHop '0.0.0.0' -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-  if (-not (Get-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -ErrorAction SilentlyContinue)) {{
-    # Fallback: next-hop = tunnel IP + IF
-    $dest = $p.Split('/')[0]
-    $mask = if ($p -like '0.0.0.0/*') {{ '128.0.0.0' }} else {{ '128.0.0.0' }}
-    route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
+$added = @()
+try {{
+  # Pin the outer transport to the selected physical interface.
+  New-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -NextHop $gw -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  $added += [PSCustomObject]@{{ DestinationPrefix = $peer; InterfaceIndex = $physIf }}
+  # Split default ON-LINK on WinTUN (this is what WireGuard uses)
+  foreach ($p in @('0.0.0.0/1','128.0.0.0/1')) {{
+    New-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -NextHop '0.0.0.0' -RouteMetric 0 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    $added += [PSCustomObject]@{{ DestinationPrefix = $p; InterfaceIndex = $tunIf }}
+    if (-not (Get-NetRoute -DestinationPrefix $p -InterfaceIndex $tunIf -ErrorAction SilentlyContinue)) {{
+      # Fallback: next-hop = tunnel IP + IF
+      $dest = $p.Split('/')[0]
+      $mask = if ($p -like '0.0.0.0/*') {{ '128.0.0.0' }} else {{ '128.0.0.0' }}
+      route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
+    }}
   }}
+  # IPv6 stays disabled until this TUN path supports it.
+  # Verify
+  $v = @(Get-NetRoute -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') }} |
+    Select-Object -ExpandProperty DestinationPrefix)
+  $peerOk = Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue
+  if ($v.Count -lt 2 -or -not $peerOk) {{ throw 'route verification failed' }}
+  Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -join ','))
+}} catch {{
+  foreach ($r in $added) {{
+    Remove-NetRoute -DestinationPrefix $r.DestinationPrefix -InterfaceIndex $r.InterfaceIndex -Confirm:$false -ErrorAction SilentlyContinue
+  }}
+  throw
 }}
-# IPv6 stays disabled until this TUN path supports it.
-# Verify
-$v = @(Get-NetRoute -InterfaceIndex $tunIf -ErrorAction SilentlyContinue |
-  Where-Object {{ $_.DestinationPrefix -in @('0.0.0.0/1','128.0.0.0/1') }} |
-  Select-Object -ExpandProperty DestinationPrefix)
-$peerOk = Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue
-if ($v.Count -lt 2 -or -not $peerOk) {{ throw 'route verification failed' }}
-Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -join ','))
 "#
     );
     match ps(&script) {

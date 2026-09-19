@@ -16,16 +16,31 @@ enum class SupervisorState {
     STOPPING,
 }
 
+interface ProcessLauncher {
+    fun launch(command: List<String>, env: Map<String, String>): Process
+}
+
+class DefaultProcessLauncher(private val workingDir: File? = null) : ProcessLauncher {
+    override fun launch(command: List<String>, env: Map<String, String>): Process {
+        val pb = ProcessBuilder(command)
+        workingDir?.let { pb.directory(it) }
+        pb.redirectErrorStream(true)
+        pb.environment().putAll(env)
+        return pb.start()
+    }
+}
+
 /**
  * Spawns the packaged engine binary.
  *
  * On modern Android (W^X), executables under filesDir are not runnable (EACCES/13).
  * Prefer [nativeLibraryDir]/libaether.so which is already executable.
  */
-class EngineRunner(
+open class EngineRunner(
     private val context: Context,
     private val onLine: (String) -> Unit,
     private val onExit: (Int?, Boolean) -> Unit,
+    private val launcher: ProcessLauncher = DefaultProcessLauncher(context.filesDir),
 ) {
     private val processRef = AtomicReference<Process?>(null)
     private val running = AtomicBoolean(false)
@@ -60,6 +75,53 @@ class EngineRunner(
         }
     }
 
+    open fun buildProcessCommand(binary: File): List<String> {
+        return listOf(binary.absolutePath)
+    }
+
+    open fun configureProcessEnvironment(settings: Settings, binary: File): Map<String, String> {
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val configPath = File(configDir, "aether.toml").absolutePath
+        val homeDir = context.filesDir.absolutePath
+
+        val protocolEnv = when (settings.protocol.lowercase()) {
+            "wireguard", "wg" -> "wg"
+            "masque-h2" -> "masque"
+            "masque", "masque-h3" -> "masque"
+            else -> "masque"
+        }
+        val isH2 = settings.protocol.lowercase() == "masque-h2" || settings.transport.lowercase() == "h2"
+
+        val env = mutableMapOf<String, String>(
+            "AETHER_PROTOCOL" to protocolEnv,
+            "AETHER_SCAN" to settings.scanMode,
+            "AETHER_IP" to settings.ipVersion,
+            "AETHER_NOIZE" to settings.noize,
+            "AETHER_SOCKS" to "127.0.0.1:${settings.socksPort}",
+            "AETHER_HTTP" to "127.0.0.1:${settings.httpPort}",
+            "AETHER_CONFIG" to configPath,
+            "AETHER_CONFIG_KEY" to ConfigKeyStore.loadOrCreate(context),
+            "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
+            "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
+            "AETHER_TUN" to "0",
+            "AETHER_WG_NO_PROFILE_RETRY" to "1",
+            "AETHER_CONTROL_STDIN" to "1",
+            "RUST_LOG" to "info",
+            "HOME" to homeDir,
+            "TMPDIR" to context.cacheDir.absolutePath
+        )
+        if (settings.peer.isNotBlank()) {
+            env["AETHER_PEER"] = settings.peer.trim()
+        }
+        if (settings.noize.equals("custom", ignoreCase = true)) {
+            env["AETHER_NOIZE_JC"] = settings.noizeJc.toString()
+            env["AETHER_NOIZE_JMIN"] = settings.noizeJmin.toString()
+            env["AETHER_NOIZE_JMAX"] = settings.noizeJmax.toString()
+            env["AETHER_NOIZE_INTERVAL_MS"] = settings.noizeIntervalMs.toString()
+        }
+        return env
+    }
+
     fun start(settings: Settings): String? = synchronized(lifecycleLock) {
         if (running.get() || supervisorState.get() != SupervisorState.IDLE) {
             return "Aether is already running"
@@ -73,65 +135,13 @@ class EngineRunner(
         return try {
             Log.i(TAG, "starting engine: ${binary.absolutePath} exists=${binary.exists()} canExec=${binary.canExecute()} len=${binary.length()}")
 
-            val configDir = File(context.filesDir, "config").apply { mkdirs() }
-            val configPath = File(configDir, "aether.toml").absolutePath
-            val homeDir = context.filesDir.absolutePath
-
-            // Map UI protocol names to engine env values.
-            val protocolEnv = when (settings.protocol.lowercase()) {
-                "wireguard", "wg" -> "wg"
-                "masque-h2" -> "masque"
-                "masque", "masque-h3" -> "masque"
-                else -> "masque"
-            }
-            val isH2 = settings.protocol.lowercase() == "masque-h2" || settings.transport.lowercase() == "h2"
-
-            val pb = ProcessBuilder(binary.absolutePath).apply {
-                // Work from a writable app dir (config/logs), not the lib folder.
-                directory(context.filesDir)
-                redirectErrorStream(true)
-                environment().apply {
-                    put("AETHER_PROTOCOL", protocolEnv)
-                    // Forced endpoint from Scanner "Connect Direct"; empty = auto-scan.
-                    if (settings.peer.isNotBlank()) {
-                        put("AETHER_PEER", settings.peer.trim())
-                    }
-                    put("AETHER_SCAN", settings.scanMode)
-                    put("AETHER_IP", settings.ipVersion)
-                    put("AETHER_NOIZE", settings.noize)
-                    put("AETHER_SOCKS", "127.0.0.1:${settings.socksPort}")
-                    put("AETHER_HTTP", "127.0.0.1:${settings.httpPort}")
-                    put("AETHER_CONFIG", configPath)
-                    put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
-                    put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
-                    // H3 anti-DPI: split the QUIC Initial ClientHello across two
-                    // datagrams (only meaningful on SNI-filtering networks).
-                    put(
-                        "AETHER_QUIC_INITIAL_FRAG",
-                        if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0",
-                    )
-                    // Android full-device routing uses hev tun2socks + VpnService, not engine TUN.
-                    put("AETHER_TUN", "0")
-                    put("AETHER_WG_NO_PROFILE_RETRY", "1")
-                    // Control channel so stop() can shut the session down gracefully.
-                    put("AETHER_CONTROL_STDIN", "1")
-                    put("RUST_LOG", "info")
-                    put("HOME", homeDir)
-                    put("TMPDIR", context.cacheDir.absolutePath)
-                    if (settings.noize.equals("custom", ignoreCase = true)) {
-                        put("AETHER_NOIZE_JC", settings.noizeJc.toString())
-                        put("AETHER_NOIZE_JMIN", settings.noizeJmin.toString())
-                        put("AETHER_NOIZE_JMAX", settings.noizeJmax.toString())
-                        put("AETHER_NOIZE_INTERVAL_MS", settings.noizeIntervalMs.toString())
-                    }
-                }
-            }
+            val command = buildProcessCommand(binary)
+            val env = configureProcessEnvironment(settings, binary)
 
             val proc = try {
-                pb.start()
+                launcher.launch(command, env)
             } catch (e: Exception) {
-                Log.e(TAG, "ProcessBuilder failed for ${binary.absolutePath}: ${e.message}", e)
-                // No sh -c fallback: data dirs are noexec on modern Android and hide real errors.
+                Log.e(TAG, "Process launch failed for ${binary.absolutePath}: ${e.message}", e)
                 throw e
             }
 
@@ -170,6 +180,43 @@ class EngineRunner(
         }
     }
 
+    open fun configureScanEnvironment(
+        protocol: String,
+        ipVersion: String,
+        concurrency: Int,
+        timeoutMs: Int,
+        noize: String,
+    ): Map<String, String> {
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val configPath = File(configDir, "aether.toml").absolutePath
+        val homeDir = context.filesDir.absolutePath
+
+        val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
+        val isH2 = protocol == "masque-h2"
+        val settings = SettingsStore(context).load()
+
+        return mutableMapOf<String, String>(
+            "AETHER_PROTOCOL" to protocolEnv,
+            "AETHER_SCAN_ONLY" to "1",
+            "AETHER_SCAN_EXHAUSTIVE" to "1",
+            "AETHER_SCAN" to "balanced",
+            "AETHER_IP" to ipVersion,
+            "AETHER_NOIZE" to noize,
+            "AETHER_SCAN_CONCURRENCY" to concurrency.toString(),
+            "AETHER_SCAN_TIMEOUT_MS" to timeoutMs.toString(),
+            "AETHER_CONFIG" to configPath,
+            "AETHER_CONFIG_KEY" to ConfigKeyStore.loadOrCreate(context),
+            "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
+            "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
+            "AETHER_TUN" to "0",
+            "AETHER_WG_NO_PROFILE_RETRY" to "1",
+            "AETHER_CONTROL_STDIN" to "1",
+            "RUST_LOG" to "info",
+            "HOME" to homeDir,
+            "TMPDIR" to context.cacheDir.absolutePath
+        )
+    }
+
     /**
      * Start the engine in scan-only mode (no tunnel, no VPN).
      * The engine emits AETHER_EVENT lines for scan progress/hits.
@@ -191,44 +238,10 @@ class EngineRunner(
         supervisorState.set(SupervisorState.SCANNING)
         val currentGeneration = generation.incrementAndGet()
         return try {
-            val configDir = File(context.filesDir, "config").apply { mkdirs() }
-            val configPath = File(configDir, "aether.toml").absolutePath
-            val homeDir = context.filesDir.absolutePath
+            val command = buildProcessCommand(binary)
+            val env = configureScanEnvironment(protocol, ipVersion, concurrency, timeoutMs, noize)
 
-            val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
-            val isH2 = protocol == "masque-h2"
-            val settings = SettingsStore(context).load()
-
-            val pb = ProcessBuilder(binary.absolutePath).apply {
-                directory(context.filesDir)
-                redirectErrorStream(true)
-                environment().apply {
-                    put("AETHER_PROTOCOL", protocolEnv)
-                    put("AETHER_SCAN_ONLY", "1")
-                    put("AETHER_SCAN_EXHAUSTIVE", "1")
-                    put("AETHER_SCAN", "balanced")
-                    put("AETHER_IP", ipVersion)
-                    put("AETHER_NOIZE", noize)
-                    put("AETHER_SCAN_CONCURRENCY", concurrency.toString())
-                    put("AETHER_SCAN_TIMEOUT_MS", timeoutMs.toString())
-                    put("AETHER_CONFIG", configPath)
-                    put("AETHER_CONFIG_KEY", ConfigKeyStore.loadOrCreate(context))
-                    put("AETHER_MASQUE_HTTP2", if (isH2) "1" else "0")
-                    put(
-                        "AETHER_QUIC_INITIAL_FRAG",
-                        if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0",
-                    )
-                    put("AETHER_TUN", "0")
-                    put("AETHER_WG_NO_PROFILE_RETRY", "1")
-                    // Control channel so stop() can cancel the scan gracefully.
-                    put("AETHER_CONTROL_STDIN", "1")
-                    put("RUST_LOG", "info")
-                    put("HOME", homeDir)
-                    put("TMPDIR", context.cacheDir.absolutePath)
-                }
-            }
-
-            val proc = pb.start()
+            val proc = launcher.launch(command, env)
             processRef.set(proc)
             Thread({
                 try {
@@ -291,17 +304,24 @@ class EngineRunner(
                 }
             }
         }
-        running.set(false)
-        supervisorState.set(SupervisorState.IDLE)
-        processRef.compareAndSet(p, null)
-        !p.isAlive
+        if (p.isAlive) {
+            Log.e(TAG, "Process failed to stop after forced kill escalation; retaining STOPPING state")
+            running.set(true)
+            supervisorState.set(SupervisorState.STOPPING)
+            false
+        } else {
+            running.set(false)
+            supervisorState.set(SupervisorState.IDLE)
+            processRef.compareAndSet(p, null)
+            true
+        }
     }
 
     fun stop() {
         stopAndWait(5000)
     }
 
-    private fun resolveEngine(configured: String): File? {
+    protected open fun resolveEngine(configured: String): File? {
         // Never run arbitrary user paths (bridge can set enginePath). Only APK natives / staged assets.
         if (configured.isNotBlank()) {
             Log.w(TAG, "ignoring custom enginePath for security: $configured")

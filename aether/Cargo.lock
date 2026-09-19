@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

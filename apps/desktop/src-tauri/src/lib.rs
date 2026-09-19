@@ -820,19 +820,38 @@ pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
     Ok(s)
 }
 
+include!(concat!(env!("OUT_DIR"), "/release_hashes.rs"));
+
 #[derive(Debug, Clone)]
 pub struct TrustedBinaryPolicy {
     pub allow_unsigned_in_debug: bool,
     pub expected_publisher_cn: &'static str,
     pub embedded_hashes: &'static [(&'static str, &'static str)],
+    pub enforce_hash_match: bool,
 }
 
 impl Default for TrustedBinaryPolicy {
     fn default() -> Self {
+        Self::for_engine()
+    }
+}
+
+impl TrustedBinaryPolicy {
+    pub fn for_engine() -> Self {
         Self {
             allow_unsigned_in_debug: true,
             expected_publisher_cn: "deathline94",
-            embedded_hashes: &[],
+            embedded_hashes: EMBEDDED_RELEASE_HASHES,
+            enforce_hash_match: !cfg!(debug_assertions),
+        }
+    }
+
+    pub fn for_wintun() -> Self {
+        Self {
+            allow_unsigned_in_debug: false,
+            expected_publisher_cn: "WireGuard LLC",
+            embedded_hashes: EMBEDDED_RELEASE_HASHES,
+            enforce_hash_match: !cfg!(debug_assertions),
         }
     }
 }
@@ -843,6 +862,7 @@ pub enum BinaryTrustError {
     Authenticode(i32, String),
     PublisherMismatch { expected: String, found: String },
     HashMismatch { filename: String, expected: String, actual: String },
+    MissingHash { filename: String },
 }
 
 impl std::fmt::Display for BinaryTrustError {
@@ -860,6 +880,9 @@ impl std::fmt::Display for BinaryTrustError {
                     f,
                     "Hash mismatch for {filename}: expected {expected}, actual {actual}"
                 )
+            }
+            Self::MissingHash { filename } => {
+                write!(f, "Missing release hash in embedded policy for {filename}")
             }
         }
     }
@@ -975,8 +998,10 @@ pub fn verify_elevated_binary(
     let actual_hash = file_sha256_hex(path)
         .map_err(BinaryTrustError::Validation)?;
 
+    let mut found_hash = false;
     for &(expected_name, expected_hash) in policy.embedded_hashes {
         if expected_name.eq_ignore_ascii_case(filename) || expected_name.eq_ignore_ascii_case(label) {
+            found_hash = true;
             if !actual_hash.eq_ignore_ascii_case(expected_hash) {
                 return Err(BinaryTrustError::HashMismatch {
                     filename: filename.to_string(),
@@ -985,6 +1010,12 @@ pub fn verify_elevated_binary(
                 });
             }
         }
+    }
+
+    if policy.enforce_hash_match && !found_hash {
+        return Err(BinaryTrustError::MissingHash {
+            filename: filename.to_string(),
+        });
     }
 
     #[cfg(windows)]
@@ -1332,12 +1363,13 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         restrict_directory_acl(&dir)?;
 
-        let policy = TrustedBinaryPolicy::default();
         if settings.routing_mode == "tun" {
-            verify_elevated_binary(&executable, "aether.exe", &policy)
+            let engine_policy = TrustedBinaryPolicy::for_engine();
+            verify_elevated_binary(&executable, "aether.exe", &engine_policy)
                 .map_err(|e| e.to_string())?;
             if let Some(wintun) = wintun_path(&app) {
-                verify_elevated_binary(&wintun, "wintun.dll", &policy)
+                let wintun_policy = TrustedBinaryPolicy::for_wintun();
+                verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
                     .map_err(|e| e.to_string())?;
                 // Optional pin: set AETHER_WINTUN_SHA256 to require exact file hash.
                 if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
@@ -1849,7 +1881,7 @@ mod autostart {
 }
 
 #[cfg(windows)]
-mod windows_proxy {
+pub mod windows_proxy {
     use serde::{Deserialize, Serialize};
     use std::io;
     use std::path::Path;
@@ -1860,9 +1892,9 @@ mod windows_proxy {
 
     #[derive(Clone, Serialize, Deserialize)]
     pub struct ProxySnapshot {
-        enabled: u32,
-        server: Option<String>,
-        bypass: Option<String>,
+        pub enabled: u32,
+        pub server: Option<String>,
+        pub bypass: Option<String>,
     }
 
     fn key() -> io::Result<RegKey> {
@@ -1950,6 +1982,49 @@ mod windows_proxy {
         Ok(snapshot)
     }
 
+    pub fn verify_readback_values(
+        snapshot: &ProxySnapshot,
+        actual_enabled: u32,
+        actual_server: Option<&str>,
+        actual_bypass: Option<&str>,
+    ) -> Result<(), String> {
+        if actual_enabled != snapshot.enabled {
+            return Err(format!(
+                "ProxyEnable read-back mismatch: expected {}, got {}",
+                snapshot.enabled, actual_enabled
+            ));
+        }
+        match (snapshot.server.as_deref(), actual_server) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => {}
+            (Some(expected), actual) => {
+                return Err(format!(
+                    "ProxyServer read-back mismatch: expected Some({expected:?}), got {actual:?}"
+                ));
+            }
+            (None, Some(actual)) => {
+                return Err(format!(
+                    "ProxyServer read-back mismatch: expected None, got Some({actual:?})"
+                ));
+            }
+        }
+        match (snapshot.bypass.as_deref(), actual_bypass) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => {}
+            (Some(expected), actual) => {
+                return Err(format!(
+                    "ProxyOverride read-back mismatch: expected Some({expected:?}), got {actual:?}"
+                ));
+            }
+            (None, Some(actual)) => {
+                return Err(format!(
+                    "ProxyOverride read-back mismatch: expected None, got Some({actual:?})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn restore(snapshot: ProxySnapshot) -> Result<(), String> {
         let key = key().map_err(|e| e.to_string())?;
         match snapshot.server.as_ref() {
@@ -1975,33 +2050,40 @@ mod windows_proxy {
         key.set_value("ProxyEnable", &snapshot.enabled)
             .map_err(|e| e.to_string())?;
 
-        // Read-back verification
+        // 3-tuple read-back verification: ProxyEnable, ProxyServer, ProxyOverride
         let current_enabled: u32 = key
             .get_value("ProxyEnable")
             .map_err(|e| format!("verify ProxyEnable: {e}"))?;
-        if current_enabled != snapshot.enabled {
-            return Err(format!(
-                "ProxyEnable read-back mismatch: expected {}, got {}",
-                snapshot.enabled, current_enabled
-            ));
-        }
-        if snapshot.server.is_none() && key.get_value::<String, _>("ProxyServer").is_ok() {
-            return Err("ProxyServer read-back check failed: value still present".into());
-        }
+        let current_server: Option<String> = key.get_value("ProxyServer").ok();
+        let current_bypass: Option<String> = key.get_value("ProxyOverride").ok();
+
+        verify_readback_values(
+            &snapshot,
+            current_enabled,
+            current_server.as_deref(),
+            current_bypass.as_deref(),
+        )?;
 
         refresh();
         Ok(())
     }
 
-    pub fn recover(path: &Path) -> Result<bool, String> {
+    pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), String>>(
+        path: &Path,
+        restorer: F,
+    ) -> Result<bool, String> {
         if !path.exists() {
             return Ok(false);
         }
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
         let snapshot: ProxySnapshot = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
-        restore(snapshot)?;
+        restorer(snapshot)?;
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
         Ok(true)
+    }
+
+    pub fn recover(path: &Path) -> Result<bool, String> {
+        recover_internal(path, restore)
     }
 }
 

@@ -101,106 +101,113 @@ class AetherVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    internal fun configureTunBuilder(): Builder {
+        val builder = Builder()
+            .setSession("Aether Next")
+            .setMtu(MTU)
+            .setBlocking(false)
+            // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
+            .addAddress(TUN_ADDR, 24)
+            // Exclusively advertise MAPPED_DNS so all lookups hit mapdns fake-IP synthesis (and NODATA on AAAA).
+            // Do NOT add public resolvers (1.1.1.1, 2606:4700:4700::1111) which cause netd to leak queries
+            // or return real IPv6 addresses that bypass the tunnel on mobile data.
+            .addDnsServer(MAPPED_DNS)
+            .addRoute("0.0.0.0", 0)
+            // /15 covers both 198.18.0.0/16 (interface & DNS) and 198.19.0.0/16 (mapdns fake-IP range)
+            .addRoute("198.18.0.0", 15)
+            // Trap all IPv6 inside the TUN interface with point-to-point host prefix 128 (prevent carrier bypass)
+            .addAddress(TUN_ADDR_V6, 128)
+            .addRoute("::", 0)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                builder.setMetered(false)
+            } catch (e: Exception) {
+                Log.w(TAG, "setMetered failed: ${e.message}")
+            }
+        }
+
+        // Keep engine + hev sockets off the TUN (otherwise infinite loop).
+        try {
+            builder.addDisallowedApplication(packageName)
+        } catch (_: Exception) {
+        }
+        return builder
+    }
+
+    internal fun registerUnderlyingNetworkCallbacks() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                connectivityManager = cm
+                val callback = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        Log.i(TAG, "underlying network available: $network")
+                        try {
+                            setUnderlyingNetworks(arrayOf(network))
+                        } catch (e: Exception) {
+                            Log.w(TAG, "setUnderlyingNetworks onAvailable failed: ${e.message}")
+                        }
+                    }
+
+                    override fun onLost(network: Network) {
+                        Log.i(TAG, "underlying network lost: $network")
+                        try {
+                            setUnderlyingNetworks(null)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "setUnderlyingNetworks onLost failed: ${e.message}")
+                        }
+                    }
+
+                    override fun onCapabilitiesChanged(
+                        network: Network,
+                        networkCapabilities: NetworkCapabilities,
+                    ) {
+                        try {
+                            setUnderlyingNetworks(arrayOf(network))
+                        } catch (e: Exception) {
+                            Log.w(TAG, "setUnderlyingNetworks onCapabilitiesChanged failed: ${e.message}")
+                        }
+                    }
+                }
+                networkCallback = callback
+                cm?.registerDefaultNetworkCallback(callback)
+            } catch (e: Exception) {
+                Log.w(TAG, "registerDefaultNetworkCallback failed: ${e.message}")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                    try {
+                        setUnderlyingNetworks(null)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            try {
+                setUnderlyingNetworks(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "setUnderlyingNetworks failed: ${e.message}")
+            }
+        }
+    }
+
     private fun establishTun(socksPort: Int, gen: Long): Boolean {
         synchronized(lifecycleLock) {
             if (stopRequested || gen != vpnGeneration.get()) return false
             // Idempotent: two onStartCommands can both observe tun == null before this
             // runs on the single worker thread; establishing twice would leak the first fd.
             if (tun != null) return true
-            val builder = Builder()
-                .setSession("Aether Next")
-                .setMtu(MTU)
-                .setBlocking(false)
-                // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
-                .addAddress(TUN_ADDR, 24)
-                // Exclusively advertise MAPPED_DNS so all lookups hit mapdns fake-IP synthesis (and NODATA on AAAA).
-                // Do NOT add public resolvers (1.1.1.1, 2606:4700:4700::1111) which cause netd to leak queries
-                // or return real IPv6 addresses that bypass the tunnel on mobile data.
-                .addDnsServer(MAPPED_DNS)
-                .addRoute("0.0.0.0", 0)
-                // /15 covers both 198.18.0.0/16 (interface & DNS) and 198.19.0.0/16 (mapdns fake-IP range)
-                .addRoute("198.18.0.0", 15)
-                // Trap all IPv6 inside the TUN interface with point-to-point host prefix 128 (prevent carrier bypass)
-                .addAddress(TUN_ADDR_V6, 128)
-                .addRoute("::", 0)
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
-                    builder.setMetered(false)
-                } catch (e: Exception) {
-                    Log.w(TAG, "setMetered failed: ${e.message}")
-                }
-            }
-
-            // Keep engine + hev sockets off the TUN (otherwise infinite loop).
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) {
-            }
-
+            val builder = configureTunBuilder()
             val established = builder.establish()
-            if (established == null) {
-                throw IllegalStateException("VpnService.Builder.establish() returned null")
-            }
+                ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
+
             if (stopRequested || gen != vpnGeneration.get()) {
                 try { established.close() } catch (_: Exception) {}
                 return false
             }
             tun = established
 
-            // Dynamically track active underlying network (Wi-Fi vs Cellular)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                try {
-                    val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                    connectivityManager = cm
-                    val callback = object : ConnectivityManager.NetworkCallback() {
-                        override fun onAvailable(network: Network) {
-                            Log.i(TAG, "underlying network available: $network")
-                            try {
-                                setUnderlyingNetworks(arrayOf(network))
-                            } catch (e: Exception) {
-                                Log.w(TAG, "setUnderlyingNetworks onAvailable failed: ${e.message}")
-                            }
-                        }
-
-                        override fun onLost(network: Network) {
-                            Log.i(TAG, "underlying network lost: $network")
-                            try {
-                                setUnderlyingNetworks(null)
-                            } catch (e: Exception) {
-                                Log.w(TAG, "setUnderlyingNetworks onLost failed: ${e.message}")
-                            }
-                        }
-
-                        override fun onCapabilitiesChanged(
-                            network: Network,
-                            networkCapabilities: NetworkCapabilities,
-                        ) {
-                            try {
-                                setUnderlyingNetworks(arrayOf(network))
-                            } catch (e: Exception) {
-                                Log.w(TAG, "setUnderlyingNetworks onCapabilitiesChanged failed: ${e.message}")
-                            }
-                        }
-                    }
-                    networkCallback = callback
-                    cm?.registerDefaultNetworkCallback(callback)
-                } catch (e: Exception) {
-                    Log.w(TAG, "registerDefaultNetworkCallback failed: ${e.message}")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                        try {
-                            setUnderlyingNetworks(null)
-                        } catch (_: Exception) {
-                        }
-                    }
-                }
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
-                try {
-                    setUnderlyingNetworks(null)
-                } catch (e: Exception) {
-                    Log.w(TAG, "setUnderlyingNetworks failed: ${e.message}")
-                }
-            }
+            registerUnderlyingNetworkCallbacks()
 
             val configPath = writeHevConfig(socksPort)
             Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")

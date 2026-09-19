@@ -22,6 +22,7 @@ data class Settings(
     var peer: String = "",
     var quicInitialFrag: Boolean = false,
     var quicInitialFragSize: Int = 96,
+    var endpointPreset: String = "warp",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("protocol", protocol)
@@ -42,6 +43,7 @@ data class Settings(
         put("peer", peer)
         put("quicInitialFrag", quicInitialFrag)
         put("quicInitialFragSize", quicInitialFragSize)
+        put("endpointPreset", endpointPreset)
     }
 
     companion object {
@@ -64,6 +66,7 @@ data class Settings(
             peer = o.optString("peer", ""),
             quicInitialFrag = o.optBoolean("quicInitialFrag", false),
             quicInitialFragSize = o.optInt("quicInitialFragSize", 96),
+            endpointPreset = o.optString("endpointPreset", o.optString("preset", "warp")),
         )
     }
 }

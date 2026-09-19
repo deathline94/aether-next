@@ -16,6 +16,8 @@ interface SettingsTabProps {
   settings: Settings;
   settingsLocked: boolean;
   settingsLoaded: boolean;
+  settingsLoadError?: boolean;
+  retrySettings?: () => void | Promise<void>;
   saved: boolean;
   admin: boolean;
   patchSettings: (patch: Partial<Settings>) => void;
@@ -36,6 +38,8 @@ export function SettingsTab({
   settings,
   settingsLocked,
   settingsLoaded,
+  settingsLoadError,
+  retrySettings,
   saved,
   admin,
   patchSettings,
@@ -44,6 +48,29 @@ export function SettingsTab({
 
   return (
     <div className="settings-view">
+      {settingsLoadError && (
+        <div className="error-banner tactical-error-banner" role="alert" style={{ marginBottom: "1rem", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.75rem 1rem", borderRadius: "8px", background: "rgba(239, 68, 68, 0.15)", border: "1px solid rgba(239, 68, 68, 0.4)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+            <AlertTriangle size={18} className="text-red-400" aria-hidden="true" />
+            <div>
+              <strong style={{ display: "block", fontSize: "0.875rem", color: "#f87171" }}>SETTINGS HYDRATION FAILED</strong>
+              <span style={{ fontSize: "0.75rem", color: "#fca5a5" }}>
+                Could not load configuration from disk. Defaults are active.
+              </span>
+            </div>
+          </div>
+          {retrySettings && (
+            <button
+              type="button"
+              onClick={() => void retrySettings()}
+              className="btn btn-secondary retry-btn"
+              style={{ padding: "0.35rem 0.75rem", fontSize: "0.75rem", cursor: "pointer" }}
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      )}
       {settingsLocked && (
         <div className="lock-banner tactical-lock-banner" role="status">
           <div className="lock-banner-icon">

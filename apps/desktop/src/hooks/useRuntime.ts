@@ -15,6 +15,7 @@ export function useRuntime(
   // Settings must not be editable until hydrated from disk — otherwise a
   // patch during that window persists `defaults` over the user's config.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsLoadError, setSettingsLoadError] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
@@ -72,6 +73,9 @@ export function useRuntime(
         if (loadedSettings) {
           settingsRef.current = loadedSettings;
           setSettings(loadedSettings);
+          setSettingsLoadError(false);
+        } else {
+          setSettingsLoadError(true);
         }
         if (state && !receivedRuntimeEvent.current) setRuntime(state);
         setAdmin(isAdmin);
@@ -220,10 +224,26 @@ export function useRuntime(
 
   const dismissUpdate = useCallback(() => setUpdateDismissed(true), []);
 
+  const retrySettings = useCallback(async () => {
+    try {
+      const loaded = await invoke<Settings>("get_settings");
+      if (loaded) {
+        settingsRef.current = loaded;
+        setSettings(loaded);
+        setSettingsLoadError(false);
+        setSettingsLoaded(true);
+        appendLog({ level: "info", message: "Settings loaded from disk." });
+      }
+    } catch (error) {
+      setSettingsLoadError(true);
+      appendLog({ level: "error", message: `Retry load settings failed: ${String(error)}` });
+    }
+  }, [appendLog]);
+
   return {
     settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
     saved, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
-    connected, running, settingsLocked, settingsLoaded,
+    connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };
 }

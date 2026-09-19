@@ -105,4 +105,42 @@ class SettingsStoreTest {
         }
         assertEquals("tun", freshInstall.routingMode)
     }
+
+    @Test
+    fun testValidateSettingsAcceptsAllPresets() {
+        val presets = listOf("warp", "gool")
+        for (preset in presets) {
+            val s = Settings(endpointPreset = preset)
+            SessionController.validateSettings(s)
+            assertEquals(preset, s.endpointPreset)
+        }
+    }
+
+    @Test
+    fun testValidateSettingsRejectsInvalidPreset() {
+        val s = Settings(endpointPreset = "unknown_preset")
+        val err = assertThrows(IllegalArgumentException::class.java) {
+            SessionController.validateSettings(s)
+        }
+        org.junit.Assert.assertTrue(err.message!!.contains("Invalid endpointPreset 'unknown_preset'"))
+    }
+
+    @Test
+    fun testValidateSettingsAcceptsAllNoiseModes() {
+        val noiseModes = listOf("off", "light", "medium", "high", "max", "custom", "on", "random", "m1", "m2")
+        for (mode in noiseModes) {
+            val s = Settings(noize = mode)
+            SessionController.validateSettings(s)
+            assertEquals(mode, s.noize)
+        }
+    }
+
+    @Test
+    fun testValidateSettingsRejectsInvalidNoiseMode() {
+        val s = Settings(noize = "unsupported_noise")
+        val err = assertThrows(IllegalArgumentException::class.java) {
+            SessionController.validateSettings(s)
+        }
+        org.junit.Assert.assertTrue(err.message!!.contains("Invalid noize mode 'unsupported_noise'"))
+    }
 }

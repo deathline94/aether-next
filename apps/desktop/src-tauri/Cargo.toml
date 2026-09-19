@@ -1,7 +1,7 @@
 [package]
 name = "aether-desktop"
-version = "1.2.8"
-description = "Aether Desktop for Windows"
+version = "1.2.9"
+description = "Aether Next desktop application"
 authors = ["deathline94"]
 edition = "2021"
 
@@ -16,6 +16,7 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }

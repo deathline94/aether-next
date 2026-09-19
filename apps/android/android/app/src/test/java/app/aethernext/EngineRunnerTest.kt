@@ -1,15 +1,34 @@
 package app.aethernext
 
+import android.content.Context
+import android.content.ContextWrapper
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
+class TestableEngineRunner(
+    context: Context,
+    private val fakeBinary: File,
+    onLine: (String) -> Unit = {},
+    onExit: (Int?, Boolean) -> Unit = { _, _ -> },
+    launcher: ProcessLauncher
+) : EngineRunner(context, onLine, onExit, launcher) {
+    override fun resolveEngine(configured: String): File = fakeBinary
+    override fun configureProcessEnvironment(settings: Settings, binary: File): Map<String, String> {
+        return mapOf("TEST_ENV" to "1")
+    }
+}
+
 class EngineRunnerTest {
+
+    private val dummyContext: Context = ContextWrapper(null)
+    private val fakeBinary = File("fake_binary")
 
     @Test
     fun testSupervisorStateTransitions() {
@@ -63,17 +82,68 @@ class EngineRunnerTest {
 
     @Test
     fun testStopAndWaitBarrierOnIdle() {
-        val generation = java.util.concurrent.atomic.AtomicLong(0)
-        val state = java.util.concurrent.atomic.AtomicReference(SupervisorState.IDLE)
-        val running = java.util.concurrent.atomic.AtomicBoolean(false)
+        val launcher = FakeProcessLauncher()
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
+        assertEquals(SupervisorState.IDLE, runner.getState())
+        assertFalse(runner.isRunning())
 
-        // Simulating stopAndWait barrier logic on idle
-        generation.incrementAndGet()
-        running.set(false)
-        state.set(SupervisorState.IDLE)
+        val stopped = runner.stopAndWait(1000)
+        assertTrue(stopped)
+        assertEquals(SupervisorState.IDLE, runner.getState())
+        assertFalse(runner.isRunning())
+    }
 
-        assertEquals(SupervisorState.IDLE, state.get())
-        assertFalse(running.get())
-        assertEquals(1L, generation.get())
+    @Test
+    fun testStartAndGracefulTermination() {
+        val fakeProc = FakeProcess(ProcessExitBehavior.GRACEFUL)
+        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
+
+        val err = runner.start(Settings())
+        assertNull("start should succeed with null error", err)
+        assertTrue(runner.isRunning())
+
+        val stopped = runner.stopAndWait(2000)
+        assertTrue("stopAndWait should return true on graceful exit", stopped)
+        assertFalse(runner.isRunning())
+        assertEquals(SupervisorState.IDLE, runner.getState())
+    }
+
+    @Test
+    fun testStartAndForcedTermination() {
+        val fakeProc = FakeProcess(ProcessExitBehavior.FORCED_ON_DESTROY_FORCIBLY)
+        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
+
+        val err = runner.start(Settings())
+        assertNull(err)
+        assertTrue(runner.isRunning())
+
+        val stopped = runner.stopAndWait(2000)
+        assertTrue("stopAndWait should return true when destroyForcibly kills process", stopped)
+        assertTrue("destroyForcibly must have been called", fakeProc.destroyForciblyCalled.get())
+        assertFalse(runner.isRunning())
+        assertEquals(SupervisorState.IDLE, runner.getState())
+    }
+
+    @Test
+    fun testUnkillableProcessRetainsStoppingStateAndBlocksNewLaunches() {
+        val fakeProc = FakeProcess(ProcessExitBehavior.UNKILLABLE)
+        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
+
+        val err = runner.start(Settings())
+        assertNull(err)
+        assertTrue(runner.isRunning())
+
+        // stopAndWait should escalate through destroy -> destroyForcibly -> fail
+        val stopped = runner.stopAndWait(500)
+        assertFalse("stopAndWait must return false for unkillable process", stopped)
+        assertTrue("runner must remain in running state", runner.isRunning())
+        assertEquals("supervisor state must remain STOPPING", SupervisorState.STOPPING, runner.getState())
+
+        // Subsequent start attempt must be rejected
+        val secondStart = runner.start(Settings())
+        assertEquals("Aether is already running", secondStart)
     }
 }

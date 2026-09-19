@@ -53,6 +53,7 @@ export type Settings = {
   quicInitialFrag: boolean;
   /** H3 anti-DPI: bytes of ClientHello in the first Initial (16–512). */
   quicInitialFragSize: number;
+  endpointPreset?: "warp" | "gool";
 };
 
 export type RuntimeState = {

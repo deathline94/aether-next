@@ -29,7 +29,7 @@ function App() {
 
   const {
     settings, runtime, busy, testBusy, saved, admin, testResult, appVersion, updateAvailable,
-    connected, running, settingsLocked, settingsLoaded,
+    connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   } = useRuntime(appendLog, clearLogs);
 
@@ -184,6 +184,8 @@ function App() {
           <SettingsTab
             settings={settings} settingsLocked={settingsLocked}
             settingsLoaded={settingsLoaded}
+            settingsLoadError={settingsLoadError}
+            retrySettings={retrySettings}
             saved={saved} patchSettings={patchSettings}
           />
         )}

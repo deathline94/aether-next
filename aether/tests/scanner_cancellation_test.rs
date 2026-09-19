@@ -99,3 +99,37 @@ async fn test_scanner_cancellation_preserves_best_hit() {
     let pr = result.unwrap();
     assert_eq!(pr.rtt, Duration::from_millis(15));
 }
+
+#[tokio::test]
+async fn test_scanner_pre_hunt_cancellation() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut config = ProbeConfig::for_test();
+    let temp_dir = std::env::temp_dir().join(format!("aether_scan_cancel_pre_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    config.config_path = temp_dir.join("aether.toml").to_string_lossy().to_string();
+    let ports = vec![443];
+
+    let probe_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_called_clone = probe_called.clone();
+    let verify: Box<VerifyFn<'static>> = Box::new(move |ip: IpAddr, port: u16, _timeout: Duration, _ironclad: bool| {
+        probe_called_clone.store(true, Ordering::SeqCst);
+        Box::pin(async move {
+            Some(ProbeResult {
+                ip,
+                port,
+                rtt: Duration::from_millis(15),
+            })
+        })
+    });
+
+    // Request cancel BEFORE hunt_best is invoked
+    request_scan_cancel();
+
+    let start = Instant::now();
+    let result = hunt_best(&config, &ports, IpScan::V4, ScanMode::Balanced, &*verify).await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "Expected error when cancelled prior to hunt_best");
+    assert!(!probe_called.load(Ordering::SeqCst), "Verify probe should not have been called");
+    assert!(elapsed < Duration::from_millis(100), "Pre-cancelled hunt must abort immediately (< 100ms), took {:?}", elapsed);
+}

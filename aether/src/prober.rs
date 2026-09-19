@@ -189,7 +189,7 @@ pub enum VerifyCost {
 }
 
 /// Per-probe budget floors/ceilings for expensive (QUIC/BoringSSL) verification.
-const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_secs(5);
+const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis(6000);
 const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
 const EXPENSIVE_MAX_CONCURRENCY: usize = 16;
 
@@ -338,11 +338,19 @@ impl ScanCancellationToken {
     }
 }
 
+pub static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SCAN_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static GLOBAL_CANCEL: parking_lot::RwLock<Option<CancellationToken>> = parking_lot::RwLock::new(None);
 
+struct ScanRunGuard(#[allow(dead_code)] u64);
+impl Drop for ScanRunGuard {
+    fn drop(&mut self) {
+        SCAN_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub fn request_scan_cancel() {
-    SCAN_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    SCAN_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
         token.cancel();
     }
@@ -356,7 +364,7 @@ pub fn current_cancel_token() -> CancellationToken {
 }
 
 fn scan_cancelled() -> bool {
-    if SCAN_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+    if SCAN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
     }
     if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
@@ -372,8 +380,12 @@ pub async fn hunt_best(
     mode: ScanMode,
     verify: &VerifyFn<'_>,
 ) -> Result<ProbeResult> {
-    // Clear any stale cancellation from a previous scan before starting a new one.
-    SCAN_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    if SCAN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        SCAN_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(AetherError::NoCleanEndpoint);
+    }
+    let gen = SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let _guard = ScanRunGuard(gen);
     let cancel_token = current_cancel_token();
     let mut st = mode.strategy(&config.profile);
     // Expensive (QUIC/H3) verification needs a longer per-probe budget than the

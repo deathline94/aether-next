@@ -21,6 +21,7 @@ fn test_elevation_trust_rejects_non_pe() {
         allow_unsigned_in_debug: true,
         expected_publisher_cn: "deathline94",
         embedded_hashes: &[],
+        enforce_hash_match: false,
     };
 
     let res = verify_elevated_binary(&fake_bin, "aether.exe", &policy);
@@ -48,6 +49,7 @@ fn test_elevation_trust_rejects_hash_mismatch() {
         allow_unsigned_in_debug: true,
         expected_publisher_cn: "deathline94",
         embedded_hashes: hashes,
+        enforce_hash_match: false,
     };
 
     let res = verify_elevated_binary(&current_exe, filename, &policy);
@@ -69,6 +71,7 @@ fn test_elevation_trust_rejects_unsigned_when_enforced() {
         allow_unsigned_in_debug: false,
         expected_publisher_cn: "deathline94",
         embedded_hashes: &[],
+        enforce_hash_match: false,
     };
 
     let filename = current_exe.file_name().unwrap().to_str().unwrap();
@@ -80,4 +83,55 @@ fn test_elevation_trust_rejects_unsigned_when_enforced() {
         }
         other => panic!("Expected Authenticode error, got {other:?}"),
     }
+}
+
+#[test]
+fn test_elevation_trust_distinct_policies() {
+    let engine_policy = TrustedBinaryPolicy::for_engine();
+    assert_eq!(engine_policy.expected_publisher_cn, "deathline94");
+    assert!(engine_policy.allow_unsigned_in_debug);
+
+    let wintun_policy = TrustedBinaryPolicy::for_wintun();
+    assert_eq!(wintun_policy.expected_publisher_cn, "WireGuard LLC");
+    assert!(!wintun_policy.allow_unsigned_in_debug);
+}
+
+#[test]
+fn test_elevation_trust_rejects_missing_hash_when_enforced() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let filename_owned = current_exe.file_name().unwrap().to_str().unwrap().to_string();
+    let filename: &'static str = Box::leak(filename_owned.clone().into_boxed_str());
+
+    let policy = TrustedBinaryPolicy {
+        allow_unsigned_in_debug: true,
+        expected_publisher_cn: "deathline94",
+        embedded_hashes: &[], // empty table -> hash is missing
+        enforce_hash_match: true,
+    };
+
+    let res = verify_elevated_binary(&current_exe, filename, &policy);
+    assert!(res.is_err(), "Missing hash must be rejected when enforce_hash_match=true");
+    match res {
+        Err(BinaryTrustError::MissingHash { filename: missing }) => {
+            assert_eq!(missing, filename_owned);
+        }
+        other => panic!("Expected MissingHash, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_elevation_trust_allows_missing_hash_when_not_enforced() {
+    let current_exe = std::env::current_exe().expect("current exe");
+    let filename_owned = current_exe.file_name().unwrap().to_str().unwrap().to_string();
+    let filename: &'static str = Box::leak(filename_owned.into_boxed_str());
+
+    let policy = TrustedBinaryPolicy {
+        allow_unsigned_in_debug: true,
+        expected_publisher_cn: "deathline94",
+        embedded_hashes: &[],
+        enforce_hash_match: false,
+    };
+
+    let res = verify_elevated_binary(&current_exe, filename, &policy);
+    assert!(res.is_ok(), "Missing hash must be allowed when enforce_hash_match=false in debug: {res:?}");
 }
