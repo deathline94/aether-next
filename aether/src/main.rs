@@ -1,3 +1,8 @@
+#![allow(unstable_name_collisions)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::new_without_default)]
+
 mod account;
 mod aethernoize;
 mod config;

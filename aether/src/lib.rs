@@ -1,3 +1,8 @@
+#![allow(unstable_name_collisions)] // fs2::FileExt::unlock vs future std method
+#![allow(clippy::uninlined_format_args)] // style: log macros with separate args
+#![allow(clippy::should_implement_trait)] // masque::next is not Iterator::next
+#![allow(clippy::new_without_default)] // WgSessionCache::new has no meaningful default
+
 pub mod account;
 pub mod aethernoize;
 pub mod config;

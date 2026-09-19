@@ -39,7 +39,8 @@ jobs:
       - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Run engine tests
         working-directory: aether
-        run: cargo test
+        # --release avoids debug CRT mismatch with BoringSSL on VS 18 2026 runners.
+        run: cargo test --release
         env:
           CMAKE_GENERATOR: Ninja
       - name: Run desktop backend tests

@@ -79,11 +79,18 @@ dependencies {
 }
 
 // Fail the build early if the React UI was not synced into assets/www.
+// Skips gracefully when the Gradle invocation targets only tests (no assemble/bundle).
 tasks.register("checkWwwAssets") {
     doLast {
         val index = file("src/main/assets/www/index.html")
-        check(index.exists()) {
-            "Missing assets/www/index.html — run: cd apps/android && npm run sync-www"
+        val requestedNames = gradle.startParameter.taskNames.map { it.substringAfterLast(':') }
+        val isAppBuild = requestedNames.any { it.startsWith("assemble") || it.startsWith("bundle") || it.startsWith("install") }
+        if (!index.exists()) {
+            if (isAppBuild) {
+                throw GradleException("Missing assets/www/index.html — run: cd apps/android && npm run sync-www")
+            } else {
+                logger.warn("checkWwwAssets: assets/www/index.html absent (OK for unit tests)")
+            }
         }
     }
 }
@@ -116,11 +123,9 @@ tasks.register("checkReleasePayloads") {
 
 // AGP creates pre*Build tasks after project evaluation — never call named() at top level.
 afterEvaluate {
-    // Only gate actual APK/AAB builds, not unit tests (www assets are gitignored).
-    tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }
-        .configureEach {
-            dependsOn("checkWwwAssets")
-        }
+    tasks.named("preBuild").configure {
+        dependsOn("checkWwwAssets")
+    }
     // Cover base release + any ABI-split pre*ReleaseBuild variants.
     tasks.matching { it.name.startsWith("pre") && it.name.contains("Release") && it.name.endsWith("Build") }
         .configureEach {
