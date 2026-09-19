@@ -40,6 +40,8 @@ jobs:
       - name: Run engine tests
         working-directory: aether
         run: cargo test
+        env:
+          CMAKE_GENERATOR: Ninja
       - name: Run desktop backend tests
         working-directory: apps/desktop/src-tauri
         run: cargo test --test dpapi_key_test --test elevation_trust_test

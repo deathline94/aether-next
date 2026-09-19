@@ -116,9 +116,11 @@ tasks.register("checkReleasePayloads") {
 
 // AGP creates pre*Build tasks after project evaluation — never call named() at top level.
 afterEvaluate {
-    tasks.named("preBuild").configure {
-        dependsOn("checkWwwAssets")
-    }
+    // Only gate actual APK/AAB builds, not unit tests (www assets are gitignored).
+    tasks.matching { it.name.startsWith("assemble") || it.name.startsWith("bundle") }
+        .configureEach {
+            dependsOn("checkWwwAssets")
+        }
     // Cover base release + any ABI-split pre*ReleaseBuild variants.
     tasks.matching { it.name.startsWith("pre") && it.name.contains("Release") && it.name.endsWith("Build") }
         .configureEach {
