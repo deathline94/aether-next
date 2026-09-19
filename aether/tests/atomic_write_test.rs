@@ -80,7 +80,7 @@ fn test_plaintext_migration_to_encrypted() {
     // 2. Set AETHER_CONFIG_KEY and load
     use base64::Engine;
     let test_key = [42u8; 32];
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&test_key);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
     std::env::set_var("AETHER_CONFIG_KEY", &key_b64);
 
     let loaded = load(&config_path).expect("load with migration").expect("identity exists");
@@ -115,7 +115,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     // 2. Set AETHER_CONFIG_KEY and load
     use base64::Engine;
     let test_key = [42u8; 32];
-    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&test_key);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
     std::env::set_var("AETHER_CONFIG_KEY", &key_b64);
 
     let res = load(&config_path);
@@ -123,6 +123,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
 
     // Cleanup permissions before deleting temp dir
     let mut perms_clean = fs::metadata(&config_path).expect("meta").permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
     perms_clean.set_readonly(false);
     let _ = fs::set_permissions(&config_path, perms_clean);
     std::env::remove_var("AETHER_CONFIG_KEY");

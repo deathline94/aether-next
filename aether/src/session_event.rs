@@ -20,6 +20,7 @@ pub enum SessionEvent {
     TunnelReady {
         transport: String,
     },
+    #[allow(dead_code)]
     TunReady,
     Connected {
         detail: String,
