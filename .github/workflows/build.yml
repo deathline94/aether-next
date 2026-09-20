@@ -173,9 +173,9 @@ jobs:
 
           foreach ($bin in @($nsis.FullName, $gui)) {
             $sig = Get-AuthenticodeSignature -FilePath $bin
-            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Signature invalid for $bin: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Publisher CN mismatch for $bin: $($sig.SignerCertificate.Subject)" }
-            Write-Host "Verified signature for $bin: $($sig.SignerCertificate.Subject)"
+            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Signature invalid for ${bin}: $($sig.StatusMessage)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Publisher CN mismatch for ${bin}: $($sig.SignerCertificate.Subject)" }
+            Write-Host "Verified signature for ${bin}: $($sig.SignerCertificate.Subject)"
           }
 
       - name: Package
@@ -210,8 +210,8 @@ jobs:
           )
           foreach ($b in $bins) {
             $sig = Get-AuthenticodeSignature -FilePath $b
-            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Packaged artifact signature invalid for $b: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for $b: $($sig.SignerCertificate.Subject)" }
+            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Packaged artifact signature invalid for ${b}: $($sig.StatusMessage)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for ${b}: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
           }
 
