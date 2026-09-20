@@ -1,18 +1,18 @@
 param(
   [Parameter(Mandatory = $true)]
+  [string]$Thumbprint,
+
+  [Parameter(Mandatory = $true)]
   [string]$Path
 )
 
 $ErrorActionPreference = "Stop"
 
-if (-not $env:WINDOWS_CERT_THUMBPRINT) {
-  throw "WINDOWS_CERT_THUMBPRINT is not set"
-}
 if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
   throw "Signing target does not exist: $Path"
 }
 
-$cert = Get-Item -LiteralPath "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT"
+$cert = Get-Item -LiteralPath "Cert:\CurrentUser\My\$Thumbprint"
 if (-not $cert.HasPrivateKey) {
   throw "Code-signing certificate does not have a private key"
 }

@@ -112,7 +112,7 @@ jobs:
           $signingConfig = @{
             bundle = @{
               windows = @{
-                signCommand = "pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$signScript`" %1"
+                signCommand = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$signScript`" -Thumbprint $($cert.Thumbprint) -Path %1"
               }
             }
           } | ConvertTo-Json -Depth 4
