@@ -233,6 +233,7 @@ pub struct ProvisionGuard {
     file: std::fs::File,
 }
 
+#[allow(clippy::incompatible_msrv)]
 impl ProvisionGuard {
     pub fn try_acquire(lock_file_path: &Path, wait: Duration) -> Result<Self> {
         if let Some(parent) = lock_file_path.parent() {
@@ -319,6 +320,7 @@ impl ProvisionGuard {
     }
 }
 
+#[allow(clippy::incompatible_msrv)]
 impl Drop for ProvisionGuard {
     fn drop(&mut self) {
         let _ = self.file.unlock();

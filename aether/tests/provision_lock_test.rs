@@ -23,8 +23,7 @@ fn test_provision_lock_mutual_exclusion_and_release() {
     let err_msg = res.err().unwrap().to_string();
     assert!(
         err_msg.contains(&format!("held by pid={} (alive=true)", std::process::id())),
-        "Timeout error must report owner pid and alive liveness: {}",
-        err_msg
+        "Timeout error must report owner pid and alive liveness: {err_msg}"
     );
 
     // 3. Drop primary lock

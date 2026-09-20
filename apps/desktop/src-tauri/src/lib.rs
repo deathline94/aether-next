@@ -75,7 +75,7 @@ pub mod dpapi {
     pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         #[cfg(windows)]
         {
-            let mut in_blob = CRYPT_INTEGER_BLOB {
+            let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: data.len() as u32,
                 pbData: data.as_ptr() as *mut u8,
             };
@@ -86,7 +86,7 @@ pub mod dpapi {
 
             let res = unsafe {
                 CryptProtectData(
-                    &mut in_blob,
+                    &in_blob,
                     ptr::null(),
                     ptr::null(),
                     ptr::null(),
@@ -120,7 +120,7 @@ pub mod dpapi {
     pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         #[cfg(windows)]
         {
-            let mut in_blob = CRYPT_INTEGER_BLOB {
+            let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: data.len() as u32,
                 pbData: data.as_ptr() as *mut u8,
             };
@@ -131,7 +131,7 @@ pub mod dpapi {
 
             let res = unsafe {
                 CryptUnprotectData(
-                    &mut in_blob,
+                    &in_blob,
                     ptr::null_mut(),
                     ptr::null(),
                     ptr::null(),
@@ -217,7 +217,7 @@ pub mod dpapi {
 
         let _ = super::restrict_directory_acl(&key_file);
 
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_key);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw_key);
         raw_key.zeroize();
         Ok(b64)
     }
