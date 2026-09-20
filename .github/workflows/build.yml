@@ -90,22 +90,13 @@ jobs:
           # Generate cert with openssl (New-SelfSignedCertificate hangs on headless CI runners)
           $pfxPass = "ci-sign-$([System.Guid]::NewGuid().ToString('N').Substring(0,16))"
 
-          # Create openssl config for code signing
-          @"
-          [req]
-          distinguished_name = req_dn
-          x509_extensions = v3_cs
-          prompt = no
-          [req_dn]
-          CN = deathline94
-          [v3_cs]
-          keyUsage = digitalSignature
-          extendedKeyUsage = codeSigning
-          basicConstraints = CA:FALSE
-          "@ | Set-Content -Path "cs.cnf"
+          # Create openssl config for code signing (avoid here-strings; closing "@ must be column 0)
+          "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = CA:FALSE" | Set-Content -Path "cs.cnf" -NoNewline
 
           openssl req -x509 -newkey rsa:2048 -keyout cs.key -out cs.crt -days 1825 -nodes -config cs.cnf 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl req failed" }
           openssl pkcs12 -export -out cs.pfx -inkey cs.key -in cs.crt -passout "pass:$pfxPass" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed" }
           Write-Host "Certificate PFX created"
 
           # Import into CurrentUser\My (for Set-AuthenticodeSignature)
