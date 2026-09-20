@@ -3,22 +3,63 @@ package app.aethernext
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
 import org.junit.Test
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.security.Key
+import java.security.KeyStore
+import java.security.KeyStoreSpi
+import java.security.cert.Certificate
+import java.util.Collections
+import java.util.Date
+import java.util.Enumeration
+import javax.crypto.KeyGenerator
+
+class MockKeyStoreSpi : KeyStoreSpi() {
+    private val keys = mutableMapOf<String, Key>()
+
+    override fun engineGetKey(alias: String?, password: CharArray?): Key? = keys[alias]
+    override fun engineGetCertificateChain(alias: String?): Array<Certificate>? = null
+    override fun engineGetCertificate(alias: String?): Certificate? = null
+    override fun engineGetCreationDate(alias: String?): Date? = null
+    override fun engineSetKeyEntry(alias: String?, key: Key?, password: CharArray?, chain: Array<out Certificate>?) {
+        if (alias != null && key != null) keys[alias] = key
+    }
+    override fun engineSetKeyEntry(alias: String?, key: ByteArray?, chain: Array<out Certificate>?) {}
+    override fun engineSetCertificateEntry(alias: String?, cert: Certificate?) {}
+    override fun engineDeleteEntry(alias: String?) { keys.remove(alias) }
+    override fun engineAliases(): Enumeration<String> = Collections.enumeration(keys.keys)
+    override fun engineContainsAlias(alias: String?): Boolean = keys.containsKey(alias)
+    override fun engineSize(): Int = keys.size
+    override fun engineIsKeyEntry(alias: String?): Boolean = keys.containsKey(alias)
+    override fun engineIsCertificateEntry(alias: String?): Boolean = false
+    override fun engineGetCertificateAlias(cert: Certificate?): String? = null
+    override fun engineStore(stream: OutputStream?, password: CharArray?) {}
+    override fun engineLoad(stream: InputStream?, password: CharArray?) {}
+}
+
+class MockKeyStore : KeyStore(MockKeyStoreSpi(), null, "MockKeyStore")
 
 class FakeKeyStoreContext(private val baseDir: File) : ContextWrapper(null) {
+    var commitSucceeds = true
+    val fakePrefs = FakeSharedPreferences { commitSucceeds }
+
     override fun getFilesDir(): File = File(baseDir, "files").apply { mkdirs() }
     override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences {
-        return FakeSharedPreferences()
+        return fakePrefs
     }
 }
 
-class FakeSharedPreferences : SharedPreferences {
-    private val map = mutableMapOf<String, Any?>()
+class FakeSharedPreferences(private val commitPredicate: () -> Boolean = { true }) : SharedPreferences {
+    val map = mutableMapOf<String, Any?>()
 
     override fun getAll(): MutableMap<String, *> = map
     override fun getString(key: String?, defValue: String?): String? = map[key] as? String ?: defValue
@@ -28,11 +69,14 @@ class FakeSharedPreferences : SharedPreferences {
     override fun getFloat(key: String?, defValue: Float): Float = map[key] as? Float ?: defValue
     override fun getBoolean(key: String?, defValue: Boolean): Boolean = map[key] as? Boolean ?: defValue
     override fun contains(key: String?): Boolean = map.containsKey(key)
-    override fun edit(): SharedPreferences.Editor = FakeEditor(map)
+    override fun edit(): SharedPreferences.Editor = FakeEditor(map, commitPredicate)
     override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
     override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) {}
 
-    class FakeEditor(private val map: MutableMap<String, Any?>) : SharedPreferences.Editor {
+    class FakeEditor(
+        private val map: MutableMap<String, Any?>,
+        private val commitPredicate: () -> Boolean
+    ) : SharedPreferences.Editor {
         override fun putString(key: String?, value: String?): SharedPreferences.Editor { map[key ?: ""] = value; return this }
         override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor { return this }
         override fun putInt(key: String?, value: Int): SharedPreferences.Editor { map[key ?: ""] = value; return this }
@@ -41,12 +85,33 @@ class FakeSharedPreferences : SharedPreferences {
         override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor { map[key ?: ""] = value; return this }
         override fun remove(key: String?): SharedPreferences.Editor { map.remove(key); return this }
         override fun clear(): SharedPreferences.Editor { map.clear(); return this }
-        override fun commit(): Boolean = true
+        override fun commit(): Boolean {
+            return commitPredicate()
+        }
         override fun apply() {}
     }
 }
 
 class ConfigKeyStoreTest {
+
+    private lateinit var mockKeyStore: MockKeyStore
+
+    @Before
+    fun setUp() {
+        mockKeyStore = MockKeyStore().apply { load(null) }
+        ConfigKeyStore.keyStoreSupplier = { mockKeyStore }
+        ConfigKeyStore.masterKeyGenerator = {
+            val keyGen = KeyGenerator.getInstance("AES")
+            keyGen.init(256)
+            mockKeyStore.setKeyEntry("aether-config-wrap-v1", keyGen.generateKey(), null, null)
+        }
+    }
+
+    @After
+    fun tearDown() {
+        ConfigKeyStore.keyStoreSupplier = null
+        ConfigKeyStore.masterKeyGenerator = null
+    }
 
     @Test
     fun testCorruptedKeyStoreQuarantinesOldConfigFiles() {
@@ -76,6 +141,38 @@ class ConfigKeyStoreTest {
         assertNotNull(corruptedFiles)
         assertTrue("Quarantined file must exist", corruptedFiles!!.isNotEmpty())
         assertEquals("corrupted_identity_data = 123", corruptedFiles[0].readText())
+
+        tempDir.deleteRecursively()
+    }
+
+    @Test
+    fun testLoadOrCreateEncryptsAndDecryptsRoundtrip() {
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "aether_rt_test_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(tempDir)
+
+        val key1 = ConfigKeyStore.loadOrCreate(context)
+        assertNotNull(key1)
+        assertTrue(key1.isNotBlank())
+
+        // Calling loadOrCreate again should successfully unwrap and return the exact same key
+        val key2 = ConfigKeyStore.loadOrCreate(context)
+        assertEquals("Subsequent load must yield identical decrypted key", key1, key2)
+
+        tempDir.deleteRecursively()
+    }
+
+    @Test
+    fun testCommitFailureFailsClosed() {
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "aether_fail_test_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(tempDir)
+        context.commitSucceeds = false // Force SharedPreferences commit failure
+
+        try {
+            ConfigKeyStore.loadOrCreate(context)
+            fail("Expected exception when SharedPreferences commit fails")
+        } catch (e: Exception) {
+            assertTrue(e.message?.contains("Failed to commit") == true || e.message?.contains("Failed to remove") == true)
+        }
 
         tempDir.deleteRecursively()
     }

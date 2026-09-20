@@ -204,11 +204,18 @@ pub mod dpapi {
         std::fs::write(&tmp_file, &envelope)
             .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
 
-        // Restrict ACL on the tmp file
-        let _ = super::restrict_directory_acl(&tmp_file);
+        // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
+        if let Err(e) = super::restrict_directory_acl(&tmp_file) {
+            let _ = std::fs::remove_file(&tmp_file);
+            return Err(format!("cannot restrict ACL on {}: {e}", tmp_file.display()));
+        }
 
-        std::fs::rename(&tmp_file, &key_file)
-            .map_err(|e| format!("cannot rename to {}: {e}", key_file.display()))?;
+        if let Err(e) = std::fs::rename(&tmp_file, &key_file) {
+            let _ = std::fs::remove_file(&tmp_file);
+            return Err(format!("cannot rename to {}: {e}", key_file.display()));
+        }
+
+        let _ = super::restrict_directory_acl(&key_file);
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_key);
         raw_key.zeroize();
@@ -2054,8 +2061,8 @@ pub mod windows_proxy {
         let current_enabled: u32 = key
             .get_value("ProxyEnable")
             .map_err(|e| format!("verify ProxyEnable: {e}"))?;
-        let current_server: Option<String> = key.get_value("ProxyServer").ok();
-        let current_bypass: Option<String> = key.get_value("ProxyOverride").ok();
+        let current_server = read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")?;
+        let current_bypass = read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")?;
 
         verify_readback_values(
             &snapshot,
@@ -2066,6 +2073,17 @@ pub mod windows_proxy {
 
         refresh();
         Ok(())
+    }
+
+    pub fn read_optional_reg_value(
+        res: io::Result<String>,
+        val_name: &str,
+    ) -> Result<Option<String>, String> {
+        match res {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("verify read {val_name}: {e}")),
+        }
     }
 
     pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), String>>(

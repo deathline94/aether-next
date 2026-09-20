@@ -125,20 +125,27 @@ fn read_text(path: &str) -> Result<String> {
     String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))
 }
 #[cfg(windows)]
-fn restrict_windows_acl(path: &str) {
-    if let Ok(user) = std::env::var("USERNAME") {
-        match std::process::Command::new("icacls")
-            .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
-            .output()
-        {
-            Ok(out) if !out.status.success() => log::warn!(
-                "[config] icacls could not restrict {path} (file may be readable by other users): {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => log::warn!("[config] failed to run icacls on {path}: {e}"),
-            _ => {}
-        }
+pub static ACL_FAIL_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn restrict_windows_acl(path: &str) -> Result<()> {
+    if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(AetherError::Other("forced ACL failure for test".into()));
     }
+    let user = std::env::var("USERNAME")
+        .map_err(|e| AetherError::Other(format!("cannot determine USERNAME for ACL: {e}")))?;
+    let output = std::process::Command::new("icacls")
+        .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+        .output()
+        .map_err(|e| AetherError::Other(format!("failed to run icacls on {path}: {e}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(AetherError::Other(format!(
+            "icacls failed to restrict permissions on {path}: {}",
+            err.trim()
+        )));
+    }
+    Ok(())
 }
 
 /// H5 fix: atomic + locked-down write for secret files (identity TOML, session
@@ -171,14 +178,30 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
         {
             let _ = std::fs::File::create(&tmp)?;
         }
-        restrict_windows_acl(&tmp);
+        if let Err(e) = restrict_windows_acl(&tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = match std::fs::OpenOptions::new()
             .truncate(true)
             .write(true)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = f.write_all(data) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = f.sync_all() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     #[cfg(windows)]
     {
@@ -234,7 +257,7 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
         } else {
             std::fs::rename(&tmp, path)?;
         }
-        restrict_windows_acl(path);
+        restrict_windows_acl(path)?;
     }
     #[cfg(not(windows))]
     {

@@ -196,19 +196,54 @@ fn lock_path(cache_file: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                let err = std::io::Error::last_os_error();
+                return err.raw_os_error() == Some(5);
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == 259 // 259 == STILL_ACTIVE
+        }
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        true
+    }
+}
+
 /// A held cross-process lock serializing one-time work that must not run twice
 /// concurrently — specifically account provisioning / MASQUE enrollment, so a
 /// scan process and a connect process don't both register a device (device churn)
 /// or race writes to the shared identity file. Never fails open. Released on drop.
 pub struct ProvisionGuard {
     file: std::fs::File,
-    path: PathBuf,
 }
 
 impl ProvisionGuard {
     pub fn try_acquire(lock_file_path: &Path, wait: Duration) -> Result<Self> {
         if let Some(parent) = lock_file_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AetherError::Other(format!(
+                        "create dir for provision lock {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
         }
         let start = Instant::now();
         let file = std::fs::OpenOptions::new()
@@ -224,20 +259,57 @@ impl ProvisionGuard {
                 Ok(()) => {
                     use std::io::{Seek, SeekFrom, Write as _};
                     let mut f = &file;
-                    let _ = f.seek(SeekFrom::Start(0));
-                    let _ = f.set_len(0);
-                    let _ = writeln!(f, "pid={}", std::process::id());
-                    return Ok(Self {
-                        file,
-                        path: lock_file_path.to_path_buf(),
-                    });
+                    f.seek(SeekFrom::Start(0)).map_err(|e| {
+                        let _ = file.unlock();
+                        AetherError::Other(format!("seek provision lock {}: {e}", lock_file_path.display()))
+                    })?;
+                    f.set_len(0).map_err(|e| {
+                        let _ = file.unlock();
+                        AetherError::Other(format!("truncate provision lock {}: {e}", lock_file_path.display()))
+                    })?;
+                    writeln!(f, "pid={}", std::process::id()).map_err(|e| {
+                        let _ = file.unlock();
+                        AetherError::Other(format!("write pid to provision lock {}: {e}", lock_file_path.display()))
+                    })?;
+                    f.flush().map_err(|e| {
+                        let _ = file.unlock();
+                        AetherError::Other(format!("flush provision lock {}: {e}", lock_file_path.display()))
+                    })?;
+
+                    // Also write unlocked companion owner file for non-blocking diagnostics
+                    let mut owner_path = lock_file_path.as_os_str().to_os_string();
+                    owner_path.push(".owner");
+                    let _ = std::fs::write(&owner_path, format!("pid={}\n", std::process::id()));
+
+                    return Ok(Self { file });
                 }
                 Err(_) => {
                     if start.elapsed() >= wait {
+                        let mut owner_path = lock_file_path.as_os_str().to_os_string();
+                        owner_path.push(".owner");
+                        let content = std::fs::read_to_string(&owner_path)
+                            .or_else(|_| std::fs::read_to_string(lock_file_path));
+                        let owner_diag = match content {
+                            Ok(content) => {
+                                let pid_str = content
+                                    .lines()
+                                    .find(|l| l.starts_with("pid="))
+                                    .map(|l| l.trim_start_matches("pid=").trim())
+                                    .unwrap_or("unknown");
+                                if let Ok(pid) = pid_str.parse::<u32>() {
+                                    let alive = is_process_alive(pid);
+                                    format!("held by pid={pid} (alive={alive})")
+                                } else {
+                                    format!("raw lock content: {content:?}")
+                                }
+                            }
+                            Err(e) => format!("could not inspect lock owner: {e}"),
+                        };
                         return Err(AetherError::Other(format!(
-                            "provisioning lock acquisition timed out after {:?} on {}",
+                            "provisioning lock acquisition timed out after {:?} on {} [{}]",
                             wait,
-                            lock_file_path.display()
+                            lock_file_path.display(),
+                            owner_diag
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -250,7 +322,7 @@ impl ProvisionGuard {
 impl Drop for ProvisionGuard {
     fn drop(&mut self) {
         let _ = self.file.unlock();
-        let _ = std::fs::remove_file(&self.path);
+        // The lock file is permanently retained to avoid unlinked-inode races across processes.
     }
 }
 

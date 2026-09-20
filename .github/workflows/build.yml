@@ -46,7 +46,7 @@ jobs:
           CMAKE_GENERATOR: Ninja
       - name: Run desktop backend tests
         working-directory: apps/desktop/src-tauri
-        run: cargo test --test dpapi_key_test --test elevation_trust_test
+        run: cargo test --tests
       - name: Run desktop frontend tests
         working-directory: apps/desktop
         run: |
@@ -84,9 +84,39 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
+      - name: Create and trust code signing certificate
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=deathline94" -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter (Get-Date).AddYears(5)
+          Write-Host "Created certificate: $($cert.Thumbprint)"
+          
+          # Install to Root and TrustedPublisher so WinVerifyTrust validates with STATUS_SUCCESS
+          $rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "CurrentUser")
+          $rootStore.Open("ReadWrite")
+          $rootStore.Add($cert)
+          $rootStore.Close()
+
+          $pubStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("TrustedPublisher", "CurrentUser")
+          $pubStore.Open("ReadWrite")
+          $pubStore.Add($cert)
+          $pubStore.Close()
+          Write-Host "Certificate installed in CurrentUser Root and TrustedPublisher stores"
+
       - name: Build engine
         working-directory: aether
         run: cargo build --release
+
+      - name: Sign and verify engine
+        shell: pwsh
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -match "CN=deathline94" } | Select-Object -First 1
+          if (-not $cert) { throw "Code signing cert not found in store" }
+          $enginePath = "aether/target/release/aether.exe"
+          Set-AuthenticodeSignature -FilePath $enginePath -Certificate $cert -HashAlgorithm SHA256
+          $sig = Get-AuthenticodeSignature -FilePath $enginePath
+          if ($sig.Status -ne "Valid") { throw "Engine signature invalid: $($sig.StatusMessage)" }
+          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Engine publisher CN mismatch: $($sig.SignerCertificate.Subject)" }
+          Write-Host "Engine signed and verified successfully: $($sig.SignerCertificate.Subject)"
 
       - name: Stage engine
         shell: pwsh
@@ -109,6 +139,33 @@ jobs:
           npm run build
           npm run tauri build
 
+      - name: Sign GUI and installer
+        shell: pwsh
+        run: |
+          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -match "CN=deathline94" } | Select-Object -First 1
+          if (-not $cert) { throw "Code signing cert not found in store" }
+
+          $nsis = Get-ChildItem "apps/desktop/src-tauri/target/release/bundle/nsis" -Filter "*setup.exe" |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $nsis) { throw "installer missing" }
+
+          $gui = @(
+            "apps/desktop/src-tauri/target/release/Aether Next.exe",
+            "apps/desktop/src-tauri/target/release/aether-desktop.exe",
+            "apps/desktop/src-tauri/target/release/Aether.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $gui) { throw "gui missing" }
+
+          Set-AuthenticodeSignature -FilePath $nsis.FullName -Certificate $cert -HashAlgorithm SHA256
+          Set-AuthenticodeSignature -FilePath $gui -Certificate $cert -HashAlgorithm SHA256
+
+          foreach ($bin in @($nsis.FullName, $gui)) {
+            $sig = Get-AuthenticodeSignature -FilePath $bin
+            if ($sig.Status -ne "Valid") { throw "Signature invalid for $bin: $($sig.StatusMessage)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Publisher CN mismatch for $bin: $($sig.SignerCertificate.Subject)" }
+            Write-Host "Verified signature for $bin: $($sig.SignerCertificate.Subject)"
+          }
+
       - name: Package
         shell: pwsh
         run: |
@@ -130,6 +187,21 @@ jobs:
           Copy-Item "packaging/wintun.dll" "$out/portable/engine/wintun.dll"
           "Run AetherNext-Desktop.exe" | Set-Content "$out/portable/README.txt"
           Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext-portable-windows-x64.zip" -Force
+
+      - name: Verify all packaged Windows binaries
+        shell: pwsh
+        run: |
+          $bins = @(
+            "dist-windows/AetherNext-windows-x64-setup.exe",
+            "dist-windows/portable/AetherNext-Desktop.exe",
+            "dist-windows/portable/engine/aether.exe"
+          )
+          foreach ($b in $bins) {
+            $sig = Get-AuthenticodeSignature -FilePath $b
+            if ($sig.Status -ne "Valid") { throw "Packaged artifact signature invalid for $b: $($sig.StatusMessage)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Packaged artifact publisher mismatch for $b: $($sig.SignerCertificate.Subject)" }
+            Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
+          }
 
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:

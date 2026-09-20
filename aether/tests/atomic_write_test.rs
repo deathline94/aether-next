@@ -17,8 +17,11 @@ fn dummy_identity() -> Identity {
     }
 }
 
+static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[test]
 fn test_atomic_write_and_overwrite() {
+    let _guard = TEST_MUTEX.lock();
     let temp_dir = std::env::temp_dir().join(format!("aether_test_atomic_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -40,6 +43,7 @@ fn test_atomic_write_and_overwrite() {
 
 #[test]
 fn test_config_recovery_from_backup() {
+    let _guard = TEST_MUTEX.lock();
     let temp_dir = std::env::temp_dir().join(format!("aether_test_bak_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -63,6 +67,7 @@ fn test_config_recovery_from_backup() {
 
 #[test]
 fn test_plaintext_migration_to_encrypted() {
+    let _guard = TEST_MUTEX.lock();
     let temp_dir = std::env::temp_dir().join(format!("aether_test_mig_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -96,6 +101,7 @@ fn test_plaintext_migration_to_encrypted() {
 
 #[test]
 fn test_plaintext_migration_fails_fatally_when_save_fails() {
+    let _guard = TEST_MUTEX.lock();
     let temp_dir = std::env::temp_dir().join(format!("aether_test_mig_fail_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -142,5 +148,29 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     perms_clean.set_readonly(false);
     let _ = fs::set_permissions(&config_path, perms_clean);
     std::env::remove_var("AETHER_CONFIG_KEY");
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_write_private_file_fails_closed_on_acl_failure() {
+    let _guard = TEST_MUTEX.lock();
+    let temp_dir = std::env::temp_dir().join(format!("aether_test_acl_fail_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let file_path = temp_dir.join("secret.bin").to_string_lossy().to_string();
+    let tmp_path = format!("{file_path}.{}.tmp", std::process::id());
+
+    // Force ACL restriction failure
+    aether::config::ACL_FAIL_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let res = write_private_file(&file_path, b"super secret data");
+    aether::config::ACL_FAIL_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    assert!(res.is_err(), "write_private_file must fail when ACL restriction fails");
+    assert!(!std::path::Path::new(&file_path).exists(), "target secret file must not be created");
+    assert!(!std::path::Path::new(&tmp_path).exists(), "temporary file must be removed on failure");
+
     let _ = fs::remove_dir_all(&temp_dir);
 }

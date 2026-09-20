@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class SessionController(
     private val context: Context,
     private var emit: (event: String, payload: JSONObject) -> Unit,
+    runnerFactory: ((onLine: (String) -> Unit, onExit: (Int?, Boolean) -> Unit) -> EngineRunner)? = null,
 ) {
     fun setEmitter(fn: (event: String, payload: JSONObject) -> Unit) {
         emit = fn
@@ -31,44 +32,49 @@ class SessionController(
     private val tearingDown = AtomicBoolean(false)
     private var settings = store.load()
 
-    private val runner = EngineRunner(
-        context = context,
-        onLine = { line -> handleEngineLine(line) },
-        onExit = { code, isScan ->
-            if (isScan) {
-                // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
-                emit(
-                    "scan://event",
-                    JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
-                )
-                if (runtime.status != "connected") {
-                    setRuntime("disconnected", "Ready", null, null)
-                }
-                return@EngineRunner
-            }
-            val wasConnected = connectedOnce.get()
-            connectedOnce.set(false)
-            socksSeen.set(false)
-            tunnelSeen.set(false)
-            vpnStarted.set(false)
-            vpnEstablished.set(false)
-            val isError = code != null && code != 0 && !wasConnected
-            setRuntime(
-                if (isError) "error" else "disconnected",
-                if (isError) "Could not find a working gateway"
-                else if (code == 0 || code == null) "Engine stopped"
-                else "Engine exited ($code)",
-                null,
-                null,
-            )
+    private fun handleExit(code: Int?, isScan: Boolean) {
+        if (isScan) {
             // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
             emit(
                 "scan://event",
                 JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
             )
-            context.stopService(Intent(context, EngineService::class.java))
-            stopVpnService()
-        },
+            if (runtime.status != "connected") {
+                setRuntime("disconnected", "Ready", null, null)
+            }
+            return
+        }
+        val wasConnected = connectedOnce.get()
+        connectedOnce.set(false)
+        socksSeen.set(false)
+        tunnelSeen.set(false)
+        vpnStarted.set(false)
+        vpnEstablished.set(false)
+        val isError = code != null && code != 0 && !wasConnected
+        setRuntime(
+            if (isError) "error" else "disconnected",
+            if (isError) "Could not find a working gateway"
+            else if (code == 0 || code == null) "Engine stopped"
+            else "Engine exited ($code)",
+            null,
+            null,
+        )
+        // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
+        emit(
+            "scan://event",
+            JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
+        )
+        context.stopService(Intent(context, EngineService::class.java))
+        stopVpnService()
+    }
+
+    internal val runner: EngineRunner = runnerFactory?.invoke(
+        { line -> handleEngineLine(line) },
+        { code, isScan -> handleExit(code, isScan) }
+    ) ?: EngineRunner(
+        context = context,
+        onLine = { line -> handleEngineLine(line) },
+        onExit = { code, isScan -> handleExit(code, isScan) },
     )
 
     fun getSettings(): Settings = store.load().also { settings = it }
@@ -83,6 +89,39 @@ class SessionController(
 
     fun isVpnPrepared(): Boolean {
         return VpnService.prepare(context) == null
+    }
+
+    internal fun rollbackStartup(reason: String): String {
+        Log.e(TAG, "Rolling back session startup: $reason")
+        emitLog("Rolling back session startup: $reason")
+
+        try {
+            context.stopService(Intent(context, EngineService::class.java))
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to stop EngineService during rollback: ${e.message}")
+        }
+        stopVpnService()
+
+        connectedOnce.set(false)
+        socksSeen.set(false)
+        tunnelSeen.set(false)
+        vpnStarted.set(false)
+        vpnEstablished.set(false)
+
+        val stopped = runner.stopAndWait(3000)
+        val stillRunning = runner.isRunning()
+        val finalReason = if (!stopped || stillRunning) {
+            val alivePid = runner.pid()
+            val warn = "$reason (Engine process pid=$alivePid still running after rollback timeout)"
+            Log.e(TAG, warn)
+            emitLog(warn)
+            warn
+        } else {
+            reason
+        }
+
+        setRuntime("error", finalReason, null, runtime.endpoint)
+        return finalReason
     }
 
     fun connect(s: Settings): String? {
@@ -128,9 +167,7 @@ class SessionController(
             context.startForegroundService(svc)
         } catch (e: Exception) {
             Log.e(TAG, "startForegroundService failed: ${e.message}", e)
-            runner.stopAndWait(3000)
-            setRuntime("error", "Service start failed: ${e.message}", null, null)
-            return e.message ?: "Service start failed"
+            return rollbackStartup("Service start failed: ${e.message}")
         }
         
         setRuntime("connecting", "Scanning reachable routes", runner.pid(), null)
@@ -177,7 +214,7 @@ class SessionController(
 
     fun disconnect() {
         if (!tearingDown.compareAndSet(false, true)) return
-        runner.stop()
+        runner.stopAndWait(3000)
         context.stopService(Intent(context, EngineService::class.java))
         if (vpnStarted.get()) {
             stopVpnService()
@@ -253,10 +290,7 @@ class SessionController(
                         val msg = json.optString("message", "Connection failed")
                         emitLog("engine error: $msg")
                         if (!runner.isScanMode()) {
-                            setRuntime("error", msg, null, runtime.endpoint)
-                            runner.stop()
-                            context.stopService(Intent(context, EngineService::class.java))
-                            stopVpnService()
+                            rollbackStartup(msg)
                         } else {
                             emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
                         }
@@ -272,10 +306,7 @@ class SessionController(
         if (line.contains("[-] session failed:")) {
             val msg = line.substringAfter("[-] session failed:").trim()
             if (!runner.isScanMode()) {
-                setRuntime("error", msg, null, runtime.endpoint)
-                runner.stop()
-                context.stopService(Intent(context, EngineService::class.java))
-                stopVpnService()
+                rollbackStartup(msg)
             } else {
                 emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
             }
@@ -321,11 +352,8 @@ class SessionController(
             Log.i(TAG, "started AetherVpnService socks=${settings.socksPort}")
             emitLog("VPN: starting tun2socks -> 127.0.0.1:${settings.socksPort}")
         } catch (e: Exception) {
-            vpnStarted.set(false)
             Log.e(TAG, "VPN start failed: ${e.message}", e)
-            runner.stop()
-            context.stopService(Intent(context, EngineService::class.java))
-            setRuntime("error", "VPN start failed: ${e.message}", null, runtime.endpoint)
+            rollbackStartup("VPN start failed: ${e.message}")
         }
     }
 
@@ -348,11 +376,7 @@ class SessionController(
     }
 
     fun onVpnFailed(message: String) {
-        vpnStarted.set(false)
-        vpnEstablished.set(false)
-        runner.stop()
-        context.stopService(Intent(context, EngineService::class.java))
-        setRuntime("error", "VPN failed: $message", null, runtime.endpoint)
+        rollbackStartup("VPN failed: $message")
     }
 
     private fun parseEndpoint(line: String): String? {

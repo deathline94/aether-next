@@ -215,3 +215,36 @@ fn test_recover_deletes_file_on_restore_success() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+#[test]
+fn test_read_optional_reg_value_error_discrimination() {
+    use std::io;
+
+    // Success -> Some(val)
+    let ok_res = aether_desktop_lib::windows_proxy::read_optional_reg_value(
+        Ok("127.0.0.1:8080".to_string()),
+        "ProxyServer",
+    );
+    assert_eq!(ok_res, Ok(Some("127.0.0.1:8080".to_string())));
+
+    // NotFound -> None (valid absence)
+    let not_found_res = aether_desktop_lib::windows_proxy::read_optional_reg_value(
+        Err(io::Error::new(io::ErrorKind::NotFound, "not found")),
+        "ProxyServer",
+    );
+    assert_eq!(not_found_res, Ok(None));
+
+    // PermissionDenied / AccessDenied -> Err (must NOT be treated as None!)
+    let denied_err = aether_desktop_lib::windows_proxy::read_optional_reg_value(
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "access denied")),
+        "ProxyServer",
+    ).unwrap_err();
+    assert!(denied_err.contains("verify read ProxyServer: access denied"));
+
+    // Other errors (e.g. BrokenPipe) -> Err
+    let other_err = aether_desktop_lib::windows_proxy::read_optional_reg_value(
+        Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe broken")),
+        "ProxyOverride",
+    ).unwrap_err();
+    assert!(other_err.contains("verify read ProxyOverride: pipe broken"));
+}
+

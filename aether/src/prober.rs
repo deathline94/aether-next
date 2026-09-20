@@ -243,7 +243,7 @@ impl CacheKind {
         }
     }
 
-    fn write_with_rtt(&self, config_path: &str, endpoints: Vec<(SocketAddr, u32)>) {
+    pub fn write_with_rtt(&self, config_path: &str, endpoints: Vec<(SocketAddr, u32)>) {
         match self {
             CacheKind::Masque => crate::cache::add_to_masque_with_rtt(config_path, endpoints),
             CacheKind::WireGuard => crate::cache::add_to_wireguard_with_rtt(config_path, endpoints),
@@ -339,38 +339,65 @@ impl ScanCancellationToken {
 }
 
 pub static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SCAN_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static GLOBAL_CANCEL: parking_lot::RwLock<Option<CancellationToken>> = parking_lot::RwLock::new(None);
 
-struct ScanRunGuard(#[allow(dead_code)] u64);
+struct ScanRegistry {
+    generation: u64,
+    token: Option<CancellationToken>,
+    cancelled: bool,
+}
+
+static SCAN_REGISTRY: parking_lot::Mutex<ScanRegistry> = parking_lot::Mutex::new(ScanRegistry {
+    generation: 0,
+    token: None,
+    cancelled: false,
+});
+
+pub struct ScanRunGuard(pub u64);
+
 impl Drop for ScanRunGuard {
     fn drop(&mut self) {
-        SCAN_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut reg = SCAN_REGISTRY.lock();
+        if reg.generation == self.0 {
+            if let Some(t) = reg.token.take() {
+                t.cancel();
+            }
+            reg.cancelled = false;
+        }
     }
 }
 
 pub fn request_scan_cancel() {
-    SCAN_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
-    if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
-        token.cancel();
+    let mut reg = SCAN_REGISTRY.lock();
+    reg.cancelled = true;
+    if let Some(t) = reg.token.as_ref() {
+        t.cancel();
     }
 }
 
+#[allow(dead_code)]
 pub fn current_cancel_token() -> CancellationToken {
-    let mut w = GLOBAL_CANCEL.write();
-    let token = CancellationToken::new();
-    *w = Some(token.clone());
-    token
+    let reg = SCAN_REGISTRY.lock();
+    reg.token.clone().unwrap_or_default()
 }
 
-fn scan_cancelled() -> bool {
-    if SCAN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
-        return true;
+pub fn scan_cancelled() -> bool {
+    let reg = SCAN_REGISTRY.lock();
+    reg.cancelled || reg.token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false)
+}
+
+pub fn register_scan_session() -> Result<(u64, CancellationToken)> {
+    let mut reg = SCAN_REGISTRY.lock();
+    if reg.cancelled {
+        reg.cancelled = false;
+        return Err(AetherError::NoCleanEndpoint);
     }
-    if let Some(token) = GLOBAL_CANCEL.read().as_ref() {
-        return token.is_cancelled();
-    }
-    false
+    reg.generation += 1;
+    let gen = reg.generation;
+    SCAN_GENERATION.store(gen, std::sync::atomic::Ordering::SeqCst);
+    let token = CancellationToken::new();
+    reg.token = Some(token.clone());
+    reg.cancelled = false;
+    Ok((gen, token))
 }
 
 pub async fn hunt_best(
@@ -380,13 +407,8 @@ pub async fn hunt_best(
     mode: ScanMode,
     verify: &VerifyFn<'_>,
 ) -> Result<ProbeResult> {
-    if SCAN_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
-        SCAN_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-        return Err(AetherError::NoCleanEndpoint);
-    }
-    let gen = SCAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let (gen, cancel_token) = register_scan_session()?;
     let _guard = ScanRunGuard(gen);
-    let cancel_token = current_cancel_token();
     let mut st = mode.strategy(&config.profile);
     // Expensive (QUIC/H3) verification needs a longer per-probe budget than the
     // fast TCP/UDP defaults, or every probe times out mid-handshake. This is the

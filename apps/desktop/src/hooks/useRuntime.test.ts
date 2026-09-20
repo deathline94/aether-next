@@ -1,91 +1,110 @@
-import { describe, it, expect, vi } from "vitest";
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { renderHook, act, waitFor } from "@testing-library/react";
+import { useRuntime } from "./useRuntime";
 
-describe("desktop useRuntime settings hydration", () => {
-  it("completes settings hydration in finally block even when get_settings throws", async () => {
-    let settingsLoaded = false;
-    let settings: Record<string, unknown> = { protocol: "masque", routingMode: "tun" };
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn(),
+}));
 
-    const mockInvoke = vi.fn().mockImplementation(async (cmd: string) => {
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
+
+import { invoke } from "@tauri-apps/api/core";
+
+describe("desktop useRuntime hook", () => {
+  const appendLog = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("completes hydration in finally block even when get_settings rejects", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") throw new Error("IPC error");
+      if (cmd === "get_state") return null;
+      if (cmd === "is_admin") return false;
+      if (cmd === "app_info") return { version: "1.2.9" };
+      return null;
+    });
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+
+    await waitFor(() => {
+      expect(result.current.settingsLoaded).toBe(true);
+    });
+
+    expect(result.current.settingsLoadError).toBe(true);
+    expect(result.current.settings.protocol).toBe("masque");
+  });
+
+  it("applies loaded settings when get_settings succeeds", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "get_settings") {
-        throw new Error("IPC error: could not load config");
+        return { protocol: "wireguard", routingMode: "system", socksPort: 1080, httpPort: 8080 };
+      }
+      if (cmd === "get_state") return null;
+      if (cmd === "is_admin") return false;
+      if (cmd === "app_info") return { version: "1.2.9" };
+      return null;
+    });
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+
+    await waitFor(() => {
+      expect(result.current.settingsLoaded).toBe(true);
+    });
+
+    expect(result.current.settingsLoadError).toBe(false);
+    expect(result.current.settings.protocol).toBe("wireguard");
+  });
+
+  it("recovers from hydration failure when retrySettings succeeds", async () => {
+    let failFirst = true;
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") {
+        if (failFirst) {
+          throw new Error("Disk error");
+        }
+        return { protocol: "gool", routingMode: "tun", socksPort: 1080, httpPort: 8080 };
       }
       return null;
     });
 
-    try {
-      const [loadedSettings] = await Promise.all([
-        mockInvoke("get_settings").catch(() => null),
-      ]);
-      if (loadedSettings) {
-        settings = loadedSettings;
-      }
-    } finally {
-      settingsLoaded = true;
-    }
+    const { result } = renderHook(() => useRuntime(appendLog));
 
-    expect(settingsLoaded).toBe(true);
-    expect(settings.routingMode).toBe("tun");
+    await waitFor(() => {
+      expect(result.current.settingsLoaded).toBe(true);
+    });
+    expect(result.current.settingsLoadError).toBe(true);
+
+    failFirst = false;
+    await act(async () => {
+      await result.current.retrySettings();
+    });
+
+    expect(result.current.settingsLoadError).toBe(false);
+    expect(result.current.settings.protocol).toBe("gool");
   });
 
-  it("flags settingsLoadError when get_settings throws and clears it on successful retry", async () => {
-    let settingsLoadError = false;
-    let settingsLoaded = false;
-    let settings = { protocol: "masque", routingMode: "tun" };
+  it("maintains settingsLoadError when retrySettings fails again", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") throw new Error("Persistent error");
+      return null;
+    });
 
-    // 1. Initial hydration failure
-    const mockInvokeFail = vi.fn().mockRejectedValue(new Error("Disk IO failure"));
-    try {
-      const [loadedSettings] = await Promise.all([
-        mockInvokeFail("get_settings").catch(() => null),
-      ]);
-      if (loadedSettings) {
-        settings = loadedSettings;
-        settingsLoadError = false;
-      } else {
-        settingsLoadError = true;
-      }
-    } finally {
-      settingsLoaded = true;
-    }
+    const { result } = renderHook(() => useRuntime(appendLog));
 
-    expect(settingsLoaded).toBe(true);
-    expect(settingsLoadError).toBe(true);
+    await waitFor(() => {
+      expect(result.current.settingsLoaded).toBe(true);
+    });
+    expect(result.current.settingsLoadError).toBe(true);
 
-    // 2. Retry succeeds
-    const mockInvokeSuccess = vi.fn().mockResolvedValue({ protocol: "wireguard", routingMode: "system" });
-    const retrySettings = async () => {
-      try {
-        const loaded = await mockInvokeSuccess("get_settings");
-        if (loaded) {
-          settings = loaded;
-          settingsLoadError = false;
-          settingsLoaded = true;
-        }
-      } catch {
-        settingsLoadError = true;
-      }
-    };
+    await act(async () => {
+      await result.current.retrySettings();
+    });
 
-    await retrySettings();
-    expect(settingsLoadError).toBe(false);
-    expect(settings.protocol).toBe("wireguard");
-    expect(settings.routingMode).toBe("system");
-  });
-
-  it("maintains settingsLoadError when retrySettings also fails", async () => {
-    let settingsLoadError = true;
-    const mockInvokeFail = vi.fn().mockRejectedValue(new Error("Persistent error"));
-
-    const retrySettings = async () => {
-      try {
-        await mockInvokeFail("get_settings");
-        settingsLoadError = false;
-      } catch {
-        settingsLoadError = true;
-      }
-    };
-
-    await retrySettings();
-    expect(settingsLoadError).toBe(true);
+    expect(result.current.settingsLoadError).toBe(true);
   });
 });
