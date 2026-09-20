@@ -107,12 +107,21 @@ jobs:
             Where-Object HasPrivateKey | Select-Object -First 1
           if (-not $cert) { throw "Imported PFX does not contain a certificate with a private key" }
 
-          # Import-Certificate can display an interactive root-trust prompt on hosted runners.
-          # certutil -f performs the same store updates without UI.
-          & certutil.exe -user -f -addstore Root $certPath
-          if ($LASTEXITCODE -ne 0) { throw "certutil Root import failed with exit code $LASTEXITCODE" }
-          & certutil.exe -user -f -addstore TrustedPublisher $certPath
-          if ($LASTEXITCODE -ne 0) { throw "certutil TrustedPublisher import failed with exit code $LASTEXITCODE" }
+          # Import-Certificate and certutil can display an interactive root-trust prompt.
+          # Add directly through the certificate-store API so hosted runners never wait for UI.
+          $publicCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath)
+          foreach ($storeName in @("Root", "TrustedPublisher")) {
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+              $storeName,
+              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+            )
+            try {
+              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+              $store.Add($publicCert)
+            } finally {
+              $store.Close()
+            }
+          }
 
           "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $signingConfig = @{
@@ -235,8 +244,22 @@ jobs:
         shell: pwsh
         run: |
           if ($env:WINDOWS_CERT_THUMBPRINT) {
-            & certutil.exe -user -delstore Root $env:WINDOWS_CERT_THUMBPRINT | Out-Null
-            & certutil.exe -user -delstore TrustedPublisher $env:WINDOWS_CERT_THUMBPRINT | Out-Null
+            foreach ($storeName in @("Root", "TrustedPublisher")) {
+              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                $storeName,
+                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+              )
+              try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $store.Certificates.Find(
+                  [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
+                  $env:WINDOWS_CERT_THUMBPRINT,
+                  $false
+                ) | ForEach-Object { $store.Remove($_) }
+              } finally {
+                $store.Close()
+              }
+            }
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
           }
           @("aether-codesign.cnf", "aether-codesign.key", "aether-codesign.crt", "aether-codesign.pfx") |
