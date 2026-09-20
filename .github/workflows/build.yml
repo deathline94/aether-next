@@ -87,20 +87,39 @@ jobs:
       - name: Create and trust code signing certificate
         shell: pwsh
         run: |
-          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=deathline94" -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter (Get-Date).AddYears(5)
-          Write-Host "Created certificate: $($cert.Thumbprint)"
-          
-          # Install to Root and TrustedPublisher so WinVerifyTrust validates with STATUS_SUCCESS
-          $rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "CurrentUser")
-          $rootStore.Open("ReadWrite")
-          $rootStore.Add($cert)
-          $rootStore.Close()
+          # Generate cert with openssl (New-SelfSignedCertificate hangs on headless CI runners)
+          $pfxPass = "ci-sign-$([System.Guid]::NewGuid().ToString('N').Substring(0,16))"
 
-          $pubStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("TrustedPublisher", "CurrentUser")
-          $pubStore.Open("ReadWrite")
-          $pubStore.Add($cert)
-          $pubStore.Close()
-          Write-Host "Certificate installed in CurrentUser Root and TrustedPublisher stores"
+          # Create openssl config for code signing
+          @"
+          [req]
+          distinguished_name = req_dn
+          x509_extensions = v3_cs
+          prompt = no
+          [req_dn]
+          CN = deathline94
+          [v3_cs]
+          keyUsage = digitalSignature
+          extendedKeyUsage = codeSigning
+          basicConstraints = CA:FALSE
+          "@ | Set-Content -Path "cs.cnf"
+
+          openssl req -x509 -newkey rsa:2048 -keyout cs.key -out cs.crt -days 1825 -nodes -config cs.cnf 2>&1
+          openssl pkcs12 -export -out cs.pfx -inkey cs.key -in cs.crt -passout "pass:$pfxPass" 2>&1
+          Write-Host "Certificate PFX created"
+
+          # Import into CurrentUser\My (for Set-AuthenticodeSignature)
+          $secPass = ConvertTo-SecureString $pfxPass -AsPlainText -Force
+          $imported = Import-PfxCertificate -FilePath cs.pfx -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass -Exportable
+          Write-Host "Imported to My store: $($imported.Thumbprint)"
+
+          # Trust it: add to Root and TrustedPublisher so WinVerifyTrust returns STATUS_SUCCESS
+          Import-Certificate -FilePath cs.crt -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
+          Import-Certificate -FilePath cs.crt -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
+          Write-Host "Certificate trusted in CurrentUser Root and TrustedPublisher stores"
+
+          # Clean up key material from disk
+          Remove-Item cs.key, cs.crt, cs.pfx, cs.cnf -Force
 
       - name: Build engine
         working-directory: aether
