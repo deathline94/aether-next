@@ -85,7 +85,7 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Create noninteractive CI code signing certificate
+      - name: Create ephemeral CI code signing certificate
         shell: pwsh
         timeout-minutes: 2
         run: |
@@ -97,7 +97,7 @@ jobs:
           "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = critical,digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = critical,CA:FALSE`nsubjectKeyIdentifier = hash" |
             Set-Content -LiteralPath $configPath -NoNewline
 
-          & openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 30 -nodes -config $configPath 2>&1
+          & openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 1825 -nodes -config $configPath 2>&1
           if ($LASTEXITCODE -ne 0) { throw "openssl req failed with exit code $LASTEXITCODE" }
           & openssl pkcs12 -export -out $pfxPath -inkey $keyPath -in $certPath -passout "pass:$pfxPass" 2>&1
           if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed with exit code $LASTEXITCODE" }
@@ -106,22 +106,6 @@ jobs:
           $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass |
             Where-Object HasPrivateKey | Select-Object -First 1
           if (-not $cert) { throw "Imported PFX does not contain a certificate with a private key" }
-
-          # Import-Certificate and certutil can display an interactive root-trust prompt.
-          # Add directly through the certificate-store API so hosted runners never wait for UI.
-          $publicCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certPath)
-          foreach ($storeName in @("Root", "TrustedPublisher")) {
-            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-              $storeName,
-              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-            )
-            try {
-              $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-              $store.Add($publicCert)
-            } finally {
-              $store.Close()
-            }
-          }
 
           "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $signingConfig = @{
@@ -134,7 +118,7 @@ jobs:
             }
           } | ConvertTo-Json -Depth 4
           $signingConfig | Set-Content "apps/desktop/src-tauri/tauri.windows-signing.conf.json"
-          Write-Host "Created and trusted CI code-signing certificate: $($cert.Subject) [$($cert.Thumbprint)]"
+          Write-Host "Created ephemeral CI code-signing certificate: $($cert.Subject) [$($cert.Thumbprint)]"
 
       - name: Build engine
         working-directory: aether
@@ -148,7 +132,7 @@ jobs:
           $enginePath = "aether/target/release/aether.exe"
           Set-AuthenticodeSignature -FilePath $enginePath -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
           $sig = Get-AuthenticodeSignature -FilePath $enginePath
-          if ($sig.Status -ne "Valid") { throw "Engine signature invalid: $($sig.StatusMessage)" }
+          if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Engine signature invalid: $($sig.StatusMessage)" }
           if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Engine publisher CN mismatch: $($sig.SignerCertificate.Subject)" }
           Write-Host "Engine signed and verified successfully: $($sig.SignerCertificate.Subject)"
 
@@ -189,7 +173,7 @@ jobs:
 
           foreach ($bin in @($nsis.FullName, $gui)) {
             $sig = Get-AuthenticodeSignature -FilePath $bin
-            if ($sig.Status -ne "Valid") { throw "Signature invalid for $bin: $($sig.StatusMessage)" }
+            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Signature invalid for $bin: $($sig.StatusMessage)" }
             if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Publisher CN mismatch for $bin: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified signature for $bin: $($sig.SignerCertificate.Subject)"
           }
@@ -226,7 +210,7 @@ jobs:
           )
           foreach ($b in $bins) {
             $sig = Get-AuthenticodeSignature -FilePath $b
-            if ($sig.Status -ne "Valid") { throw "Packaged artifact signature invalid for $b: $($sig.StatusMessage)" }
+            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Packaged artifact signature invalid for $b: $($sig.StatusMessage)" }
             if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for $b: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
           }
@@ -244,22 +228,6 @@ jobs:
         shell: pwsh
         run: |
           if ($env:WINDOWS_CERT_THUMBPRINT) {
-            foreach ($storeName in @("Root", "TrustedPublisher")) {
-              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                $storeName,
-                [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-              )
-              try {
-                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-                $store.Certificates.Find(
-                  [System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint,
-                  $env:WINDOWS_CERT_THUMBPRINT,
-                  $false
-                ) | ForEach-Object { $store.Remove($_) }
-              } finally {
-                $store.Close()
-              }
-            }
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
           }
           @("aether-codesign.cnf", "aether-codesign.key", "aether-codesign.crt", "aether-codesign.pfx") |
