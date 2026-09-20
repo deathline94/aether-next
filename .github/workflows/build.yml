@@ -65,6 +65,7 @@ jobs:
     name: Windows x64
     needs: [test]
     runs-on: windows-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -84,33 +85,47 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Create and trust code signing certificate
+      - name: Create noninteractive CI code signing certificate
         shell: pwsh
+        timeout-minutes: 2
         run: |
-          # Generate cert with openssl (New-SelfSignedCertificate hangs on headless CI runners)
-          $pfxPass = "ci-sign-$([System.Guid]::NewGuid().ToString('N').Substring(0,16))"
+          $pfxPass = "ci-sign-$([Guid]::NewGuid().ToString('N').Substring(0,16))"
+          $configPath = Join-Path $env:RUNNER_TEMP "aether-codesign.cnf"
+          $keyPath = Join-Path $env:RUNNER_TEMP "aether-codesign.key"
+          $certPath = Join-Path $env:RUNNER_TEMP "aether-codesign.crt"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "aether-codesign.pfx"
+          "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = critical,digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = critical,CA:FALSE`nsubjectKeyIdentifier = hash" |
+            Set-Content -LiteralPath $configPath -NoNewline
 
-          # Create openssl config for code signing (avoid here-strings; closing "@ must be column 0)
-          "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = CA:FALSE" | Set-Content -Path "cs.cnf" -NoNewline
+          & openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 30 -nodes -config $configPath 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl req failed with exit code $LASTEXITCODE" }
+          & openssl pkcs12 -export -out $pfxPath -inkey $keyPath -in $certPath -passout "pass:$pfxPass" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed with exit code $LASTEXITCODE" }
 
-          openssl req -x509 -newkey rsa:2048 -keyout cs.key -out cs.crt -days 1825 -nodes -config cs.cnf 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "openssl req failed" }
-          openssl pkcs12 -export -out cs.pfx -inkey cs.key -in cs.crt -passout "pass:$pfxPass" 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed" }
-          Write-Host "Certificate PFX created"
-
-          # Import into CurrentUser\My (for Set-AuthenticodeSignature)
           $secPass = ConvertTo-SecureString $pfxPass -AsPlainText -Force
-          $imported = Import-PfxCertificate -FilePath cs.pfx -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass -Exportable
-          Write-Host "Imported to My store: $($imported.Thumbprint)"
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass |
+            Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $cert) { throw "Imported PFX does not contain a certificate with a private key" }
 
-          # Trust it: add to Root and TrustedPublisher so WinVerifyTrust returns STATUS_SUCCESS
-          Import-Certificate -FilePath cs.crt -CertStoreLocation "Cert:\CurrentUser\Root" | Out-Null
-          Import-Certificate -FilePath cs.crt -CertStoreLocation "Cert:\CurrentUser\TrustedPublisher" | Out-Null
-          Write-Host "Certificate trusted in CurrentUser Root and TrustedPublisher stores"
+          # Import-Certificate can display an interactive root-trust prompt on hosted runners.
+          # certutil -f performs the same store updates without UI.
+          & certutil.exe -user -f -addstore Root $certPath
+          if ($LASTEXITCODE -ne 0) { throw "certutil Root import failed with exit code $LASTEXITCODE" }
+          & certutil.exe -user -f -addstore TrustedPublisher $certPath
+          if ($LASTEXITCODE -ne 0) { throw "certutil TrustedPublisher import failed with exit code $LASTEXITCODE" }
 
-          # Clean up key material from disk
-          Remove-Item cs.key, cs.crt, cs.pfx, cs.cnf -Force
+          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $signingConfig = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $cert.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          } | ConvertTo-Json -Depth 4
+          $signingConfig | Set-Content "apps/desktop/src-tauri/tauri.windows-signing.conf.json"
+          Write-Host "Created and trusted CI code-signing certificate: $($cert.Subject) [$($cert.Thumbprint)]"
 
       - name: Build engine
         working-directory: aether
@@ -119,13 +134,13 @@ jobs:
       - name: Sign and verify engine
         shell: pwsh
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -match "CN=deathline94" } | Select-Object -First 1
+          $cert = Get-Item "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT"
           if (-not $cert) { throw "Code signing cert not found in store" }
           $enginePath = "aether/target/release/aether.exe"
-          Set-AuthenticodeSignature -FilePath $enginePath -Certificate $cert -HashAlgorithm SHA256
+          Set-AuthenticodeSignature -FilePath $enginePath -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
           $sig = Get-AuthenticodeSignature -FilePath $enginePath
           if ($sig.Status -ne "Valid") { throw "Engine signature invalid: $($sig.StatusMessage)" }
-          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Engine publisher CN mismatch: $($sig.SignerCertificate.Subject)" }
+          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Engine publisher CN mismatch: $($sig.SignerCertificate.Subject)" }
           Write-Host "Engine signed and verified successfully: $($sig.SignerCertificate.Subject)"
 
       - name: Stage engine
@@ -147,14 +162,11 @@ jobs:
         run: |
           npm ci
           npm run build
-          npm run tauri build
+          npm run tauri build -- --config src-tauri/tauri.windows-signing.conf.json
 
-      - name: Sign GUI and installer
+      - name: Verify GUI and installer signatures
         shell: pwsh
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -match "CN=deathline94" } | Select-Object -First 1
-          if (-not $cert) { throw "Code signing cert not found in store" }
-
           $nsis = Get-ChildItem "apps/desktop/src-tauri/target/release/bundle/nsis" -Filter "*setup.exe" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $nsis) { throw "installer missing" }
@@ -166,13 +178,10 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $gui) { throw "gui missing" }
 
-          Set-AuthenticodeSignature -FilePath $nsis.FullName -Certificate $cert -HashAlgorithm SHA256
-          Set-AuthenticodeSignature -FilePath $gui -Certificate $cert -HashAlgorithm SHA256
-
           foreach ($bin in @($nsis.FullName, $gui)) {
             $sig = Get-AuthenticodeSignature -FilePath $bin
             if ($sig.Status -ne "Valid") { throw "Signature invalid for $bin: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Publisher CN mismatch for $bin: $($sig.SignerCertificate.Subject)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Publisher CN mismatch for $bin: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified signature for $bin: $($sig.SignerCertificate.Subject)"
           }
 
@@ -209,7 +218,7 @@ jobs:
           foreach ($b in $bins) {
             $sig = Get-AuthenticodeSignature -FilePath $b
             if ($sig.Status -ne "Valid") { throw "Packaged artifact signature invalid for $b: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94") { throw "Packaged artifact publisher mismatch for $b: $($sig.SignerCertificate.Subject)" }
+            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for $b: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
           }
 
@@ -220,6 +229,21 @@ jobs:
             dist-windows/AetherNext-windows-x64-setup.exe
             dist-windows/AetherNext-portable-windows-x64.zip
           if-no-files-found: error
+
+      - name: Remove signing key material
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERT_THUMBPRINT) {
+            & certutil.exe -user -delstore Root $env:WINDOWS_CERT_THUMBPRINT | Out-Null
+            & certutil.exe -user -delstore TrustedPublisher $env:WINDOWS_CERT_THUMBPRINT | Out-Null
+            Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+          @("aether-codesign.cnf", "aether-codesign.key", "aether-codesign.crt", "aether-codesign.pfx") |
+            ForEach-Object {
+              $path = Join-Path $env:RUNNER_TEMP $_
+              if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
+            }
 
   android-apk:
     name: Android APKs
