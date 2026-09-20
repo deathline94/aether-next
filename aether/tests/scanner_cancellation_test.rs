@@ -1,3 +1,5 @@
+#![allow(clippy::uninlined_format_args)]
+
 use aether::prober::{hunt_best, request_scan_cancel, IpScan, ProbeConfig, ProbeResult, ScanMode, VerifyFn};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,8 +42,7 @@ async fn test_scanner_cancellation_aborts_pending_futures() {
     // Cancellation must break out promptly (< 250ms), far faster than the 10s pending futures
     assert!(
         elapsed < Duration::from_millis(250),
-        "hunt_best took {:?} to abort, expected < 250ms",
-        elapsed
+        "hunt_best took {elapsed:?} to abort, expected < 250ms"
     );
     // Since no probe finished, result is NoCleanEndpoint
     assert!(result.is_err(), "Expected error when cancelled before any probe succeeded");
@@ -92,8 +93,7 @@ async fn test_scanner_cancellation_preserves_best_hit() {
 
     assert!(
         elapsed < Duration::from_millis(300),
-        "hunt_best took {:?} to abort, expected < 300ms",
-        elapsed
+        "hunt_best took {elapsed:?} to abort, expected < 300ms"
     );
     assert!(result.is_ok(), "Expected Ok(best) when cancelled after a probe succeeded");
     let pr = result.unwrap();
@@ -131,5 +131,5 @@ async fn test_scanner_pre_hunt_cancellation() {
 
     assert!(result.is_err(), "Expected error when cancelled prior to hunt_best");
     assert!(!probe_called.load(Ordering::SeqCst), "Verify probe should not have been called");
-    assert!(elapsed < Duration::from_millis(100), "Pre-cancelled hunt must abort immediately (< 100ms), took {:?}", elapsed);
+    assert!(elapsed < Duration::from_millis(100), "Pre-cancelled hunt must abort immediately (< 100ms), took {elapsed:?}");
 }
