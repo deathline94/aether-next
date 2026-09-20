@@ -112,6 +112,14 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     perms.set_readonly(true);
     fs::set_permissions(&config_path, perms).expect("set readonly");
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dir_perms = fs::metadata(&temp_dir).expect("meta dir").permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(&temp_dir, dir_perms).expect("set dir readonly");
+    }
+
     // 2. Set AETHER_CONFIG_KEY and load
     use base64::Engine;
     let test_key = [42u8; 32];
@@ -122,6 +130,13 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     assert!(res.is_err(), "Migration must fail fatally if saving encrypted config fails");
 
     // Cleanup permissions before deleting temp dir
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dir_perms = fs::metadata(&temp_dir).expect("meta dir").permissions();
+        dir_perms.set_mode(0o755);
+        let _ = fs::set_permissions(&temp_dir, dir_perms);
+    }
     let mut perms_clean = fs::metadata(&config_path).expect("meta").permissions();
     #[allow(clippy::permissions_set_readonly_false)]
     perms_clean.set_readonly(false);
