@@ -176,98 +176,143 @@ pub mod dpapi {
         CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
     };
 
-    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
+    /// Which OS secret store can wrap the master key right now.
+    ///
+    /// The point of naming it is that the wrapping is then a *choice made in one
+    /// place*. Until now the off-Windows `encrypt`/`decrypt` were the identity
+    /// function, so "encrypted at rest" was true on one platform and false
+    /// everywhere else — and the tests that would have shown it are all
+    /// `#[cfg(windows)]`, so the failure was invisible by construction.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum KeyService {
+        /// Windows Data Protection API, scoped to the current user and process.
+        #[cfg(windows)]
+        Dpapi,
+        /// Nothing available: an honest `None`, not a silent pass-through.
+        None,
+    }
+
+    pub fn service() -> KeyService {
         #[cfg(windows)]
         {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: data.len() as u32,
-                pbData: data.as_ptr() as *mut u8,
-            };
-            let mut out_blob = CRYPT_INTEGER_BLOB {
-                cbData: 0,
-                pbData: ptr::null_mut(),
-            };
-
-            let res = unsafe {
-                CryptProtectData(
-                    &in_blob,
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    CRYPTPROTECT_UI_FORBIDDEN,
-                    &mut out_blob,
-                )
-            };
-
-            if res == 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("CryptProtectData failed: {err}").into());
-            }
-
-            let encrypted = unsafe {
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
-            };
-
-            unsafe {
-                LocalFree(out_blob.pbData as _);
-            }
-
-            Ok(encrypted)
+            KeyService::Dpapi
         }
         #[cfg(not(windows))]
         {
-            Ok(data.to_vec())
+            // Keychain (macOS) and libsecret (Linux) are the remaining sources —
+            // specs/015 T096. Adding them means adding a variant here and a real
+            // arm below; there is no path that stores a key unwrapped.
+            KeyService::None
         }
     }
 
-    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
-        #[cfg(windows)]
-        {
-            let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: data.len() as u32,
-                pbData: data.as_ptr() as *mut u8,
-            };
-            let mut out_blob = CRYPT_INTEGER_BLOB {
-                cbData: 0,
-                pbData: ptr::null_mut(),
-            };
+    fn no_key_service() -> CommandError {
+        CommandError::new(
+            "key_service_unavailable",
+            "this platform has no OS-backed secret store, and the configuration master key is \
+             never written unwrapped; run on Windows or add the Keychain/libsecret key source",
+        )
+    }
 
-            let res = unsafe {
-                CryptUnprotectData(
-                    &in_blob,
-                    ptr::null_mut(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    CRYPTPROTECT_UI_FORBIDDEN,
-                    &mut out_blob,
-                )
-            };
+    pub fn encrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandError> {
+        match svc {
+            #[cfg(windows)]
+            KeyService::Dpapi => {
+                let in_blob = CRYPT_INTEGER_BLOB {
+                    cbData: data.len() as u32,
+                    pbData: data.as_ptr() as *mut u8,
+                };
+                let mut out_blob = CRYPT_INTEGER_BLOB {
+                    cbData: 0,
+                    pbData: ptr::null_mut(),
+                };
 
-            if res == 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("CryptUnprotectData failed: {err}").into());
-            }
+                let res = unsafe {
+                    CryptProtectData(
+                        &in_blob,
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        &mut out_blob,
+                    )
+                };
 
-            let decrypted = unsafe {
-                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
-            };
-
-            unsafe {
-                if !out_blob.pbData.is_null() && out_blob.cbData > 0 {
-                    let slice = std::slice::from_raw_parts_mut(out_blob.pbData, out_blob.cbData as usize);
-                    slice.zeroize();
+                if res == 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!("CryptProtectData failed: {err}").into());
                 }
-                LocalFree(out_blob.pbData as _);
-            }
 
-            Ok(decrypted)
+                let encrypted = unsafe {
+                    std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+                };
+
+                unsafe {
+                    LocalFree(out_blob.pbData as _);
+                }
+
+                Ok(encrypted)
+            }
+            KeyService::None => Err(no_key_service()),
         }
-        #[cfg(not(windows))]
-        {
-            Ok(data.to_vec())
+    }
+
+    pub fn decrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandError> {
+        match svc {
+            #[cfg(windows)]
+            KeyService::Dpapi => {
+                let in_blob = CRYPT_INTEGER_BLOB {
+                    cbData: data.len() as u32,
+                    pbData: data.as_ptr() as *mut u8,
+                };
+                let mut out_blob = CRYPT_INTEGER_BLOB {
+                    cbData: 0,
+                    pbData: ptr::null_mut(),
+                };
+
+                let res = unsafe {
+                    CryptUnprotectData(
+                        &in_blob,
+                        ptr::null_mut(),
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        &mut out_blob,
+                    )
+                };
+
+                if res == 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!("CryptUnprotectData failed: {err}").into());
+                }
+
+                let decrypted = unsafe {
+                    std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+                };
+
+                unsafe {
+                    if !out_blob.pbData.is_null() && out_blob.cbData > 0 {
+                        let slice =
+                            std::slice::from_raw_parts_mut(out_blob.pbData, out_blob.cbData as usize);
+                        slice.zeroize();
+                    }
+                    LocalFree(out_blob.pbData as _);
+                }
+
+                Ok(decrypted)
+            }
+            KeyService::None => Err(no_key_service()),
         }
+    }
+
+    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
+        encrypt_with(data, service())
+    }
+
+    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
+        decrypt_with(data, service())
     }
 
     const DPAPI_MAGIC: &[u8] = b"DP01";
@@ -295,7 +340,7 @@ pub mod dpapi {
 
         // Generate new 32-byte key
         let mut raw_key = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw_key);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw_key);
 
         let ciphertext = encrypt(&raw_key)?;
         let mut envelope = Vec::with_capacity(DPAPI_MAGIC.len() + ciphertext.len());
@@ -341,18 +386,6 @@ pub mod dpapi {
                 f.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
             }
         }
-        #[cfg(not(windows))]
-        {
-            use std::io::Write as _;
-            // Say it out loud rather than letting the filename imply a
-            // protection that does not exist off Windows (T096 lands the real
-            // Keychain / libsecret sources).
-            eprintln!(
-                "[aether] WARNING: no OS credential store on this platform yet; the master key in                  {} is protected only by file permissions.",
-                app_data_dir.display()
-            );
-        }
-
         // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
         if let Err(e) = super::restrict_directory_acl(&tmp_file) {
             let _ = std::fs::remove_file(&tmp_file);

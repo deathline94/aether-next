@@ -2,6 +2,37 @@
 #[link(name = "resource", kind = "static")]
 extern "C" {}
 
+use aether_desktop_lib::dpapi::{encrypt_with, service, KeyService};
+
+/// The bug this replaces was invisible *because* of how the tests were written:
+/// `encrypt`/`decrypt` were the identity function off Windows, and every test
+/// that checked them was `#[cfg(windows)]`, so the platform that stored the
+/// master key in plaintext had nothing asserting on it.
+///
+/// This test is not cfg-gated. Whatever the platform's answer is, the pair must
+/// not be able to agree that an unwrapped key counts as protected.
+#[test]
+fn an_unavailable_key_service_refuses_rather_than_echoing_the_plaintext() {
+    let key = [0x5au8; 32];
+    if service() == KeyService::None {
+        let err = encrypt_with(&key, KeyService::None)
+            .expect_err("no OS secret store must be a refusal, not a pass-through");
+        assert!(
+            err.message.contains("never written unwrapped"),
+            "the error has to name the missing backend: {err:?}"
+        );
+    } else {
+        let wrapped = encrypt_with(&key, service()).expect("a real service wraps the key");
+        assert_ne!(&wrapped[..], &key[..], "the key went to disk as plaintext");
+        let back = aether_desktop_lib::dpapi::decrypt_with(&wrapped, service())
+            .expect("unwrap succeeds");
+        assert_eq!(&back[..], &key[..]);
+        // Asking the unavailable service explicitly must still refuse, even on
+        // the platform where production never selects it.
+        assert!(encrypt_with(&key, KeyService::None).is_err());
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn test_dpapi_roundtrip() {
