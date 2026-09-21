@@ -40,6 +40,34 @@ const MAX_SUCCESSES: u32 = 1000;
 /// Anything above this is not a measured round trip (60 s).
 const MAX_PLAUSIBLE_RTT_MS: u32 = 60_000;
 
+/// Which transport produced a measurement, recorded on the entry that carries it.
+///
+/// Two endpoints that look identical — same IP, same port — are not the same
+/// claim under QUIC and under HTTP/2: an edge that refuses UDP entirely is a
+/// healthy H2 gateway and a dead QUIC one. Sharing one `successes`/`failures`
+/// counter between the two is what evicted working H2 gateways after three
+/// QUIC probes failed, and made every later connect pay for a full scan again.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    #[default]
+    Quic,
+    H2,
+}
+
+/// The transport the MASQUE tunnel would actually use right now.
+///
+/// One function answers "which transport am I in" so that no writer or reader has
+/// to re-derive it from the environment — that derivation is how the two ends of
+/// the cache disagreed before.
+pub fn active_masque_transport() -> TransportKind {
+    if crate::masque_h2::enabled() {
+        TransportKind::H2
+    } else {
+        TransportKind::Quic
+    }
+}
+
 /// Provisioning (account registration / MASQUE enrollment) makes network calls to
 /// Cloudflare that can take several seconds, so its cross-process lock waits much
 /// longer and treats the holder as stale much later than the fast cache lock.
@@ -136,6 +164,11 @@ pub struct CachedEndpoint {
     /// evict endpoints that died (e.g. after a network change).
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Which transport this measurement came from. Entries from another transport
+    /// are not shown to a connect that will not use it — and a legacy entry with
+    /// no field decodes as `Quic`, which is what every pre-v2 file meant.
+    #[serde(default)]
+    pub transport: TransportKind,
 }
 
 impl CachedEndpoint {
@@ -544,7 +577,11 @@ pub fn save_endpoints(base_config: &str, cache: &EndpointsCache) {
     }
 }
 
-fn upsert(list: &mut Vec<CachedEndpoint>, endpoints: Vec<(SocketAddr, u32)>) {
+fn upsert(
+    list: &mut Vec<CachedEndpoint>,
+    endpoints: Vec<(SocketAddr, u32)>,
+    transport: TransportKind,
+) {
     let now = now_secs();
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
         // Preserve accumulated trust when re-adding a known endpoint.
@@ -559,6 +596,7 @@ fn upsert(list: &mut Vec<CachedEndpoint>, endpoints: Vec<(SocketAddr, u32)>) {
                 successes: prev.as_ref().map(|p| p.successes).unwrap_or(0),
                 failures: prev.as_ref().map(|p| p.failures).unwrap_or(0),
                 consecutive_failures: 0,
+                transport,
             },
         );
     }
@@ -566,16 +604,28 @@ fn upsert(list: &mut Vec<CachedEndpoint>, endpoints: Vec<(SocketAddr, u32)>) {
 }
 
 pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) {
-    with_cache(base_config, |cache| upsert(&mut cache.masque, endpoints));
+    let transport = active_masque_transport();
+    with_cache(base_config, move |cache| {
+        upsert(&mut cache.masque, endpoints, transport)
+    });
 }
 
-/// Cached masque endpoints sorted by trust score (highest first).
+/// Cached masque endpoints that were measured over `transport`, best first.
+pub fn get_masque_sorted_for(base_config: &str, transport: TransportKind) -> Vec<(SocketAddr, u32)> {
+    let mut eps = load_endpoints(base_config).masque;
+    eps.retain(|e| e.transport == transport);
+    sorted(eps)
+}
+
+/// Cached masque endpoints for the transport the tunnel would use now.
 pub fn get_masque_sorted(base_config: &str) -> Vec<(SocketAddr, u32)> {
-    sorted(load_endpoints(base_config).masque)
+    get_masque_sorted_for(base_config, active_masque_transport())
 }
 
 pub fn add_to_wireguard_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) {
-    with_cache(base_config, |cache| upsert(&mut cache.wireguard, endpoints));
+    with_cache(base_config, |cache| {
+        upsert(&mut cache.wireguard, endpoints, TransportKind::default())
+    });
 }
 
 /// Cached wireguard endpoints sorted by trust score (highest first).
@@ -592,52 +642,78 @@ fn sorted(mut eps: Vec<CachedEndpoint>) -> Vec<(SocketAddr, u32)> {
 /// Record a successful connection. Upserts: an endpoint reached via the
 /// enroll/anycast fallback (never a scan hit) still accrues trust.
 pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) {
-    with_cache(base_config, |cache| {
+    let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
+    with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
         } else {
             &mut cache.wireguard
         };
-        if let Some(ep) = list.iter_mut().find(|e| e.addr == addr) {
-            ep.successes += 1;
-            ep.consecutive_failures = 0;
-            ep.timestamp = now_secs();
-        } else {
-            list.insert(
-                0,
-                CachedEndpoint {
-                    addr,
-                    timestamp: now_secs(),
-                    rtt_ms: 0,
-                    successes: 1,
-                    failures: 0,
-                    consecutive_failures: 0,
-                },
-            );
-            list.truncate(MAX_CACHED);
-        }
+        record_success_on(list, addr, transport, now_secs());
     });
+}
+
+fn record_success_on(
+    list: &mut Vec<CachedEndpoint>,
+    addr: SocketAddr,
+    transport: TransportKind,
+    now: u64,
+) {
+    if let Some(ep) = list.iter_mut().find(|e| e.addr == addr && e.transport == transport) {
+        ep.successes = ep.successes.saturating_add(1);
+        ep.consecutive_failures = 0;
+        ep.timestamp = now;
+    } else {
+        list.insert(
+            0,
+            CachedEndpoint {
+                addr,
+                timestamp: now,
+                rtt_ms: 0,
+                successes: 1,
+                failures: 0,
+                consecutive_failures: 0,
+                transport,
+            },
+        );
+        list.truncate(MAX_CACHED);
+    }
 }
 
 /// Record a failed connection attempt. Evicts the endpoint after
 /// `EVICT_AFTER_CONSECUTIVE_FAILURES` consecutive failures so a peer that died
 /// (e.g. the network changed) stops being tried first on every reconnect.
+///
+/// The strike lands on the entry for *this* transport only. Probing an H2-capable
+/// gateway over QUIC used to add a failure that evicted it from the H2 list too,
+/// so a gateway that had never once failed over the transport in use was deleted
+/// after three failures of a transport we were not even using.
 pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) {
-    with_cache(base_config, |cache| {
+    let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
+    with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
         } else {
             &mut cache.wireguard
         };
-        if let Some(idx) = list.iter().position(|e| e.addr == addr) {
-            list[idx].failures += 1;
-            list[idx].consecutive_failures += 1;
-            list[idx].timestamp = now_secs();
-            if list[idx].consecutive_failures >= EVICT_AFTER_CONSECUTIVE_FAILURES {
-                list.remove(idx);
-            }
-        }
+        record_failure_on(list, addr, transport, now_secs());
     });
+}
+
+fn record_failure_on(
+    list: &mut Vec<CachedEndpoint>,
+    addr: SocketAddr,
+    transport: TransportKind,
+    now: u64,
+) {
+    if let Some(idx) = list.iter().position(|e| e.addr == addr && e.transport == transport) {
+        list[idx].failures = list[idx].failures.saturating_add(1);
+        list[idx].consecutive_failures = list[idx].consecutive_failures.saturating_add(1);
+        list[idx].timestamp = now;
+        if list[idx].consecutive_failures >= EVICT_AFTER_CONSECUTIVE_FAILURES {
+            list.remove(idx);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -652,7 +728,111 @@ mod tests {
             successes: succ,
             failures: 0,
             consecutive_failures: 0,
+            transport: TransportKind::default(),
         }
+    }
+
+    /// A "healthy" gateway is a claim about a transport, not just an address.
+    /// Sharing one failure counter across QUIC and H2 evicted gateways that had
+    /// never failed over the transport the tunnel was actually using.
+    #[test]
+    fn a_failure_over_one_transport_cannot_evict_the_other() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_transport_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let gw: SocketAddr = "162.159.193.1:443".parse().unwrap();
+
+        // The H2-mode shape: this gateway is only ever known to work over H2.
+        record_success_h2(&base, gw);
+        for _ in 0..EVICT_AFTER_CONSECUTIVE_FAILURES {
+            record_failure_quic(&base, gw);
+        }
+        assert_eq!(
+            get_masque_sorted_for(&base, TransportKind::H2).len(),
+            1,
+            "a gateway that never failed over H2 must not be evicted by QUIC failures"
+        );
+
+        // And the strikes do land where they belong — an assertion that passes on
+        // an empty list would prove nothing.
+        record_success_quic(&base, gw);
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::Quic).len(), 1);
+        for _ in 0..EVICT_AFTER_CONSECUTIVE_FAILURES {
+            record_failure_quic(&base, gw);
+        }
+        assert!(get_masque_sorted_for(&base, TransportKind::Quic).is_empty());
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::H2).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A success over one transport must not launder another transport's record.
+    #[test]
+    fn a_success_over_one_transport_does_not_reset_the_other() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_xport_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let gw: SocketAddr = "162.159.193.1:443".parse().unwrap();
+
+        record_success_quic(&base, gw);
+        record_failure_quic(&base, gw);
+        record_success_h2(&base, gw);
+        with_cache(&base, |cache| {
+            let quic = cache
+                .masque
+                .iter()
+                .find(|e| e.addr == gw && e.transport == TransportKind::Quic)
+                .expect("quic entry");
+            assert_eq!(
+                quic.consecutive_failures, 1,
+                "the H2 connect says nothing about this endpoint over QUIC"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before the discriminator existed carries measurements that
+    /// were all taken over QUIC, so it must decode that way rather than be
+    /// invisible (or worse, be read as H2 history).
+    #[test]
+    fn a_legacy_entry_without_a_transport_is_a_quic_measurement() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_legacy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        // Stamped "now": an old timestamp is pruned as stale before anything can
+        // look at its transport, and the test would pass for the wrong reason.
+        let doc = format!(
+            r#"{{"version":2,"written_at":{n},"masque":[{{"addr":"162.159.193.1:443","timestamp":{n},"rtt_ms":30,"successes":4,"failures":0,"consecutive_failures":0}}],"wireguard":[]}}"#,
+            n = now_secs()
+        );
+        std::fs::write(cache_path(&base), doc).unwrap();
+        let entries = get_masque_sorted_for(&base, TransportKind::Quic);
+        assert_eq!(entries.len(), 1, "legacy entry must decode, not vanish");
+        assert!(get_masque_sorted_for(&base, TransportKind::H2).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// These helpers pin the transport explicitly so the assertions are about the
+    /// cache, not about the ambient `AETHER_MASQUE_HTTP2` value another test in
+    /// this binary may have left set.
+    fn record_failure_quic(base: &str, addr: SocketAddr) {
+        with_cache(base, |cache| {
+            record_failure_on(&mut cache.masque, addr, TransportKind::Quic, now_secs())
+        });
+    }
+
+    fn record_success_quic(base: &str, addr: SocketAddr) {
+        with_cache(base, |cache| {
+            record_success_on(&mut cache.masque, addr, TransportKind::Quic, now_secs())
+        });
+    }
+
+    fn record_success_h2(base: &str, addr: SocketAddr) {
+        with_cache(base, |cache| {
+            record_success_on(&mut cache.masque, addr, TransportKind::H2, now_secs())
+        });
     }
 
     /// A cached endpoint is untrusted input. The scanner is not the only writer
@@ -734,6 +914,7 @@ mod tests {
             successes,
             failures,
             consecutive_failures: consec,
+            transport: TransportKind::default(),
         }
     }
 

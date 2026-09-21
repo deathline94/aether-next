@@ -533,12 +533,36 @@ async fn select_peer(
                 if let Some(cached) = lastconn::load(&cache_path) {
                     if let Ok(peer_addr) = cached.peer.parse::<SocketAddr>() {
                         log::info!("[*] verifying cached gateway {peer_addr} before reuse");
-                        if let Ok(_rtt) = quick_verify_masque(
-                            identity,
-                            peer_addr,
-                            &probe.sni,
-                            ech_config.as_deref(),
-                        ).await {
+                        // Verify over the transport the tunnel will actually use.
+                        // This call was always QUIC, so in H2 mode a gateway that
+                        // answers on TCP 443 and never on UDP accumulated three
+                        // strikes from its own health checks and was evicted —
+                        // then every connect paid for a full scan again.
+                        let verified = if masque_h2::enabled() {
+                            let h2cfg = masque_h2::H2TunnelConfig {
+                                peer: masque_h2::h2_peer(peer_addr),
+                                sni: probe.sni.clone(),
+                                authority: probe.authority.clone(),
+                                cert_pem: identity.cert_pem.clone(),
+                                key_pem: identity.key_pem.clone(),
+                                probe_src: Some(
+                                    identity
+                                        .ipv4
+                                        .parse()
+                                        .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2)),
+                                ),
+                            };
+                            masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
+                        } else {
+                            quick_verify_masque(
+                                identity,
+                                peer_addr,
+                                &probe.sni,
+                                ech_config.as_deref(),
+                            )
+                            .await
+                        };
+                        if let Ok(_rtt) = verified {
                             log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
                             crate::cache::record_success(base_config, peer_addr, true);
                             session_event::emit(SessionEvent::EndpointSelected {
