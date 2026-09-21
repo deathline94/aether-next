@@ -1782,19 +1782,20 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandE
             let _ = stdin.write_all(b"shutdown\n");
             let _ = stdin.flush();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Fifteen seconds, and never silently. The engine uses this window to
+        // close the tunnel, drop the routes it journaled and reset the adapter;
+        // five was routinely too short on a slow link, so the shell killed it
+        // mid-teardown and the machine kept routes to a dead adapter — with no
+        // log line saying a kill happened.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                Err(_) => {
+                _ => {
+                    eprintln!("[aether] engine outlived the 15s teardown grace; forcing exit (host state may need repair: run Aether with --repair-proxy, or reconnect once)");
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -2045,7 +2046,10 @@ fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
         let _ = stdin.write_all(b"cancel\n");
         let _ = stdin.flush();
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    // A cancelled scan is mid-write to the endpoint cache more often than a
+    // tunnel teardown is, and the whole point of `cancel` (rather than `kill`)
+    // is that it finishes persisting best-so-far. Four seconds cut that short.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -2053,6 +2057,7 @@ fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             _ => {
+                eprintln!("[aether] scan child outlived the 15s cancel grace; forcing exit");
                 let _ = child.kill();
                 let _ = child.wait();
                 break;
