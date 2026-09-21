@@ -81,12 +81,24 @@ const GATES = [
     summary: 'AETHER_* is read through runtime_env, never std::env',
     scan(api) {
       const v = [];
-      for (const f of api.files('aether/src', /\.rs$/)) {
-        if (rel(f).endsWith('runtime_env.rs')) continue;
-        const t = api.read(f);
-        const re = /std::env::var(?:_os)?\(\s*"AETHER_/g;
-        let m;
-        while ((m = re.exec(t))) v.push(`${locate(f, t, m.index)} reads AETHER_* from the process env`);
+      // The shell is scanned too: it *writes* the engine environment (those are
+      // `Command::env` calls and do not match), but an ambient *read* there is
+      // just as much a second source of truth as one in the engine.
+      //
+      // Allowlist is per-key and has to say why it is safe: a value that can
+      // only ever *add* verification cannot be used to turn a check off.
+      const SHELL_ADDITIVE_ONLY = new Set(['AETHER_WINTUN_SHA256']);
+      for (const dir of ['aether/src', 'apps/desktop/src-tauri/src']) {
+        for (const f of api.files(dir, /\.rs$/)) {
+          if (rel(f).endsWith('runtime_env.rs')) continue;
+          const t = api.read(f);
+          const re = /std::env::var(?:_os)?\(\s*"(AETHER_[A-Z0-9_]*)"/g;
+          let m;
+          while ((m = re.exec(t))) {
+            if (rel(f).startsWith('apps/desktop') && SHELL_ADDITIVE_ONLY.has(m[1])) continue;
+            v.push(`${locate(f, t, m.index)} reads ${m[1]} from the process env`);
+          }
+        }
       }
       return v;
     },

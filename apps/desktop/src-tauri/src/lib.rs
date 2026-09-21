@@ -1150,15 +1150,11 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
         validate_trusted_binary(&path, "aether.exe")?;
         return Ok(path);
     }
-    if settings.routing_mode != "tun" {
-        if let Ok(path) = std::env::var("AETHER_ENGINE") {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                validate_trusted_binary(&path, "aether.exe")?;
-                return Ok(path);
-            }
-        }
-    }
+    // No `AETHER_ENGINE` override: `settings.engine_path` above already lets a
+    // user point at their own build, it is visible in the UI and persisted, and
+    // it goes through the same `validate_trusted_binary` check. A second,
+    // invisible env route to the same decision is how "which binary did the
+    // shell actually launch" stops being answerable from the saved settings.
     if let Some(path) = resolve_resource(app, "aether.exe") {
         return Ok(path);
     }
