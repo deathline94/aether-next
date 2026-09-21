@@ -386,6 +386,29 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'engine-spawns-scrub-ambient-env',
+    invariant: 'BC-04',
+    summary: 'every engine spawn site clears the inherited AETHER_* environment first',
+    scan(api) {
+      const v = [];
+      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
+        const t = api.read(f);
+        const spawns = [...t.matchAll(/Command::new\(&executable\)/g)].length;
+        const scrubs = [...t.matchAll(/scrub_ambient_engine_env\(&mut command\)/g)].length;
+        if (spawns > scrubs) {
+          v.push(`${rel(f)}: ${spawns - scrubs} of ${spawns} spawn sites inherit AETHER_* untouched — a session variable then outranks the handoff the shell promised`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/lib.rs',
+        content: 'fn a() {\n  let mut command = Command::new(&executable);\n  command.env("AETHER_TUN", "1");\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

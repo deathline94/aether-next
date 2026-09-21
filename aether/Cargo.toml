@@ -57,12 +57,17 @@ quiche = { path = "../quiche/quiche", default-features = false, features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
-wintun-bindings = "0.7"
+# `verify_binary_signature` makes `load_from_path` run WinVerifyTrust and check
+# the signer name *before* LoadLibrary, so a tampered or substituted wintun.dll
+# is refused without ever executing its DllMain.
+wintun-bindings = { version = "0.7", features = ["verify_binary_signature"] }
 windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem",
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_System_LibraryLoader",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
 ] }
 

@@ -23,35 +23,79 @@ pub fn enabled() -> bool {
     }
 }
 
-fn find_wintun_dll() -> Result<PathBuf> {
-    if let Some(p) = crate::runtime_env::var("AETHER_WINTUN") {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Ok(path);
+/// Roots the driver may be loaded from: the directory holding `aether.exe`, and
+/// its parent (the packaged layout puts binaries under `install-dir/resources`).
+/// Same pair the shell uses for its own allow-list, so the two ends cannot drift.
+fn wintun_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let canon = dir.canonicalize().unwrap_or(dir.clone());
+        roots.push(canon.clone());
+        if let Some(parent) = canon.parent() {
+            roots.push(parent.to_path_buf());
         }
     }
+    roots
+}
+
+/// Accept `raw` only if it resolves to a plain `wintun.dll` inside one of
+/// [`wintun_roots`]. Canonicalising *before* the comparison is the point: a
+/// `..\`-laden or symlinked path is judged by where it ends up, not how it reads.
+fn inside_allowed_root(raw: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(raw);
+    if !path
+        .file_name()
+        .and_then(|n| n.to_str())?
+        .eq_ignore_ascii_case("wintun.dll")
+    {
+        return None;
+    }
+    let canon = path.canonicalize().ok()?;
+    if !canon.is_file() {
+        return None;
+    }
+    wintun_roots().into_iter().find(|r| canon.starts_with(r)).map(|_| canon)
+}
+
+fn find_wintun_dll() -> Result<PathBuf> {
+    // Handed over by the parent that already Authenticode-verified this exact
+    // file, before it launched us elevated.
+    if let Some(p) = crate::keyhandoff::wintun_dll_path() {
+        let s = p.to_string_lossy();
+        return inside_allowed_root(&s).ok_or_else(|| {
+            AetherError::Other(format!(
+                "wintun path from the parent ({s}) is not a plain wintun.dll inside the install \
+                 directory; refusing to load a driver from anywhere else"
+            ))
+        });
+    }
+    // No handoff (CLI, or a shell that did not opt in): only the copy sitting
+    // next to the executable. The former `AETHER_WINTUN` environment read and the
+    // relative `./wintun.dll` probe are gone — the first let anything that could
+    // set the child's environment point the elevated engine at its own DLL, and
+    // the second made the *working directory* a component of the trust decision,
+    // which is exactly how a `LoadLibrary` hijack becomes a token escalation.
     let beside = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("wintun.dll")));
-    if let Some(path) = beside {
-        if path.exists() {
+    if let Some(path) = beside.as_ref().and_then(|p| p.canonicalize().ok()) {
+        if path.is_file() {
             return Ok(path);
         }
     }
-    let cwd = PathBuf::from("wintun.dll");
-    if cwd.exists() {
-        return Ok(cwd);
-    }
     Err(AetherError::Other(
-        "wintun.dll not found (set AETHER_WINTUN or place next to aether.exe)".into(),
+        "wintun.dll not found beside aether.exe, and the parent handed over no path".into(),
     ))
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
+    // Never by name: this process runs elevated, and the default search order
+    // includes the current directory.
+    let exe = crate::win_exec::system_exe(program)?;
+    let out = Command::new(&exe)
         .args(args)
         .output()
-        .map_err(|e| AetherError::Other(format!("{program} failed: {e}")))?;
+        .map_err(|e| AetherError::Other(format!("{} failed: {e}", exe.display())))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
@@ -622,7 +666,14 @@ fn process_alive(pid: u32) -> bool {
         return false;
     }
     use std::os::windows::process::CommandExt;
-    let out = Command::new("tasklist")
+    let exe = match crate::win_exec::system_exe("tasklist") {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[tun] liveness probe for pid {pid} cannot be resolved ({e}); assuming dead");
+            return false;
+        }
+    };
+    let out = Command::new(exe)
         .args([
             "/FI",
             &format!("PID eq {pid}"),

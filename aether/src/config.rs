@@ -295,10 +295,13 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
         return Err(AetherError::Other("forced ACL failure for test".into()));
     }
     let principal = crate::win_acl::current_user_sid()?;
-    let output = std::process::Command::new("icacls")
+    let exe = crate::win_exec::system_exe("icacls")?;
+    let output = std::process::Command::new(&exe)
         .args([path, "/inheritance:r", "/grant:r", &format!("*{principal}:F")])
         .output()
-        .map_err(|e| AetherError::Other(format!("failed to run icacls on {path}: {e}")))?;
+        .map_err(|e| {
+            AetherError::Other(format!("failed to run {} on {path}: {e}", exe.display()))
+        })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         return Err(AetherError::Other(format!(

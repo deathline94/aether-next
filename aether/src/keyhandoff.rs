@@ -21,8 +21,26 @@ use crate::runtime_env;
 pub const REQUEST_ENV: &str = "AETHER_CONFIG_KEY_STDIN";
 /// Prefix of the first control-channel line that carries the key.
 pub const LINE_PREFIX: &str = "key ";
+/// Prefix of the second control-channel line: where the driver DLL lives.
+pub const DLL_PREFIX: &str = "dll wintun ";
 
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The Wintun path the verified parent named on the control channel.
+///
+/// Deliberately not an environment variable. `AETHER_WINTUN` used to be read
+/// from the child's environment, which meant the *elevated* engine would
+/// `LoadLibrary` whatever DLL any process able to influence its environment
+/// pointed at — a token privilege escalation with a one-variable setup step. The
+/// only ways to name the driver now are this line, from the parent that already
+/// Authenticode-verified it, or the copy sitting next to `aether.exe`.
+#[cfg(windows)]
+static WINTUN_TOKEN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub fn wintun_dll_path() -> Option<std::path::PathBuf> {
+    WINTUN_TOKEN.get().cloned()
+}
 
 /// Validate one handoff line and return the base64 key it carried.
 pub fn parse_key_line(line: &str) -> Result<String> {
@@ -45,8 +63,69 @@ pub fn parse_key_line(line: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
-/// Read the key from stdin when the parent asked for that handoff route, and
-/// install it into [`runtime_env`] so the single-reader rule still holds.
+/// Validate the driver-path handoff line. No existence or shape check happens
+/// here: the path is only a *name*, and [`crate::tun_win`] is what decides
+/// whether it is inside the allow-listed roots.
+pub fn parse_dll_line(line: &str) -> Result<String> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let Some(value) = line.strip_prefix(DLL_PREFIX) else {
+        return Err(AetherError::Other(format!(
+            "expected a `{DLL_PREFIX}<path>` handoff line on stdin"
+        )));
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        return Err(AetherError::Other(format!(
+            "wintun handoff path is empty, over-long ({} bytes) or contains a NUL",
+            value.len()
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn read_preamble_line(what: &str) -> Result<String> {
+    // A blocking `read_line` cannot be interrupted, so it runs on its own thread
+    // and the caller waits with a deadline: a parent that opted in and then
+    // never wrote would otherwise hang startup forever with no diagnostic.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::Builder::new()
+        .name("aether-handoff-reader".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let mut stdin = std::io::stdin().lock();
+            match stdin.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "control stdin closed before the handoff line arrived",
+                    )));
+                }
+                Ok(_) => {
+                    let _ = tx.send(Ok(line));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })
+        .map_err(|e| AetherError::Other(format!("cannot start handoff reader: {e}")))?;
+
+    match rx.recv_timeout(HANDOFF_TIMEOUT) {
+        Ok(Ok(line)) => Ok(line),
+        Ok(Err(e)) => Err(AetherError::Other(format!("{what} read failed: {e}"))),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AetherError::Other(format!(
+            "{REQUEST_ENV}=1 but no {what} line arrived within {:?}",
+            HANDOFF_TIMEOUT
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AetherError::Other(format!("{what} reader died")))
+        }
+    }
+}
+
+/// Read the key — and, in TUN mode, the driver path — from stdin when the parent
+/// asked for that handoff route, and install the key into [`runtime_env`] so the
+/// single-reader rule still holds.
 ///
 /// A no-op when a key is already present (an explicit environment variable still
 /// works, which keeps the CLI usable) or when the parent did not opt in.
@@ -59,50 +138,22 @@ pub fn receive_if_requested() -> Result<()> {
         return Ok(());
     }
 
-    // A blocking `read_line` cannot be interrupted, so it runs on its own thread
-    // and the caller waits with a deadline: a parent that opted in and then
-    // never wrote would otherwise hang startup forever with no diagnostic.
-    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
-    std::thread::Builder::new()
-        .name("aether-key-handoff".into())
-        .spawn(move || {
-            let mut line = String::new();
-            let mut stdin = std::io::stdin().lock();
-            match stdin.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "control stdin closed before the key arrived",
-                    )));
-                }
-                Ok(_) => {
-                    let _ = tx.send(Ok(line));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
-            }
-        })
-        .map_err(|e| AetherError::Other(format!("cannot start key handoff reader: {e}")))?;
-
-    let line = match rx.recv_timeout(HANDOFF_TIMEOUT) {
-        Ok(Ok(line)) => line,
-        Ok(Err(e)) => return Err(AetherError::Other(format!("key handoff read failed: {e}"))),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            return Err(AetherError::Other(format!(
-                "{REQUEST_ENV}=1 but no key line arrived within {:?}",
-                HANDOFF_TIMEOUT
-            )))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(AetherError::Other("key handoff reader died".into()))
-        }
-    };
-
-    let mut key = parse_key_line(&line)?;
+    let mut key = parse_key_line(&read_preamble_line("key")?)?;
     runtime_env::set("AETHER_CONFIG_KEY", &key);
     key.zeroize();
     log::debug!("[keyhandoff] configuration key received over stdin");
+
+    // The order is part of the protocol: the GUI writes the key line, then the
+    // driver line iff it started the engine in TUN mode. Anything else and the
+    // two sides disagree about how many preamble lines exist.
+    #[cfg(windows)]
+    if crate::tun_win::enabled() {
+        let raw = parse_dll_line(&read_preamble_line("wintun")?)?;
+        if WINTUN_TOKEN.set(std::path::PathBuf::from(raw)).is_err() {
+            return Err(AetherError::Other("wintun handoff delivered twice".into()));
+        }
+        log::debug!("[keyhandoff] wintun path received over stdin");
+    }
     Ok(())
 }
 
@@ -127,5 +178,25 @@ mod tests {
         let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
         let err = parse_key_line(&format!("key {short}")).unwrap_err();
         assert!(err.to_string().contains("32 bytes"), "{err}");
+    }
+
+    #[test]
+    fn a_dll_line_carries_the_parents_path_verbatim() {
+        assert_eq!(
+            parse_dll_line("dll wintun C:\\Program Files\\Aether\\wintun.dll\n").unwrap(),
+            r"C:\Program Files\Aether\wintun.dll"
+        );
+    }
+
+    #[test]
+    fn a_dll_line_that_is_not_a_path_is_rejected() {
+        assert!(parse_dll_line("key abc\n").is_err(), "wrong token");
+        assert!(parse_dll_line("dll wintun \n").is_err(), "empty path");
+        assert!(parse_dll_line("dll wintun a\0b").is_err(), "NUL inside the path");
+        assert!(
+            parse_dll_line(&format!("dll wintun {}", "x".repeat(5000))).is_err(),
+            "absurd length"
+        );
+        assert!(parse_dll_line("shutdown\n").is_err(), "a control command is not a path");
     }
 }

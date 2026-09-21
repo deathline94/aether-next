@@ -1278,7 +1278,27 @@ pub fn verify_elevated_binary(
     Ok(())
 }
 
-/// Hand the configuration key to the engine over its control stdin.
+/// Drop every `AETHER_*` variable this process inherited before spawning the
+/// engine.
+///
+/// The child's environment used to be "ours plus the keys we set", which made
+/// the whole `runtime_env` single-reader rule decorative: anything already in
+/// the user's session — `AETHER_TUN`, `AETHER_CONFIG_KEY`, a kill-switch, a peer
+/// override — reached the elevated process without the shell deciding it, and
+/// `AETHER_CONFIG_KEY` in particular made the child skip the stdin handoff it was
+/// promised. Enumerated rather than listed, so a new engine key cannot be
+/// forgotten here.
+fn scrub_ambient_engine_env(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().into_owned();
+        if name.to_ascii_uppercase().starts_with("AETHER_") {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// Write the engine's stdin preamble: the envelope key, and in TUN mode the one
+/// path it is allowed to load the driver from.
 ///
 /// A child process environment stays readable for the whole lifetime of that
 /// process — crash collectors, profilers, monitoring agents and (on a debuggable
@@ -1287,7 +1307,15 @@ pub fn verify_elevated_binary(
 /// process-wide, long-lived, world-adjacent place. One line down the pipe this
 /// parent already owns carries the same bytes with a far shorter exposure, and
 /// the key is zeroized immediately after.
-fn handoff_config_key(child: &mut Child, key: &str) -> Result<(), CommandError> {
+///
+/// The driver path left the environment for the same reason and a sharper one:
+/// `AETHER_WINTUN` was the elevated engine being told "load that DLL" by a value
+/// any bystander able to influence the environment could set.
+fn handoff_preamble(
+    child: &mut Child,
+    key: &str,
+    wintun: Option<&Path>,
+) -> Result<(), CommandError> {
     use std::io::Write as _;
     let Some(stdin) = child.stdin.as_mut() else {
         return Err(CommandError::new(
@@ -1295,15 +1323,33 @@ fn handoff_config_key(child: &mut Child, key: &str) -> Result<(), CommandError> 
             "engine stdin is not piped; refusing to launch an engine that cannot receive its key",
         ));
     };
-    let written = stdin
-        .write_all(b"key ")
-        .and_then(|()| stdin.write_all(key.as_bytes()))
-        .and_then(|()| stdin.write_all(b"
-"))
-        .and_then(|()| stdin.flush());
+    let mut buf: Vec<u8> = Vec::with_capacity(key.len() + 64);
+    buf.extend_from_slice(b"key ");
+    buf.extend_from_slice(key.as_bytes());
+    buf.push(b'\n');
+    if let Some(path) = wintun {
+        // Lossy-converted paths would name a file that does not exist, and the
+        // engine would then refuse to start the tunnel with a confusing error.
+        let text = path.to_str().ok_or_else(|| {
+            CommandError::new(
+                "handoff_failed",
+                format!(
+                    "wintun path {} is not valid UTF-8; install Aether under a plain path",
+                    path.display()
+                ),
+            )
+        })?;
+        // Windows forbids control characters in file names, so a path cannot
+        // forge a second preamble line.
+        buf.extend_from_slice(b"dll wintun ");
+        buf.extend_from_slice(text.as_bytes());
+        buf.push(b'\n');
+    }
+    let written = stdin.write_all(&buf).and_then(|()| stdin.flush());
+    zeroize::Zeroize::zeroize(&mut buf);
     match written {
         Ok(()) => Ok(()),
-        Err(e) => Err(CommandError::new("handoff_failed", format!("config key handoff: {e}"))),
+        Err(e) => Err(CommandError::new("handoff_failed", format!("handoff write: {e}"))),
     }
 }
 
@@ -1639,36 +1685,49 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         fs::create_dir_all(&dir).map_err(CommandError::from)?;
         restrict_directory_acl(&dir)?;
 
+        // In TUN mode the driver is not optional, and neither is verifying it.
+        // `if let Some(wintun) = wintun_path(&app)` skipped the whole check
+        // precisely in the case that matters: the packaged DLL missing, silently
+        // renamed, or shadowed by one the user dropped next to the exe.
+        let mut wintun_for_handoff: Option<PathBuf> = None;
         if settings.routing_mode == "tun" {
             let engine_policy = TrustedBinaryPolicy::for_engine();
             verify_elevated_binary(&executable, "aether.exe", &engine_policy)
                 .map_err(CommandError::from)?;
-            if let Some(wintun) = wintun_path(&app) {
-                let wintun_policy = TrustedBinaryPolicy::for_wintun();
-                verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
-                    .map_err(CommandError::from)?;
-                // Optional pin: set AETHER_WINTUN_SHA256 to require an exact file
-                // hash. Read from the ambient environment on purpose, and note
-                // that it can only ever *add* verification — leaving it unset
-                // still requires a passing Authenticode chain, so there is no
-                // value this key can take that weakens the check.
-                #[allow(clippy::disallowed_methods)]
-                if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
-                    let expected = expected.trim().to_ascii_lowercase();
-                    if !expected.is_empty() {
-                        let actual = file_sha256_hex(&wintun)?;
-                        if actual != expected {
-                            return Err(format!(
-                                "wintun.dll hash mismatch (got {actual}, want {expected})"
-                            ).into());
-                        }
+            let wintun = wintun_path(&app).ok_or_else(|| {
+                CommandError::new(
+                    "not_found",
+                    "wintun.dll is missing from the install directory; TUN cannot start and the \
+                     driver will not be loaded from anywhere else",
+                )
+            })?;
+            let wintun_policy = TrustedBinaryPolicy::for_wintun();
+            verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
+                .map_err(CommandError::from)?;
+            // Optional pin: set AETHER_WINTUN_SHA256 to require an exact file
+            // hash. Read from the ambient environment on purpose, and note
+            // that it can only ever *add* verification — leaving it unset
+            // still requires a passing Authenticode chain, so there is no
+            // value this key can take that weakens the check.
+            #[allow(clippy::disallowed_methods)]
+            if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
+                let expected = expected.trim().to_ascii_lowercase();
+                if !expected.is_empty() {
+                    let actual = file_sha256_hex(&wintun)?;
+                    if actual != expected {
+                        return Err(format!(
+                            "wintun.dll hash mismatch (got {actual}, want {expected})"
+                        )
+                        .into());
                     }
                 }
             }
+            wintun_for_handoff = Some(wintun);
         }
 
         let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
         let mut command = Command::new(&executable);
+        scrub_ambient_engine_env(&mut command);
         command
             .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
             .env("AETHER_CONFIG_KEY_STDIN", "1")
@@ -1727,10 +1786,8 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                 );
         }
 
-        if let Some(wintun) = wintun_path(&app) {
-            // Only pass Wintun path we already validated for TUN; never env override.
-            command.env("AETHER_WINTUN", wintun);
-        }
+        // The driver path goes on the control pipe below, never in the child's
+        // environment: see `handoff_preamble`.
 
         #[cfg(windows)]
         {
@@ -1746,7 +1803,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             })?;
         // The key travels on stdin, then is wiped: the child never holds it in
         // its environment and neither does this process for longer than a call.
-        if let Err(e) = handoff_config_key(&mut child, &dpapi_key) {
+        if let Err(e) = handoff_preamble(&mut child, &dpapi_key, wintun_for_handoff.as_deref()) {
             dpapi_key.zeroize();
             let _ = child.kill();
             let _ = child.wait();
@@ -1945,6 +2002,7 @@ fn scan(
 
     let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
     let mut command = Command::new(&executable);
+    scrub_ambient_engine_env(&mut command);
     command
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
         .env("AETHER_CONFIG_KEY_STDIN", "1")
@@ -1989,7 +2047,9 @@ fn scan(
             dpapi_key.zeroize();
             format!("Could not start scan: {e}")
         })?;
-    if let Err(e) = handoff_config_key(&mut child, &dpapi_key) {
+    // A scan child never brings the tunnel up, so it gets the key line and no
+    // driver line — the engine only waits for the second when AETHER_TUN is on.
+    if let Err(e) = handoff_preamble(&mut child, &dpapi_key, None) {
         dpapi_key.zeroize();
         let _ = child.kill();
         let _ = child.wait();

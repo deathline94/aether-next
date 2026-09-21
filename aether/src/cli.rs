@@ -26,6 +26,11 @@ pub async fn run() -> Result<()> {
 
     install_panic_guard();
 
+    // Before the first spawned tool or loaded DLL, and before the route replay
+    // below: pin the search order to `%WINDIR%\System32`.
+    #[cfg(windows)]
+    crate::win_exec::pin_dll_search_path()?;
+
     // Host-state repair, before anything else can touch the routing table.
     //
     // It used to live only inside the TUN bring-up, so an abandoned journal was

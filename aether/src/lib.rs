@@ -39,6 +39,8 @@ pub mod tunnelping;
 pub mod wireguard;
 #[cfg(windows)]
 pub mod win_acl;
+#[cfg(windows)]
+pub mod win_exec;
 
 pub use engine_config::EngineConfig;
 pub use error::{AetherError, Result};
