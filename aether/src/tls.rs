@@ -39,7 +39,7 @@ fn leaf_is_temporally_valid(leaf: &boring::x509::X509Ref, now_unix: u64) -> std:
     // ones, so the conversion must follow the target instead of naming a width
     // that only compiles half the time. Refuse rather than compare against a
     // silently truncated "now".
-    if cfg!(target_pointer_width = "32") && now_unix > u64::from(i32::MAX) {
+    if cfg!(target_pointer_width = "32") && now_unix > i32::MAX as u64 {
         return Err("system clock beyond 32-bit time_t range".into());
     }
     let now = Asn1Time::from_unix(now_unix as _).map_err(|e| format!("clock: {e}"))?;
