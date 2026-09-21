@@ -17,7 +17,35 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
 
 struct DnsCache {
-    map: HashMap<String, (IpAddr, Instant)>,
+    /// `(address, first-seen, last-used)`. `last-used` is what eviction ranks
+    /// on: with only the insert time, `retain(ttl)` at the cap removed nothing
+    /// while the TTL was long, so a wildcard-DNS page grew the map forever.
+    map: HashMap<String, (IpAddr, Instant, Instant)>,
+}
+
+const DNS_CACHE_MAX: usize = 2048;
+
+/// Drop the least-recently-used quarter of the cache once it is full.
+/// Evicting a slice rather than one entry keeps the amortised cost of an
+/// insert at O(1) instead of O(n) per insert at the cap.
+fn evict_lru(cache: &mut DnsCache) {
+    if cache.map.len() <= DNS_CACHE_MAX {
+        return;
+    }
+    cache.map.retain(|_, (_, first, _)| first.elapsed() < DNS_CACHE_TTL);
+    let target = DNS_CACHE_MAX - DNS_CACHE_MAX / 4;
+    if cache.map.len() <= target {
+        return;
+    }
+    let mut by_use: Vec<(Instant, String)> = cache
+        .map
+        .iter()
+        .map(|(k, (_, _, used))| (*used, k.clone()))
+        .collect();
+    by_use.sort_unstable_by_key(|(used, _)| *used);
+    for (_, key) in by_use.iter().take(by_use.len() - target) {
+        cache.map.remove(key.as_str());
+    }
 }
 
 fn dns_cache() -> &'static Mutex<DnsCache> {
@@ -37,7 +65,12 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 const REP_OK: u8 = 0x00;
 const REP_GENERAL: u8 = 0x01;
-const REP_NOT_SUPPORTED: u8 = 0x07;
+/// RFC 1928 §6: 0x02 is "command not supported", 0x07 is "address type not
+/// supported". Answering a refused *command* with 0x07 tells the client its
+/// address was the problem, which sends it looking in the wrong place.
+const REP_CMD_NOT_SUPPORTED: u8 = 0x02;
+const REP_ATYP_NOT_SUPPORTED: u8 = 0x07;
+const CMD_BIND: u8 = 0x02;
 
 enum Target {
     Ip(IpAddr),
@@ -85,8 +118,14 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
         CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack).await,
+        CMD_BIND => {
+            // BIND is not implemented; refuse it with the command code and close
+            // instead of falling through to a protocol-mislabelled reply.
+            reply(&mut sock, REP_CMD_NOT_SUPPORTED).await?;
+            Err(AetherError::Other("SOCKS BIND is not supported".into()))
+        }
         _ => {
-            reply(&mut sock, REP_NOT_SUPPORTED).await?;
+            reply(&mut sock, REP_CMD_NOT_SUPPORTED).await?;
             Err(AetherError::Other("unsupported socks command".into()))
         }
     }
@@ -119,6 +158,26 @@ fn select_auth_method(methods: &[u8]) -> u8 {
     }
 }
 
+/// Validate a wire-domain exactly as it will be put on the wire.
+///
+/// A lossy decode let a byte the client never sent become `U+FFFD`, and the
+/// query builder then dropped labels it considered too long: the proxy looked
+/// up a *different* host than the client asked for and reported success.
+fn parse_domain_name(raw: &[u8]) -> Result<String> {
+    if raw.is_empty() || raw.len() > 253 {
+        return Err(AetherError::Other("invalid SOCKS domain length".into()));
+    }
+    if !raw.is_ascii() {
+        return Err(AetherError::Other("non-ASCII SOCKS domain".into()));
+    }
+    let name = String::from_utf8(raw.to_vec())
+        .map_err(|_| AetherError::Other("invalid SOCKS domain encoding".into()))?;
+    if !name.split('.').all(|l| !l.is_empty() && l.len() <= 63) {
+        return Err(AetherError::Other("invalid SOCKS domain label".into()));
+    }
+    Ok(name)
+}
+
 async fn read_target(sock: &mut TcpStream, atyp: u8) -> Result<(Target, u16)> {
     let target = match atyp {
         ATYP_V4 => {
@@ -136,7 +195,7 @@ async fn read_target(sock: &mut TcpStream, atyp: u8) -> Result<(Target, u16)> {
             sock.read_exact(&mut len).await?;
             let mut name = vec![0u8; len[0] as usize];
             sock.read_exact(&mut name).await?;
-            Target::Domain(String::from_utf8_lossy(&name).to_string())
+            Target::Domain(parse_domain_name(&name)?)
         }
         _ => return Err(AetherError::Other("bad atyp".into())),
     };
@@ -264,9 +323,10 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
         // `parking_lot` has no poison state: with `std::sync::Mutex` a panic
         // under this guard made `lock()` an `Err` forever, so every later
         // lookup silently missed the cache and re-resolved over the tunnel.
-        let guard = dns_cache().lock();
-        if let Some((ip, at)) = guard.map.get(&key) {
-            if at.elapsed() < DNS_CACHE_TTL {
+        let mut guard = dns_cache().lock();
+        if let Some((ip, first, used)) = guard.map.get_mut(&key) {
+            if first.elapsed() < DNS_CACHE_TTL {
+                *used = Instant::now();
                 return Ok(*ip);
             }
         }
@@ -284,7 +344,7 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
     for server in configured_dns_servers() {
         for qtype in dns_prefer_order() {
-            let (qid, query) = build_dns_query(name, qtype);
+            let (qid, query) = build_dns_query(name, qtype)?;
             if let Err(e) = sender.send_to(server, query).await {
                 last_err = e;
                 break; // server unreachable; try the next one
@@ -309,11 +369,10 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
             }
             if let Some(ip) = parse_dns_answer_id(&resp, qtype, Some(qid), Some(&key)) {
                 {
+                    let now = Instant::now();
                     let mut guard = dns_cache().lock();
-                    guard.map.insert(key, (ip, Instant::now()));
-                    if guard.map.len() > 2048 {
-                        guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
-                    }
+                    guard.map.insert(key, (ip, now, now));
+                    evict_lru(&mut guard);
                 }
                 return Ok(ip);
             }
@@ -330,7 +389,7 @@ pub async fn resolve_host(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     }
 }
 
-fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
+fn build_dns_query(name: &str, qtype: u16) -> Result<(u16, Vec<u8>)> {
     let mut q = Vec::with_capacity(32 + name.len());
     let id: u16 = rand::random();
     q.extend_from_slice(&id.to_be_bytes());
@@ -339,7 +398,12 @@ fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
-            continue;
+            // Dropping the label would ask for `example.com` when the client
+            // asked for `<64+-byte-label>.example.com`.
+            return Err(AetherError::Other(format!(
+                "cannot encode DNS label {:?} (empty or longer than 63 bytes)",
+                label
+            )));
         }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
@@ -347,7 +411,7 @@ fn build_dns_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     q.push(0x00);
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]);
-    (id, q)
+    Ok((id, q))
 }
 
 fn parse_dns_answer_id(
@@ -482,7 +546,7 @@ async fn handle_connect(
     };
 
     if ip.is_ipv6() && is_ipv4_only() {
-        let _ = reply(&mut sock, REP_NOT_SUPPORTED).await;
+        let _ = reply(&mut sock, REP_ATYP_NOT_SUPPORTED).await;
         return Err(AetherError::Other("IPv6 target rejected in IPv4-only mode".into()));
     }
 
@@ -508,7 +572,11 @@ async fn handle_connect(
         }
     };
 
-    reply_bound(&mut sock, "0.0.0.0:0".parse().unwrap()).await?;
+    // Report the address the client is actually talking to. `0.0.0.0:0` is a
+    // placeholder clients that read BND.ADDR (some UDP-over-SOCKS stacks) take
+    // literally and then fail to send.
+    let bound = sock.local_addr().unwrap_or_else(|_| ([0, 0, 0, 0], 0).into());
+    reply_bound(&mut sock, bound).await?;
 
     let (sender, mut from_stack) = conn.into_split();
     let (mut rd, mut wr) = sock.into_split();
@@ -670,7 +738,8 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
 }
 
 fn parse_udp_request(buf: &[u8]) -> Option<(Target, (u16, Vec<u8>))> {
-    if buf.len() < 4 || buf[2] != 0 {
+    // RFC 1928 §7: two reserved zero bytes, then FRAG which must be 0.
+    if buf.len() < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
         return None;
     }
     let atyp = buf[3];
@@ -699,7 +768,7 @@ fn parse_udp_request(buf: &[u8]) -> Option<(Target, (u16, Vec<u8>))> {
             if buf.len() < pos + len {
                 return None;
             }
-            let name = String::from_utf8_lossy(&buf[pos..pos + len]).to_string();
+            let name = parse_domain_name(&buf[pos..pos + len]).ok()?;
             pos += len;
             Target::Domain(name)
         }
@@ -733,7 +802,15 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_qname, parse_dns_answer_id, select_auth_method};
+    use super::{
+        build_dns_query, decode_qname, evict_lru, parse_dns_answer_id, parse_domain_name,
+        parse_udp_request, select_auth_method, DnsCache, DNS_CACHE_MAX,
+    };
+    use std::{
+        collections::HashMap,
+        net::IpAddr,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn parses_dns_servers_handles_bare_and_bracketed_ipv6_and_ports() {
@@ -822,5 +899,80 @@ mod tests {
         full.extend_from_slice(&with_ptr);
         assert_eq!(decode_qname(&full, 12).as_deref(), Some("www.example.com"));
         assert_eq!(decode_qname(&full, full.len() - 2).as_deref(), Some("www.example.com"));
+    }
+
+    /// The old builder `continue`d past an over-long label, so a client asking
+    /// for `<65-byte-label>.example.com` got `example.com` connected — a
+    /// different host, reported as success.
+    #[test]
+    fn query_builder_refuses_names_it_cannot_encode() {
+        let long_label = "a".repeat(64);
+        assert!(build_dns_query(&format!("{long_label}.example.com"), 1).is_err());
+        assert!(build_dns_query("example..com", 1).is_err());
+        assert!(build_dns_query("", 1).is_err());
+
+        let (_, q) = build_dns_query("www.example.com", 1).unwrap();
+        // Header is 12 bytes; then length-prefixed labels, root, qtype, qclass.
+        assert_eq!(&q[12..16], &[3, b'w', b'w', b'w']);
+        assert_eq!(&q[16..24], &[7, b'e', b'x', b'a', b'm', b'p', b'l', b'e']);
+        assert_eq!(&q[24..28], &[3, b'c', b'o', b'm']);
+        assert_eq!(q[28], 0);
+    }
+
+    #[test]
+    fn wire_domains_are_validated_not_lossy_decoded() {
+        assert!(parse_domain_name(b"example.com").is_ok());
+        assert!(parse_domain_name("exämple.com".as_bytes()).is_err());
+        assert!(parse_domain_name(b"").is_err());
+        assert!(parse_domain_name(b"example..com").is_err());
+        assert!(parse_domain_name("a".repeat(254).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn udp_relay_header_requires_reserved_zeroes() {
+        let mut hdr = vec![0x00, 0x00, 0x00, 0x01, 93, 184, 216, 34, 1, 187];
+        let payload = b"hi".to_vec();
+        hdr.extend_from_slice(&payload);
+        assert!(parse_udp_request(&hdr).is_some());
+
+        for bad in [0usize, 1, 2] {
+            let mut mangled = hdr.clone();
+            mangled[bad] = 0xAA;
+            assert!(
+                parse_udp_request(&mangled).is_none(),
+                "byte {bad} of the SOCKS5 UDP header is reserved/FRAG and must be zero"
+            );
+        }
+    }
+
+    /// `retain(ttl)` at the cap evicted nothing while the TTL was still live, so
+    /// a wildcard-DNS page grew the cache without bound.
+    #[test]
+    fn dns_cache_evicts_least_recently_used() {
+        let base = Instant::now();
+        let addr = IpAddr::from([93, 184, 216, 34]);
+        let mut cache = DnsCache { map: HashMap::new() };
+        for i in 0..DNS_CACHE_MAX + 100 {
+            let first = base - Duration::from_secs(5);
+            // Higher index == touched more recently; key 0 is stale by 10 s.
+            let used = if i == 0 {
+                base - Duration::from_secs(10)
+            } else {
+                base + Duration::from_micros(i as u64)
+            };
+            cache.map.insert(format!("host{i}.example.com"), (addr, first, used));
+        }
+        assert!(cache.map.len() > DNS_CACHE_MAX);
+        evict_lru(&mut cache);
+        assert!(
+            cache.map.len() <= DNS_CACHE_MAX,
+            "cache still over budget after eviction: {}",
+            cache.map.len()
+        );
+        assert!(
+            !cache.map.contains_key("host0.example.com"),
+            "eviction must remove the least-recently-used entry first"
+        );
+        assert!(cache.map.contains_key(&format!("host{DNS_CACHE_MAX}.example.com")));
     }
 }

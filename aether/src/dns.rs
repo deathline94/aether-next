@@ -37,7 +37,7 @@ async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(server).await?;
 
-    let query = build_query(host, RR_HTTPS);
+    let (qid, query) = build_query(host, RR_HTTPS);
     sock.send(&query).await?;
 
     let mut buf = [0u8; 4096];
@@ -45,10 +45,10 @@ async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
         .await
         .map_err(|_| AetherError::Ech("dns timeout".into()))??;
 
-    parse_https_ech(&buf[..n]).ok_or_else(|| AetherError::Ech("no ech svcparam".into()))
+    parse_https_ech(&buf[..n], qid, host).ok_or_else(|| AetherError::Ech("no ech svcparam".into()))
 }
 
-fn build_query(name: &str, qtype: u16) -> Vec<u8> {
+fn build_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     let mut q = Vec::with_capacity(32 + name.len());
     let id: u16 = rand::random();
     q.extend_from_slice(&id.to_be_bytes());
@@ -65,20 +65,62 @@ fn build_query(name: &str, qtype: u16) -> Vec<u8> {
     q.push(0x00);
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]);
-    q
+    (id, q)
 }
 
-fn parse_https_ech(msg: &[u8]) -> Option<Vec<u8>> {
+/// Read the HTTPS RR and pull out the `ech` SvcParam.
+///
+/// The reply is authenticated against the request — transaction id, the echoed
+/// question name and type, `QR`, and a `TC` refusal. Without those checks any
+/// off-path UDP packet on the ephemeral local port (the socket *is* connected to
+/// the resolver, but a forged reply from the resolver itself, or a response to a
+/// stale query, still matches) decided which ECH public key every later
+/// ClientHello was encrypted to, which is the whole point of ECH.
+fn parse_https_ech(msg: &[u8], qid: u16, name: &str) -> Option<Vec<u8>> {
     if msg.len() < 12 {
         return None;
     }
+    if u16::from_be_bytes([msg[0], msg[1]]) != qid {
+        return None;
+    }
+    let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    let qr = flags & 0x8000 != 0;
+    let opcode = (flags >> 11) & 0x0f;
+    let tc = flags & 0x0200 != 0;
+    if !qr || opcode != 0 {
+        return None;
+    }
+    // A truncated answer may carry a partial ECHConfig; adopting it would break
+    // (or silently weaken) every handshake that followed.
+    if tc {
+        return None;
+    }
+    let rcode = flags & 0x000f;
+    if rcode != 0 {
+        return None;
+    }
+
     let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
     let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
     let mut pos = 12;
 
+    if qd != 1 {
+        return None;
+    }
     for _ in 0..qd {
+        let asked = read_name(msg, pos)?;
+        if !asked.eq_ignore_ascii_case(name) {
+            return None;
+        }
         pos = skip_name(msg, pos)?;
-        pos = pos.checked_add(4)?;
+        if pos + 4 > msg.len() {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        if qtype != RR_HTTPS {
+            return None;
+        }
+        pos += 4;
     }
 
     for _ in 0..an {
@@ -122,6 +164,29 @@ fn parse_svcparams_ech(msg: &[u8], rdata_start: usize, rdlen: usize) -> Option<V
         p += len;
     }
     None
+}
+
+/// Decode an uncompressed wire name. Question-section names are never
+/// compressed, so a pointer here is a forged or malformed reply.
+fn read_name(buf: &[u8], mut pos: usize) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    loop {
+        let len = *buf.get(pos)?;
+        if len & 0xc0 == 0xc0 {
+            return None;
+        }
+        if len == 0 {
+            break;
+        }
+        let start = pos + 1;
+        let end = start.checked_add(len as usize)?;
+        if end > buf.len() {
+            return None;
+        }
+        labels.push(String::from_utf8_lossy(&buf[start..end]).to_string());
+        pos = end;
+    }
+    Some(labels.join("."))
 }
 
 fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
@@ -232,4 +297,84 @@ pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
         return false;
     }
     u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_https_ech, read_name, RR_HTTPS};
+
+    const QID: u16 = 0x1234;
+    const NAME: &str = "cloudflare-ech.com";
+
+    /// `flags`, `ancount` and the echoed name are the parts an attacker varies.
+    fn reply(flags: u16, an: u16, name: &str) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&QID.to_be_bytes());
+        msg.extend_from_slice(&flags.to_be_bytes());
+        msg.extend_from_slice(&[0, 1, an.to_be_bytes()[0], an.to_be_bytes()[1], 0, 0, 0, 0]);
+        for label in name.split('.') {
+            msg.push(label.len() as u8);
+            msg.extend_from_slice(label.as_bytes());
+        }
+        msg.push(0);
+        msg.extend_from_slice(&RR_HTTPS.to_be_bytes());
+        msg.extend_from_slice(&[0x00, 0x01]);
+        if an == 0 {
+            return msg;
+        }
+        // Answer: pointer to the question name, HTTPS rdata with an `ech` param.
+        msg.extend_from_slice(&[0xc0, 0x0c]);
+        let rdata: Vec<u8> = vec![
+            0x00, 0x00, // SVC priority
+            0x00, // empty target name
+            0x00, 0x05, // SvcParamKey = ech
+            0x00, 0x04, // SvcParamValue length
+            0xde, 0xad, 0xbe, 0xef,
+        ];
+        msg.extend_from_slice(&RR_HTTPS.to_be_bytes());
+        msg.extend_from_slice(&[0x00, 0x01]);
+        msg.extend_from_slice(&[0, 0, 0, 60]);
+        msg.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&rdata);
+        msg
+    }
+
+    #[test]
+    fn accepts_a_well_formed_answer() {
+        let msg = reply(0x8180, 1, NAME);
+        assert_eq!(parse_https_ech(&msg, QID, NAME).as_deref(), Some(&[0xde, 0xad, 0xbe, 0xef][..]));
+    }
+
+    #[test]
+    fn rejects_forged_or_unasked_for_answers() {
+        // Right shape, wrong transaction id: this is what an off-path spoof or a
+        // late reply to an earlier query looks like.
+        assert_eq!(parse_https_ech(&reply(0x8180, 1, NAME), 0x4321, NAME), None);
+        // Answering a name nobody asked about must not configure ECH.
+        assert_eq!(parse_https_ech(&reply(0x8180, 1, "evil.example"), QID, NAME), None);
+        // Truncated: a partial ECHConfig is worse than none.
+        assert_eq!(parse_https_ech(&reply(0x8380, 1, NAME), QID, NAME), None);
+        // Not a response, an error, or a non-standard opcode.
+        assert_eq!(parse_https_ech(&reply(0x0180, 1, NAME), QID, NAME), None);
+        assert_eq!(parse_https_ech(&reply(0x8183, 1, NAME), QID, NAME), None);
+        assert_eq!(parse_https_ech(&reply(0x8180, 0, NAME), QID, NAME), None);
+        assert_eq!(parse_https_ech(&[0u8; 4], QID, NAME), None);
+    }
+
+    #[test]
+    fn read_name_refers_to_compression() {
+        let mut buf = Vec::new();
+        buf.push(3);
+        buf.extend_from_slice(b"www");
+        buf.push(7);
+        buf.extend_from_slice(b"example");
+        buf.extend_from_slice(b"");
+        buf.push(3);
+        buf.extend_from_slice(b"com");
+        buf.push(0);
+        assert_eq!(read_name(&buf, 0).as_deref(), Some("www.example.com"));
+        // A pointer in the question section is not legal.
+        let ptr = [0xc0, 0x0c];
+        assert_eq!(read_name(&ptr, 0), None);
+    }
 }

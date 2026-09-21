@@ -145,7 +145,10 @@ fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             }
         }
     }
-    if let Some(path) = crate::runtime_env::var("SSLKEYLOGFILE") {
+    // Standard tooling variable, read from the real environment on purpose.
+    #[allow(clippy::disallowed_methods)]
+    let keylog = std::env::var("SSLKEYLOGFILE").ok();
+    if let Some(path) = keylog {
         let path = path.trim().to_string();
         if !path.is_empty() {
             if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {

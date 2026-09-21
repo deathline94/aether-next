@@ -499,9 +499,12 @@ fn clear_journal() {
 }
 
 fn legacy_state_path() -> Option<PathBuf> {
-    let dir = crate::runtime_env::var("LOCALAPPDATA")
+    // OS environment fact, not app configuration: `runtime_env` only owns
+    // `AETHER_*` keys, so routing this through it would return `None`.
+    #[allow(clippy::disallowed_methods)]
+    let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .or_else(|| crate::runtime_env::var("TEMP").map(PathBuf::from))?;
+        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
     Some(dir.join("AetherNext").join("tun-routes.json"))
 }
 

@@ -136,8 +136,11 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
     if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(AetherError::Other("forced ACL failure for test".into()));
     }
-    let user = crate::runtime_env::var("USERNAME")
-        .ok_or_else(|| AetherError::Other("cannot determine USERNAME for ACL".into()))?;
+    // OS environment fact, not app configuration: `runtime_env` only owns
+    // `AETHER_*` keys, so routing this through it would return `None`.
+    #[allow(clippy::disallowed_methods)]
+    let user = std::env::var("USERNAME")
+        .map_err(|e| AetherError::Other(format!("cannot determine USERNAME for ACL: {e}")))?;
     let output = std::process::Command::new("icacls")
         .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
         .output()

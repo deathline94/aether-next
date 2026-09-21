@@ -568,3 +568,14 @@ If capacity forces a cut line, take Phases 1–5 plus Phase 10's T229/T230/T239 
 - Numeric constants in task text are contract values from `data-model.md` and `research.md` — do not re-derive them at implementation time: `TX_RING=256`, `enable_dgram(true,2048,2048)`, `45_000 ms` max idle, `15 s` keep-alive / `75 s` established abort, `MAX_UDP_PROXY=96`/`RESOLVER=32`, `MAX_TCP_PROXY=480`/`RESOLVER=32`, `128 MB` budget, `175 s` WG session cache TTL, junk clamp `[0,512]`, `MAX_SUCCESSES=1000`, `now+300 s` timestamp reject, `90 s` route lease / `30 s` refresh, `15 s` grace (from 5 s), teardown `< 500 ms`, `0x40000` revocation flag, `90 s` connect watchdog / `15 s` heartbeat / 3 misses, `3` restarts at `2/8/30 s`, `3×` keystore retry at `200/1000 ms`, `overscan: 8`, `SCAN_MAX = 500`, `minWidth 901`/`(max-width: 899px)`, `4.5:1`/`3:1`/`1.6:1` contrast, `11 px` type floor, `24 px`/`44 px` targets, `p_align ≥ 0x4000`, `targetSdk 36`.
 - Commit after each task or logical group; stop at every checkpoint to validate independently.
 - **Do not mark a task `[x]` without recording its step-3 guard-mutation result.** That single discipline is the difference between this feature and the fourteen that preceded it.
+
+## Execution log (implement phase)
+
+- **Reverted: root npm workspace manifest.** A root `package.json` with
+  `workspaces: [packages/ui, apps/desktop, apps/android]` makes `npm ci` inside
+  `apps/*` resolve to the workspace root, which then demands a root
+  `package-lock.json`; CI's per-app installs (`cache-dependency-path:
+  apps/desktop/package-lock.json`) failed with `EUSAGE`. The drift that actually
+  hurts is duplicated *source*, which `packages/ui` + T188–T194 address by
+  importing shared tokens, not by a shared install graph. Re-open only together
+  with a committed root lockfile and CI changes in the same PR.

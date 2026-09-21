@@ -1,5 +1,6 @@
 use aether::account::Identity;
 use aether::config::{load, save, write_private_file};
+use aether::runtime_env;
 use std::fs;
 
 fn dummy_identity() -> Identity {
@@ -76,7 +77,7 @@ fn test_plaintext_migration_to_encrypted() {
 
     // 1. Write legacy plaintext identity (without AETHERCFG1 header)
     let ident = dummy_identity();
-    std::env::remove_var("AETHER_CONFIG_KEY");
+    runtime_env::remove("AETHER_CONFIG_KEY");
     save(&config_path, &ident).expect("save plaintext");
 
     let raw = fs::read(&config_path).expect("read raw");
@@ -86,7 +87,7 @@ fn test_plaintext_migration_to_encrypted() {
     use base64::Engine;
     let test_key = [42u8; 32];
     let key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    std::env::set_var("AETHER_CONFIG_KEY", &key_b64);
+    runtime_env::set("AETHER_CONFIG_KEY", &key_b64);
 
     let loaded = load(&config_path).expect("load with migration").expect("identity exists");
     assert_eq!(loaded.device_id, "test_dev");
@@ -95,7 +96,7 @@ fn test_plaintext_migration_to_encrypted() {
     let migrated_raw = fs::read(&config_path).expect("read migrated");
     assert!(migrated_raw.starts_with(b"AETHERCFG1\n"), "Must be migrated to encrypted format");
 
-    std::env::remove_var("AETHER_CONFIG_KEY");
+    runtime_env::remove("AETHER_CONFIG_KEY");
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
@@ -110,7 +111,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
 
     // 1. Write legacy plaintext identity (without AETHERCFG1 header)
     let ident = dummy_identity();
-    std::env::remove_var("AETHER_CONFIG_KEY");
+    runtime_env::remove("AETHER_CONFIG_KEY");
     save(&config_path, &ident).expect("save plaintext");
 
     // Make config_path read-only so subsequent atomic save fails
@@ -130,7 +131,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     use base64::Engine;
     let test_key = [42u8; 32];
     let key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    std::env::set_var("AETHER_CONFIG_KEY", &key_b64);
+    runtime_env::set("AETHER_CONFIG_KEY", &key_b64);
 
     let res = load(&config_path);
     assert!(res.is_err(), "Migration must fail fatally if saving encrypted config fails");
@@ -147,7 +148,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     #[allow(clippy::permissions_set_readonly_false)]
     perms_clean.set_readonly(false);
     let _ = fs::set_permissions(&config_path, perms_clean);
-    std::env::remove_var("AETHER_CONFIG_KEY");
+    runtime_env::remove("AETHER_CONFIG_KEY");
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
