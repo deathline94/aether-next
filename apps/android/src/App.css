@@ -22,11 +22,18 @@
   --panel-active: #17202b;
   --panel-nested: #090d12;
 
+    /* Opaque edge tokens (WCAG 1.4.11). Raw alpha hairlines antialias away at
+     Windows 125%/150% scaling and vanish on any surface but the exact one they
+     were blended against, so boundaries are composited colours instead. */
+  --edge: #232b34;              /* decorative separation, >=1.6:1 vs --panel */
+  --edge-interactive: #4a5764;  /* control boundary, >=3:1 vs --panel */
+  --edge-strong: #6b7b8a;
+
   /* Micro-Borders & Architectural Highlights */
-  --border-subtle: rgba(255, 255, 255, 0.05);
-  --border-card: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --line: rgba(255, 255, 255, 0.07);
+  --border-subtle: var(--edge);
+  --border-card: var(--edge);
+  --border-strong: var(--edge-interactive);
+  --line: var(--edge);
   --inner-highlight: inset 0 1px 0 0 rgba(255, 255, 255, 0.07);
   --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
 
@@ -52,6 +59,8 @@
   --blue-dim: rgba(56, 189, 248, 0.12);
   --blue-border: rgba(56, 189, 248, 0.32);
 
+  --amber: #facc15;
+  --violet: #a78bfa;
   --muted: #7d8b96;
   --muted-light: #a4b3be;
   --muted-dark: #47535e;
@@ -74,8 +83,8 @@ html, body, #root {
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 999px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 999px; }@media (hover: hover){
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }}
 
 button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible {
@@ -110,8 +119,8 @@ code, kbd, pre {
 
 /* ─── App Shell & Layout ───────────────────────────────────────────────────── */
 .app-shell {
-  min-height: 100vh;
-  height: 100vh;
+  min-height: 100svh;
+  height: 100dvh;
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
   background: var(--bg-app);
@@ -121,7 +130,7 @@ code, kbd, pre {
 /* ─── Sidebar (Tactical Pilot Deck) ────────────────────────────────────────── */
 .sidebar {
   position: relative;
-  height: 100vh;
+  height: 100dvh;
   padding: 24px 16px 18px;
   border-right: 1px solid var(--border-subtle);
   background: var(--bg-sidebar);
@@ -193,13 +202,13 @@ code, kbd, pre {
   gap: 11px;
   cursor: pointer;
   text-align: left;
-  transition: all 0.2s var(--ease-spring);
-}
+  transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
+}@media (hover: hover){
 .nav-pill:hover {
   background: rgba(255, 255, 255, 0.035);
   color: #dce4e8;
   transform: translateX(1px);
-}
+}}
 .nav-pill.active {
   color: #ffffff;
   background: rgba(255, 255, 255, 0.06);
@@ -248,17 +257,17 @@ code, kbd, pre {
   align-items: center;
   justify-content: center;
   background: rgba(255, 255, 255, 0.03);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--edge);
   border-radius: 4px;
   color: var(--muted-dark);
   font-size: 10px;
   font-weight: 600;
   transition: color 0.15s, border-color 0.15s;
-}
+}@media (hover: hover){
 .nav-pill:hover .nav-shortcut {
   color: var(--muted);
   border-color: rgba(255, 255, 255, 0.12);
-}
+}}
 .nav-pill.active .nav-shortcut {
   color: var(--muted-light);
   border-color: rgba(255, 255, 255, 0.18);
@@ -322,7 +331,7 @@ code, kbd, pre {
   border-radius: 50%;
   background: var(--muted);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
-  transition: all 0.3s var(--ease-spring);
+  transition: color 0.3s var(--ease-spring), background-color 0.3s var(--ease-spring), border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), transform 0.3s var(--ease-spring), opacity 0.3s var(--ease-spring);
 }
 .connected .beacon-core {
   background: var(--emerald);
@@ -409,7 +418,7 @@ code, kbd, pre {
 /* ─── Workspace & Glass Topbar ─────────────────────────────────────────────── */
 .workspace {
   min-width: 0;
-  height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
   background: var(--bg-app);
 }
@@ -559,7 +568,7 @@ code, kbd, pre {
   width: 120px;
   height: 120px;
   transform: translate(-50%, -50%);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--edge);
   border-radius: 50%;
   transition: border-color 0.4s;
 }
@@ -673,12 +682,12 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   background: radial-gradient(circle at 50% 32%, #1a222c 0%, #0d1217 65%, #07090b 100%);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--edge-interactive);
   box-shadow: 0 0 0 5px #07090b,
               0 0 0 6px rgba(255, 255, 255, 0.05),
               0 18px 40px rgba(0, 0, 0, 0.75),
               inset 0 1px 1px rgba(255, 255, 255, 0.16);
-  transition: all 0.3s var(--ease-spring);
+  transition: color 0.3s var(--ease-spring), background-color 0.3s var(--ease-spring), border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), transform 0.3s var(--ease-spring), opacity 0.3s var(--ease-spring);
 }
 .master-switch-chassis.connected {
   border-color: rgba(0, 240, 138, 0.4);
@@ -747,7 +756,7 @@ code, kbd, pre {
               inset 0 -2px 5px rgba(0, 0, 0, 0.65),
               0 6px 18px rgba(0, 0, 0, 0.5);
   transition: transform 0.15s var(--ease-spring), box-shadow 0.2s, background 0.2s, filter 0.2s;
-}
+}@media (hover: hover){
 .master-toggle-btn:hover {
   transform: scale(1.03);
   filter: brightness(1.12);
@@ -755,7 +764,7 @@ code, kbd, pre {
               inset 0 -2px 5px rgba(0, 0, 0, 0.7),
               0 0 22px rgba(0, 240, 138, 0.3),
               0 8px 24px rgba(0, 0, 0, 0.6);
-}
+}}
 .master-toggle-btn:active {
   transform: scale(0.98);
   box-shadow: inset 0 3px 8px rgba(0, 0, 0, 0.8),
@@ -765,13 +774,13 @@ code, kbd, pre {
   border-color: rgba(255, 92, 92, 0.35);
   background: radial-gradient(circle at 50% 28%, #3c1916 0%, #240e0c 100%);
   color: var(--coral);
-}
+}@media (hover: hover){
 .master-toggle-btn.stop:hover {
   box-shadow: inset 0 2px 2px rgba(255, 255, 255, 0.3),
               inset 0 -2px 5px rgba(0, 0, 0, 0.7),
               0 0 22px rgba(255, 92, 92, 0.3),
               0 8px 24px rgba(0, 0, 0, 0.6);
-}
+}}
 .master-toggle-btn:disabled {
   opacity: 0.65;
   cursor: wait;
@@ -810,7 +819,7 @@ code, kbd, pre {
   letter-spacing: 0.06em;
   font-family: var(--font-mono);
   background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--edge);
   color: var(--muted);
 }
 .switch-status-pill.connected {
@@ -867,11 +876,11 @@ code, kbd, pre {
   flex-direction: column;
   justify-content: space-between;
   transition: border-color 0.2s var(--ease-spring), transform 0.2s var(--ease-spring);
-}
+}@media (hover: hover){
 .bento-card:hover {
   border-color: rgba(255, 255, 255, 0.14);
   transform: translateY(-1px);
-}
+}}
 
 .bento-card-header {
   display: flex;
@@ -919,7 +928,7 @@ code, kbd, pre {
 }
 .bento-chip {
   background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--edge);
   color: var(--muted);
 }
 .bento-chip.active {
@@ -1133,13 +1142,13 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   cursor: pointer;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .tactile-copy-btn:hover {
   color: var(--emerald);
   border-color: var(--emerald-border);
   background: var(--emerald-dim);
-}
+}}
 
 /* ─── Speed Profile Presets ────────────────────────────────────────── */
 .profiles-panel {
@@ -1167,19 +1176,19 @@ code, kbd, pre {
   min-height: 84px;
   padding: 14px 16px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--edge-interactive);
   background: #0d131a;
   cursor: pointer;
   user-select: none;
-  transition: all 0.18s var(--ease-spring);
+  transition: color 0.18s var(--ease-spring), background-color 0.18s var(--ease-spring), border-color 0.18s var(--ease-spring), box-shadow 0.18s var(--ease-spring), transform 0.18s var(--ease-spring), opacity 0.18s var(--ease-spring);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
+}@media (hover: hover){
 
 .profile-card:hover:not(:disabled) {
   border-color: rgba(255, 255, 255, 0.28);
   background: #131c26;
   transform: translateY(-1px);
-}
+}}
 
 .profile-card:active:not(:disabled) {
   transform: scale(0.98);
@@ -1328,13 +1337,13 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   cursor: pointer;
-  transition: all 0.2s var(--ease-spring);
-}
+  transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
+}@media (hover: hover){
 .endpoint-row button:hover {
   color: var(--emerald);
   border-color: var(--emerald-border);
   background: var(--emerald-dim);
-}
+}}
 
 /* Connection Test */
 .test-row {
@@ -1359,12 +1368,12 @@ code, kbd, pre {
   font-size: 11.5px;
   font-weight: 650;
   cursor: pointer;
-  transition: all 0.2s var(--ease-spring);
-}
+  transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
+}@media (hover: hover){
 .test-row button:hover:not(:disabled) {
   background: #1c4933;
   box-shadow: 0 0 16px rgba(0, 240, 138, 0.25);
-}
+}}
 .test-row button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -1518,10 +1527,10 @@ code, kbd, pre {
   flex-wrap: wrap;
   transition: background 0.15s;
 }
-.setting-row:last-child { border-bottom: 0; }
+.setting-row:last-child { border-bottom: 0; }@media (hover: hover){
 .setting-row:hover {
   background: rgba(255, 255, 255, 0.015);
-}
+}}
 .setting-row > div:first-child { min-width: 0; flex: 1 1 240px; }
 .setting-label-row {
   display: flex;
@@ -1548,7 +1557,7 @@ code, kbd, pre {
   padding: 1px 7px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--edge-interactive);
   color: var(--muted-light);
   font-family: var(--font-mono);
   letter-spacing: 0.05em;
@@ -1581,7 +1590,7 @@ code, kbd, pre {
   padding: 16px 18px;
   border-radius: 10px;
   background: #06090c;
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--edge);
   box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
 }
 .matrix-title {
@@ -1678,7 +1687,7 @@ code, kbd, pre {
   font-size: 11.5px;
   font-family: var(--font-mono);
   outline: none;
-  transition: all 0.15s;
+  transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s, opacity 0.15s;
 }
 .tactical-text-input:focus {
   border-color: var(--emerald);
@@ -1816,11 +1825,11 @@ code, kbd, pre {
   padding: 0;
   flex-shrink: 0;
   transition: background 0.15s, color 0.15s, transform 0.1s;
-}
+}@media (hover: hover){
 .stepper-btn:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.08);
   color: #ffffff;
-}
+}}
 .stepper-btn:active:not(:disabled) {
   transform: scale(0.92);
 }
@@ -1863,16 +1872,16 @@ code, kbd, pre {
   width: 44px;
   height: 24px;
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--edge-interactive);
   background: #090d12;
   cursor: pointer;
-  transition: all 0.2s var(--ease-spring);
+  transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
   padding: 2px;
   outline: none;
-}
+}@media (hover: hover){
 .tactile-toggle:hover:not(:disabled) {
   border-color: rgba(255, 255, 255, 0.2);
-}
+}}
 .tactile-toggle.on {
   background: #113622;
   border-color: var(--emerald-border);
@@ -1918,11 +1927,11 @@ code, kbd, pre {
   font-size: 11px;
   font-weight: 550;
   cursor: pointer;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .segmented button:hover:not(:disabled) {
   color: #ffffff;
-}
+}}
 .segmented button.active {
   color: #ffffff;
   background: var(--panel-2);
@@ -2066,30 +2075,30 @@ code, kbd, pre {
   font-weight: 650;
   cursor: pointer;
   border: 1px solid;
-  transition: all 0.2s var(--ease-spring);
+  transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
 }
 .primary-cta.connect {
   border-color: var(--emerald-border);
   background: linear-gradient(135deg, #143825 0%, #0d2319 100%);
   color: var(--emerald);
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35), var(--inner-highlight);
-}
+}@media (hover: hover){
 .primary-cta.connect:hover:not(:disabled) {
   background: linear-gradient(135deg, #1a4730 0%, #102d20 100%);
   box-shadow: 0 0 24px rgba(0, 240, 138, 0.3), var(--inner-highlight);
   transform: translateY(-1px);
-}
+}}
 .primary-cta.disconnect {
   border-color: var(--coral-border);
   background: linear-gradient(135deg, #3d1b18 0%, #25110f 100%);
   color: var(--coral);
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
-}
+}@media (hover: hover){
 .primary-cta.disconnect:hover {
   background: linear-gradient(135deg, #4d221e 0%, #2f1513 100%);
   box-shadow: 0 0 24px rgba(255, 92, 92, 0.3);
   transform: translateY(-1px);
-}
+}}
 .primary-cta:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .scan-inline-progress {
@@ -2145,7 +2154,7 @@ code, kbd, pre {
   font-weight: 600;
   font-family: var(--font-mono);
   background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--edge);
   color: var(--muted-light);
 }
 .stat-chip-pill.hits {
@@ -2192,13 +2201,13 @@ code, kbd, pre {
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.16s var(--ease-spring);
-}
+  transition: color 0.16s var(--ease-spring), background-color 0.16s var(--ease-spring), border-color 0.16s var(--ease-spring), box-shadow 0.16s var(--ease-spring), transform 0.16s var(--ease-spring), opacity 0.16s var(--ease-spring);
+}@media (hover: hover){
 .proto-tab:hover {
   border-color: rgba(255, 255, 255, 0.18);
   color: #fff;
   background: var(--panel-hover);
-}
+}}
 .proto-tab.active {
   border-color: var(--emerald-border);
   background: var(--emerald-dim);
@@ -2235,12 +2244,12 @@ code, kbd, pre {
   justify-content: space-between;
   gap: 14px;
   min-width: 0;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .discovered-row:hover {
   border-color: rgba(255, 255, 255, 0.14);
   background: var(--panel-hover);
-}
+}}
 .discovered-info {
   display: flex;
   align-items: center;
@@ -2284,14 +2293,14 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   cursor: pointer;
-  transition: all 0.15s;
+  transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s, opacity 0.15s;
   padding: 0;
-}
+}@media (hover: hover){
 .tactile-copy-btn:hover {
   border-color: rgba(255, 255, 255, 0.18);
   color: #ffffff;
   background: var(--panel-hover);
-}
+}}
 
 .rtt-badge {
   display: inline-flex;
@@ -2342,17 +2351,17 @@ code, kbd, pre {
   font-size: 11.5px;
   font-weight: 650;
   cursor: pointer;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .connect-direct-btn:hover:not(:disabled) {
   background: #1c4933;
   box-shadow: 0 0 14px rgba(0, 240, 138, 0.25);
-}
+}}
 .connect-direct-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ─── Activity Tab (Terminal Console) ─────────────────────────────────────── */
 .tactical-activity-view {
-  height: calc(100vh - 76px);
+  height: calc(100dvh - 76px);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -2496,11 +2505,11 @@ code, kbd, pre {
   opacity: 0.75;
   flex-shrink: 0;
   transition: opacity 0.15s, background 0.15s;
-}
+}@media (hover: hover){
 .error-banner-dismiss:hover {
   opacity: 1;
   background: rgba(255, 92, 92, 0.18);
-}
+}}
 .pinned-peer-bar {
   display: flex;
   align-items: center;
@@ -2541,7 +2550,7 @@ code, kbd, pre {
 }
 .pinned-peer-clear-btn {
   background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid var(--edge-interactive);
   color: #ffffff;
   font-size: 11px;
   font-weight: 600;
@@ -2550,11 +2559,11 @@ code, kbd, pre {
   cursor: pointer;
   flex-shrink: 0;
   transition: background 0.15s, border-color 0.15s;
-}
+}@media (hover: hover){
 .pinned-peer-clear-btn:hover {
   background: rgba(255, 255, 255, 0.14);
   border-color: rgba(255, 255, 255, 0.25);
-}
+}}
 .update-banner {
   display: flex;
   align-items: center;
@@ -2587,17 +2596,17 @@ code, kbd, pre {
   cursor: pointer;
   padding: 4px;
   opacity: 0.75;
-}
+}@media (hover: hover){
 .banner-dismiss:hover {
   opacity: 1;
-}
+}}
 
 .tactical-terminal-chassis {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  border: 1px solid var(--edge);
   border-radius: 14px;
   background: #07090b;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), var(--inner-highlight);
@@ -2668,29 +2677,29 @@ code, kbd, pre {
   height: 28px;
   padding: 0 11px;
   border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--edge);
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted-light);
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .tactile-terminal-btn:hover:not(:disabled) {
   border-color: rgba(255, 255, 255, 0.18);
   color: #ffffff;
   background: rgba(255, 255, 255, 0.08);
-}
+}}
 .tactile-terminal-btn.copied {
   border-color: var(--emerald-border);
   color: var(--emerald);
   background: var(--emerald-dim);
-}
+}@media (hover: hover){
 .tactile-terminal-btn.danger:hover:not(:disabled) {
   border-color: var(--coral-border);
   color: #ffa191;
   background: rgba(255, 92, 92, 0.12);
-}
+}}
 .tactile-terminal-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* Sticky Terminal Filter Dock */
@@ -2723,12 +2732,12 @@ code, kbd, pre {
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s var(--ease-spring);
-}
+  transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
+}@media (hover: hover){
 .filter-chip:hover {
   color: #ffffff;
   border-color: rgba(255, 255, 255, 0.15);
-}
+}}
 .filter-chip.active {
   color: var(--emerald);
   border-color: var(--emerald-border);
@@ -2780,10 +2789,10 @@ code, kbd, pre {
   font-size: 11px;
   line-height: 1.5;
   transition: background 0.1s;
-}
+}@media (hover: hover){
 .terminal-log-row:hover {
   background: rgba(255, 255, 255, 0.025);
-}
+}}
 .terminal-log-row time {
   color: var(--muted-dark);
   font-size: 10.5px;
@@ -2922,7 +2931,7 @@ code, kbd, pre {
 
 /* Crash screen rendered by the ErrorBoundary */
 .crash-screen {
-  min-height: 100vh;
+  min-height: 100svh;
   display: grid;
   place-content: center;
   justify-items: center;
@@ -2998,7 +3007,7 @@ code, kbd, pre {
   }
   .nav-pill-label { display: block; font-size: 9px; }
   .nav-active-pill { display: none; }
-  .workspace { height: auto; min-height: calc(100vh - 60px); }
+  .workspace { height: auto; min-height: calc(100dvh - 60px); }
   .topbar {
     height: auto;
     min-height: 56px;
@@ -3107,7 +3116,7 @@ code, kbd, pre {
   }
   .path-row input, .input-row input { width: 100%; }
   .test-row { flex-direction: column; align-items: stretch; }
-  .activity-view { height: auto; min-height: calc(100vh - 134px); padding: 16px 14px 26px; }
+  .activity-view { height: auto; min-height: calc(100dvh - 134px); padding: 16px 14px 26px; }
   .activity-console { min-height: 260px; }
   .activity-head { flex-direction: column; align-items: stretch; gap: 10px; }
   .activity-actions { justify-content: flex-end; }
@@ -3288,4 +3297,61 @@ code, kbd, pre {
     padding: 0 12px;
     font-size: 11.5px;
   }
+}
+
+/* ─── Declared-in-markup class layer (spec 015 / BC-10) ───────────────────
+   These rules used to exist only in the JSX: every consumer rendered as
+   unstyled text because no selector matched. Hover-free on purpose, so no
+   pointer guard is needed. */
+
+.badge,
+.tactile-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-light);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.badge-emerald,
+.metric-icon.green { color: var(--emerald); }
+.badge-cyan,
+.metric-icon.blue { color: var(--blue); }
+.badge-amber,
+.metric-icon.yellow { color: var(--amber); }
+.badge-coral,
+.metric-icon.coral { color: var(--coral); }
+.badge-violet { color: var(--violet); }
+.badge-muted { color: var(--muted); }
+
+.badge-emerald { border-color: var(--emerald-border); background: var(--emerald-dim); }
+.badge-cyan { border-color: var(--blue-border); background: var(--blue-dim); }
+.badge-amber { border-color: rgba(250, 204, 21, 0.32); background: rgba(250, 204, 21, 0.12); }
+.badge-coral { border-color: var(--coral-border); background: var(--coral-dim); }
+.badge-violet { border-color: rgba(167, 139, 250, 0.32); background: rgba(167, 139, 250, 0.12); }
+
+/* Bento card icons: the tone class decided nothing until now. */
+.metric-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Concurrency chip sat unstyled beside its styled siblings. */
+.stat-chip-pill.workers {
+  border-color: var(--blue-border);
+  color: var(--blue);
+  background: var(--blue-dim);
 }

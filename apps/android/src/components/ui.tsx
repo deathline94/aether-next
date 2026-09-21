@@ -52,7 +52,7 @@ export function Toggle({
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
-      className={`toggle tactile-toggle ${checked ? "on" : ""}`}
+      className={`tactile-toggle ${checked ? "on" : ""}`}
       onClick={() => !disabled && onChange(!checked)}
     >
       <span className="toggle-slider" />
@@ -108,7 +108,7 @@ export function NumberField({
     <div className={`stepper-input-wrapper ${disabled ? "disabled" : ""}`}>
       <button
         type="button"
-        className="stepper-btn dec"
+        className="stepper-btn"
         onClick={() => handleStep(-step)}
         disabled={disabled || (Number.parseInt(draft, 10) || value) <= min}
         aria-label={`Decrease ${label}`}
@@ -134,7 +134,7 @@ export function NumberField({
       {suffix && <span className="stepper-suffix">{suffix}</span>}
       <button
         type="button"
-        className="stepper-btn inc"
+        className="stepper-btn"
         onClick={() => handleStep(step)}
         disabled={disabled || (Number.parseInt(draft, 10) || value) >= max}
         aria-label={`Increase ${label}`}
@@ -158,7 +158,7 @@ export function Badge({
   return (
     <span className={`tactile-badge ${variant} ${className}`}>
       <span className="tactile-badge-dot" aria-hidden="true" />
-      <span className="tactile-badge-text">{children}</span>
+      <span className="tactile-badge">{children}</span>
     </span>
   );
 }

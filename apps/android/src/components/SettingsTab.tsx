@@ -49,7 +49,7 @@ export function SettingsTab({
   return (
     <div className="settings-view">
       {settingsLoadError && (
-        <div className="error-banner tactical-error-banner" role="alert" style={{ marginBottom: "1rem", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.75rem 1rem", borderRadius: "8px", background: "rgba(239, 68, 68, 0.15)", border: "1px solid rgba(239, 68, 68, 0.4)" }}>
+        <div className="error-banner" role="alert" style={{ marginBottom: "1rem", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0.75rem 1rem", borderRadius: "8px", background: "rgba(239, 68, 68, 0.15)", border: "1px solid rgba(239, 68, 68, 0.4)" }}>
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
             <AlertTriangle size={18} className="text-red-400" aria-hidden="true" />
             <div>
@@ -63,7 +63,7 @@ export function SettingsTab({
             <button
               type="button"
               onClick={() => void retrySettings()}
-              className="btn btn-secondary retry-btn"
+              className="banner-dismiss"
               style={{ padding: "0.35rem 0.75rem", fontSize: "0.75rem", cursor: "pointer" }}
             >
               Retry
@@ -72,7 +72,7 @@ export function SettingsTab({
         </div>
       )}
       {settingsLocked && (
-        <div className="lock-banner tactical-lock-banner" role="status">
+        <div className="tactical-lock-banner" role="status">
           <div className="lock-banner-icon">
             <Lock size={16} aria-hidden="true" />
           </div>
@@ -385,7 +385,7 @@ export function SettingsTab({
       </section>
 
       {/* ─── Panel 4: Local Ports & Listeners ────────────────────────────── */}
-      <section className="settings-section tactical-panel advanced">
+      <section className="settings-section tactical-panel">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">LOCAL LISTENERS</p>

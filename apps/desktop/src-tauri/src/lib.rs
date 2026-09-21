@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 /// It serialises as the message string on purpose: the shipped frontend still
 /// does `String(e)`, so the wire shape stays compatible until typed
 /// (`tauri-specta`) bindings replace those calls in spec 016.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,

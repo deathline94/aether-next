@@ -134,7 +134,7 @@ function App() {
           <div className="topbar-actions">
             <div className={`header-status ${runtime.status}`} title={runtime.detail}>
               <span className="status-dot" aria-hidden="true" />
-              <span className="status-text">{runtime.status}</span>
+              <span>{runtime.status}</span>
             </div>
           </div>
         </header>

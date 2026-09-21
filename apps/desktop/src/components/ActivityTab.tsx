@@ -124,7 +124,7 @@ export function ActivityTab({
   return (
     <div className="activity-view tactical-activity-view">
       {scanState.active && (
-        <div className="scan-card tactical-scan-card">
+        <div className="tactical-scan-card">
           <div className="scan-card-header">
             <div className="scan-title">
               <Sparkles size={15} className="spin-icon" aria-hidden="true" />
@@ -156,7 +156,7 @@ export function ActivityTab({
         </div>
       )}
 
-      <section className="activity-panel tactical-terminal-chassis">
+      <section className="tactical-terminal-chassis">
         {/* Terminal Window Header Chrome */}
         <header className="terminal-header-chrome">
           <div className="terminal-window-controls">
@@ -177,7 +177,7 @@ export function ActivityTab({
             {!autoScroll && (
               <button
                 type="button"
-                className="tactile-terminal-btn follow-btn"
+                className="tactile-terminal-btn"
                 onClick={() => {
                   setAutoScroll(true);
                   if (consoleRef.current) {
@@ -215,7 +215,7 @@ export function ActivityTab({
         </header>
 
         {/* Sticky Filter Pill Bar */}
-        <div className="activity-filters tactical-filter-dock" role="radiogroup" aria-label="Log filter">
+        <div className="tactical-filter-dock" role="radiogroup" aria-label="Log filter">
           <div className="filter-pill-group">
             {FILTERS.map((f) => (
               <button
@@ -226,7 +226,7 @@ export function ActivityTab({
                 className={`filter-chip ${logFilter === f.id ? "active" : ""}`}
                 onClick={() => setLogFilter(f.id)}
               >
-                <span className="filter-chip-label">{f.label}</span>
+                <span>{f.label}</span>
                 <span className="chip-count tabular-nums">{filterCounts[f.id].toLocaleString()}</span>
               </button>
             ))}

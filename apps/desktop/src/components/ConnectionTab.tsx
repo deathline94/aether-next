@@ -85,18 +85,16 @@ export function ConnectionTab({
 }: ConnectionTabProps) {
   const hero = heroCopy[runtime.status];
 
-  // Parse verified live latency from testResult if available
+  // Only a measured round-trip may be shown as a number: the engine reports no
+  // latency of its own, so anything else here would be invented telemetry.
   const parsedLatency = testResult?.match(/(\d+)\s*ms/i)?.[1];
-  const displayLatency = parsedLatency
-    ? `${parsedLatency} ms`
-    : connected
-      ? "< 45 ms"
-      : "-- ms";
+  const displayLatency = parsedLatency ? `${parsedLatency} ms` : "not measured";
+  const displayLoss = "not measured";
 
   return (
     <div className="home-view">
       {/* ─── Hero Centerpiece Stage ────────────────────────────────────────── */}
-      <section className={`connection-stage cyber-hero ${runtime.status}`}>
+      <section className={`connection-stage ${runtime.status}`}>
         <div className="signal-field" aria-hidden="true">
           <span />
           <span />
@@ -254,7 +252,7 @@ export function ConnectionTab({
       {/* ─── Telemetry & Metrics Bento Grid (12-Column Asymmetric) ────────── */}
       <section className="telemetry-bento" aria-label="Tunnel Telemetry and Subsystem Status">
         {/* Card 1 (Span 7): Gateway Edge Route & Live Sparkline */}
-        <article className="bento-card bento-col-7 edge-telemetry-card">
+        <article className="bento-card bento-col-7">
           <div className="bento-card-header">
             <div className="bento-title-group">
               <div className="metric-icon blue"><Gauge size={18} aria-hidden="true" /></div>
@@ -280,11 +278,11 @@ export function ConnectionTab({
               </div>
               <div className="stat-unit">
                 <span className="stat-label">PACKET LOSS</span>
-                <span className="stat-value tabular-nums">{connected ? "0.0%" : "--"}</span>
+                <span className="stat-value tabular-nums">{displayLoss}</span>
               </div>
               <div className="stat-unit">
                 <span className="stat-label">IP STACK</span>
-                <span className="stat-value tabular-nums">{settings.ipVersion.toUpperCase()} DUAL-READY</span>
+                <span className="stat-value tabular-nums">{settings.ipVersion.toUpperCase()}</span>
               </div>
             </div>
 
@@ -314,7 +312,7 @@ export function ConnectionTab({
         </article>
 
         {/* Card 2 (Span 5): Carrier & Cipher Engine */}
-        <article className="bento-card bento-col-5 cipher-engine-card">
+        <article className="bento-card bento-col-5">
           <div className="bento-card-header">
             <div className="bento-title-group">
               <div className="metric-icon coral"><Route size={18} aria-hidden="true" /></div>
@@ -350,12 +348,12 @@ export function ConnectionTab({
           </div>
 
           <div className="bento-footer">
-            <small className="bento-subtext">ENCRYPTION: <strong>END-TO-END TLS 1.3</strong></small>
+            <small className="bento-subtext">EDGE TLS: <strong>TLS 1.3 to the MASQUE edge</strong> · beyond the edge this app cannot observe your TLS</small>
           </div>
         </article>
 
         {/* Card 3 (Span 6): Routing Topology */}
-        <article className="bento-card bento-col-6 topology-card">
+        <article className="bento-card bento-col-6">
           <div className="bento-card-header">
             <div className="bento-title-group">
               <div className="metric-icon green"><Globe2 size={18} aria-hidden="true" /></div>
@@ -394,7 +392,7 @@ export function ConnectionTab({
         </article>
 
         {/* Card 4 (Span 6): Core Daemon Subsystem */}
-        <article className="bento-card bento-col-6 daemon-card">
+        <article className="bento-card bento-col-6">
           <div className="bento-card-header">
             <div className="bento-title-group">
               <div className="metric-icon yellow"><Cpu size={18} aria-hidden="true" /></div>
@@ -420,8 +418,8 @@ export function ConnectionTab({
               </div>
             </div>
             <div className="daemon-metrics-row">
-              <div className="daemon-tag">PORT {settings.httpPort}: <strong>HTTP LISTENING</strong></div>
-              <div className="daemon-tag">PORT {settings.socksPort}: <strong>SOCKS5 READY</strong></div>
+              <div className="daemon-tag">PORT {settings.httpPort}: <strong>{runtime.status === "connected" ? "HTTP proxy configured" : "idle"}</strong></div>
+              <div className="daemon-tag">PORT {settings.socksPort}: <strong>{runtime.status === "connected" ? "SOCKS5 configured" : "idle"}</strong></div>
             </div>
           </div>
 

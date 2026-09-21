@@ -23,6 +23,9 @@ import { join, relative, sep, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+// A gate that cannot show you the whole failure list cannot fix it either.
+const MAX_FINDINGS = Number(process.env.VERIFY_MAX_FINDINGS ?? 25);
+
 const SKIP_DIRS = new Set([
   'node_modules', '.git', 'target', 'dist', 'build', 'out', '.gradle', 'coverage', '.next',
 ]);
@@ -146,12 +149,27 @@ const GATES = [
         .map((p) => readFileSync(join(ROOT, p), 'utf8'))
         .join('\n');
       const defined = new Set([...sheets.matchAll(/\.([A-Za-z][\w-]*)/g)].map((m) => m[1]));
+      /*
+       * Tailwind generates utilities at build time, so they never appear as a
+       * literal `.class` in the source sheets. The list is deliberately
+       * per-token: a wildcard/prefix rule would blind this gate to every
+       * genuinely unstyled element, which is the bug it exists to catch.
+       */
+      const BUILD_GENERATED = new Set(['font-mono', 'tabular-nums', 'text-red-400']);
       const v = [];
       for (const f of api.files('apps', /\.(tsx|jsx)$/)) {
         const t = api.read(f);
         for (const m of t.matchAll(/className=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
           const raw = (m[1] ?? m[2] ?? '').replace(/\$\{[^}]*\}/g, ' ');
           for (const tok of raw.split(/\s+/).filter(Boolean)) {
+            if (BUILD_GENERATED.has(tok)) continue;
+            // `badge-${tone}` strips to `badge-`: accept it as a family only if
+            // at least one `badge-*` rule actually exists.
+            if (tok.endsWith('-')) {
+              let hit = false;
+              for (const c of defined) if (c.startsWith(tok)) { hit = true; break; }
+              if (hit) continue;
+            }
             if (!defined.has(tok)) v.push(`${locate(f, t, m.index)} className "${tok}" has no rule`);
           }
         }
@@ -369,8 +387,8 @@ function main() {
     }
     const ok = out.length === 0;
     console.log(`${ok ? 'ok  ' : 'FAIL'} ${g.name} [${g.invariant}] — ${g.summary}`);
-    for (const line of out.slice(0, 25)) console.log(`   ${line}`);
-    if (out.length > 25) console.log(`   … ${out.length - 25} more`);
+    for (const line of out.slice(0, MAX_FINDINGS)) console.log(`   ${line}`);
+    if (out.length > MAX_FINDINGS) console.log(`   … ${out.length - MAX_FINDINGS} more`);
     if (!ok) failing += 1;
   }
   console.log(failing ? `\n# ${failing}/${selected.length} gate(s) failing` : `\n# all ${selected.length} gate(s) passing`);

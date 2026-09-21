@@ -382,7 +382,7 @@ export function ScannerTab({
                   <div className="discovered-actions">
                     <span className={`rtt-badge ${tierClass}`} title={badgeText}>
                       <span className="rtt-dot" />
-                      <span className="rtt-val tabular-nums">{item.rtt}</span>
+                      <span className="tabular-nums">{item.rtt}</span>
                     </span>
                     <button
                       type="button"

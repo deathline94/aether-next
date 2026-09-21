@@ -81,7 +81,7 @@ fn test_readback_verification_detects_proxy_enable_mismatch() {
         None,
         None,
     ).unwrap_err();
-    assert!(err.contains("ProxyEnable read-back mismatch"));
+    assert!(err.message.contains("ProxyEnable read-back mismatch"));
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn test_readback_verification_detects_proxy_server_mismatch() {
         Some("127.0.0.1:9090"),
         None,
     ).unwrap_err();
-    assert!(err1.contains("ProxyServer read-back mismatch"));
+    assert!(err1.message.contains("ProxyServer read-back mismatch"));
 
     // Missing actual value
     let err2 = aether_desktop_lib::windows_proxy::verify_readback_values(
@@ -108,7 +108,7 @@ fn test_readback_verification_detects_proxy_server_mismatch() {
         None,
         None,
     ).unwrap_err();
-    assert!(err2.contains("ProxyServer read-back mismatch"));
+    assert!(err2.message.contains("ProxyServer read-back mismatch"));
 
     // Expected None, but got Some
     let snapshot_none = ProxySnapshot {
@@ -122,7 +122,7 @@ fn test_readback_verification_detects_proxy_server_mismatch() {
         Some("127.0.0.1:8080"),
         None,
     ).unwrap_err();
-    assert!(err3.contains("ProxyServer read-back mismatch"));
+    assert!(err3.message.contains("ProxyServer read-back mismatch"));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn test_readback_verification_detects_proxy_override_mismatch() {
         None,
         Some("different"),
     ).unwrap_err();
-    assert!(err1.contains("ProxyOverride read-back mismatch"));
+    assert!(err1.message.contains("ProxyOverride read-back mismatch"));
 
     let err2 = aether_desktop_lib::windows_proxy::verify_readback_values(
         &snapshot,
@@ -147,7 +147,7 @@ fn test_readback_verification_detects_proxy_override_mismatch() {
         None,
         None,
     ).unwrap_err();
-    assert!(err2.contains("ProxyOverride read-back mismatch"));
+    assert!(err2.message.contains("ProxyOverride read-back mismatch"));
 
     let snapshot_none = ProxySnapshot {
         enabled: 0,
@@ -160,7 +160,7 @@ fn test_readback_verification_detects_proxy_override_mismatch() {
         None,
         Some("<local>"),
     ).unwrap_err();
-    assert!(err3.contains("ProxyOverride read-back mismatch"));
+    assert!(err3.message.contains("ProxyOverride read-back mismatch"));
 }
 
 #[test]
@@ -180,7 +180,9 @@ fn test_recover_preserves_file_on_restore_failure() {
 
     // Fails in restorer
     let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| {
-        Err("read-back mismatch simulated".to_string())
+        Err(aether_desktop_lib::CommandError::new(
+            "readback", "read-back mismatch simulated",
+        ))
     });
 
     assert!(res.is_err());
@@ -208,7 +210,7 @@ fn test_recover_deletes_file_on_restore_success() {
 
     let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| Ok(()));
 
-    assert_eq!(res, Ok(true));
+    assert!(matches!(res, Ok(true)), "restored file should report success");
     // File MUST be deleted
     assert!(!path.exists(), "recovery file must be deleted on successful restore");
 
@@ -224,7 +226,7 @@ fn test_read_optional_reg_value_error_discrimination() {
         Ok("127.0.0.1:8080".to_string()),
         "ProxyServer",
     );
-    assert_eq!(ok_res, Ok(Some("127.0.0.1:8080".to_string())));
+    assert_eq!(ok_res.unwrap().as_deref(), Some("127.0.0.1:8080"));
 
     // NotFound -> None (valid absence)
     let not_found_res = aether_desktop_lib::windows_proxy::read_optional_reg_value(
@@ -238,13 +240,13 @@ fn test_read_optional_reg_value_error_discrimination() {
         Err(io::Error::new(io::ErrorKind::PermissionDenied, "access denied")),
         "ProxyServer",
     ).unwrap_err();
-    assert!(denied_err.contains("verify read ProxyServer: access denied"));
+    assert!(denied_err.message.contains("verify read ProxyServer: access denied"));
 
     // Other errors (e.g. BrokenPipe) -> Err
     let other_err = aether_desktop_lib::windows_proxy::read_optional_reg_value(
         Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe broken")),
         "ProxyOverride",
     ).unwrap_err();
-    assert!(other_err.contains("verify read ProxyOverride: pipe broken"));
+    assert!(other_err.message.contains("verify read ProxyOverride: pipe broken"));
 }
 
