@@ -47,8 +47,7 @@ class EngineRunnerTest {
         val written = String(fakeProc.stdinSink.toByteArray(), Charsets.US_ASCII)
         assertTrue(
             "expected a `key <base64>` handoff line first, got: $written",
-            written.startsWith("key a2V5
-")
+            written == "key a2V5" + String(byteArrayOf(0x0A))
         )
     }
 

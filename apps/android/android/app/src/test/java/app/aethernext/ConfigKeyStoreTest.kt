@@ -113,6 +113,66 @@ class ConfigKeyStoreTest {
         ConfigKeyStore.masterKeyGenerator = null
     }
 
+    /**
+     * A keystore that is briefly unavailable must not cost the user their
+     * identity. Every exception used to route into `rotateAndRecover()`, which
+     * deletes the master key and quarantines `aether.toml`, so one `keystore2`
+     * hiccup after a system update silently reprovisioned the device.
+     */
+    @Test
+    fun transientKeyStoreFailuresAreRetriedAndKeepTheIdentity() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "aether_ks_transient_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(dir)
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val tomlFile = File(configDir, "aether.toml")
+        tomlFile.writeText("device_id = \"keep_me\"")
+
+        val first = ConfigKeyStore.loadOrCreate(context)
+        val wrappedBefore = context.fakePrefs.map["wrapped"]
+
+        val healthy = mockKeyStore
+        var calls = 0
+        ConfigKeyStore.keyStoreSupplier = {
+            calls += 1
+            if (calls <= 2) throw java.security.UnrecoverableKeyException("keystore2 is starting")
+            healthy
+        }
+        try {
+            val again = ConfigKeyStore.loadOrCreate(context)
+            assertEquals("a transient failure must not change the key", first, again)
+            assertEquals("the wrapped key must survive", wrappedBefore, context.fakePrefs.map["wrapped"])
+            assertTrue("expected at least three attempts, saw $calls", calls >= 3)
+        } finally {
+            ConfigKeyStore.keyStoreSupplier = { mockKeyStore }
+        }
+        assertTrue("a transient failure must not quarantine the identity", tomlFile.exists())
+        dir.deleteRecursively()
+    }
+
+    /** The rotation path stays available for the case it was built for. */
+    @Test
+    fun anUnreadableWrappingStillRotatesAndQuarantines() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "aether_ks_corrupt_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(dir)
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val tomlFile = File(configDir, "aether.toml")
+        tomlFile.writeText("device_id = \"stale\"")
+
+        val first = ConfigKeyStore.loadOrCreate(context)
+        // Base64 of three bytes: no IV, no GCM tag.
+        context.fakePrefs.map["wrapped"] = "AQID"
+
+        val rotated = ConfigKeyStore.loadOrCreate(context)
+        assertTrue(rotated.isNotBlank())
+        assertFalse("rotation must produce a new key", rotated == first)
+        assertFalse("the unreadable identity must be quarantined", tomlFile.exists())
+        assertTrue(
+            "a fresh wrapping must be committed",
+            context.fakePrefs.map["wrapped"] != null && context.fakePrefs.map["wrapped"] != "AQID",
+        )
+        dir.deleteRecursively()
+    }
+
     @Test
     fun testCorruptedKeyStoreQuarantinesOldConfigFiles() {
         val tempDir = File(System.getProperty("java.io.tmpdir"), "aether_keystore_test_${System.currentTimeMillis()}").apply { mkdirs() }
