@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,22 +21,102 @@ const STALE_THRESHOLD_SECS: u64 = 6 * 60 * 60; // 6 hours
 /// network change) instead of letting `quick_reconnect` keep timing out on them.
 const EVICT_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
-/// How long to wait for the cross-process cache lock before proceeding anyway.
+/// How long to wait for the cross-process cache lock. Past this the mutation is
+/// **skipped**, not performed unlocked: the cache is learned, non-authoritative
+/// state, so losing one update is harmless and writing over another process's
+/// update is the bug this lock exists to prevent.
 const LOCK_WAIT: Duration = Duration::from_millis(1500);
-/// A lock older than this is considered abandoned (holder was killed) and stolen.
-const LOCK_STALE: Duration = Duration::from_secs(5);
+
+/// Written into every cache file so a reader can tell a legacy layout from the
+/// current one instead of guessing from whichever fields happen to be present.
+const CACHE_VERSION: u32 = 2;
+/// A stamped time this far ahead of the clock is not "recent", it is fabricated
+/// or the product of a clock jump. `saturating_sub` made such an entry immortal
+/// *and* permanently earn the recency bonus in `trust_score`.
+const MAX_FUTURE_SKEW_SECS: u64 = 300;
+/// A counter is bounded by what the writer could plausibly have observed;
+/// `u32::MAX` successes in a 10-entry cache is an injection, not a history.
+const MAX_SUCCESSES: u32 = 1000;
+/// Anything above this is not a measured round trip (60 s).
+const MAX_PLAUSIBLE_RTT_MS: u32 = 60_000;
 
 /// Provisioning (account registration / MASQUE enrollment) makes network calls to
 /// Cloudflare that can take several seconds, so its cross-process lock waits much
 /// longer and treats the holder as stale much later than the fast cache lock.
 const PROVISION_LOCK_WAIT: Duration = Duration::from_secs(20);
-#[allow(dead_code)]
-const PROVISION_LOCK_STALE: Duration = Duration::from_secs(60);
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct EndpointsCache {
+    /// `0` means "written by a version that had no schema field".
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub written_at: u64,
+    /// Both collections default so a partial or older document can never fatal a
+    /// reader that only needs one of them.
+    #[serde(default)]
     pub masque: Vec<CachedEndpoint>,
+    #[serde(default)]
     pub wireguard: Vec<CachedEndpoint>,
+}
+
+/// What sanitising a persisted cache had to throw away.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Rejected {
+    pub future_timestamp: u32,
+    pub implausible_address: u32,
+    pub clamped_counters: u32,
+    pub implausible_rtt: u32,
+}
+
+impl Rejected {
+    pub fn is_empty(&self) -> bool {
+        *self == Rejected::default()
+    }
+}
+
+fn address_is_plausible(addr: SocketAddr) -> bool {
+    let ip = addr.ip();
+    // A learned-endpoint cache must never hand the tunnel a loopback,
+    // link-local, multicast or "this host" address: those are the targets a
+    // hostile local writer would plant to make the engine connect to something
+    // it was never shown by a scan.
+    let v4_link_local = match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    };
+    !(ip.is_loopback() || ip.is_unspecified() || v4_link_local || ip.is_multicast())
+}
+
+/// Validate untrusted on-disk entries before anything scores or connects with
+/// them. Mutates in place, returns the tally of what was dropped or clamped.
+pub fn sanitise(endpoints: &mut Vec<CachedEndpoint>, now: u64) -> Rejected {
+    let mut out = Rejected::default();
+    for e in endpoints.iter_mut() {
+        if e.successes > MAX_SUCCESSES || e.failures > MAX_SUCCESSES {
+            out.clamped_counters += 1;
+            e.successes = e.successes.min(MAX_SUCCESSES);
+            e.failures = e.failures.min(MAX_SUCCESSES);
+        }
+        if e.rtt_ms > MAX_PLAUSIBLE_RTT_MS {
+            out.implausible_rtt += 1;
+            e.rtt_ms = 0;
+        }
+    }
+    let mut kept = Vec::with_capacity(endpoints.len());
+    for e in endpoints.drain(..) {
+        if e.timestamp > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+            out.future_timestamp += 1;
+            continue;
+        }
+        if !address_is_plausible(e.addr) {
+            out.implausible_address += 1;
+            continue;
+        }
+        kept.push(e);
+    }
+    *endpoints = kept;
+    out
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -100,10 +180,40 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Remove endpoints older than `STALE_THRESHOLD_SECS`.
+/// Drop entries older than `STALE_THRESHOLD_SECS`, then validate what is left.
 fn decay_stale(endpoints: &mut Vec<CachedEndpoint>) {
     let now = now_secs();
     endpoints.retain(|e| now.saturating_sub(e.timestamp) < STALE_THRESHOLD_SECS);
+    let rejected = sanitise(endpoints, now);
+    if !rejected.is_empty() {
+        log::warn!("[cache] rejected untrusted entries: {rejected:?}");
+    }
+}
+
+/// Move an unreadable cache aside *while the caller holds the lock*, under a
+/// name that cannot collide with a previous bad file.
+fn quarantine_corrupt(path: &Path) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut bad = path.as_os_str().to_os_string();
+    bad.push(format!(".corrupt.{}.{}", std::process::id(), seq));
+    match std::fs::rename(path, PathBuf::from(&bad)) {
+        Ok(()) => log::error!(
+            "[cache] {} was unreadable; preserved as {} for inspection",
+            path.display(),
+            PathBuf::from(&bad).display()
+        ),
+        Err(e) => log::error!("[cache] could not preserve corrupt {}: {e}", path.display()),
+    }
+}
+
+fn parses_as_cache(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str::<EndpointsCache>(&data).is_ok(),
+        // Absent or unreadable is not "corrupt": nothing is preserved, and the
+        // caller starts from an empty cache.
+        Err(_) => true,
+    }
 }
 
 pub fn cache_path(base_config: &str) -> PathBuf {
@@ -131,69 +241,74 @@ pub fn cache_path(base_config: &str) -> PathBuf {
 // than block forever) and self-healing (a lock left by a killed process is
 // stolen once it goes stale).
 // ─────────────────────────────────────────────────────────────────────────────
-struct CacheLock {
-    path: PathBuf,
-    held: bool,
+/// Cross-process serialisation for one read-modify-write of the cache, held on
+/// an advisory lock kept by the OS on an open file descriptor.
+///
+/// The previous implementation was a `create_new` marker file whose age decided
+/// whether it could be deleted. That failed in three ways at once: a live holder
+/// older than five seconds lost the lock to the next arrival; an `elapsed()`
+/// error mapped to `unwrap_or(true)`, i.e. "always stale", so the lock was
+/// routinely stolen; the retry `continue`d without re-checking the deadline and
+/// could spin; and `Drop` unlinked whichever file existed, not just its own.
+struct CacheGuard {
+    file: std::fs::File,
 }
 
-impl CacheLock {
-    fn acquire(cache_file: &Path) -> CacheLock {
-        Self::acquire_with(cache_file, LOCK_WAIT, LOCK_STALE)
-    }
-
-    fn acquire_with(cache_file: &Path, wait: Duration, stale_after: Duration) -> CacheLock {
-        let path = lock_path(cache_file);
-        let deadline = Instant::now() + wait;
+impl CacheGuard {
+    fn acquire(cache_file: &Path) -> Option<CacheGuard> {
+        let path = {
+            let mut s = cache_file.as_os_str().to_os_string();
+            s.push(".lock");
+            PathBuf::from(s)
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[cache] cannot open lock {}: {e}", path.display());
+                return None;
+            }
+        };
+        let deadline = Instant::now() + LOCK_WAIT;
         loop {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    let _ = write!(f, "{}", std::process::id());
-                    return CacheLock { path, held: true };
-                }
+            match file.try_lock_exclusive() {
+                Ok(()) => return Some(CacheGuard { file }),
                 Err(_) => {
-                    // Steal an abandoned lock (holder crashed/killed).
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        let stale = meta
-                            .modified()
-                            .ok()
-                            .and_then(|m| m.elapsed().ok())
-                            .map(|age| age > stale_after)
-                            .unwrap_or(true);
-                        if stale {
-                            let _ = std::fs::remove_file(&path);
-                            continue;
-                        }
+                    if deadline.checked_duration_since(Instant::now()).is_none() {
+                        log::error!(
+                            "[cache] {} is locked by another process; skipping this update",
+                            path.display()
+                        );
+                        return None;
                     }
-                    if Instant::now() >= deadline {
-                        // Best-effort: proceed unlocked rather than wedge forever.
-                        return CacheLock {
-                            path,
-                            held: false,
-                        };
-                    }
-                    std::thread::sleep(Duration::from_millis(15));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         }
     }
 }
 
-impl Drop for CacheLock {
+// `fs2::FileExt::unlock` shares its name with the (newer) inherent
+// `std::fs::File::unlock`, which trips the MSRV check the same way it does for
+// `ProvisionGuard` below.
+#[allow(clippy::incompatible_msrv)]
+impl Drop for CacheGuard {
     fn drop(&mut self) {
-        if self.held {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        // Release the advisory lock; the file stays, exactly like the
+        // provisioning guard, so two processes can never be holding "the" lock
+        // file that the other one unlinked.
+        let _ = self.file.unlock();
     }
-}
-
-fn lock_path(cache_file: &Path) -> PathBuf {
-    let mut s = cache_file.as_os_str().to_os_string();
-    s.push(".lock");
-    PathBuf::from(s)
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -380,28 +495,33 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// then persist atomically. The single entry point for every mutation.
 fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) {
     let path = cache_path(base_config);
-    let _lock = CacheLock::acquire(&path);
+    let Some(_guard) = CacheGuard::acquire(&path) else {
+        return;
+    };
+    if !parses_as_cache(&path) {
+        quarantine_corrupt(&path);
+    }
     let mut cache = load_endpoints(base_config);
     f(&mut cache);
+    cache.version = CACHE_VERSION;
+    cache.written_at = now_secs();
     save_endpoints(base_config, &cache);
 }
 
+/// Read the cache. Never writes, never renames: a read that destroyed evidence
+/// (or a working file, when the rename raced) made "I looked at the cache" an
+/// operation with side effects, and `get_*_sorted` are called on the connect
+/// path.
 pub fn load_endpoints(base_config: &str) -> EndpointsCache {
     let path = cache_path(base_config);
     let mut cache = match std::fs::read_to_string(&path) {
         Ok(data) => match serde_json::from_str::<EndpointsCache>(&data) {
             Ok(c) => c,
             Err(e) => {
-                // Never silently wipe: preserve the bad file for inspection and
-                // start fresh in memory. Atomic writes mean this should only
-                // ever be a genuinely corrupt / legacy file, not a torn write.
                 log::warn!(
-                    "[cache] {} is unreadable ({e}); preserving as .corrupt and starting empty",
+                    "[cache] {} is unreadable ({e}); starting empty without touching it",
                     path.display()
                 );
-                let mut bad = path.as_os_str().to_os_string();
-                bad.push(".corrupt");
-                let _ = std::fs::rename(&path, PathBuf::from(bad));
                 EndpointsCache::default()
             }
         },
@@ -523,6 +643,88 @@ pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(addr: &str, stamp: u64, succ: u32, rtt: u32) -> CachedEndpoint {
+        CachedEndpoint {
+            addr: addr.parse().unwrap(),
+            timestamp: stamp,
+            rtt_ms: rtt,
+            successes: succ,
+            failures: 0,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// A cached endpoint is untrusted input. The scanner is not the only writer
+    /// to that file, and the entry that wins `trust_score` decides where every
+    /// later tunnel connection goes.
+    #[test]
+    fn sanitising_rejects_fabricated_history() {
+        let now = 1_800_000_000;
+        let mut list = vec![
+            entry("93.184.216.34:443", now, 5, 40),
+            // A year ahead: `saturating_sub` made it immortal *and* max recency.
+            entry("93.184.216.35:443", now + 3600, 5, 40),
+            // The metadata service, planted as a "great" gateway.
+            entry("169.254.169.254:443", now, 9, 1),
+            entry("127.0.0.1:1080", now, 9, 1),
+            entry("224.0.0.5:443", now, 9, 1),
+        ];
+        let rejected = sanitise(&mut list, now);
+        assert_eq!(rejected.future_timestamp, 1, "{rejected:?}");
+        assert_eq!(rejected.implausible_address, 3, "{rejected:?}");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].addr.port(), 443);
+
+        // Counters clamp rather than drop: the address may be real.
+        let mut clamped = vec![entry("93.184.216.34:443", now, u32::MAX, 999_999)];
+        let r = sanitise(&mut clamped, now);
+        assert_eq!(r.clamped_counters, 1);
+        assert_eq!(r.implausible_rtt, 1);
+        assert_eq!(clamped[0].successes, MAX_SUCCESSES);
+        assert_eq!(clamped[0].rtt_ms, 0, "an impossible rtt must not earn points");
+    }
+
+    #[test]
+    fn a_read_does_not_disturb_the_file_on_disk() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_read_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let path = cache_path(&base);
+        std::fs::write(&path, b"{ not json at all").unwrap();
+
+        let cache = load_endpoints(&base);
+        assert!(cache.masque.is_empty());
+        assert!(path.exists(), "a read must not rename or delete the cache file");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ not json at all",
+            "a read must not modify the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_and_legacy_documents_still_parse() {
+        // Data-model rule: a reader must never fatal on a missing optional field.
+        let c: EndpointsCache = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.version, 0);
+        let c: EndpointsCache = serde_json::from_str(r#"{"masque":[]}"#).unwrap();
+        assert!(c.wireguard.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("aether_cache_ver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        add_to_masque_with_rtt(&base, vec![("93.184.216.34:443".parse().unwrap(), 42)]);
+        let written = std::fs::read_to_string(cache_path(&base)).unwrap();
+        let doc: EndpointsCache = serde_json::from_str(&written).unwrap();
+        assert_eq!(doc.version, CACHE_VERSION, "a writer must stamp its schema");
+        assert!(doc.written_at > 0);
+        assert_eq!(doc.masque.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ep(addr: &str, successes: u32, failures: u32, consec: u32, rtt: u32) -> CachedEndpoint {
         CachedEndpoint {
