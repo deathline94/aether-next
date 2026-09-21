@@ -35,7 +35,14 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// accepted just as happily.
 fn leaf_is_temporally_valid(leaf: &boring::x509::X509Ref, now_unix: u64) -> std::result::Result<(), String> {
     use boring::asn1::Asn1Time;
-    let now = Asn1Time::from_unix(now_unix as i64).map_err(|e| format!("clock: {e}"))?;
+    // `time_t` is 64-bit on the desktop ABIs and 32-bit on the 32-bit Android
+    // ones, so the conversion must follow the target instead of naming a width
+    // that only compiles half the time. Refuse rather than compare against a
+    // silently truncated "now".
+    if cfg!(target_pointer_width = "32") && now_unix > u64::from(i32::MAX) {
+        return Err("system clock beyond 32-bit time_t range".into());
+    }
+    let now = Asn1Time::from_unix(now_unix as _).map_err(|e| format!("clock: {e}"))?;
     let not_before = leaf.not_before();
     let not_after = leaf.not_after();
     if now < not_before {
