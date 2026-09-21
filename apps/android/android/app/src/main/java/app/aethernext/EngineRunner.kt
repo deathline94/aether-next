@@ -162,7 +162,13 @@ open class EngineRunner(
                     } catch (_: Exception) {
                         null
                     }
-                    if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
+                    // EOF on stdout is not process death. A child that closes or
+                    // redirects stdout used to flip the runner to IDLE while the
+                    // engine was still up, and the supervisor then launched a
+                    // *second* engine: two tunnels, two route tables, one device.
+                    if (proc.isAlive) {
+                        Log.w(TAG, "engine stdout closed while process still alive; not marking it stopped")
+                    } else if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
                         supervisorState.set(SupervisorState.IDLE)
                         processRef.compareAndSet(proc, null)
@@ -255,7 +261,13 @@ open class EngineRunner(
                     Log.w(TAG, "scan reader ended: ${e.message}")
                 } finally {
                     val code = try { proc.waitFor() } catch (_: Exception) { null }
-                    if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
+                    // EOF on stdout is not process death. A child that closes or
+                    // redirects stdout used to flip the runner to IDLE while the
+                    // engine was still up, and the supervisor then launched a
+                    // *second* engine: two tunnels, two route tables, one device.
+                    if (proc.isAlive) {
+                        Log.w(TAG, "engine stdout closed while process still alive; not marking it stopped")
+                    } else if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
                         running.set(false)
                         supervisorState.set(SupervisorState.IDLE)
                         processRef.compareAndSet(proc, null)

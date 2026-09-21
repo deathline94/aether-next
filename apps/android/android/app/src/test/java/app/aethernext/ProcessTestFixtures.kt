@@ -15,15 +15,39 @@ enum class ProcessExitBehavior {
     UNKILLABLE
 }
 
+/**
+ * A live process does not hand its readers EOF: an empty stream let the engine
+ * io thread finish the instant it started, so `start()` raced the very next
+ * assertion and hid the "EOF is not death" bug. Bounded at ~200 ms so no test
+ * leaks a parked thread.
+ */
+private class BlockingInputStream : InputStream() {
+    @Volatile private var released = false
+
+    override fun read(): Int {
+        var waited = 0L
+        while (!released && waited < 200) {
+            Thread.sleep(10)
+            waited += 10
+        }
+        return -1
+    }
+
+    fun release() {
+        released = true
+    }
+}
+
 class FakeProcess(
     private val behavior: ProcessExitBehavior = ProcessExitBehavior.GRACEFUL
 ) : Process() {
+    private val stdout = BlockingInputStream()
     val destroyCalled = AtomicBoolean(false)
     val destroyForciblyCalled = AtomicBoolean(false)
     val waitCount = AtomicInteger(0)
 
     override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
-    override fun getInputStream(): InputStream = ByteArrayInputStream(ByteArray(0))
+    override fun getInputStream(): InputStream = stdout
     override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
 
     val isTerminated: Boolean
@@ -34,7 +58,10 @@ class FakeProcess(
             ProcessExitBehavior.UNKILLABLE -> false
         }
 
-    override fun isAlive(): Boolean = !isTerminated
+    override fun isAlive(): Boolean {
+        if (isTerminated) stdout.release()
+        return !isTerminated
+    }
 
     override fun exitValue(): Int = if (isTerminated) 0 else throw IllegalThreadStateException("Process still alive")
 
@@ -52,10 +79,12 @@ class FakeProcess(
 
     override fun destroy() {
         destroyCalled.set(true)
+        stdout.release()
     }
 
     override fun destroyForcibly(): Process {
         destroyForciblyCalled.set(true)
+        stdout.release()
         return this
     }
 }
