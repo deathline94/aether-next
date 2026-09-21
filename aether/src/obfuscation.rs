@@ -52,7 +52,7 @@ pub fn default_profile(transport: Transport) -> &'static str {
 }
 
 fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.trim().parse().ok()
+    crate::runtime_env::var(key)?.trim().parse().ok()
 }
 
 /// Optional custom knobs from env (used when profile is `custom`).

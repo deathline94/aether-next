@@ -1,0 +1,53 @@
+{
+  "$comment": [
+    "Per-host SPKI pins for the MASQUE/WARP edges. Loaded by aether::trust and",
+    "validated by trust::active_pins() at startup: a host with zero unexpired",
+    "pins is a hard error, never a fallback to 'trust everyone'.",
+    "",
+    "WHY BOTH PINS ARE LISTED UNDER EACH HOST: the two digests below are lifted",
+    "verbatim from consts.rs::MASQUE_PINS, where today they form one global set.",
+    "The audit defect being fixed is that the set replaced certificate",
+    "validation entirely (no chain, no validity period, no hostname) - not that",
+    "it was shared between the two Cloudflare hostnames. Splitting the digests",
+    "across hosts from an armchair would risk rejecting a live peer on a guess,",
+    "so the split is left as an explicitly measured task: observe the leaf each",
+    "SNI actually presents, then narrow. require_hostname stays false for the",
+    "same reason - the peer is dialled by IP, so tightening it needs a live",
+    "verification pass first (T065/T067)."
+  ],
+  "version": 1,
+  "hosts": [
+    {
+      "host": "consumer-masque.cloudflareclient.com",
+      "require_hostname": false,
+      "pins": [
+        {
+          "spki_sha256": "eb591b36ab26ba617e98371918c10bcdeae3742db6e76543f94be524dce1d555",
+          "expires_unix": 1805500800,
+          "note": "masque.cloudflareclient.com leaf, self-signed by Cloudflare"
+        },
+        {
+          "spki_sha256": "3fbb1d7452d32b3881eb4b5d48421445b6b9d8f5225959f033532d502637b040",
+          "expires_unix": 1805500800,
+          "note": "cloudflareaccess.com leaf, issued by Google Trust Services WE1"
+        }
+      ]
+    },
+    {
+      "host": "consumer-masque-proxy.cloudflareclient.com",
+      "require_hostname": false,
+      "pins": [
+        {
+          "spki_sha256": "eb591b36ab26ba617e98371918c10bcdeae3742db6e76543f94be524dce1d555",
+          "expires_unix": 1805500800,
+          "note": "masque.cloudflareclient.com leaf, self-signed by Cloudflare"
+        },
+        {
+          "spki_sha256": "3fbb1d7452d32b3881eb4b5d48421445b6b9d8f5225959f033532d502637b040",
+          "expires_unix": 1805500800,
+          "note": "cloudflareaccess.com leaf, issued by Google Trust Services WE1"
+        }
+      ]
+    }
+  ]
+}

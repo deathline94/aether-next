@@ -30,7 +30,7 @@ pub fn save(path: &str, peer: &str, profile: &str) {
 /// Path for the last-connection cache (smart reconnect). Sibling of the
 /// engine config so it moves with the user's profile.
 pub fn cache_path(base_config: &str) -> String {
-    if let Ok(p) = std::env::var("AETHER_LASTCONN_PATH") {
+    if let Some(p) = crate::runtime_env::var("AETHER_LASTCONN_PATH") {
         return p;
     }
     let dir_end = base_config.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);

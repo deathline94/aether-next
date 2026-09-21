@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod aethernoize;
+pub mod cli;
 pub mod config;
 pub mod consts;
 pub mod dns;
@@ -23,6 +24,7 @@ pub mod obfuscation;
 pub mod prober;
 pub mod quic;
 pub mod routing_plane;
+pub mod route_repair;
 pub mod runtime_env;
 pub mod session;
 pub mod session_event;
@@ -30,6 +32,7 @@ pub mod socks;
 pub mod tls;
 #[cfg(windows)]
 pub mod tun_win;
+pub mod trust;
 pub mod tunnel;
 pub mod tunnelping;
 pub mod wireguard;

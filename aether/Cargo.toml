@@ -42,6 +42,20 @@ tokio-util = { version = "0.7", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 fs2 = "0.4"
 
+[dev-dependencies]
+# `internal` exposes quiche::test_utils::Pipe, an in-memory QUIC pair, so the
+# transport tests can feed the tunnel loop hostile post-handshake packets,
+# interim responses and off-stream headers deterministically.
+#
+# Dev-only on purpose: enabling it for the release build would ship quiche's
+# test hooks. Test-only fixtures that cannot run against shipped code are one of
+# the failure modes this feature exists to remove (see specs/015 research R42).
+quiche = { path = "../quiche/quiche", default-features = false, features = [
+  "boringssl-boring-crate",
+  "qlog",
+  "internal",
+] }
+
 [target.'cfg(windows)'.dependencies]
 wintun-bindings = "0.7"
 windows-sys = { version = "0.61", features = [

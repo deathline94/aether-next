@@ -13,6 +13,7 @@ name = "aether-desktop"
 version = "1.2.9"
 dependencies = [
  "base64 0.22.1",
+ "parking_lot",
  "rand",
  "serde",
  "serde_json",

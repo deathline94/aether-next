@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use wintun_bindings::{Adapter, Session, MAX_RING_CAPACITY};
 
 use crate::error::{AetherError, Result};
+use crate::route_repair::{RouteIntent, RouteJournal, ScopeKind};
 
 const ADAPTER_NAME: &str = "Aether";
 const TUNNEL_TYPE: &str = "Aether";
@@ -23,7 +24,7 @@ pub fn enabled() -> bool {
 }
 
 fn find_wintun_dll() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("AETHER_WINTUN") {
+    if let Some(p) = crate::runtime_env::var("AETHER_WINTUN") {
         let path = PathBuf::from(p);
         if path.exists() {
             return Ok(path);
@@ -209,7 +210,58 @@ fn interface_index(name: &str) -> Result<u32> {
     Ok(idx)
 }
 
-fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<(Ipv4Addr, u32, u32)> {
+/// Build the intent journal for the routes this function is about to create.
+///
+/// Written and flushed to disk **before** the first mutation, so a process that
+/// dies mid-install leaves a replayable record instead of a half-configured host
+/// with no note of what it touched.
+fn plan_journal(
+    peer_ip: Ipv4Addr,
+    ipv4: Ipv4Addr,
+    gateway: Ipv4Addr,
+    tun_if: u32,
+    phys_if: u32,
+) -> RouteJournal {
+    let mut entries = Vec::new();
+    for dest in crate::route_repair::SPLIT_DEFAULTS_V4 {
+        let (destination, mask) = dest.split_once('/').unwrap_or((dest, "0"));
+        entries.push(RouteIntent {
+            destination: destination.into(),
+            mask: crate::route_repair::prefix_len_to_mask(
+                mask.parse::<u32>().unwrap_or(0)
+            ),
+            // On-link on the tunnel interface, WireGuard-style.
+            next_hop: "0.0.0.0".into(),
+            if_index: tun_if,
+            family: 2,
+        });
+    }
+    entries.push(RouteIntent {
+        destination: peer_ip.to_string(),
+        mask: "255.255.255.255".into(),
+        next_hop: gateway.to_string(),
+        if_index: phys_if,
+        family: 2,
+    });
+    RouteJournal {
+        version: crate::route_repair::JOURNAL_VERSION,
+        created_unix: crate::trust::now_unix(),
+        creator_pid: std::process::id(),
+        tun_alias: ADAPTER_NAME.into(),
+        tun_if_index: tun_if,
+        phys_if_index: phys_if,
+        gateway: gateway.to_string(),
+        tunnel_ipv4: ipv4.to_string(),
+        peer_ipv4: peer_ip.to_string(),
+        entries,
+        // Captured by configure_adapter_ip's caller on a future pass; the
+        // reset path today restores to Automatic/empty, which is the safe
+        // default for an adapter this process created.
+        before: None,
+    }
+}
+
+fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
     let peer_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => {
@@ -223,6 +275,14 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<(Ipv4Addr, u32, u3
     let peer_s = peer_ip.to_string();
     let gw_s = gw.to_string();
     let via = ipv4.to_string();
+
+    // Journal first, fail closed: an install we cannot record is an install we
+    // cannot undo, and undoing is the whole point.
+    let mut journal = plan_journal(peer_ip, ipv4, gw, if_index, physical_if_index);
+    if let Some(path) = crate::route_repair::journal_path() {
+        crate::route_repair::write_journal(&path, &journal)
+            .map_err(|e| AetherError::Other(format!("refusing to mutate routes: {e}")))?;
+    }
 
     // WireGuard-Windows style: on-link split default on tunnel IF (NextHop 0.0.0.0),
     // plus host route for edge peer via physical gateway. Prefer New-NetRoute.
@@ -288,12 +348,15 @@ try {{
             let ifs = if_index.to_string();
             let phys_s = physical_if_index.to_string();
             // 1. Mandatory peer escape route pinned to physical interface
-            run_cmd(
+            if let Err(err) = run_cmd(
                 "route",
                 &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1", "IF", &phys_s],
-            ).map_err(|err| {
-                AetherError::Other(format!("failed to install physical peer escape route: {err}"))
-            })?;
+            ) {
+                clear_journal();
+                return Err(AetherError::Other(format!(
+                    "failed to install physical peer escape route: {err}"
+                )));
+            }
 
             // 2. Transactional split-default installation with rollback on failure
             let mut installed_splits = Vec::new();
@@ -308,64 +371,94 @@ try {{
                         let _ = run_cmd("route", &["delete", installed, "mask", "128.0.0.0", "IF", &ifs]);
                     }
                     let _ = run_cmd("route", &["delete", &peer_s, "mask", "255.255.255.255", "IF", &phys_s]);
+                    clear_journal();
                     return Err(add_err);
                 }
                 installed_splits.push(dest);
+            }
+            // route.exe installs the split defaults *via the tunnel address*, not
+            // on-link. The journal must describe what actually exists, or a later
+            // next-hop-scoped removal would match nothing and leave the routes in
+            // place forever.
+            for entry in &mut journal.entries {
+                if entry.next_hop == "0.0.0.0" {
+                    entry.next_hop = via.clone();
+                }
+            }
+            if let Some(path) = crate::route_repair::journal_path() {
+                if let Err(err) = crate::route_repair::write_journal(&path, &journal) {
+                    log::error!("[tun] installed routes but the journal is stale: {err}");
+                }
             }
             log::info!(
                 "[tun] routes installed (route.exe): peer via {gw_s} IF={physical_if_index}, split-default {via} IF={if_index}"
             );
         }
     }
-    Ok((gw, if_index, physical_if_index))
+    Ok(journal)
 }
 
-fn remove_routes(peer: SocketAddr, ipv4: Ipv4Addr, gateway: Ipv4Addr, tun_if: u32, phys_if: u32) {
-    let _ = ipv4;
-    let peer_s = match peer.ip() {
-        IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(_) => return,
-    };
-    let gw_s = gateway.to_string();
-    // M1 fix: scope every deletion to the interfaces WE touched instead of
-    // ripping 0/1+128/1 split defaults from ALL interfaces (which killed any
-    // coexisting VPN's routes). Legacy state files without recorded indexes
-    // fall back to the old global behavior rather than leaking routes.
-    let scope_ps = if tun_if != 0 || phys_if != 0 {
-        let mut conds = Vec::new();
-        if tun_if != 0 {
-            conds.push(format!("$_.InterfaceIndex -eq {tun_if}"));
+/// Remove exactly the routes the journal says we created, and nothing else.
+///
+/// Every deletion is scoped by a recorded interface index or, failing that, by
+/// our own next-hop address; where neither is known the plan refuses. The
+/// previous code fell back to removing `0.0.0.0/1` and `128.0.0.0/1` from
+/// *every* interface whenever the recorded indexes were 0 — which is the exact
+/// prefix pair OpenVPN/Cisco/AnyConnect use for split tunnelling, so a legacy or
+/// truncated state file let an Aether disconnect take down an unrelated VPN.
+fn remove_routes(journal: &RouteJournal) {
+    let plan = journal.removal_plan();
+    if plan.is_empty() {
+        log::warn!("[tun] no removal plan for this journal; leaving routes untouched");
+        return;
+    }
+    let mut script = String::from("$ErrorActionPreference = 'SilentlyContinue'\n");
+    let mut issued = 0usize;
+    let mut refused = 0usize;
+    for p in plan {
+        let Some(cidr) = crate::route_repair::as_cidr(&p.destination, &p.mask) else {
+            log::error!(
+                "[tun] cannot express {}/{:?} as a prefix; refusing this removal",
+                p.destination, p.mask
+            );
+            refused += 1;
+            continue;
+        };
+        match &p.scope {
+            ScopeKind::Interface { if_index } => {
+                script.push_str(&format!(
+                    "Get-NetRoute -DestinationPrefix '{cidr}' -InterfaceIndex {if_index} -ErrorAction SilentlyContinue |\n  Where-Object {{ $_.InterfaceIndex -eq {if_index} }} |\n  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n"
+                ));
+                issued += 1;
+            }
+            ScopeKind::NextHop { next_hop } if ps_literal_is_safe(next_hop) => {
+                script.push_str(&format!(
+                    "Get-NetRoute -DestinationPrefix '{cidr}' -ErrorAction SilentlyContinue |\n  Where-Object {{ $_.NextHop -eq '{next_hop}' }} |\n  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n"
+                ));
+                issued += 1;
+            }
+            ScopeKind::NextHop { next_hop } => {
+                log::error!("[tun] refusing removal for {cidr}: rejected next-hop {next_hop:?}");
+                refused += 1;
+            }
+            ScopeKind::Refused { why } => {
+                log::error!("[tun] refusing to remove {cidr}: {why}");
+                refused += 1;
+            }
         }
-        if phys_if != 0 {
-            conds.push(format!("$_.InterfaceIndex -eq {phys_if}"));
+    }
+    if issued > 0 {
+        // One shell spawn for the whole plan, not one per prefix: the teardown
+        // has to fit inside the supervisor's grace window or it never runs.
+        if let Err(e) = ps(&script) {
+            log::error!("[tun] route removal reported an error: {e}");
         }
-        format!("| Where-Object {{ {} }}", conds.join(" -or "))
-    } else {
-        String::new()
-    };
-    let mut script = format!(
-        r#"
-foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','{peer_s}/32')) {{
-  Get-NetRoute -DestinationPrefix $p -ErrorAction SilentlyContinue{scope_ps} |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-}}
-"#
+    }
+    log::info!(
+        "[tun] route removal: {} scoped deletion(s) issued, {} refused",
+        issued,
+        refused
     );
-    script.push_str(&format!(
-        "\nroute delete {peer_s} mask 255.255.255.255 {gw_s}"
-    ));
-    if tun_if != 0 {
-        script.push_str(&format!(" IF {tun_if}"));
-    }
-    script.push_str(" 2>$null\n");
-    for dest in ["0.0.0.0", "128.0.0.0"] {
-        script.push_str(&format!("\nroute delete {dest} mask 128.0.0.0"));
-        if tun_if != 0 {
-            script.push_str(&format!(" IF {tun_if}"));
-        }
-        script.push_str(" 2>$null");
-    }
-    let _ = ps(&script);
 }
 
 /// M1 fix (continued): undo what configure_adapter_ip set on the tunnel NIC —
@@ -374,6 +467,7 @@ foreach ($p in @('0.0.0.0/1','128.0.0.0/1','::/1','8000::/1','{peer_s}/32')) {{
 /// resolution via a now-dead path. Called on drop and on stale-state recovery.
 fn reset_adapter_config(name: &str) {
     if !ps_literal_is_safe(name) {
+        log::error!("[tun] refusing to reset adapter config for unsafe alias {name:?}");
         return;
     }
     let script = format!(
@@ -382,147 +476,197 @@ Set-DnsClientServerAddress -InterfaceAlias '{name}' -ResetServerAddresses -Error
 Set-NetIPInterface -InterfaceAlias '{name}' -AutomaticMetric Enabled -ErrorAction SilentlyContinue
 "#
     );
-    let _ = ps(&script);
+    // Teardown failures used to be discarded with `let _ =`, so a host left with
+    // a dead NIC's pinned resolver looked like a clean disconnect.
+    if let Err(e) = ps(&script) {
+        log::error!("[tun] adapter {name} reset failed: {e}");
+    }
 }
 
-fn route_state_path() -> Option<PathBuf> {
+fn clear_journal() {
+    if let Some(path) = crate::route_repair::journal_path() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::error!("[tun] could not clear journal {}: {e}", path.display());
+            }
+        }
+    }
+    // The pre-journal file name, cleaned up so an upgrade cannot leave a second
+    // stale record that a future reader might trust over the journal.
+    if let Some(legacy) = legacy_state_path() {
+        let _ = std::fs::remove_file(legacy);
+    }
+}
+
+fn legacy_state_path() -> Option<PathBuf> {
     let dir = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
     Some(dir.join("AetherNext").join("tun-routes.json"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RouteState {
-    peer: String,
-    ipv4: String,
-    gateway: String,
-    /// Process id that installed routes (stale if dead).
-    pid: u32,
-    /// Interface indexes the routes were installed on, so cleanup can be scoped
-    /// (0 = unknown / legacy state file → global removal fallback).
-    #[serde(default)]
-    tun_if: u32,
-    #[serde(default)]
-    phys_if: u32,
-}
-
-fn persist_routes(
-    peer: SocketAddr,
-    ipv4: Ipv4Addr,
-    gateway: Ipv4Addr,
-    tun_if: u32,
-    phys_if: u32,
-) {
-    let Some(path) = route_state_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// Upgrade the pre-journal `tun-routes.json` into a journal.
+///
+/// The legacy record carries the tunnel address, so removal can still be
+/// next-hop scoped even when its interface indexes are zero — which is exactly
+/// the case that used to trigger global prefix deletion.
+fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
+    let g = |k: &str| state.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let u = |k: &str| state.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(0);
+    let tunnel_ipv4 = g("ipv4");
+    let peer_ipv4 = g("peer");
+    if tunnel_ipv4.is_empty() && peer_ipv4.is_empty() {
+        return None;
     }
-    let state = RouteState {
-        peer: peer.ip().to_string(),
-        ipv4: ipv4.to_string(),
-        gateway: gateway.to_string(),
-        pid: std::process::id(),
-        tun_if,
-        phys_if,
-    };
-    if let Ok(body) = serde_json::to_vec_pretty(&state) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(tmp, path);
-        }
+    let tun_if = u("tun_if");
+    let phys_if = u("phys_if");
+    let mut entries = Vec::new();
+    for dest in crate::route_repair::SPLIT_DEFAULTS_V4 {
+        let (destination, mask) = dest.split_once('/').unwrap_or((dest, "0"));
+        entries.push(RouteIntent {
+            destination: destination.into(),
+            mask: crate::route_repair::prefix_len_to_mask(mask.parse::<u32>().unwrap_or(0)),
+            next_hop: if tun_if != 0 { "0.0.0.0".into() } else { tunnel_ipv4.clone() },
+            if_index: tun_if,
+            family: 2,
+        });
     }
-}
-
-fn clear_persisted_routes() {
-    if let Some(path) = route_state_path() {
-        let _ = std::fs::remove_file(path);
+    if !peer_ipv4.is_empty() {
+        entries.push(RouteIntent {
+            destination: peer_ipv4.clone(),
+            mask: "255.255.255.255".into(),
+            next_hop: g("gateway"),
+            if_index: phys_if,
+            family: 2,
+        });
     }
+    Some(RouteJournal {
+        version: crate::route_repair::JOURNAL_VERSION,
+        created_unix: 0,
+        creator_pid: u("pid"),
+        tun_alias: ADAPTER_NAME.into(),
+        tun_if_index: tun_if,
+        phys_if_index: phys_if,
+        gateway: g("gateway"),
+        tunnel_ipv4,
+        peer_ipv4,
+        entries,
+        before: None,
+    })
 }
 
 /// Remove routes left by a crashed previous engine process.
 pub fn recover_stale_routes() {
-    let Some(path) = route_state_path() else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
-    };
-    let Ok(state) = serde_json::from_slice::<RouteState>(&bytes) else {
-        let _ = std::fs::remove_file(&path);
-        return;
-    };
-    // If installer process still lives, leave routes alone (another instance).
-    if state.pid != 0 && process_alive(state.pid) {
-        return;
-    }
-    let peer_ip = state.peer.parse::<IpAddr>().ok();
-    let ipv4 = state.ipv4.parse::<Ipv4Addr>().ok();
-    let gateway = state.gateway.parse::<Ipv4Addr>().ok();
-    if let (Some(IpAddr::V4(peer_ip)), Some(ipv4), Some(gateway)) = (peer_ip, ipv4, gateway) {
-        log::warn!("[tun] recovering stale routes from previous session");
-        remove_routes(
-            SocketAddr::new(IpAddr::V4(peer_ip), 0),
-            ipv4,
-            gateway,
-            state.tun_if,
-            state.phys_if,
-        );
-        // M1 fix: the crashed session also left pinned DNS + metric=1 on the
-        // adapter; reset those too or name resolution limps through a dead NIC.
-        reset_adapter_config(ADAPTER_NAME);
-    }
-    let _ = std::fs::remove_file(path);
-}
-
-fn process_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // tasklist is slow; use OpenProcess via wmic-less approach: try kill with signal 0 equivalent.
-        // On Windows, OpenProcess + GetExitCodeProcess would need FFI; use `tasklist /FI PID eq`.
-        let out = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .creation_flags(0x08000000)
-            .output();
-        match out {
-            Ok(o) => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.contains(&pid.to_string())
+    let mut handled = false;
+    if let Some(path) = crate::route_repair::journal_path() {
+        match RouteJournal::load_opt(&path) {
+            Ok(Some(journal)) => {
+                let alive = journal.creator_pid != 0 && process_alive(journal.creator_pid);
+                if alive {
+                    log::info!(
+                        "[tun] routes owned by live pid {}; leaving them alone",
+                        journal.creator_pid
+                    );
+                    return;
+                }
+                if journal.creator_pid != 0 {
+                    log::warn!(
+                        "[tun] recovering stale routes from dead pid {}",
+                        journal.creator_pid
+                    );
+                    remove_routes(&journal);
+                    reset_adapter_config(ADAPTER_NAME);
+                    handled = true;
+                }
+                let _ = std::fs::remove_file(&path);
             }
-            Err(_) => false,
+            Ok(None) => {}
+            Err(e) => log::error!("[tun] journal unreadable, cannot verify host state: {e}"),
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = pid;
-        false
+    // Pre-journal state file from an older build.
+    if let Some(legacy) = legacy_state_path() {
+        if let Ok(raw) = std::fs::read(&legacy) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(journal) = journal_from_legacy(&v) {
+                    if journal.is_abandoned(process_alive(journal.creator_pid)) {
+                        log::warn!(
+                            "[tun] recovering legacy routes from dead pid {}",
+                            journal.creator_pid
+                        );
+                        remove_routes(&journal);
+                        reset_adapter_config(ADAPTER_NAME);
+                        handled = true;
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+    if handled {
+        log::info!("[tun] stale route recovery complete");
     }
 }
+
+/// Is this pid ours, right now?
+///
+/// Exact field match. The shipped version asked `tasklist` for the pid and then
+/// substring-searched the whole output, so pid `4` matched the working-set and
+/// session columns of unrelated rows: a long-dead holder looked alive, stale
+/// routes were never cleaned, and the machine stayed black-holed.
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use std::os::windows::process::CommandExt;
+    let out = Command::new("tasklist")
+        .args([
+            "/FI",
+            &format!("PID eq {pid}"),
+            "/NH",
+            "/FO",
+            "CSV",
+        ])
+        .creation_flags(0x08000000)
+        .output();
+    let Ok(o) = out else {
+        log::warn!("[tun] liveness probe for pid {pid} failed to run; assuming dead");
+        return false;
+    };
+    if !o.status.success() {
+        log::warn!(
+            "[tun] liveness probe for pid {pid} exited {}: assuming dead",
+            o.status.code().unwrap_or(-1)
+        );
+        return false;
+    }
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("INFO:") {
+            continue;
+        }
+        // CSV row: "image.exe","pid","session name",...
+        if let Some(field) = line.split(',').nth(1) {
+            if field.trim_matches('"').parse::<u32>() == Ok(pid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 
 pub struct TunHandle {
     _adapter: Arc<Adapter>,
     session: Arc<Session>,
-    peer: SocketAddr,
-    ipv4: Ipv4Addr,
-    gateway: Ipv4Addr,
-    tun_if: u32,
-    phys_if: u32,
+    journal: RouteJournal,
 }
 
 impl Drop for TunHandle {
     fn drop(&mut self) {
-        remove_routes(
-            self.peer,
-            self.ipv4,
-            self.gateway,
-            self.tun_if,
-            self.phys_if,
-        );
-        clear_persisted_routes();
-        // M1 fix: restore adapter DNS + metric so the lingering NIC cannot keep
+        remove_routes(&self.journal);
+        clear_journal();
+        // Restore adapter DNS + metric so the lingering NIC cannot keep
         // hijacking name resolution after disconnect.
         reset_adapter_config(ADAPTER_NAME);
         let _ = self.session.shutdown();
@@ -564,11 +708,8 @@ pub async fn spawn(
         .start_session(MAX_RING_CAPACITY)
         .map_err(|e| AetherError::Other(format!("start session: {e}")))?;
     recover_stale_routes();
-    let (gateway, tun_if, phys_if) = match install_routes(peer, ipv4) {
-        Ok(result) => {
-            persist_routes(peer, ipv4, result.0, result.1, result.2);
-            result
-        }
+    let journal = match install_routes(peer, ipv4) {
+        Ok(journal) => journal,
         Err(error) => {
             let _ = session.shutdown();
             return Err(error);
@@ -579,11 +720,7 @@ pub async fn spawn(
     let handle = TunHandle {
         _adapter: adapter,
         session: session.clone(),
-        peer,
-        ipv4,
-        gateway,
-        tun_if,
-        phys_if,
+        journal,
     };
 
     // High-throughput path: dedicated OS thread reads WinTUN ring (kernel packets)

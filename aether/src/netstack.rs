@@ -18,10 +18,30 @@ const UDP_BUF: usize = 128 * 1024;
 const UDP_META: usize = 128;
 const APP_QUEUE: usize = 256;
 const MAX_INGEST_PER_TICK: usize = 256;
+const MAX_CMDS_PER_TICK: usize = 64;
+const MAX_APPDATA_PER_TICK: usize = 64;
 const MAX_RECV_CHUNKS: usize = 64;
 const MAX_TCP_CONNECTIONS: usize = 512;
 const MAX_UDP_CONNECTIONS: usize = 128;
 const MAX_PENDING_PER_CONN: usize = 512 * 1024;
+
+/// Upper bound on frames the device will queue for the tunnel.
+///
+/// Returning `None` from `transmit` is smoltcp's "device buffer full" signal
+/// (`socket_egress` maps it to `EgressError::Exhausted => break`), and because
+/// `emit()` runs before the TCP sequence state advances, the segment is retried
+/// on the next poll rather than lost. Before this cap the queue was an
+/// unbounded `VecDeque<Vec<u8>>`: a peer that advertises a window while the
+/// tunnel queue is saturated grew memory until the allocator aborted.
+const TX_RING: usize = 256;
+
+/// Upper bound on frames the tunnel has pushed in that smoltcp has not polled
+/// yet. Symmetric with TX_RING: the inbound side is attacker-influenced (the
+/// peer decides how much comes back), so an unbounded `rx` let a fast peer grow
+/// our memory while our poll loop was busy. Dropping here is safe — TCP/UDP
+/// recover by retransmit, which is exactly what an oversize window would have
+/// caused anyway once the socket buffer filled.
+const RX_RING: usize = 512;
 
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
 type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
@@ -30,6 +50,13 @@ pub struct StackDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
     mtu: usize,
+    /// Frames refused because the ring was full, so "backpressured" is
+    /// distinguishable from "idle" in diagnostics instead of being invisible.
+    pub tx_deferred: u64,
+    /// Inbound frames dropped by the RX_RING admission cap (see `push_ingress`).
+    pub rx_dropped: u64,
+    /// Bytes currently queued for ingress; drives the soft byte admission budget.
+    pub rx_bytes: usize,
 }
 
 impl StackDevice {
@@ -38,12 +65,35 @@ impl StackDevice {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
             mtu,
+            tx_deferred: 0,
+            rx_dropped: 0,
+            rx_bytes: 0,
         }
+    }
+
+    /// Admit one inbound frame, bounded by both frame count and bytes.
+    ///
+    /// Returns `false` when the frame was dropped. Silently accepting an
+    /// unbounded queue turned a peer that floods us while our poll loop is busy
+    /// into an allocator abort, so over the budget the frame is discarded and
+    /// the count is surfaced instead — TCP/UDP retransmit is the intended
+    /// recovery path for a full receiver, not memory exhaustion.
+    fn push_ingress(&mut self, pkt: Vec<u8>) -> bool {
+        const RX_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+        if self.rx.len() >= RX_RING || self.rx_bytes + pkt.len() > RX_BYTE_BUDGET {
+            self.rx_dropped += 1;
+            return false;
+        }
+        self.rx_bytes += pkt.len();
+        self.rx.push_back(pkt);
+        true
     }
 }
 
 pub struct StackRxToken(Vec<u8>);
-pub struct StackTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+pub struct StackTxToken<'a> {
+    queue: &'a mut VecDeque<Vec<u8>>,
+}
 
 impl RxToken for StackRxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -55,7 +105,7 @@ impl<'a> TxToken for StackTxToken<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        self.0.push_back(buf);
+        self.queue.push_back(buf);
         r
     }
 }
@@ -66,11 +116,27 @@ impl Device for StackDevice {
 
     fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.pop_front()?;
-        Some((StackRxToken(pkt), StackTxToken(&mut self.tx)))
+        self.rx_bytes = self.rx_bytes.saturating_sub(pkt.len());
+        // The token paired with an ingress packet is deliberately *not* capped:
+        // dropping an ACK is unsafe, because `ack_reply` updates remote_last_ack
+        // eagerly and a lost reply is not regenerated until new data or a window
+        // update arrives — whereas a refused egress segment is simply retried.
+        Some((
+            StackRxToken(pkt),
+            StackTxToken {
+                queue: &mut self.tx,
+            },
+        ))
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
-        Some(StackTxToken(&mut self.tx))
+        if self.tx.len() >= TX_RING {
+            self.tx_deferred += 1;
+            return None;
+        }
+        Some(StackTxToken {
+            queue: &mut self.tx,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -265,6 +331,8 @@ pub struct NetStack {
     udp_conns: HashMap<usize, UdpState>,
     next_id: usize,
     next_port: u16,
+    /// Odd step used to walk the ephemeral band (see `alloc_port`).
+    port_stride: u16,
     data_in_tx: mpsc::Sender<DataIn>,
 }
 
@@ -402,7 +470,8 @@ pub fn spawn(
         tcp_conns: HashMap::new(),
         udp_conns: HashMap::new(),
         next_id: 1,
-        next_port: 49152,
+        next_port: port_seed().0,
+        port_stride: port_seed().1,
         data_in_tx: data_in_tx.clone(),
     };
 
@@ -411,10 +480,46 @@ pub fn spawn(
     Ok(StackHandle { cmd_tx })
 }
 
-fn alloc_port(p: &mut u16) -> u16 {
+/// Ephemeral band.
+///
+/// Sequential allocation (49152, 49153, …) let an off-path attacker predict a
+/// query's client port, leaving only the 16-bit DNS transaction ID to guess and
+/// making retries free. 49152..=65535 spans exactly 2^14, so any odd stride is
+/// coprime with it and visits the whole band before repeating.
+const EPHEMERAL_BASE: u16 = 49152;
+const EPHEMERAL_SPAN: u16 = 16384;
+
+fn alloc_port(p: &mut u16, stride: u16) -> u16 {
     let port = *p;
-    *p = if port >= 65000 { 49152 } else { port + 1 };
+    let next = port.wrapping_add(stride);
+    // Only the `wrapping_add` overflow can leave the band, and 65536 is a
+    // multiple of EPHEMERAL_SPAN, so the remap is an exact mod-band wrap: every
+    // port in 49152..=65535 is visited before the cycle repeats.
+    *p = if next < EPHEMERAL_BASE {
+        EPHEMERAL_BASE + (next % EPHEMERAL_SPAN)
+    } else {
+        next
+    };
     port
+}
+
+fn next_ephemeral(from: u16, stride: u16) -> u16 {
+    let mut cursor = from;
+    alloc_port(&mut cursor, stride);
+    cursor
+}
+
+/// Random start plus an odd stride inside the ephemeral band.
+fn seed_port_cursor() -> (u16, u16) {
+    let start = EPHEMERAL_BASE + (rand::random::<u16>() % EPHEMERAL_SPAN);
+    let stride = (((rand::random::<u16>() | 1) % (EPHEMERAL_SPAN - 1)) | 1).max(17);
+    (start, stride)
+}
+
+/// One random seed shared by every stack in the process.
+fn port_seed() -> (u16, u16) {
+    static SEED: std::sync::OnceLock<(u16, u16)> = std::sync::OnceLock::new();
+    *SEED.get_or_init(seed_port_cursor)
 }
 
 /// L-fix: pick the next ephemeral port that no live TCP/UDP socket is bound to.
@@ -424,7 +529,7 @@ fn alloc_port(p: &mut u16) -> u16 {
 fn alloc_unique_port(s: &NetStack) -> Option<u16> {
     let mut cursor = s.next_port;
     for _ in 0..16000 {
-        let cand = alloc_port(&mut cursor);
+        let cand = alloc_port(&mut cursor, s.port_stride);
         let tcp_taken = s.tcp_conns.values().any(|st| {
             matches!(
                 s.sockets.get::<tcp::Socket>(st.handle).local_endpoint(),
@@ -465,6 +570,7 @@ async fn run(
                 "[netstack] smoltcp poll panicked; dropping in-flight rx/tx buffers and continuing"
             );
             s.device.rx.clear();
+            s.device.rx_bytes = 0;
             s.device.tx.clear();
         }
         for (name, svc) in [
@@ -486,6 +592,7 @@ async fn run(
             if outcome.is_err() {
                 log::error!("[netstack] {name} panicked; dropping in-flight rx/tx buffers and continuing");
                 s.device.rx.clear();
+                s.device.rx_bytes = 0;
                 s.device.tx.clear();
             }
         }
@@ -496,19 +603,11 @@ async fn run(
             .map(|d| std::time::Duration::from_micros(d.total_micros()));
 
         tokio::select! {
-            biased;
-
             maybe = inbound_rx.recv() => {
                 match maybe {
                     Some(pkt) => {
-                        s.device.rx.push_back(pkt);
-                        let mut n = 0;
-                        while n < MAX_INGEST_PER_TICK {
-                            match inbound_rx.try_recv() {
-                                Ok(p) => { s.device.rx.push_back(p); n += 1; }
-                                Err(_) => break,
-                            }
-                        }
+                        s.device.push_ingress(pkt);
+                        drain_backlog(&mut s, &mut cmd_rx, &mut data_in_rx, &mut inbound_rx);
                     }
                     None => return Ok(()),
                 }
@@ -516,22 +615,95 @@ async fn run(
 
             maybe = cmd_rx.recv() => {
                 match maybe {
-                    Some(cmd) => handle_cmd(&mut s, cmd),
+                    Some(cmd) => {
+                        guard_cmd(&mut s, cmd);
+                        drain_backlog(&mut s, &mut cmd_rx, &mut data_in_rx, &mut inbound_rx);
+                    }
                     None => return Ok(()),
                 }
             }
 
             maybe = data_in_rx.recv() => {
                 if let Some(d) = maybe {
-                    handle_data(&mut s, d);
-                    while let Ok(d2) = data_in_rx.try_recv() {
-                        handle_data(&mut s, d2);
-                    }
+                    guard_data(&mut s, d);
+                    drain_backlog(&mut s, &mut cmd_rx, &mut data_in_rx, &mut inbound_rx);
+                } else {
+                    return Ok(());
                 }
             }
 
             _ = sleep_opt(delay) => {}
         }
+    }
+}
+
+/// Round-robin the channels' backlog after any wakeup.
+///
+/// Each source is capped per pass and every pass restarts from the top, so a
+/// flood on one class (the peer pushing ingress at us, or a client blasting
+/// writes) cannot starve the other two. Without this, a `biased;` select let
+/// the always-ready inbound arm win every iteration: `open_tcp` from a new tab
+/// then waits out the browser connection storm instead of the ~ms it should.
+fn drain_backlog(
+    s: &mut NetStack,
+    cmd_rx: &mut mpsc::Receiver<Cmd>,
+    data_in_rx: &mut mpsc::Receiver<DataIn>,
+    inbound_rx: &mut mpsc::Receiver<Vec<u8>>,
+) {
+    let (mut ing, mut cm, mut ad) = (0usize, 0usize, 0usize);
+    loop {
+        let mut progressed = false;
+
+        if ing < MAX_INGEST_PER_TICK {
+            if let Ok(pkt) = inbound_rx.try_recv() {
+                s.device.push_ingress(pkt);
+                ing += 1;
+                progressed = true;
+            }
+        }
+        if cm < MAX_CMDS_PER_TICK {
+            if let Ok(cmd) = cmd_rx.try_recv() {
+                guard_cmd(s, cmd);
+                cm += 1;
+                progressed = true;
+            }
+        }
+        if ad < MAX_APPDATA_PER_TICK {
+            if let Ok(d) = data_in_rx.try_recv() {
+                guard_data(s, d);
+                ad += 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return;
+        }
+    }
+}
+
+/// `handle_cmd` touches every socket handle the app knows about; a panic there
+/// previously aborted the whole netstack task (and with it every tunnel)
+/// because only `iface.poll` was wrapped. A dropped responder is a clean
+/// `Err` at the caller, so containing here is strictly better than dying.
+fn guard_cmd(s: &mut NetStack, cmd: Cmd) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_cmd(s, cmd);
+    }));
+    if outcome.is_err() {
+        log::error!("[netstack] handle_cmd panicked; dropping in-flight rx buffers and continuing");
+        s.device.rx.clear();
+        s.device.rx_bytes = 0;
+    }
+}
+
+fn guard_data(s: &mut NetStack, d: DataIn) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_data(s, d);
+    }));
+    if outcome.is_err() {
+        log::error!("[netstack] handle_data panicked; dropping in-flight rx buffers and continuing");
+        s.device.rx.clear();
+        s.device.rx_bytes = 0;
     }
 }
 
@@ -563,7 +735,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
 
             let local_port = match alloc_unique_port(s) {
                 Some(p) => {
-                    s.next_port = if p >= 65000 { 49152 } else { p + 1 };
+                    s.next_port = next_ephemeral(p, s.port_stride);
                     p
                 }
                 None => {
@@ -610,7 +782,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
 
             let local_port = match alloc_unique_port(s) {
                 Some(p) => {
-                    s.next_port = if p >= 65000 { 49152 } else { p + 1 };
+                    s.next_port = next_ephemeral(p, s.port_stride);
                     p
                 }
                 None => {
@@ -688,6 +860,18 @@ fn service_tcp(s: &mut NetStack) {
         let data_in_tx = s.data_in_tx.clone();
 
         if !s.tcp_conns[&id].established && state == tcp::State::Established {
+            // The 10 s timeout armed at connect is *also* smoltcp's inactivity
+            // abort (`timed_out` compares remote_last_ts + timeout), so leaving
+            // it armed killed every SSH / IMAP / long-poll / WebSocket / DB /
+            // HTTP keep-alive session that went quiet for 10 s. Widen the abort
+            // and start probing: a live idle peer's ACK refreshes
+            // remote_last_ts, a dead peer stops answering and is reaped ~75 s.
+            // `set_timeout(None)` was rejected — it leaves the stack unsupervised.
+            {
+                let sock = s.sockets.get_mut::<tcp::Socket>(handle);
+                sock.set_timeout(Some(smoltcp::time::Duration::from_secs(75)));
+                sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
+            }
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.established = true;
                 if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
@@ -815,35 +999,24 @@ fn service_udp(s: &mut NetStack) {
 }
 
 fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
-    // Prefer small packets (TCP ACKs ~40-80B). If data fills the tunnel queue first,
-    // ACKs starve and download collapses — classic userspace-tunnel failure mode.
-    const ACKISH: usize = 128;
-    let mut deferred: VecDeque<Vec<u8>> = VecDeque::new();
+    // Strict FIFO. The previous version sent every frame <= 128 bytes ahead of
+    // larger deferred ones so TCP ACKs could not starve — but size cannot
+    // distinguish a pure ACK from a small PSH data segment (an SSH keystroke, a
+    // short HTTP request), so a later small frame overtook an earlier 1448-byte
+    // segment *on the same connection*: receiver reordering, duplicate ACKs and
+    // spurious fast-retransmit / reorder-timeout. `specs/004` FR-001 was marked
+    // fixed by a test using four identical 200-byte packets, which cannot
+    // observe the inversion.
+    //
+    // ACK latency is already bounded structurally: `socket_egress` emits at most
+    // one packet per socket per poll, and TX_RING caps how long a frame waits.
     while let Some(pkt) = s.device.tx.pop_front() {
-        if pkt.len() > ACKISH {
-            deferred.push_back(pkt);
-            continue;
-        }
         match outbound_tx.try_send(pkt) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
+                // Head-of-queue restore, then stop: order is preserved and the
+                // next poll retries the same frame.
                 s.device.tx.push_front(pkt);
-                while let Some(d) = deferred.pop_back() {
-                    s.device.tx.push_front(d);
-                }
-                return;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-        }
-    }
-    while let Some(pkt) = deferred.pop_front() {
-        match outbound_tx.try_send(pkt) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
-                deferred.push_front(pkt);
-                while let Some(d) = deferred.pop_back() {
-                    s.device.tx.push_front(d);
-                }
                 return;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
@@ -883,7 +1056,8 @@ mod tests {
             tcp_conns: HashMap::new(),
             udp_conns: HashMap::new(),
             next_id: 1,
-            next_port: 49152,
+            next_port: port_seed().0,
+            port_stride: port_seed().1,
             data_in_tx,
         };
 
@@ -914,5 +1088,144 @@ mod tests {
         flush_tx(&mut stack, &tx);
         assert_eq!(rx.recv().await, Some(p4));
         assert!(stack.device.tx.is_empty());
+    }
+
+    /// The ACK-over-`specs/004` FR-001 fix was "verified" by a test that pushed
+    /// four *identical-sized* packets — a shape the size-based reordering could
+    /// not invert. Mixed sizes are what actually broke TCP.
+    #[tokio::test]
+    async fn fifo_survives_mixed_frame_sizes() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut device = StackDevice::new(1500);
+
+        // Two short frames interleave three full-MTU segments. Under the old
+        // "send <=128B first" split, the 52B ACK overtook the pending 1448B
+        // segment on the same connection.
+        let frames: Vec<Vec<u8>> = vec![
+            vec![0xAA; 1448],
+            vec![0x02; 52],
+            vec![0xBB; 1448],
+            vec![0x03; 60],
+            vec![0xCC; 1448],
+        ];
+        for f in &frames {
+            device.tx.push_back(f.clone());
+        }
+
+        let config = Config::new(HardwareAddress::Ip);
+        let iface = Interface::new(config, &mut device, Instant::now());
+        let (data_in_tx, _data_in_rx) = mpsc::channel(1);
+        let mut stack = NetStack {
+            iface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            tcp_conns: HashMap::new(),
+            udp_conns: HashMap::new(),
+            next_id: 1,
+            next_port: port_seed().0,
+            port_stride: port_seed().1,
+            data_in_tx,
+        };
+
+        let mut sent = Vec::new();
+        for _ in 0..frames.len() {
+            flush_tx(&mut stack, &tx);
+            match rx.recv().await {
+                Some(p) => sent.push(p),
+                None => break,
+            }
+        }
+        assert_eq!(
+            sent.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            frames.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            "egress order must match ingress order regardless of frame size"
+        );
+        assert_eq!(sent, frames);
+        assert!(stack.device.tx.is_empty());
+    }
+
+    /// The old ring was unbounded: a saturated tunnel plus a peer that kept
+    /// advertising window turned memory growth into an allocator abort.
+    #[test]
+    fn transmit_ring_is_bounded_and_reports_backpressure() {
+        let mut device = StackDevice::new(1500);
+        let t = Instant::now();
+
+        for i in 0..TX_RING * 3 {
+            match device.transmit(t) {
+                Some(tok) => tok.consume(64, |b| {
+                    b[0] = (i & 0xff) as u8;
+                }),
+                None => break,
+            }
+        }
+
+        assert_eq!(device.tx.len(), TX_RING, "ring must stop at TX_RING");
+        assert!(
+            device.tx_deferred > 0,
+            "saturation must be observable, not indistinguishable from idle"
+        );
+        assert!(device.transmit(t).is_none());
+    }
+
+    /// Sequential ephemeral ports left DNS protected only by a 16-bit txid, and
+    /// made a retry's source port free to guess.
+    #[test]
+    fn ephemeral_ports_are_scattered_and_cover_the_band() {
+        let (mut cursor, stride) = seed_port_cursor();
+        assert!(stride % 2 == 1, "stride must be odd to cover the band");
+        assert!(stride >= 17);
+
+        // alloc_port returns the *current* cursor, so the first value equals
+        // the seed; start comparing from the second.
+        let first = alloc_port(&mut cursor, stride);
+        assert!((EPHEMERAL_BASE..=65535).contains(&first));
+
+        let mut prev = first;
+        let mut min_delta = u16::MAX;
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(first);
+        for _ in 0..(EPHEMERAL_SPAN - 1) {
+            let port = alloc_port(&mut cursor, stride);
+            assert!(
+                (EPHEMERAL_BASE..=65535).contains(&port),
+                "port {port} escaped the ephemeral band"
+            );
+            assert!(seen.insert(port), "cycle repeated after only {} ports", seen.len());
+            min_delta = min_delta.min(port.wrapping_sub(prev));
+            prev = port;
+        }
+        assert_eq!(seen.len(), EPHEMERAL_SPAN as usize, "did not cover the band");
+        assert!(
+            min_delta >= 17,
+            "consecutive allocations differed by only {min_delta} — predictable"
+        );
+    }
+
+    /// The inbound queue was unbounded and attacker-influenced: a peer that
+    /// floods us while the poll loop is busy grew memory until the allocator
+    /// aborted. Over the budget the frame must be dropped *and counted*.
+    #[test]
+    fn ingress_admission_is_bounded_and_counted() {
+        let mut device = StackDevice::new(1500);
+        let mut accepted = 0;
+        for _ in 0..RX_RING * 2 {
+            if device.push_ingress(vec![0u8; 1448]) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, RX_RING, "admission ignored the frame cap");
+        assert_eq!(device.rx.len(), RX_RING);
+        assert_eq!(
+            device.rx_dropped,
+            (RX_RING * 2 - accepted) as u64,
+            "drops must be visible, not silently swallowed"
+        );
+
+        // Draining frees the budget again.
+        let token = device.receive(Instant::now()).map(|(r, _)| r);
+        assert!(token.is_some());
+        drop(token);
+        assert!(device.push_ingress(vec![0u8; 64]));
     }
 }

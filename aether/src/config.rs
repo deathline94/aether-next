@@ -98,8 +98,12 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAGIC: &[u8] = b"AETHERCFG1\n";
 
 fn key() -> Result<Option<[u8; 32]>> {
-    let Some(v) = std::env::var_os("AETHER_CONFIG_KEY") else { return Ok(None) };
-    let b = base64::engine::general_purpose::STANDARD.decode(v.to_string_lossy().trim())
+    // Read through `runtime_env`, the single reader for every `AETHER_*` key.
+    // `std::env::var_os` here made the key a second, ambient source of truth: a
+    // value the GUI injected in-process was invisible to it (and vice versa), so
+    // the same config file decrypted for one caller and not the other.
+    let Some(v) = crate::runtime_env::var("AETHER_CONFIG_KEY") else { return Ok(None) };
+    let b = base64::engine::general_purpose::STANDARD.decode(v.trim())
         .map_err(|_| AetherError::Other("invalid config key".into()))?;
     if b.len() != 32 { return Err(AetherError::Other("config key must be 32 bytes".into())); }
     let mut k=[0u8;32]; k.copy_from_slice(&b); Ok(Some(k))

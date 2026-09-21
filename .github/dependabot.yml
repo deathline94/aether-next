@@ -1,0 +1,56 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      root-npm:
+        dependency-type: development
+    ignore:
+      # Runtime deps stay individually reviewable; only dev tooling is grouped.
+      - dependency-name: react
+      - dependency-name: react-dom
+
+  - package-ecosystem: npm
+    directory: /apps/desktop
+    schedule:
+      interval: weekly
+    groups:
+      desktop:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /apps/android
+    schedule:
+      interval: weekly
+    groups:
+      android-web:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /aether
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    ignore:
+      # Pinned to a pre-release by design (see aether/Cargo.toml). Changing it is
+      # a deliberate, reviewed act, not a routine bump.
+      - dependency-name: x25519-dalek
+
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly

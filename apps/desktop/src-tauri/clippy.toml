@@ -1,0 +1,10 @@
+# Tauri shell lint pins. See aether/clippy.toml for the reasoning.
+#
+# The shell owns: the engine child process, the Windows job object, the system
+# proxy journal and the route/proxy repair hook. A panic on any thread holding
+# those locks strands host state, so the unwrap is the bug, not the panic.
+
+disallowed-methods = [
+  { path = "std::env::var", reason = "pass explicit configuration to the engine; never read ambient env in the shell" },
+  { path = "std::process::Command::spawn", reason = "spawn through the engine supervisor so every child is assigned to a kill-on-close job" },
+]

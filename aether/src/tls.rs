@@ -21,31 +21,128 @@ fn spki_sha256(cert: &boring::x509::X509Ref) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Install SPKI certificate pinning on a TLS context builder.
-/// If `pins` is non-empty, sets a custom verify callback that checks the leaf
-/// cert's SPKI hash against the pinned set. Otherwise falls back to no-verify.
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Is the leaf inside its own validity window?
+///
+/// This check did not exist at all before: the verify callback discarded
+/// BoringSSL's precomputed result, so no signature, chain, **validity period**
+/// or hostname check was performed. A committed SPKI pin therefore kept
+/// authenticating a certificate years after it expired, and an edge that
+/// presented a *not-yet-valid* leaf (clock skew, misprovisioned deployment) was
+/// accepted just as happily.
+fn leaf_is_temporally_valid(leaf: &boring::x509::X509Ref, now_unix: u64) -> std::result::Result<(), String> {
+    use boring::asn1::Asn1Time;
+    let now = Asn1Time::from_unix(now_unix as i64).map_err(|e| format!("clock: {e}"))?;
+    let not_before = leaf.not_before();
+    let not_after = leaf.not_after();
+    if now < not_before {
+        return Err("leaf certificate is not yet valid".into());
+    }
+    if not_after <= &now {
+        return Err("leaf certificate has expired".into());
+    }
+    Ok(())
+}
+
+/// Install SPKI pinning **on top of** normal verification.
+///
+/// Previously this installed a callback of the shape
+/// `move |_ok, ctx| { ...pin match... }`, which threw away `_ok`. In BoringSSL a
+/// `set_verify_callback` result is authoritative: the callback *replaces*
+/// chain building, so the handshake validated nothing but a hash. An attacker
+/// holding a copy of a pinned edge key — or any CA that ever minted a
+/// cloudflare-looking cert while hostname checks were globally off — could MITM
+/// the tunnel.
+///
+/// The pinned-SPKI check is retained as the primary mechanism (correct for the
+/// self-signed consumer MASQUE leaf), but it is now *additive*: leaf validity is
+/// always enforced, and full chain building runs for any host whose
+/// [`PinSet::require_chain`] is set.
 pub fn install_pin_verification(
     builder: &mut SslContextBuilder,
-    pins: &'static [&'static [u8; 32]],
-) {
-    if pins.is_empty() {
-        builder.set_verify(SslVerifyMode::NONE);
-        return;
+    sets: &[crate::trust::PinSet],
+    host: &str,
+) -> Result<()> {
+    let set = sets
+        .iter()
+        .find(|s| s.host.eq_ignore_ascii_case(host))
+        .ok_or_else(|| {
+            AetherError::Tls(format!(
+                "no pinned key set for host {host:?}; refusing to connect unverified"
+            ))
+        })?;
+    if set.pins.is_empty() {
+        return Err(AetherError::Tls(format!(
+            "pin set for {host:?} is empty; refusing to fall back to no-verify"
+        )));
     }
-    builder.set_verify_callback(SslVerifyMode::PEER, move |_ok, ctx| {
-        let Some(chain) = ctx.chain() else { return false };
-        let Some(leaf) = chain.iter().next() else { return false };
-        let Some(hash) = spki_sha256(leaf) else { return false };
-        let matched = pins.iter().any(|pin| pin.as_slice() == hash.as_slice());
+    let pins: Vec<([u8; 32], u64)> = set
+        .pins
+        .iter()
+        .filter_map(|p| hex_to_32(&p.spki_sha256).map(|h| (h, p.expires_unix)))
+        .collect();
+    if pins.is_empty() {
+        return Err(AetherError::Tls(format!(
+            "pin set for {host:?} contains no well-formed SHA-256 digests"
+        )));
+    }
+    let require_chain = set.require_chain;
+    let host_owned = host.to_string();
+    builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| {
+        let host = host_owned.as_str();
+        let now = crate::trust::now_unix();
+        // Runs before `ctx.chain()` because both need `ctx` and verify_cert
+        // takes it mutably.
+        if require_chain && !(ok && ctx.verify_cert().unwrap_or(false)) {
+            log::error!("[tls] {host:?}: certificate chain verification failed");
+            return false;
+        }
+        let Some(chain) = ctx.chain() else {
+            log::error!("[tls] peer sent no certificate chain for {host:?}");
+            return false;
+        };
+        let Some(leaf) = chain.iter().next() else {
+            log::error!("[tls] empty certificate chain for {host:?}");
+            return false;
+        };
+        if let Err(reason) = leaf_is_temporally_valid(leaf, now) {
+            log::error!("[tls] {host:?}: {reason}");
+            return false;
+        }
+        let Some(hash) = spki_sha256(leaf) else {
+            log::error!("[tls] {host:?}: cannot read leaf SPKI");
+            return false;
+        };
+        let matched = pins
+            .iter()
+            .any(|(pinned, expires)| *expires > now && pinned == &hash);
         if !matched {
-            log::debug!(
-                "[tls] SPKI pin mismatch: {:02x?} — rejecting candidate. If Cloudflare rotated \
-                 their edge certificate, update consts::MASQUE_PINS.",
-                &hash[..8]
+            // Was `log::debug!`, i.e. invisible at the default filter: a key
+            // rotation looked like "network blocks QUIC" rather than what it was.
+            log::error!(
+                "[tls] SPKI pin mismatch for {host:?}: observed {} — rejecting. \
+                 If the edge key rotated, refresh packaging/trust/masque-pins.json.",
+                hex32(&hash)
             );
         }
         matched
     });
+    Ok(())
+}
+
+fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = (0..32)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
 }
 
 extern "C" {
@@ -67,6 +164,12 @@ const CHROME_GROUPS: &str = "X25519:P-256:P-384";
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
     pub key_pem: &'a [u8],
+    /// Host whose [`crate::trust::PinSet`] authenticates this peer. Pass the
+    /// pinned identity host (`consts::CONNECT_SNI`), *not* a fronted SNI value:
+    /// the pin set is the trust decision, and fronting must not be able to
+    /// change which key is trusted.
+    pub pin_host: &'a str,
+    pub policy: crate::trust::VerifyPolicy<'a>,
 }
 
 pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
@@ -93,7 +196,7 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     let idx = rand::random::<usize>() % cipher_sets.len();
     let _ = builder.set_cipher_list(cipher_sets[idx]);
 
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
+    let groups = crate::runtime_env::var("AETHER_TLS_GROUPS");
     let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
     builder
         .set_curves_list(groups)
@@ -116,27 +219,36 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-
-    // SPKI certificate pinning (mirrors masque_h2): Cloudflare edges serve
-    // self-signed / mixed CA certs per SNI, so instead of trusting the system
-    // CA store the leaf cert's SPKI hash is checked against the pinned MASQUE
-    // edge set. This prevents MITM by any attacker able to mint a
-    // "cloudflare"-looking certificate. Override only for explicit debugging.
-    let pins_disabled = std::env::var("AETHER_MASQUE_DISABLE_SPKI_PINS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-
-    if dangerous || pins_disabled {
-        builder.set_verify(SslVerifyMode::NONE);
-        static DANGER_WARN: std::sync::Once = std::sync::Once::new();
-        DANGER_WARN.call_once(|| {
-            log::warn!("[tls] H3 SPKI pinning disabled (AETHER_DANGEROUS_DISABLE_TLS_VERIFY or AETHER_MASQUE_DISABLE_SPKI_PINS set)");
-        });
-    } else {
-        install_pin_verification(&mut builder, consts::MASQUE_PINS);
+    // Verification is decided by an explicit policy passed by the caller, never
+    // by an ambient environment variable. The two former TLS kill-switch env
+    // vars (names deliberately not repeated here — see the tls-no-ambient-bypass
+    // gate) are gone: presence of a variable readable by any local process must
+    // not be able to turn off authentication for a tool whose threat model
+    // includes a coercible on-path adversary.
+    match params.policy {
+        crate::trust::VerifyPolicy::Pinned(sets) => {
+            // SPKI pinning (mirrors masque_h2): Cloudflare's consumer MASQUE
+            // edges present a self-signed or WE1-mixed leaf that is not issued
+            // for the dialled IP, so the pinned SPKI *is* the trust anchor.
+            // It is now additive with leaf-validity enforcement, and an empty or
+            // unusable pin set is a hard error instead of `SslVerifyMode::NONE`.
+            install_pin_verification(&mut builder, sets, params.pin_host)?;
+        }
+        crate::trust::VerifyPolicy::ReadOnlyProbe => {
+            builder.set_verify(SslVerifyMode::NONE);
+            static PROBE_WARN: std::sync::Once = std::sync::Once::new();
+            PROBE_WARN.call_once(|| {
+                log::warn!(
+                    "[tls] unpinned probe mode: results may include hostile peers; \
+                     never used for tunnel traffic"
+                );
+            });
+        }
+        #[cfg(debug_assertions)]
+        crate::trust::VerifyPolicy::Insecure { reason } => {
+            builder.set_verify(SslVerifyMode::NONE);
+            log::error!("[tls] DEV BUILD: verification disabled (reason: {reason})");
+        }
     }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
@@ -151,7 +263,14 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_application_protos(&[consts::ALPN_H3])
         .map_err(AetherError::Quic)?;
 
-    config.set_max_idle_timeout(120_000);
+    // Idle timeout: 45 s, not 120 s. Two independent reasons:
+    //  * the effective timeout is min(local, peer) floored to 3*PTO, so a 120 s
+    //    local value is silently shortened by any stricter peer and only ever
+    //    delays dead-peer detection (quiche lib.rs:8897-8928);
+    //  * NAT/UDP soft state typically expires around 30 s, so a "healthy" 120 s
+    //    idle tunnel is usually already black-holing.
+    // The 15 s keepalive in quic.rs gives ~3 keepalives inside this window.
+    config.set_max_idle_timeout(45_000);
     // UDP payload size (QUIC `max_udp_payload_size` transport param + our send cap).
     let max_udp = crate::runtime_env::usize("AETHER_QUIC_MAX_UDP_PAYLOAD")
         .unwrap_or(1350)
@@ -179,7 +298,12 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
-    config.enable_dgram(true, 65536, 65536);
+    // `enable_dgram(enabled, recv_queue_len, send_queue_len)` — these are QUEUE
+    // ENTRY COUNTS, not byte sizes (quiche lib.rs:1198-1208; the advertised
+    // max_datagram_frame_size is a fixed 65536). Passing 65536 here permitted
+    // ~65 k queued datagrams, i.e. tens of megabytes of unacknowledged inbound
+    // memory on a tunnel that can be fed by a remote peer.
+    config.enable_dgram(true, crate::tunnel::NET_QUEUE, crate::tunnel::NET_QUEUE);
 
     Ok(config)
 }

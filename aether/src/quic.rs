@@ -63,16 +63,21 @@ fn send_ip_h3(
     ip_packet: &[u8],
     use_capsule: bool,
 ) {
+    // Every failure below destroys an IP packet. `Error::Done` here means
+    // "stream window / datagram queue full, retry later", which this call site
+    // cannot retry — so it is counted, with the first occurrence and every
+    // 1000th logged, instead of vanishing at debug while the tunnel reports
+    // itself healthy.
     if use_capsule {
         let cap = masque::encode_datagram_capsule(ip_packet);
         if let Err(e) = h3c.send_body(conn, sid, &cap, false) {
-            log::debug!("capsule dgram send: {e}");
+            note_dropped("capsule", e);
         }
     } else {
         match masque::encode_ip_datagram(sid, ip_packet) {
             Ok(framed) => {
                 if let Err(e) = conn.dgram_send(&framed) {
-                    log::debug!("dgram_send: {e}");
+                    note_dropped("datagram", e);
                 }
             }
             Err(e) => log::debug!("encap: {e}"),
@@ -80,11 +85,38 @@ fn send_ip_h3(
     }
 }
 
-/// Emit a labeled H3 milestone to logs + as a structured `AETHER_EVENT` so the
-/// exact failing stage is unambiguous. `detail` must not contain double quotes.
+/// Count a silently destroyed outbound packet and log it at a visible rate.
+///
+/// The counter exists because "the tunnel is healthy" and "we are throwing
+/// away TCP payload under load" were previously indistinguishable from outside.
+fn note_dropped(what: &str, e: impl std::fmt::Display) {
+    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(1000) {
+        log::warn!("[quic] dropped {what} packet (count {n}): {e}");
+    } else {
+        log::debug!("[quic] dropped {what} packet (count {n}): {e}");
+    }
+}
+
+/// Emit a labeled H3 milestone to logs +, when tracing is on, as a structured
+/// `AETHER_EVENT` so the exact failing stage is unambiguous.
+///
+/// Serialised with serde_json instead of interpolated: `detail` carries
+/// peer-controlled bytes (an HTTP header value from the edge), so the old
+/// "`detail` must not contain double quotes" comment was an unenforced
+/// assertion and a peer could break the JSON or forge sibling fields on the
+/// single channel the GUI trusts for status.
 fn h3_stage(stage: &str, detail: &str) {
     log::info!("[h3][stage] {stage} \u{2014} {detail}");
-    log::info!("AETHER_EVENT {{\"type\":\"h3_stage\",\"stage\":\"{stage}\",\"detail\":\"{detail}\"}}");
+    if h3_trace_on() {
+        let payload = serde_json::json!({
+            "type": "h3_stage",
+            "stage": stage,
+            "detail": detail,
+        });
+        log::info!("AETHER_EVENT {payload}");
+    }
 }
 
 /// True when H3 per-stage tracing is requested (`AETHER_H3_TRACE`). The probe
@@ -243,12 +275,13 @@ pub const QUIC_V2_BAIT_LEN: usize = 1200;
 pub const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 1;
 
 pub fn quic_v2_bait_enabled() -> bool {
-    let val = crate::runtime_env::var("AETHER_QUIC_V2")
-        .or_else(|| std::env::var("AETHER_QUIC_V2").ok());
-    !matches!(
-        val.as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
-    )
+    // Default on; only an explicit negative turns the bait off. Uses the shared
+    // truthiness rule so `OFF`, `off` and `0` all mean the same thing. An empty
+    // value is treated as "not configured", matching the previous behaviour.
+    match crate::runtime_env::var("AETHER_QUIC_V2") {
+        Some(v) if !v.trim().is_empty() => crate::runtime_env::truthy(&v),
+        _ => true,
+    }
 }
 
 fn quic_varint2(value: u64) -> [u8; 2] {
@@ -350,6 +383,12 @@ pub async fn run(
     let mut ready_tx = Some(ready_tx);
     let mut h3_ready = false;
     let mut dataplane_ok = false;
+    // Distinguishes an intentional, healthy local teardown from a transport
+    // failure. Previously every close path returned Ok(()), so the caller
+    // recorded a *success* for the peer that had just killed the tunnel and a
+    // flapping endpoint kept maximum cache trust (session.rs record_success).
+    let mut local_shutdown = false;
+    let mut fatal: Option<String> = None;
     let mut probe_deadline: Option<Instant> = None;
     let mut last_probe = Instant::now()
         .checked_sub(Duration::from_secs(1))
@@ -378,10 +417,18 @@ pub async fn run(
     // that holds a 64KB buffer + task slot forever — long sessions leak.
     let mut readers = ReaderGuard::new();
     readers.push(spawn_reader(init_sock, local, net_tx.clone()));
+    // Drop our own sender so `net_rx.recv()` yields None once every reader dies.
+    // Previously `net_tx` stayed alive for the whole body, the channel could
+    // never close, and the `None =>` arm below (labelled "L6 fix") was
+    // unreachable: a dead socket left a zombie tunnel reporting
+    // dataplane_ok == true until the QUIC idle timeout.
+    drop(net_tx);
 
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &cfg.cert_pem,
         key_pem: &cfg.key_pem,
+        pin_host: consts::CONNECT_SNI,
+        policy: crate::trust::VerifyPolicy::Pinned(crate::trust::masque_pin_sets()),
     })?;
 
     // #1: Load cached session ticket for 0-RTT resumption (faster reconnect).
@@ -427,7 +474,6 @@ pub async fn run(
 
     flush(&mut conn, &sockets).await?;
 
-    let mut out_buf = vec![0u8; 65535];
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
     keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut started = Instant::now();
@@ -480,10 +526,22 @@ pub async fn run(
                         }
                         let info = quiche::RecvInfo { from, to: to_local };
                         if let Err(e) = conn.recv(&mut data, info) {
-                            log::debug!("recv error: {e}");
+                            // `Done` is benign; anything else is a protocol
+                            // failure that quiche expects us to act on. It used
+                            // to be logged at debug and swallowed, which left the
+                            // loop spinning until the idle timeout while the GUI
+                            // saw a clean-looking session.
+                            if e != quiche::Error::Done {
+                                log::error!("[quic] fatal recv error: {e}");
+                                let code: u64 = if e == quiche::Error::TlsFail { 0x101 } else { 0x1 };
+                                fatal = Some(format!("recv error {e}"));
+                                let _ = conn.close(false, code, b"recv");
+                            }
                         }
                     }
                     None => {
+                        log::error!("[quic] every UDP reader exited; socket is gone");
+                        fatal = Some("all UDP readers exited".into());
                         let _ = conn.close(true, 0x00, b"udp readers gone");
                     }
                 }
@@ -502,6 +560,7 @@ pub async fn run(
                         }
                     }
                     None => {
+                        local_shutdown = true;
                         let _ = conn.close(true, 0x00, b"eof");
                     }
                 }
@@ -609,11 +668,10 @@ pub async fn run(
             &mut conn,
             req_stream,
             &internals.inbound_tx,
-            &mut out_buf,
             h3_ready && !dataplane_ok,
             &mut dataplane_ok,
         )
-        .await;
+        .await?;
 
         if h3_ready && dataplane_ok {
             if let Some(tx) = ready_tx.take() {
@@ -660,23 +718,26 @@ pub async fn run(
             }
 
             log::info!("connection closed: {:?}", conn.stats());
-            if let Some(e) = conn.peer_error() {
-                log::warn!(
-                    "peer closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                );
+            // A teardown we did not ask for is an error, never a success: this
+            // return value decides whether the endpoint is credited or struck.
+            if let Some(reason) = fatal {
+                return Err(AetherError::Masque(format!("tunnel died: {reason}")));
             }
-            if let Some(e) = conn.local_error() {
-                log::warn!(
-                    "local closed: code=0x{:x} app={} reason={}",
-                    e.error_code,
-                    e.is_app,
-                    String::from_utf8_lossy(&e.reason)
-                );
+            if conn.peer_error().is_some() {
+                let reason = conn
+                    .peer_error()
+                    .map(|e| String::from_utf8_lossy(&e.reason).into_owned())
+                    .unwrap_or_default();
+                return Err(AetherError::Masque(format!(
+                    "peer closed the tunnel: {reason}"
+                )));
             }
-            return Ok(());
+            if local_shutdown {
+                return Ok(());
+            }
+            return Err(AetherError::Masque(
+                "connection closed without a local shutdown request".into(),
+            ));
         }
     }
 }
@@ -685,6 +746,37 @@ async fn sleep_opt(timeout: Option<Duration>) {
     match timeout {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+/// Which `:status` line establishes a CONNECT-IP tunnel.
+///
+/// Three separate bugs lived in the old two-line rule:
+///  * the positive check (`value == 200`) was **not stream-scoped** while the
+///    negative one was, so a `200` on any other stream marked the tunnel
+///    established;
+///  * any non-2xx was fatal, so an RFC 9114 interim response (103 Early Hints,
+///    100 Continue) killed a perfectly good tunnel;
+///  * nothing detected a *second* final response.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusAction {
+    Ignore,
+    Interim,
+    Ready,
+    Fatal,
+}
+
+fn classify_status(stream_id: u64, req_stream: u64, status: &str) -> StatusAction {
+    if stream_id != req_stream {
+        return StatusAction::Ignore;
+    }
+    let Ok(code) = status.trim().parse::<u16>() else {
+        return StatusAction::Fatal;
+    };
+    match code {
+        100..=199 => StatusAction::Interim,
+        200..=299 => StatusAction::Ready,
+        _ => StatusAction::Fatal,
     }
 }
 
@@ -712,13 +804,26 @@ fn poll_h3(
                         let status = String::from_utf8_lossy(h.value()).to_string();
                         log::info!("connect-ip status: {status}");
                         h3_stage("connect_ip_status", &format!("code={status}"));
-                        if stream_id == req_stream && !status.starts_with('2') {
-                            return Err(AetherError::Masque(format!(
-                                "the edge refused connect-ip with status {status}"
-                            )));
-                        }
-                        if h.value() == b"200" {
-                            *h3_ready = true;
+                        match classify_status(stream_id, req_stream, &status) {
+                            StatusAction::Ignore => {
+                                log::debug!("[h3] ignoring :status {status} on stream {stream_id}");
+                            }
+                            StatusAction::Interim => {
+                                log::info!("[h3] interim {status} on the request stream; awaiting final");
+                            }
+                            StatusAction::Ready => {
+                                if *h3_ready {
+                                    return Err(AetherError::Masque(format!(
+                                        "duplicate final response {status} on the connect stream"
+                                    )));
+                                }
+                                *h3_ready = true;
+                            }
+                            StatusAction::Fatal => {
+                                return Err(AetherError::Masque(format!(
+                                    "the edge refused connect-ip with status {status}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -827,28 +932,80 @@ fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
     }
 }
 
+/// Does this inner packet actually prove the data plane forwards traffic?
+///
+/// The previous rule was "any datagram, even ICMP errors" — a peer that echoed
+/// back bytes, or an edge that answered CONNECT-IP and then black-holed everything,
+/// therefore passed verification and got promoted into the trust cache. ICMP
+/// *error* types (dest-unreachable, TTL-expired, fragment-exceeded) are evidence
+/// of a broken path, not a working tunnel, so they are rejected here.
+fn is_forwardable_ip_packet(pkt: &[u8]) -> bool {
+    let Some((&first, rest)) = pkt.split_first() else {
+        return false;
+    };
+    match first >> 4 {
+        4 => {
+            // IPv4: header length from IHL, protocol at offset 9.
+            if rest.len() < 12 {
+                return false;
+            }
+            let ihl = ((first & 0x0f) as usize) * 4;
+            if ihl < 20 || pkt.len() < ihl {
+                return false;
+            }
+            let proto = pkt[9];
+            let payload = &pkt[ihl..];
+            match proto {
+                1 => icmp_is_echo_reply(payload),
+                6 | 17 => !payload.is_empty(),
+                41 => !payload.is_empty(), // IPv6 encapsulated
+                _ => false,
+            }
+        }
+        6 => {
+            // IPv6: next header at offset 6, fixed 40-byte header.
+            if pkt.len() < 40 {
+                return false;
+            }
+            let proto = pkt[6];
+            let payload = &pkt[40..];
+            match proto {
+                58 => icmp_is_echo_reply(payload),
+                6 | 17 | 43 | 44 => !payload.is_empty(),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn icmp_is_echo_reply(payload: &[u8]) -> bool {
+    // type 0 = echo reply. 3/4/11/12 are errors and must not count as proof.
+    matches!(payload.first(), Some(0))
+}
+
 async fn drain_datagrams(
     conn: &mut quiche::Connection,
     req_stream: Option<u64>,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
-    buf: &mut [u8],
     watch_dataplane: bool,
     dataplane_ok: &mut bool,
-) {
+) -> Result<()> {
     let sid = match req_stream {
         Some(s) => s,
-        None => return,
+        None => return Ok(()),
     };
 
     loop {
-        match conn.dgram_recv(buf) {
-            Ok(n) => match masque::decode_ip_datagram(&buf[..n], sid) {
+        // `dgram_recv_buf()` always pops; `dgram_recv(buf)` copies into a caller
+        // buffer and had no size advantage here, while any buffer that is too
+        // small loses a datagram. Owned buffers also skip a copy.
+        match conn.dgram_recv_buf() {
+            Ok(buf) => match masque::decode_ip_datagram(buf.as_ref(), sid) {
                 Ok(Some(ip_packet)) => {
-                    // S4 fix rollback: accept any datagram (even ICMP errors) as proof 
-                    // the tunnel isn't a zombie.
-                    if watch_dataplane {
+                    if watch_dataplane && is_forwardable_ip_packet(&ip_packet) {
                         if !*dataplane_ok {
-                            h3_stage("first_inbound_datagram", "dataplane packet received");
+                            h3_stage("first_inbound_datagram", "dataplane reply received");
                         }
                         *dataplane_ok = true;
                     }
@@ -857,10 +1014,10 @@ async fn drain_datagrams(
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
                             if inbound_tx.send(pkt).await.is_err() {
-                                return;
+                                return Ok(());
                             }
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                     }
                 }
                 Ok(None) => {}
@@ -868,11 +1025,14 @@ async fn drain_datagrams(
             },
             Err(quiche::Error::Done) => break,
             Err(e) => {
-                log::debug!("dgram_recv: {e}");
-                break;
+                // Anything else is fatal; breaking here used to leave the loop
+                // silently consuming nothing while the tunnel looked alive.
+                log::error!("[quic] fatal datagram read error: {e}");
+                return Err(e.into());
             }
         }
     }
+    Ok(())
 }
 
 async fn flush(
@@ -941,7 +1101,15 @@ pub async fn fingerprint_h3(
     };
     let sock = bind_udp_fast(bind).await?;
     let local = sock.local_addr()?;
-    let mut config = tls::build_config(&TlsParams { cert_pem, key_pem })?;
+    // Fingerprint/probe path: unpinned by design (it deliberately talks to
+    // arbitrary edges to read SETTINGS), but scoped to this call instead of the
+    // ambient env kill-switch that used to disable verification process-wide.
+    let mut config = tls::build_config(&TlsParams {
+        cert_pem,
+        key_pem,
+        pin_host: consts::CONNECT_SNI,
+        policy: crate::trust::VerifyPolicy::ReadOnlyProbe,
+    })?;
     let scid_bytes = random_scid();
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
     let mut conn = quiche::connect(Some(sni), &scid, local, peer, &mut config)?;
@@ -1048,6 +1216,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &p.cert_pem,
         key_pem: &p.key_pem,
+        pin_host: consts::CONNECT_SNI,
+        policy: crate::trust::VerifyPolicy::Pinned(crate::trust::masque_pin_sets()),
     })?;
 
     let scid_bytes = random_scid();
@@ -1331,6 +1501,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn status_is_stream_scoped_and_interim_responses_are_not_fatal() {
+        // A 200 on any stream other than the CONNECT request must not establish.
+        assert_eq!(classify_status(8, 0, "200"), StatusAction::Ignore);
+        // 103 Early Hints precedes the final response; it used to abort the tunnel.
+        assert_eq!(classify_status(0, 0, "103"), StatusAction::Interim);
+        assert_eq!(classify_status(0, 0, "100"), StatusAction::Interim);
+        assert_eq!(classify_status(0, 0, "200"), StatusAction::Ready);
+        assert_eq!(classify_status(0, 0, "400"), StatusAction::Fatal);
+        assert_eq!(classify_status(0, 0, "500"), StatusAction::Fatal);
+        assert_eq!(classify_status(0, 0, "garbage"), StatusAction::Fatal);
+    }
+
+    #[test]
+    fn data_plane_proof_rejects_icmp_errors_and_accepts_replies() {
+        // A real 20-byte IPv4 header: proto at offset 9, src 12..16, dst 16..20.
+        fn ipv4(proto: u8) -> Vec<u8> {
+            let h = vec![0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00, 64, proto, 0x00, 0x00,
+                             1, 1, 1, 1, 2, 2, 2, 2];
+            assert_eq!(h[9], proto);
+            h
+        }
+        // ICMP destination-unreachable (type 3) is NOT evidence of a working path.
+        let mut unreachable = ipv4(1);
+        unreachable.push(3);
+        assert!(!is_forwardable_ip_packet(&unreachable));
+        let mut reply = ipv4(1);
+        reply.push(0); // echo reply
+        assert!(is_forwardable_ip_packet(&reply));
+        // UDP with payload accepted, without payload rejected.
+        let mut udp = ipv4(17);
+        udp.extend_from_slice(&[0x12, 0x34, 0x00, 0x08, 0x00, 0x00, 0xab, 0xcd]);
+        assert!(is_forwardable_ip_packet(&udp));
+        assert!(!is_forwardable_ip_packet(&ipv4(17)));
+        // A truncated header (ihl claims 20 bytes, fewer present) must not panic.
+        assert!(!is_forwardable_ip_packet(&[0x45, 0, 0, 0]));
+        assert!(!is_forwardable_ip_packet(&[]));
+        assert!(!is_forwardable_ip_packet(&[0x00, 0x01]));
+        assert!(!is_forwardable_ip_packet(&[]));
+        assert!(!is_forwardable_ip_packet(&[0x00, 0x01]));
+    }
+
+    #[test]
     fn h3_sni_defaults_to_consumer_masque() {
         assert_eq!(resolve_h3_sni_from(None, None), consts::CONNECT_SNI);
     }
@@ -1376,14 +1588,21 @@ mod tests {
 
     #[test]
     fn the_bait_is_on_unless_it_is_turned_off() {
-        std::env::remove_var("AETHER_QUIC_V2");
-        assert!(quic_v2_bait_enabled());
-        std::env::set_var("AETHER_QUIC_V2", "0");
-        assert!(!quic_v2_bait_enabled());
-        std::env::set_var("AETHER_QUIC_V2", "off");
-        assert!(!quic_v2_bait_enabled());
-        std::env::set_var("AETHER_QUIC_V2", "1");
-        assert!(quic_v2_bait_enabled());
-        std::env::remove_var("AETHER_QUIC_V2");
+        // Driven through the runtime store, which is the only reader: a test
+        // that set the process environment would now be asserting nothing,
+        // because reads no longer consult it.
+        crate::runtime_env::remove("AETHER_QUIC_V2");
+        assert!(quic_v2_bait_enabled(), "absent means on");
+        for off in ["0", "off", "false", "no", "OFF"] {
+            crate::runtime_env::set("AETHER_QUIC_V2", off);
+            assert!(!quic_v2_bait_enabled(), "{off:?} must disable the bait");
+        }
+        crate::runtime_env::set("AETHER_QUIC_V2", "");
+        assert!(quic_v2_bait_enabled(), "an empty value is not a setting");
+        for on in ["1", "true", "yes", "on"] {
+            crate::runtime_env::set("AETHER_QUIC_V2", on);
+            assert!(quic_v2_bait_enabled(), "{on:?} must keep the bait on");
+        }
+        crate::runtime_env::remove("AETHER_QUIC_V2");
     }
 }

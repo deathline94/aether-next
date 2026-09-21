@@ -177,7 +177,7 @@ fn build_brute_matrix(_ech: &Option<Vec<u8>>) -> Vec<Combo> {
 fn build_default_matrix(ech: &Option<Vec<u8>>, base_authority: &str, base_path: &str) -> Vec<Combo> {
     let mut combos: Vec<Combo> = Vec::new();
     // Control combo (runs first): a neutral SNI every Cloudflare edge has a cert
-    // for. With AETHER_MASQUE_DISABLE_SPKI_PINS=1, reaching quic_established here
+    // for. With the former ambient TLS kill-switch=1, reaching quic_established here
     // while the consumer-masque SNIs fail at TLS proves the ClientHello is fine.
     combos.push(Combo {
         sni: "cloudflare.com",
@@ -247,9 +247,12 @@ const FP_MAX_HOSTS_PER_24: u16 = 64;
 /// MASQUE-capable. This precedes any auth gate, so it needs no working identity
 /// beyond a cert to present. Emits the discovered endpoints and their /24s.
 pub async fn run_fingerprint(spec: &str, identity: &Identity) -> Result<()> {
-    // Read-only classification: disable SPKI pins so the handshake completes
-    // against any edge cert (we only inspect SETTINGS, never tunnel traffic).
-    crate::runtime_env::set("AETHER_MASQUE_DISABLE_SPKI_PINS", "1");
+    // Read-only classification: `quic::fingerprint_h3` builds its TLS config
+    // with VerifyPolicy::ReadOnlyProbe, so no pins are required and — unlike the
+    // previous `runtime_env::set` of a process-wide kill-switch — nothing here
+    // can affect verification for tunnel traffic. (That set call was also inert:
+    // the readers still used std::env, so the probe's advertised mode never
+    // applied.)
     let sni = quic::resolve_h3_sni();
     let cert = identity.cert_pem.clone();
     let key = identity.key_pem.clone();

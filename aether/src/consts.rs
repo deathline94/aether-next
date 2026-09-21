@@ -12,14 +12,10 @@ pub const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 #[allow(dead_code)]
 pub const MASQUE_H3_ENDPOINT: &str = "162.159.198.2:443";
 
-/// SHA-256 SPKI hashes of Cloudflare MASQUE edge certificates.
-/// Used for certificate pinning to prevent MITM attacks.
-pub const MASQUE_PINS: &[&[u8; 32]] = &[
-    // masque.cloudflareclient.com — self-signed by Cloudflare
-    b"\xeb\x59\x1b\x36\xab\x26\xba\x61\x7e\x98\x37\x19\x18\xc1\x0b\xcd\xea\xe3\x74\x2d\xb6\xe7\x65\x43\xf9\x4b\xe5\x24\xdc\xe1\xd5\x55",
-    // cloudflareaccess.com — signed by Google Trust Services WE1
-    b"\x3f\xbb\x1d\x74\x52\xd3\x2b\x38\x81\xeb\x4b\x5d\x48\x42\x14\x45\xb6\xb9\xd8\xf5\x22\x59\x59\xf0\x33\x53\x2d\x50\x26\x37\xb0\x40",
-];
+/// SPKI pins live in `packaging/trust/masque-pins.json` (loaded and validated by
+/// `crate::trust::masque_pin_sets`), not in a byte literal here. A committed
+/// reviewable file makes a key rotation a visible one-line diff and removes the
+/// "empty slice means trust everyone" fallback this constant used to enable.
 
 pub const DEFAULT_MODEL: &str = "PC";
 pub const DEFAULT_LOCALE: &str = "en_US";

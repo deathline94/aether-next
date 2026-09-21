@@ -64,8 +64,26 @@ async fn wait_stack_alive(stack: &netstack::StackHandle, label: &str) -> Result<
     let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
     for attempt in 1..=ATTEMPTS {
         match tokio::time::timeout(Duration::from_secs(3), stack.open_tcp(dst)).await {
-            Ok(_) => {
-                log::info!("[+] {label} data plane alive (attempt {attempt})");
+            // Opening a socket proves the stack is responsive; the handle must
+            // then be closed. TcpSender has no Drop guard, so every probe leaked
+            // a socket plus its buffers.
+            Ok(Ok(conn)) => {
+                let (tx, _rx) = conn.into_split();
+                tx.close().await;
+                log::info!("[+] {label} data plane accepting opens (attempt {attempt})");
+                return Ok(());
+            }
+            // A refusal from our own stack ("netstack closed", "too many TCP
+            // connections", "no free local ports") is the opposite of proof of
+            // life, yet the old `Ok(_)` arm matched the Err variant too and a
+            // dead stack satisfied the readiness gate.
+            Ok(Err(ref e)) if local_stack_broken(&e.to_string()) => {
+                log::error!("[-] {label} local stack refused the probe open ({e}); retrying");
+            }
+            // Refused *through* the tunnel: a packet went out and an answer came
+            // back, so the data plane round-trips.
+            Ok(Err(_)) => {
+                log::info!("[+] {label} data plane round-trips (attempt {attempt})");
                 return Ok(());
             }
             Err(_) => {
@@ -77,6 +95,38 @@ async fn wait_stack_alive(stack: &netstack::StackHandle, label: &str) -> Result<
     Err(AetherError::Other(format!(
         "{label} WireGuard data plane did not come up"
     )))
+}
+
+/// True when an open failure came from our own netstack rather than from the
+/// remote end. A readiness gate must never conflate the two.
+fn local_stack_broken(err: &str) -> bool {
+    const LOCAL: &[&str] = &[
+        "netstack closed",
+        "netstack dropped",
+        "too many TCP connections",
+        "no free local ports",
+    ];
+    LOCAL.iter().any(|k| err.contains(k))
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::local_stack_broken;
+
+
+    #[test]
+    fn local_refusals_are_not_proof_of_life() {
+        assert!(local_stack_broken("netstack dropped"));
+        assert!(local_stack_broken("too many TCP connections"));
+        assert!(local_stack_broken("no free local ports"));
+    }
+
+    #[test]
+    fn remote_refusals_still_prove_a_round_trip() {
+        assert!(!local_stack_broken("connection refused"));
+        assert!(!local_stack_broken("timed out"));
+        assert!(!local_stack_broken(""));
+    }
 }
 
 // ─── Protocol ───────────────────────────────────────────────────────────────
@@ -569,9 +619,10 @@ async fn select_peer(
 /// only matters when nothing is cached (in which case there is nothing to
 /// verify anyway, so force-on is effectively the same as default here).
 fn quick_reconnect_enabled() -> bool {
-    match std::env::var("AETHER_QUICK_RECONNECT").as_deref() {
-        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on") => true,
+    match crate::runtime_env::var("AETHER_QUICK_RECONNECT") {
+        // Same truth table as every other boolean knob: `0/false/no/off` mean
+        // off, anything unrecognised falls back to the default-on behaviour.
+        Some(v) if !v.trim().is_empty() => crate::runtime_env::truthy(&v),
         _ => true, // default: attempt cached-gateway reuse when present
     }
 }
@@ -607,12 +658,12 @@ async fn quick_verify_masque(
 }
 
 async fn resolve_ech() -> Option<Vec<u8>> {
-    match std::env::var("AETHER_ECH") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
+    match crate::runtime_env::var("AETHER_ECH") {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
             log::info!("[+] ECH explicitly disabled via AETHER_ECH={v}");
             None
         }
-        Ok(v) if v.eq_ignore_ascii_case("auto") => match dns::fetch_ech_config().await {
+        Some(v) if v.eq_ignore_ascii_case("auto") => match dns::fetch_ech_config().await {
             Ok(raw) => {
                 log::info!(
                     "[+] fetched ECHConfigList automatically ({} bytes)",
@@ -625,7 +676,7 @@ async fn resolve_ech() -> Option<Vec<u8>> {
                 None
             }
         },
-        Ok(b64) if !b64.is_empty() => match tls::decode_ech_config_list(&b64) {
+        Some(b64) if !b64.is_empty() => match tls::decode_ech_config_list(&b64) {
             Ok(v) => {
                 log::info!("[+] using ECHConfigList from AETHER_ECH");
                 Some(v)
@@ -870,10 +921,9 @@ async fn await_opt<T>(handle: &mut Option<tokio::task::JoinHandle<T>>) {
 // ─── WireGuard tunnel runner ────────────────────────────────────────────────
 
 fn wg_keepalive_secs() -> u16 {
-    std::env::var("AETHER_WG_KEEPALIVE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v| v > 0)
+    crate::runtime_env::var("AETHER_WG_KEEPALIVE")
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v: &u16| v > 0)
         .unwrap_or(5)
 }
 
@@ -1252,7 +1302,7 @@ async fn select_scan_mode_str() -> String {
 }
 
 async fn select_protocol() -> Protocol {
-    if let Ok(v) = std::env::var("AETHER_PROTOCOL") {
+    if let Some(v) = crate::runtime_env::var("AETHER_PROTOCOL") {
         return Protocol::parse(&v);
     }
 

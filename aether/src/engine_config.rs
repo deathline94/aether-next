@@ -39,27 +39,27 @@ impl Default for EngineConfig {
 impl EngineConfig {
     pub fn from_env() -> Result<Self> {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("AETHER_PROTOCOL") {
+        if let Some(v) = crate::runtime_env::var("AETHER_PROTOCOL") {
             if !v.trim().is_empty() {
                 cfg.protocol = v.trim().to_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("AETHER_SCAN") {
+        if let Some(v) = crate::runtime_env::var("AETHER_SCAN") {
             if !v.trim().is_empty() {
                 cfg.scan = v.trim().to_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("AETHER_IP") {
+        if let Some(v) = crate::runtime_env::var("AETHER_IP") {
             if !v.trim().is_empty() {
                 cfg.ip = v.trim().to_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("AETHER_NOIZE") {
+        if let Some(v) = crate::runtime_env::var("AETHER_NOIZE") {
             if !v.trim().is_empty() {
                 cfg.noize = v.trim().to_lowercase();
             }
         }
-        if let Ok(v) = std::env::var("AETHER_CONFIG") {
+        if let Some(v) = crate::runtime_env::var("AETHER_CONFIG") {
             if !v.trim().is_empty() {
                 cfg.config_path = v;
             }
@@ -91,18 +91,18 @@ impl EngineConfig {
 }
 
 fn env_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
+    match crate::runtime_env::var(name) {
+        Some(v) => {
             let v = v.trim().to_lowercase();
             v == "1" || v == "true" || v == "yes" || v == "on" || v == "h2"
         }
-        Err(_) => false,
+        None => false,
     }
 }
 
 fn env_addr(name: &str) -> Result<Option<SocketAddr>> {
-    match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => {
+    match crate::runtime_env::var(name) {
+        Some(v) if !v.trim().is_empty() => {
             let addr: SocketAddr = v
                 .trim()
                 .parse()
@@ -114,7 +114,7 @@ fn env_addr(name: &str) -> Result<Option<SocketAddr>> {
 }
 
 fn parse_listen(var: &str, default: &str) -> Result<SocketAddr> {
-    let raw = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    let raw = crate::runtime_env::var(var).unwrap_or_else(|| default.to_string());
     let addr: SocketAddr = raw
         .parse()
         .map_err(|_| AetherError::Other(format!("bad {var} address {raw}")))?;

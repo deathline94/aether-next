@@ -1,0 +1,18 @@
+# Pinned APIs for the engine. Referenced by Cargo via RUSTFLAGS or
+# `cargo clippy -- -c lints` / workspace lint config; scripts/verify-invariants
+# also greps for the same patterns so the rule holds even if clippy is skipped.
+#
+# Rationale (specs/015 audit): the dominant defect class is a panic or a
+# silently-swallowed error on a path the user cannot recover from — a peer
+# packet, a state file, or a supervisor thread that owns route/proxy teardown.
+
+disallowed-methods = [
+  # Panicking on a poisoned lock in a process that owns host network state kills
+  # the watcher thread, leaving the system proxy enabled with no restore path.
+  # Use lock().unwrap_or_else(PoisonError::into_inner) or an unpoisonable lock.
+  { path = "std::sync::Mutex::lock", reason = "handle the PoisonError explicitly (unwrap_or_else(into_inner)) in lifecycle-owning code" },
+  # Ambient config reads bypass the single runtime-config store and are the
+  # reason one security control shipped permanently inert.
+  { path = "std::env::var", reason = "read AETHER_* through crate::runtime_env::var() only" },
+  { path = "std::env::var_os", reason = "read AETHER_* through crate::runtime_env::var() only" },
+]

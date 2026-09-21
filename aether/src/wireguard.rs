@@ -426,7 +426,7 @@ pub async fn verify_endpoint_keep_session(
     aethernoize: &AetherNoizeConfig,
     timeout: Duration,
 ) -> Result<(Duration, EstablishedSession)> {
-    let data_check = std::env::var("AETHER_WG_NO_DATA_CHECK").is_err();
+    let data_check = !crate::runtime_env::flag("AETHER_WG_NO_DATA_CHECK");
     log::debug!("[wg] verify {} obf={} data_check={}", peer, aethernoize.is_enabled(), data_check);
 
     let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };

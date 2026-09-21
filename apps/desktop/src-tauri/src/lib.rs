@@ -1,5 +1,97 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use parking_lot::Mutex;
+
+/// Structured shell/IPC error.
+///
+/// Every shell helper used to return `Result<_, CommandError>`, so a caller could only
+/// branch on prose (`msg.contains("not found")`) and the frontend received an
+/// opaque rejection it had to stringify. `code` is the machine-readable half.
+///
+/// It serialises as the message string on purpose: the shipped frontend still
+/// does `String(e)`, so the wire shape stays compatible until typed
+/// (`tauri-specta`) bindings replace those calls in spec 016.
+#[derive(Debug, Clone)]
+pub struct CommandError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CommandError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+impl Serialize for CommandError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.message)
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self { code: "internal", message }
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self { code: "internal", message: message.to_string() }
+    }
+}
+
+impl From<serde_json::Error> for CommandError {
+    fn from(e: serde_json::Error) -> Self {
+        Self { code: "encode", message: e.to_string() }
+    }
+}
+
+impl From<tauri::Error> for CommandError {
+    fn from(e: tauri::Error) -> Self {
+        Self { code: "shell", message: e.to_string() }
+    }
+}
+
+impl From<ureq::Error> for CommandError {
+    fn from(e: ureq::Error) -> Self {
+        Self { code: "network", message: e.to_string() }
+    }
+}
+
+impl From<BinaryTrustError> for CommandError {
+    fn from(e: BinaryTrustError) -> Self {
+        let code = match e {
+            BinaryTrustError::Authenticode(_, _) => "authenticode",
+            BinaryTrustError::PublisherMismatch { .. } => "publisher_mismatch",
+            BinaryTrustError::HashMismatch { .. } => "hash_mismatch",
+            BinaryTrustError::MissingHash { .. } => "missing_hash",
+            BinaryTrustError::Validation(_) => "validation",
+        };
+        Self { code, message: e.to_string() }
+    }
+}
+
+impl From<std::io::Error> for CommandError {
+    fn from(e: std::io::Error) -> Self {
+        let code = match e.kind() {
+            std::io::ErrorKind::NotFound => "not_found",
+            std::io::ErrorKind::PermissionDenied => "permission_denied",
+            std::io::ErrorKind::AlreadyExists => "already_exists",
+            _ => "io",
+        };
+        Self { code, message: e.to_string() }
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -8,7 +100,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 use tauri::{
@@ -20,7 +112,7 @@ use tauri::{
 use zeroize::Zeroize;
 
 #[cfg(windows)]
-pub fn restrict_directory_acl(path: &Path) -> Result<(), String> {
+pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
     if let Ok(user) = std::env::var("USERNAME") {
         let is_dir = path.is_dir();
         let user_perm = if is_dir {
@@ -48,18 +140,20 @@ pub fn restrict_directory_acl(path: &Path) -> Result<(), String> {
                 "icacls failed to restrict permissions on {}: {}",
                 path.display(),
                 err.trim()
-            ));
+            ).into());
         }
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn restrict_directory_acl(_path: &Path) -> Result<(), String> {
+pub fn restrict_directory_acl(_path: &Path) -> Result<(), CommandError> {
     Ok(())
 }
 
 pub mod dpapi {
+    use crate::CommandError;
+
     use std::path::Path;
     use zeroize::Zeroize;
 
@@ -72,7 +166,7 @@ pub mod dpapi {
         CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
     };
 
-    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn encrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
         #[cfg(windows)]
         {
             let in_blob = CRYPT_INTEGER_BLOB {
@@ -98,7 +192,7 @@ pub mod dpapi {
 
             if res == 0 {
                 let err = std::io::Error::last_os_error();
-                return Err(format!("CryptProtectData failed: {err}"));
+                return Err(format!("CryptProtectData failed: {err}").into());
             }
 
             let encrypted = unsafe {
@@ -117,7 +211,7 @@ pub mod dpapi {
         }
     }
 
-    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
         #[cfg(windows)]
         {
             let in_blob = CRYPT_INTEGER_BLOB {
@@ -143,7 +237,7 @@ pub mod dpapi {
 
             if res == 0 {
                 let err = std::io::Error::last_os_error();
-                return Err(format!("CryptUnprotectData failed: {err}"));
+                return Err(format!("CryptUnprotectData failed: {err}").into());
             }
 
             let decrypted = unsafe {
@@ -170,14 +264,14 @@ pub mod dpapi {
 
     /// Derives or retrieves the 32-byte DPAPI-protected configuration master key.
     /// Returns the base64-encoded string representation for `AETHER_CONFIG_KEY`.
-    pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, String> {
+    pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, CommandError> {
         use base64::Engine;
         let key_file = app_data_dir.join("config_key.dpapi");
         if key_file.exists() {
             let raw = std::fs::read(&key_file)
                 .map_err(|e| format!("failed reading {}: {e}", key_file.display()))?;
             if !raw.starts_with(DPAPI_MAGIC) {
-                return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()));
+                return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()).into());
             }
             let mut decrypted = decrypt(&raw[DPAPI_MAGIC.len()..])?;
             if decrypted.len() != 32 {
@@ -207,12 +301,12 @@ pub mod dpapi {
         // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
         if let Err(e) = super::restrict_directory_acl(&tmp_file) {
             let _ = std::fs::remove_file(&tmp_file);
-            return Err(format!("cannot restrict ACL on {}: {e}", tmp_file.display()));
+            return Err(format!("cannot restrict ACL on {}: {e}", tmp_file.display()).into());
         }
 
         if let Err(e) = std::fs::rename(&tmp_file, &key_file) {
             let _ = std::fs::remove_file(&tmp_file);
-            return Err(format!("cannot rename to {}: {e}", key_file.display()));
+            return Err(format!("cannot rename to {}: {e}", key_file.display()).into());
         }
 
         let _ = super::restrict_directory_acl(&key_file);
@@ -324,6 +418,8 @@ struct AppState {
 // the system-proxy registry while every future launch fails to bind.
 #[cfg(windows)]
 mod engine_job {
+    use crate::CommandError;
+
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -338,7 +434,7 @@ mod engine_job {
     pub struct Job(isize);
 
     impl Job {
-        pub fn create() -> Result<Self, String> {
+        pub fn create() -> Result<Self, CommandError> {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
                 return Err("CreateJobObjectW failed".into());
@@ -360,7 +456,7 @@ mod engine_job {
             Ok(Job(handle as isize))
         }
 
-        pub fn assign_child(&self, child: &Child) -> Result<(), String> {
+        pub fn assign_child(&self, child: &Child) -> Result<(), CommandError> {
             let ok = unsafe {
                 AssignProcessToJobObject(self.0 as HANDLE, child.as_raw_handle() as HANDLE)
             };
@@ -404,16 +500,16 @@ impl Default for AppState {
     }
 }
 
-fn config_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_config_dir().map_err(|e| e.to_string())
+fn config_dir(app: &AppHandle) -> Result<PathBuf, CommandError> {
+    app.path().app_config_dir().map_err(CommandError::from)
 }
 
-fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
     Ok(config_dir(app)?.join("settings.json"))
 }
 
 #[cfg(windows)]
-fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
     Ok(config_dir(app)?.join("proxy-recovery.json"))
 }
 
@@ -440,15 +536,15 @@ fn load_settings_file(app: &AppHandle) -> Settings {
     }
 }
 
-fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), CommandError> {
     let path = settings_path(app)?;
     let parent = path.parent().ok_or("invalid config path")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    fs::create_dir_all(parent).map_err(CommandError::from)?;
     restrict_directory_acl(parent)?;
-    let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(settings).map_err(CommandError::from)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    fs::write(&tmp, json).map_err(CommandError::from)?;
+    fs::rename(&tmp, &path).map_err(CommandError::from)
 }
 
 fn emit_state(
@@ -465,7 +561,7 @@ fn emit_state(
         pid,
         endpoint,
     };
-    *state.runtime.lock().unwrap() = value.clone();
+    *state.runtime.lock() = value.clone();
     let _ = app.emit("session://state", value);
 }
 
@@ -490,23 +586,23 @@ fn parse_endpoint(line: &str) -> Option<String> {
     None
 }
 
-fn validate_settings(settings: &Settings) -> Result<(), String> {
+fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     for (name, port) in [
         ("HTTP", settings.http_port),
         ("SOCKS5", settings.socks_port),
     ] {
         if !(1024..=65535).contains(&port) {
-            return Err(format!("{name} port must be 1024–65535 (got {port})"));
+            return Err(format!("{name} port must be 1024–65535 (got {port})").into());
         }
     }
     if settings.http_port == settings.socks_port {
         return Err("HTTP and SOCKS5 ports must differ".into());
     }
-    let allow = |field: &str, val: &str, opts: &[&str]| {
+    let allow = |field: &str, val: &str, opts: &[&str]| -> Result<(), CommandError> {
         if opts.iter().any(|o| o.eq_ignore_ascii_case(val.trim())) {
             Ok(())
         } else {
-            Err(format!("{field} must be one of: {}", opts.join(", ")))
+            Err(format!("{field} must be one of: {}", opts.join(", ")).into())
         }
     };
     allow(
@@ -589,7 +685,7 @@ fn handle_engine_line(
                 "endpoint_selected" => {
                     if let Some(addr) = v.get("addr").and_then(|a| a.as_str()) {
                         let state = app.state::<AppState>();
-                        let mut rt = state.runtime.lock().unwrap();
+                        let mut rt = state.runtime.lock();
                         rt.endpoint = Some(addr.to_string());
                         let snap = rt.clone();
                         drop(rt);
@@ -621,7 +717,7 @@ fn handle_engine_line(
                         .to_string();
                     emit_log(app, format!("engine error: {msg}"));
                     let state = app.state::<AppState>();
-                    let endpoint = state.runtime.lock().unwrap().endpoint.clone();
+                    let endpoint = state.runtime.lock().endpoint.clone();
                     
                     // 1) Paint the banner.
                     emit_state(app, &state, "error", &msg, None, endpoint);
@@ -631,7 +727,7 @@ fn handle_engine_line(
                     //    the error banner visible when the child finally exits.
                     state.generation.fetch_add(1, Ordering::SeqCst);
                     state.connecting.store(false, Ordering::SeqCst);
-                    let child = state.child.lock().unwrap().take();
+                    let child = state.child.lock().take();
                     if let Some(mut child) = child {
                         if let Some(mut stdin) = child.stdin.take() {
                             use std::io::Write;
@@ -656,7 +752,7 @@ fn handle_engine_line(
             .map(|s| s.trim())
             .unwrap_or("Connection failed");
         let state = app.state::<AppState>();
-        if !state.runtime.lock().unwrap().status.eq_ignore_ascii_case("error") {
+        if !state.runtime.lock().status.eq_ignore_ascii_case("error") {
             emit_state(app, &state, "error", msg, None, None);
             state.generation.fetch_add(1, Ordering::SeqCst);
             state.connecting.store(false, Ordering::SeqCst);
@@ -679,7 +775,7 @@ fn handle_engine_line(
     }
     if let Some(endpoint) = parse_endpoint(line) {
         let state = app.state::<AppState>();
-        let mut rt = state.runtime.lock().unwrap();
+        let mut rt = state.runtime.lock();
         rt.endpoint = Some(endpoint);
         let snap = rt.clone();
         drop(rt);
@@ -734,20 +830,20 @@ fn resolve_resource(app: &AppHandle, name: &str) -> Option<PathBuf> {
 }
 
 /// TUN runs elevated: only load regular files under the app install / portable root.
-pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String> {
+pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), CommandError> {
     let meta = fs::metadata(path).map_err(|e| format!("{label}: {e}"))?;
     if !meta.is_file() {
-        return Err(format!("{label} is not a regular file"));
+        return Err(format!("{label} is not a regular file").into());
     }
     if meta.len() == 0 {
-        return Err(format!("{label} is empty"));
+        return Err(format!("{label} is empty").into());
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!("{label} must not be a reparse point/symlink"));
+            return Err(format!("{label} must not be a reparse point/symlink").into());
         }
         // PE header check (MZ) — fail closed if unreadable or not PE.
         let mut hdr = [0u8; 2];
@@ -756,7 +852,7 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String
         f.read_exact(&mut hdr)
             .map_err(|e| format!("{label}: cannot read PE header: {e}"))?;
         if hdr != *b"MZ" {
-            return Err(format!("{label} is not a Windows PE binary"));
+            return Err(format!("{label} is not a Windows PE binary").into());
         }
     }
     let app_root = std::env::current_exe()
@@ -783,7 +879,7 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), String
     Err(format!(
         "{label} rejected: must live under the app install directory (got {})",
         path.display()
-    ))
+    ).into())
 }
 
 /// Only allow safe host tokens into Windows ProxyOverride (no `;` injection).
@@ -805,7 +901,7 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
     ok.then(|| host.to_string())
 }
 
-pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
+pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
@@ -951,7 +1047,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
         return Err(BinaryTrustError::Authenticode(
             status,
             format!("WinVerifyTrust returned error code: 0x{status:08x}"),
-        ));
+        ).into());
     }
 
     if !expected_cn.is_empty() {
@@ -968,7 +1064,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
             return Err(BinaryTrustError::Validation(format!(
                 "failed to read signer certificate: {}",
                 String::from_utf8_lossy(&out.stderr)
-            )));
+            )).into());
         }
 
         let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -977,7 +1073,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
             return Err(BinaryTrustError::PublisherMismatch {
                 expected: expected_cn.to_string(),
                 found: subject,
-            });
+            }.into());
         }
     }
 
@@ -996,14 +1092,14 @@ pub fn verify_elevated_binary(
 ) -> Result<(), BinaryTrustError> {
     let path_buf = path.to_path_buf();
     validate_trusted_binary(&path_buf, label)
-        .map_err(BinaryTrustError::Validation)?;
+        .map_err(|e| BinaryTrustError::Validation(e.message))?;
 
     let filename = path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(label);
 
     let actual_hash = file_sha256_hex(path)
-        .map_err(BinaryTrustError::Validation)?;
+        .map_err(|e| BinaryTrustError::Validation(e.message))?;
 
     let mut found_hash = false;
     for &(expected_name, expected_hash) in policy.embedded_hashes {
@@ -1014,7 +1110,7 @@ pub fn verify_elevated_binary(
                     filename: filename.to_string(),
                     expected: expected_hash.to_string(),
                     actual: actual_hash,
-                });
+                }.into());
             }
         }
     }
@@ -1022,7 +1118,7 @@ pub fn verify_elevated_binary(
     if policy.enforce_hash_match && !found_hash {
         return Err(BinaryTrustError::MissingHash {
             filename: filename.to_string(),
-        });
+        }.into());
     }
 
     #[cfg(windows)]
@@ -1043,7 +1139,7 @@ pub fn verify_elevated_binary(
     Ok(())
 }
 
-fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, String> {
+fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandError> {
     // TUN: never honor custom overrides (elevated risk).
     // Non-TUN: custom paths allowed only after full trust checks.
     if settings.routing_mode != "tun" && !settings.engine_path.trim().is_empty() {
@@ -1107,7 +1203,7 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
     if state.connected_once.swap(true, Ordering::SeqCst) {
         return;
     }
-    let endpoint = state.runtime.lock().unwrap().endpoint.clone();
+    let endpoint = state.runtime.lock().endpoint.clone();
     if settings.routing_mode == "system-proxy" {
         #[cfg(windows)]
         {
@@ -1118,17 +1214,17 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
                 recovery_path.as_deref(),
             ) {
                 Ok(snapshot) => {
-                    *state.proxy_snapshot.lock().unwrap() = Some(snapshot);
+                    *state.proxy_snapshot.lock() = Some(snapshot);
                     state.proxy_enabled.store(true, Ordering::SeqCst);
                 }
                 Err((error, snapshot)) => {
                     if let Some(snapshot) = snapshot {
-                        *state.proxy_snapshot.lock().unwrap() = Some(snapshot);
+                        *state.proxy_snapshot.lock() = Some(snapshot);
                         state.proxy_enabled.store(true, Ordering::SeqCst);
                     }
                     emit_log(app, format!("System proxy failed: {error}"));
                     // Stop engine so UI is not stuck with orphan child.
-                    if let Some(mut child) = state.child.lock().unwrap().take() {
+                    if let Some(mut child) = state.child.lock().take() {
                         state.generation.fetch_add(1, Ordering::SeqCst);
                         if let Some(mut stdin) = child.stdin.take() {
                             let _ = stdin.write_all(b"shutdown\n");
@@ -1151,7 +1247,7 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
             }
         }
     }
-    let pid = state.runtime.lock().unwrap().pid;
+    let pid = state.runtime.lock().pid;
     let detail = match settings.routing_mode.as_str() {
         "tun" => "TUN active (full system)",
         "system-proxy" => "System proxy active",
@@ -1174,7 +1270,7 @@ fn stream_output<R: std::io::Read + Send + 'static>(
             let state = app.state::<AppState>();
             // Hold operation only for generation check + dispatch, not forever.
             {
-                let _operation = state.operation.lock().unwrap();
+                let _operation = state.operation.lock();
                 if state.generation.load(Ordering::SeqCst) != generation {
                     break;
                 }
@@ -1195,7 +1291,7 @@ fn stream_output<R: std::io::Read + Send + 'static>(
 fn cleanup_routing(app: &AppHandle, state: &AppState) {
     #[cfg(windows)]
     if state.proxy_enabled.swap(false, Ordering::SeqCst) {
-        let mut snapshot = state.proxy_snapshot.lock().unwrap();
+        let mut snapshot = state.proxy_snapshot.lock();
         if let Some(saved) = snapshot.take() {
             if let Err(error) = windows_proxy::restore(saved.clone()) {
                 *snapshot = Some(saved);
@@ -1210,7 +1306,7 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) {
     // M8: drop the job object (closing its handle kills any surviving engine).
     #[cfg(windows)]
     {
-        state.job.lock().unwrap().take();
+        state.job.lock().take();
     }
 }
 
@@ -1218,8 +1314,8 @@ fn watch_child(app: AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let state = app.state::<AppState>();
-        let _operation = state.operation.lock().unwrap();
-        let mut child_slot = state.child.lock().unwrap();
+        let _operation = state.operation.lock();
+        let mut child_slot = state.child.lock();
         let Some(child) = child_slot.as_mut() else {
             continue;
         };
@@ -1234,7 +1330,6 @@ fn watch_child(app: AppHandle) {
                 let already_error = state
                     .runtime
                     .lock()
-                    .unwrap()
                     .status
                     .eq_ignore_ascii_case("error");
                 if already_error {
@@ -1265,7 +1360,6 @@ fn watch_child(app: AppHandle) {
                 let already_error = state
                     .runtime
                     .lock()
-                    .unwrap()
                     .status
                     .eq_ignore_ascii_case("error");
                 if already_error {
@@ -1294,7 +1388,7 @@ fn get_settings(app: AppHandle) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
+fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
     validate_settings(&settings)?;
     save_settings_file(&app, &settings)?;
     #[cfg(windows)]
@@ -1304,7 +1398,7 @@ fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
 
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> RuntimeState {
-    state.runtime.lock().unwrap().clone()
+    state.runtime.lock().clone()
 }
 
 #[tauri::command]
@@ -1320,8 +1414,8 @@ fn is_admin() -> bool {
 }
 
 #[tauri::command]
-fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
-    let _operation = state.operation.lock().unwrap();
+fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), CommandError> {
+    let _operation = state.operation.lock();
     if state
         .connecting
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1329,11 +1423,11 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
     {
         return Err("Aether is already running".into());
     }
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<(), CommandError> {
         // A scan and a tunnel must not run at once: stop any active scan first
         // (gracefully, persisting its best-so-far) before bringing up the tunnel.
         stop_scan_child(&state.scan_child);
-        if state.child.lock().unwrap().is_some() {
+        if state.child.lock().is_some() {
             return Err("Aether is already running".into());
         }
         validate_settings(&settings)?;
@@ -1347,16 +1441,16 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                 // Prefer Admin session for TUN (Wintun + routes). No whole-GUI auto-relaunch.
                 // Run Aether as Administrator once, or accept UAC when engine elevates via helper later.
                 if !elevation::is_elevated() {
-                    return Err(
-                        "Full-device TUN needs Administrator. Right-click Aether → Run as administrator, then Connect."
-                            .into(),
-                    );
+                    return Err(CommandError::new(
+                        "permission_denied",
+                        "Full-device TUN needs Administrator. Right-click Aether → Run as administrator, then Connect.",
+                    ));
                 }
                 if wintun_path(&app).is_none() {
-                    return Err(
-                        "wintun.dll not found. Reinstall Aether or place wintun.dll next to the app."
-                            .into(),
-                    );
+                    return Err(CommandError::new(
+                        "not_found",
+                        "wintun.dll not found. Reinstall Aether or place wintun.dll next to the app.",
+                    ));
                 }
             }
             #[cfg(not(windows))]
@@ -1367,17 +1461,17 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
 
         let executable = engine_path(&app, &settings)?;
         let dir = config_dir(&app)?;
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir).map_err(CommandError::from)?;
         restrict_directory_acl(&dir)?;
 
         if settings.routing_mode == "tun" {
             let engine_policy = TrustedBinaryPolicy::for_engine();
             verify_elevated_binary(&executable, "aether.exe", &engine_policy)
-                .map_err(|e| e.to_string())?;
+                .map_err(CommandError::from)?;
             if let Some(wintun) = wintun_path(&app) {
                 let wintun_policy = TrustedBinaryPolicy::for_wintun();
                 verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(CommandError::from)?;
                 // Optional pin: set AETHER_WINTUN_SHA256 to require exact file hash.
                 if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
                     let expected = expected.trim().to_ascii_lowercase();
@@ -1386,7 +1480,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                         if actual != expected {
                             return Err(format!(
                                 "wintun.dll hash mismatch (got {actual}, want {expected})"
-                            ));
+                            ).into());
                         }
                     }
                 }
@@ -1477,7 +1571,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         match engine_job::Job::create().and_then(|j| {
             let assigned = j.assign_child(&child);
             if assigned.is_ok() {
-                *state.job.lock().unwrap() = Some(j);
+                *state.job.lock() = Some(j);
             }
             assigned
         }) {
@@ -1494,7 +1588,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        *state.child.lock().unwrap() = Some(child);
+        *state.child.lock() = Some(child);
         emit_state(
             &app,
             &state,
@@ -1536,17 +1630,17 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
 }
 
 #[tauri::command]
-fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandError> {
     // M7 fix: hold the operation lock across the WHOLE teardown. The old code
     // released it while waiting on the child, letting a concurrent connect slip
     // in — after which cleanup_routing tore down the NEW session's system-proxy
     // state and clobbered its UI status with "disconnected". Holding is safe:
     // stream threads acquire the lock per-line only and observe the bumped
     // generation as soon as we release.
-    let _operation = state.operation.lock().unwrap();
+    let _operation = state.operation.lock();
     state.generation.fetch_add(1, Ordering::SeqCst);
     state.connecting.store(false, Ordering::SeqCst);
-    let mut child = state.child.lock().unwrap().take();
+    let mut child = state.child.lock().take();
     if let Some(child) = child.as_mut() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(b"shutdown\n");
@@ -1588,7 +1682,7 @@ fn app_info() -> serde_json::Value {
 }
 
 #[tauri::command]
-fn test_connection(settings: Settings) -> Result<String, String> {
+fn test_connection(settings: Settings) -> Result<String, CommandError> {
     validate_settings(&settings)?;
     let url = "https://www.cloudflare.com/cdn-cgi/trace";
 
@@ -1601,7 +1695,7 @@ fn test_connection(settings: Settings) -> Result<String, String> {
         let proxy = format!("http://127.0.0.1:{}", settings.http_port);
         let client = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(12))
-            .proxy(ureq::Proxy::new(&proxy).map_err(|e| e.to_string())?)
+            .proxy(ureq::Proxy::new(&proxy).map_err(CommandError::from)?)
             .build();
         (client, proxy)
     };
@@ -1611,7 +1705,7 @@ fn test_connection(settings: Settings) -> Result<String, String> {
         .call()
         .map_err(|e| format!("connection test failed: {e}"))?
         .into_string()
-        .map_err(|e| e.to_string())?;
+        .map_err(CommandError::from)?;
     let ip = body
         .lines()
         .find_map(|l| l.strip_prefix("ip="))
@@ -1632,13 +1726,13 @@ fn scan(
     concurrency: u32,
     timeout_ms: u32,
     noize: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     // Serialize with connect/disconnect/stop_scan (QA-5) so two engine processes
     // can't spawn concurrently (double device registration + proxy-port contention).
-    let _operation = state.operation.lock().unwrap();
+    let _operation = state.operation.lock();
     // A tunnel and a scan must not run at once. The frontend disconnects first,
     // but guard here too in case that flow is bypassed.
-    if state.child.lock().unwrap().is_some() {
+    if state.child.lock().is_some() {
         return Err("Disconnect before starting a scan.".into());
     }
     // Clamp scan parameters defensively: the UI clamps too, but a replayed/direct
@@ -1652,7 +1746,7 @@ fn scan(
     let settings = load_settings_file(&app);
     let executable = engine_path(&app, &settings)?;
     let dir = config_dir(&app)?;
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(CommandError::from)?;
     restrict_directory_acl(&dir)?;
 
     let engine_protocol = match protocol.as_str() {
@@ -1710,7 +1804,7 @@ fn scan(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    *state.scan_child.lock().unwrap() = Some(child);
+    *state.scan_child.lock() = Some(child);
 
     // Stream scan output on a SEPARATE thread per pipe. The engine writes
     // AETHER_EVENT progress to stdout and diagnostics to stderr; reading them
@@ -1801,7 +1895,7 @@ fn pump_scan_stream(
 /// best endpoint found so far), wait briefly, then kill as a fallback. Does not
 /// touch the `operation` lock, so callers already holding it won't deadlock.
 fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
-    let mut child = match scan_child.lock().unwrap().take() {
+    let mut child = match scan_child.lock().take() {
         Some(c) => c,
         None => return,
     };
@@ -1826,15 +1920,16 @@ fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
 }
 
 #[tauri::command]
-fn stop_scan(state: State<'_, AppState>) -> Result<(), String> {
+fn stop_scan(state: State<'_, AppState>) -> Result<(), CommandError> {
     // Serialize with connect/disconnect (QA-5) and cancel gracefully (QA-1).
-    let _operation = state.operation.lock().unwrap();
+    let _operation = state.operation.lock();
     stop_scan_child(&state.scan_child);
     Ok(())
 }
 
 #[cfg(windows)]
 mod elevation {
+
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
@@ -1864,22 +1959,24 @@ mod elevation {
 
 #[cfg(windows)]
 mod autostart {
+    use crate::CommandError;
+
     use std::env;
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
     const VALUE: &str = "Aether Next";
 
-    pub fn set(enabled: bool) -> Result<(), String> {
+    pub fn set(enabled: bool) -> Result<(), CommandError> {
         let key = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(
                 "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                 winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(CommandError::from)?;
         if enabled {
-            let exe = env::current_exe().map_err(|e| e.to_string())?;
+            let exe = env::current_exe().map_err(CommandError::from)?;
             let cmd = format!("\"{}\"", exe.display());
-            key.set_value(VALUE, &cmd).map_err(|e| e.to_string())
+            key.set_value(VALUE, &cmd).map_err(CommandError::from)
         } else {
             let _ = key.delete_value(VALUE);
             Ok(())
@@ -1889,6 +1986,8 @@ mod autostart {
 
 #[cfg(windows)]
 pub mod windows_proxy {
+    use crate::CommandError;
+
     use serde::{Deserialize, Serialize};
     use std::io;
     use std::path::Path;
@@ -1952,12 +2051,12 @@ pub mod windows_proxy {
             std::fs::rename(&tmp, path)
                 .map_err(|e| (format!("proxy recovery commit: {e}"), None))?;
         }
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<(), CommandError> {
             key.set_value(
                 "ProxyServer",
                 &format!("http=127.0.0.1:{port};https=127.0.0.1:{port}"),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(CommandError::from)?;
             let mut bypass = String::from("localhost;127.*;<local>");
             if let Some(ep) = endpoint {
                 if let Some(host) = super::sanitize_proxy_bypass_host(ep) {
@@ -1966,9 +2065,9 @@ pub mod windows_proxy {
                 }
             }
             key.set_value("ProxyOverride", &bypass)
-                .map_err(|e| e.to_string())?;
+                .map_err(CommandError::from)?;
             key.set_value("ProxyEnable", &1u32)
-                .map_err(|e| e.to_string())?;
+                .map_err(CommandError::from)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -1977,7 +2076,7 @@ pub mod windows_proxy {
                     if let Some(path) = recovery_path {
                         let _ = std::fs::remove_file(path);
                     }
-                    Err((error, None))
+                    Err((error.message, None))
                 }
                 Err(rollback) => Err((
                     format!("{error}; rollback failed: {rollback}"),
@@ -1994,12 +2093,12 @@ pub mod windows_proxy {
         actual_enabled: u32,
         actual_server: Option<&str>,
         actual_bypass: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         if actual_enabled != snapshot.enabled {
             return Err(format!(
                 "ProxyEnable read-back mismatch: expected {}, got {}",
                 snapshot.enabled, actual_enabled
-            ));
+            ).into());
         }
         match (snapshot.server.as_deref(), actual_server) {
             (Some(expected), Some(actual)) if expected == actual => {}
@@ -2007,12 +2106,12 @@ pub mod windows_proxy {
             (Some(expected), actual) => {
                 return Err(format!(
                     "ProxyServer read-back mismatch: expected Some({expected:?}), got {actual:?}"
-                ));
+                ).into());
             }
             (None, Some(actual)) => {
                 return Err(format!(
                     "ProxyServer read-back mismatch: expected None, got Some({actual:?})"
-                ));
+                ).into());
             }
         }
         match (snapshot.bypass.as_deref(), actual_bypass) {
@@ -2021,41 +2120,41 @@ pub mod windows_proxy {
             (Some(expected), actual) => {
                 return Err(format!(
                     "ProxyOverride read-back mismatch: expected Some({expected:?}), got {actual:?}"
-                ));
+                ).into());
             }
             (None, Some(actual)) => {
                 return Err(format!(
                     "ProxyOverride read-back mismatch: expected None, got Some({actual:?})"
-                ));
+                ).into());
             }
         }
         Ok(())
     }
 
-    pub fn restore(snapshot: ProxySnapshot) -> Result<(), String> {
-        let key = key().map_err(|e| e.to_string())?;
+    pub fn restore(snapshot: ProxySnapshot) -> Result<(), CommandError> {
+        let key = key().map_err(CommandError::from)?;
         match snapshot.server.as_ref() {
             Some(value) => key
                 .set_value("ProxyServer", value)
-                .map_err(|e| e.to_string())?,
+                .map_err(CommandError::from)?,
             None => match key.delete_value("ProxyServer") {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("delete ProxyServer: {e}")),
+                Err(e) => return Err(format!("delete ProxyServer: {e}").into()),
             },
         }
         match snapshot.bypass.as_ref() {
             Some(value) => key
                 .set_value("ProxyOverride", value)
-                .map_err(|e| e.to_string())?,
+                .map_err(CommandError::from)?,
             None => match key.delete_value("ProxyOverride") {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("delete ProxyOverride: {e}")),
+                Err(e) => return Err(format!("delete ProxyOverride: {e}").into()),
             },
         }
         key.set_value("ProxyEnable", &snapshot.enabled)
-            .map_err(|e| e.to_string())?;
+            .map_err(CommandError::from)?;
 
         // 3-tuple read-back verification: ProxyEnable, ProxyServer, ProxyOverride
         let current_enabled: u32 = key
@@ -2078,29 +2177,29 @@ pub mod windows_proxy {
     pub fn read_optional_reg_value(
         res: io::Result<String>,
         val_name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, CommandError> {
         match res {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("verify read {val_name}: {e}")),
+            Err(e) => Err(format!("verify read {val_name}: {e}").into()),
         }
     }
 
-    pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), String>>(
+    pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), CommandError>>(
         path: &Path,
         restorer: F,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommandError> {
         if !path.exists() {
             return Ok(false);
         }
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let snapshot: ProxySnapshot = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+        let data = std::fs::read(path).map_err(CommandError::from)?;
+        let snapshot: ProxySnapshot = serde_json::from_slice(&data).map_err(CommandError::from)?;
         restorer(snapshot)?;
-        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        std::fs::remove_file(path).map_err(CommandError::from)?;
         Ok(true)
     }
 
-    pub fn recover(path: &Path) -> Result<bool, String> {
+    pub fn recover(path: &Path) -> Result<bool, CommandError> {
         recover_internal(path, restore)
     }
 }

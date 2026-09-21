@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
-use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVersion};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
@@ -41,7 +41,7 @@ pub fn enabled() -> bool {
 }
 
 pub fn h2_peer(quic_peer: SocketAddr) -> SocketAddr {
-    if let Ok(v) = std::env::var("AETHER_MASQUE_H2_PEER") {
+    if let Some(v) = crate::runtime_env::var("AETHER_MASQUE_H2_PEER") {
         if let Ok(addr) = v.trim().parse::<SocketAddr>() {
             return addr;
         }
@@ -75,7 +75,7 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
 
     builder.set_grease_enabled(true);
 
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
+    let groups = crate::runtime_env::var("AETHER_TLS_GROUPS");
     let groups = groups
         .as_deref()
         .map(str::trim)
@@ -99,38 +99,26 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .set_private_key(&key)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let dangerous = std::env::var("AETHER_DANGEROUS_DISABLE_TLS_VERIFY")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-
-    // SPKI certificate pinning: cloudflare edges serve self-signed / mixed CA
-    // certs per SNI. Pin the known MASQUE edge SPKI hashes instead of trusting
-    // the system CA store, preventing MITM by any attacker who can mint a
-    // "cloudflare" looking certificate. Override with AETHER_DANGEROUS_*
-    // only for explicit debugging.
-    let pins_disabled = std::env::var("AETHER_MASQUE_DISABLE_SPKI_PINS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-
-    if dangerous || pins_disabled {
-        static COFF_WARN: std::sync::Once = std::sync::Once::new();
-        COFF_WARN.call_once(|| {
-            log::warn!("[tls] H2 SPKI pinning disabled (AETHER_DANGEROUS_DISABLE_TLS_VERIFY or AETHER_MASQUE_DISABLE_SPKI_PINS set)");
-        });
-        builder.set_verify(SslVerifyMode::NONE);
-    } else {
-        crate::tls::install_pin_verification(&mut builder, consts::MASQUE_PINS);
-    }
+    // SPKI pinning, shared with the H3 path so the two transports cannot drift
+    // apart again. Hostname verification is driven by the pin set rather than
+    // switched off globally for the whole process: an SNI-fronted edge needs its
+    // name check relaxed *for that host only* (see
+    // packaging/trust/masque-pins.json), and the former ambient env switches
+    // (`the former ambient TLS kill-switch` / `the former ambient TLS kill-switch`)
+    // are gone — any local process that could set one could previously disable
+    // authentication for the whole tunnel.
+    let pin_host = consts::CONNECT_SNI;
+    let pin_sets = crate::trust::masque_pin_sets();
+    crate::tls::install_pin_verification(&mut builder, pin_sets, pin_host)?;
+    let require_hostname = pin_sets
+        .iter()
+        .any(|s| s.host.eq_ignore_ascii_case(pin_host) && s.require_hostname);
 
     let connector = builder.build();
     let mut config = connector
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
-    // Disable hostname verification entirely: SPKI pinning (or its opt-out)
-    // handles authentication. CN-matching hostname constraints would reject
-    // SNI-fronted connections (AETHER_MASQUE_SNI != cert CN) even when the
-    // SPKI pin matches a known-good Cloudflare edge.
-    config.set_verify_hostname(false);
+    config.set_verify_hostname(require_hostname);
     config.set_use_server_name_indication(true);
 
     Ok(config)
@@ -184,16 +172,16 @@ impl FragmentConfig {
     /// Full random-fragmentation mode driven by AETHER_MASQUE_H2_FRAGMENT* env vars.
     /// Defaults when unset: chunks 16-32 bytes, delay 2-10 ms.
     fn from_env() -> Self {
-        let enabled = is_truthy(std::env::var("AETHER_MASQUE_H2_FRAGMENT").as_deref().unwrap_or(""));
+        let enabled = is_truthy(&crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT").unwrap_or_default());
         if !enabled {
             return Self::disabled();
         }
         let (size_min, size_max) = parse_range(
-            &std::env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
+            &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
             (16, 32),
         );
         let (delay_min_ms, delay_max_ms) = parse_range(
-            &std::env::var("AETHER_MASQUE_H2_FRAGMENT_DELAY").unwrap_or_default(),
+            &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_DELAY").unwrap_or_default(),
             (2, 10),
         );
         let size_min = (size_min.max(1) as usize).max(1);
