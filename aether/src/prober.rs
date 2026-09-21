@@ -1305,11 +1305,11 @@ pub struct WgProbe {
 
 /// Cache of handshakes established by the scanner, shared with the tunnel runner.
 #[derive(Clone)]
-pub struct WgSessionCache(Arc<std::sync::Mutex<HashMap<SocketAddr, crate::wireguard::EstablishedSession>>>);
+pub struct WgSessionCache(Arc<parking_lot::Mutex<HashMap<SocketAddr, crate::wireguard::EstablishedSession>>>);
 
 impl WgSessionCache {
     pub fn new() -> Self {
-        Self(Arc::new(std::sync::Mutex::new(HashMap::new())))
+        Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
     }
 
     pub fn insert_capped(
@@ -1317,7 +1317,7 @@ impl WgSessionCache {
         peer: SocketAddr,
         session: crate::wireguard::EstablishedSession,
     ) {
-        let mut map = self.0.lock().unwrap();
+        let mut map = self.0.lock();
         if map.len() >= 4 {
             map.clear();
         }
@@ -1325,7 +1325,7 @@ impl WgSessionCache {
     }
 
     pub fn take(&self, peer: &SocketAddr) -> Option<crate::wireguard::EstablishedSession> {
-        self.0.lock().unwrap().remove(peer)
+        self.0.lock().remove(peer)
     }
 }
 

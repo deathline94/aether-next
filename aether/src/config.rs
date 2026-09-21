@@ -136,8 +136,8 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
     if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(AetherError::Other("forced ACL failure for test".into()));
     }
-    let user = std::env::var("USERNAME")
-        .map_err(|e| AetherError::Other(format!("cannot determine USERNAME for ACL: {e}")))?;
+    let user = crate::runtime_env::var("USERNAME")
+        .ok_or_else(|| AetherError::Other("cannot determine USERNAME for ACL".into()))?;
     let output = std::process::Command::new("icacls")
         .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
         .output()

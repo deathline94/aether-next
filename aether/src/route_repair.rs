@@ -362,9 +362,9 @@ fn sibling_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
 /// journal with all fields defaulted to zero — which is exactly how the
 /// unscoped-deletion branch was reached.
 pub fn journal_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("LOCALAPPDATA")
+    let dir = crate::runtime_env::var("LOCALAPPDATA")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
+        .or_else(|| crate::runtime_env::var("TEMP").map(PathBuf::from))?;
     Some(dir.join("AetherNext").join("routes.journal.json"))
 }
 

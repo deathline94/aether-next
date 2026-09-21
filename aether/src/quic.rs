@@ -145,7 +145,7 @@ fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             }
         }
     }
-    if let Ok(path) = std::env::var("SSLKEYLOGFILE") {
+    if let Some(path) = crate::runtime_env::var("SSLKEYLOGFILE") {
         let path = path.trim().to_string();
         if !path.is_empty() {
             if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -259,7 +260,11 @@ fn valid_dns_name(name: &str) -> bool {
 
 pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let key = name.to_ascii_lowercase();
-    if let Ok(guard) = dns_cache().lock() {
+    {
+        // `parking_lot` has no poison state: with `std::sync::Mutex` a panic
+        // under this guard made `lock()` an `Err` forever, so every later
+        // lookup silently missed the cache and re-resolved over the tunnel.
+        let guard = dns_cache().lock();
         if let Some((ip, at)) = guard.map.get(&key) {
             if at.elapsed() < DNS_CACHE_TTL {
                 return Ok(*ip);
@@ -303,7 +308,8 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
                 continue;
             }
             if let Some(ip) = parse_dns_answer_id(&resp, qtype, Some(qid), Some(&key)) {
-                if let Ok(mut guard) = dns_cache().lock() {
+                {
+                    let mut guard = dns_cache().lock();
                     guard.map.insert(key, (ip, Instant::now()));
                     if guard.map.len() > 2048 {
                         guard.map.retain(|_, (_, at)| at.elapsed() < DNS_CACHE_TTL);
@@ -579,7 +585,8 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
             match tokio::time::timeout(Duration::from_secs(4), dns_resolve(&stack, &name)).await {
                 Ok(Ok(ip)) => {
                     let dst = SocketAddr::new(ip, port);
-                    if let Ok(mut map) = resolver_routes.lock() {
+                    {
+                        let mut map = resolver_routes.lock();
                         map.insert(dst, from);
                         if map.len() > 2048 {
                             map.clear();
@@ -624,7 +631,8 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                             continue;
                         }
                         let dst = SocketAddr::new(ip, payload.0);
-                        if let Ok(mut map) = routes.lock() {
+                        {
+                            let mut map = routes.lock();
                             map.insert(dst, from);
                             if map.len() > 2048 {
                                 map.clear();
@@ -643,7 +651,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
                 let target_client = {
-                    routes.lock().ok().and_then(|map| map.get(&src).copied()).or(client)
+                    routes.lock().get(&src).copied().or(client)
                 };
                 if let Some(c) = target_client {
                     let pkt = build_udp_reply(src, &data);

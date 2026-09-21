@@ -253,14 +253,6 @@ pub enum VerifyPolicy<'a> {
     Insecure { reason: &'static str },
 }
 
-impl Default for VerifyPolicy<'_> {
-    fn default() -> Self {
-        // Fail closed by construction: a missing policy probes, it does not
-        // trust. Nothing that ships traffic may use this default.
-        VerifyPolicy::ReadOnlyProbe
-    }
-}
-
 impl VerifyPolicy<'_> {
     /// True when the peer certificate chain must still be validated normally.
     pub fn requires_chain_validation(&self) -> bool {

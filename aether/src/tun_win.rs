@@ -499,9 +499,9 @@ fn clear_journal() {
 }
 
 fn legacy_state_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("LOCALAPPDATA")
+    let dir = crate::runtime_env::var("LOCALAPPDATA")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
+        .or_else(|| crate::runtime_env::var("TEMP").map(PathBuf::from))?;
     Some(dir.join("AetherNext").join("tun-routes.json"))
 }
 

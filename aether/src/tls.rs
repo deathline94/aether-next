@@ -41,7 +41,7 @@ fn leaf_is_temporally_valid(leaf: &boring::x509::X509Ref, now_unix: u64) -> std:
     if now < not_before {
         return Err("leaf certificate is not yet valid".into());
     }
-    if not_after <= &now {
+    if not_after <= now {
         return Err("leaf certificate has expired".into());
     }
     Ok(())

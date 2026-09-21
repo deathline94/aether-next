@@ -12,10 +12,10 @@ pub const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
 #[allow(dead_code)]
 pub const MASQUE_H3_ENDPOINT: &str = "162.159.198.2:443";
 
-/// SPKI pins live in `packaging/trust/masque-pins.json` (loaded and validated by
-/// `crate::trust::masque_pin_sets`), not in a byte literal here. A committed
-/// reviewable file makes a key rotation a visible one-line diff and removes the
-/// "empty slice means trust everyone" fallback this constant used to enable.
+// SPKI pins live in `packaging/trust/masque-pins.json` (loaded and validated by
+// `crate::trust::masque_pin_sets`), not in a byte literal here. A committed
+// reviewable file makes a key rotation a visible one-line diff and removes the
+// "empty slice means trust everyone" fallback this constant used to enable.
 
 pub const DEFAULT_MODEL: &str = "PC";
 pub const DEFAULT_LOCALE: &str = "en_US";
