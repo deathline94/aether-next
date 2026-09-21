@@ -46,7 +46,10 @@ class FakeProcess(
     val destroyForciblyCalled = AtomicBoolean(false)
     val waitCount = AtomicInteger(0)
 
-    override fun getOutputStream(): OutputStream = ByteArrayOutputStream()
+    /** One sink per process, so a test can assert what was written to stdin. */
+    val stdinSink = ByteArrayOutputStream()
+
+    override fun getOutputStream(): OutputStream = stdinSink
     override fun getInputStream(): InputStream = stdout
     override fun getErrorStream(): InputStream = ByteArrayInputStream(ByteArray(0))
 

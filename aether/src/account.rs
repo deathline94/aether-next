@@ -86,7 +86,12 @@ pub struct Addresses {
 }
 
 // Contains bearer tokens and private keys; never derive Debug.
-#[derive(Clone)]
+//
+// `ZeroizeOnDrop` because an `Identity` outlives its useful life by hours: the
+// access token, the certificate key and the WireGuard scalar sat in heap that
+// the allocator happily hands to the next allocation, so anything reading
+// process memory after a disconnect still saw them.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct Identity {
     pub device_id: String,
     pub access_token: String,
@@ -282,8 +287,12 @@ fn base_headers() -> reqwest::header::HeaderMap {
 }
 
 fn generate_x25519_keypair() -> ([u8; 32], String) {
+    use rand::RngCore;
+    // The OS generator, not the thread RNG: this is the long-lived device key,
+    // and the only thing between a leaked private scalar and a forged
+    // WireGuard identity is how the 32 bytes were drawn.
     let mut private = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut private);
+    rand::rngs::OsRng.fill_bytes(&mut private);
 
     private[0] &= 248;
     private[31] &= 127;

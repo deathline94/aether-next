@@ -131,8 +131,14 @@ open class EngineRunner(
      * down, because it will otherwise sit waiting for a key until its own
      * handoff deadline expires.
      */
+    /**
+     * The envelope key. A seam so tests (and nothing else) can supply it without
+     * touching AndroidKeyStore, which is unavailable under plain JVM unit tests.
+     */
+    open fun configKey(): String = ConfigKeyStore.loadOrCreate(context)
+
     private fun handoffConfigKey(proc: Process): Boolean = try {
-        val key = ConfigKeyStore.loadOrCreate(context)
+        val key = configKey()
         val stream = proc.outputStream
         stream.write("key ".toByteArray(Charsets.US_ASCII))
         stream.write(key.toByteArray(Charsets.US_ASCII))

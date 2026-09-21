@@ -20,6 +20,7 @@ class TestableEngineRunner(
     launcher: ProcessLauncher
 ) : EngineRunner(context, onLine, onExit, launcher) {
     override fun resolveEngine(configured: String): File = fakeBinary
+    override fun configKey(): String = "a2V5" // base64("key"); no keystore in a unit test
     override fun configureProcessEnvironment(settings: Settings, binary: File): Map<String, String> {
         return mapOf("TEST_ENV" to "1")
     }
@@ -29,6 +30,27 @@ class EngineRunnerTest {
 
     private val dummyContext: Context = ContextWrapper(null)
     private val fakeBinary = File("fake_binary")
+
+    /**
+     * The key used to be handed to the engine in its environment, where it stayed
+     * readable for the whole life of the process. It now goes down the control
+     * pipe as the first line, and the engine refuses to start without it.
+     */
+    @Test
+    fun testConfigKeyIsHandedOverOnStdin() {
+        val fakeProc = FakeProcess(ProcessExitBehavior.UNKILLABLE)
+        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
+
+        assertNull("start should succeed with null error", runner.start(Settings()))
+
+        val written = String(fakeProc.stdinSink.toByteArray(), Charsets.US_ASCII)
+        assertTrue(
+            "expected a `key <base64>` handoff line first, got: $written",
+            written.startsWith("key a2V5
+")
+        )
+    }
 
     @Test
     fun testSupervisorStateTransitions() {

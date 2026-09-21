@@ -447,12 +447,12 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
         }
         log::info!("[+] masque identity missing credentials; enrolling masque key");
         let (cert_pem, key_pem, masque_endpoint) = account::ensure_masque_enrolled(&identity).await?;
-        let identity = account::Identity {
-            cert_pem,
-            key_pem,
-            masque_endpoint,
-            ..identity
-        };
+        // Assigned in place rather than rebuilt with `..identity`: an `Identity`
+        // zeroizes on drop, so it cannot be partially moved out of.
+        let mut identity = identity;
+        identity.cert_pem = cert_pem;
+        identity.key_pem = key_pem;
+        identity.masque_endpoint = masque_endpoint;
         config::save(config_path, &identity)?;
         return Ok(identity);
     }
@@ -461,12 +461,10 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
     let identity =
         account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
     let (cert_pem, key_pem, masque_endpoint) = account::ensure_masque_enrolled(&identity).await?;
-    let identity = account::Identity {
-        cert_pem,
-        key_pem,
-        masque_endpoint,
-        ..identity
-    };
+    let mut identity = identity;
+    identity.cert_pem = cert_pem;
+    identity.key_pem = key_pem;
+    identity.masque_endpoint = masque_endpoint;
     config::save(config_path, &identity)?;
     log::info!("[+] provisioned and saved new masque identity to {config_path}");
     Ok(identity)

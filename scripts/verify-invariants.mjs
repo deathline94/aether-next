@@ -110,6 +110,36 @@ const GATES = [
     },
   },
   {
+    name: 'secrets-not-in-child-env',
+    invariant: 'BC-04',
+    summary: 'the config key is handed to the engine over stdin, never in its environment',
+    scan(api) {
+      const v = [];
+      // A child's environment is readable for its whole lifetime (crash
+      // collectors, profilers, `adb` on a debuggable build) and is not cleared
+      // when the parent wipes its own copy. The key now travels on the control
+      // pipe, so any code that puts it back into the spawn environment is
+      // re-opening the leak this replaced.
+      const re = /\.env\(\s*"AETHER_CONFIG_KEY"|\["AETHER_CONFIG_KEY"\]\s*=|"AETHER_CONFIG_KEY"\s+to/g;
+      for (const dir of ['apps/desktop/src-tauri/src', 'apps/android/android/app/src/main']) {
+        for (const f of api.files(dir, /\.(rs|kt)$/)) {
+          const t = api.read(f);
+          let m;
+          while ((m = re.exec(t))) {
+            v.push(`${locate(f, t, m.index)} puts AETHER_CONFIG_KEY back into the child environment`);
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/__selftest_secrets__.rs',
+        content: 'fn f(c: &mut std::process::Command) { c.env("AETHER_CONFIG_KEY", "x"); }\n',
+      };
+    },
+  },
+  {
     name: 'ipc-typed-errors',
     invariant: 'BC-20',
     summary: 'Tauri commands return CommandError, never String',
