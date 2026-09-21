@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -170,10 +172,12 @@ pub struct TcpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<Vec<u8>>,
     data_in: mpsc::Sender<DataIn>,
+    dead: Arc<AtomicBool>,
 }
 
 impl TcpConn {
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
+        check_live(&self.dead)?;
         self.data_in
             .send(DataIn::Tcp(self.id, data))
             .await
@@ -185,15 +189,27 @@ impl TcpConn {
             TcpSender {
                 id: self.id,
                 data_in: self.data_in,
+                dead: self.dead,
             },
             self.from_stack,
         )
     }
 }
 
+/// A write against a flow the stack has already discarded.
+fn check_live(dead: &AtomicBool) -> Result<()> {
+    if dead.load(Ordering::Relaxed) {
+        return Err(AetherError::Other(
+            "connection is closed; data was not written".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct TcpSender {
     id: usize,
     data_in: mpsc::Sender<DataIn>,
+    dead: Arc<AtomicBool>,
 }
 
 impl Clone for TcpSender {
@@ -201,12 +217,14 @@ impl Clone for TcpSender {
         Self {
             id: self.id,
             data_in: self.data_in.clone(),
+            dead: self.dead.clone(),
         }
     }
 }
 
 impl TcpSender {
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
+        check_live(&self.dead)?;
         self.data_in
             .send(DataIn::Tcp(self.id, data))
             .await
@@ -227,31 +245,52 @@ pub struct UdpConn {
 impl UdpConn {
     pub fn into_split(self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
         (
-            UdpSender {
-                id: self.id,
-                data_in: self.data_in,
-            },
+            UdpSender::new(self.id, self.data_in),
             self.from_stack,
         )
     }
 }
 
-#[derive(Clone)]
 pub struct UdpSender {
+    inner: Option<std::sync::Arc<UdpSenderShared>>,
+}
+
+struct UdpSenderShared {
     id: usize,
     data_in: mpsc::Sender<DataIn>,
 }
 
+impl Clone for UdpSender {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 impl UdpSender {
+    fn new(id: usize, data_in: mpsc::Sender<DataIn>) -> Self {
+        Self {
+            inner: Some(std::sync::Arc::new(UdpSenderShared { id, data_in })),
+        }
+    }
+
+    fn shared(&self) -> &UdpSenderShared {
+        self.inner.as_ref().expect("UdpSender used after close")
+    }
+
     pub async fn send_to(&self, dst: SocketAddr, data: Vec<u8>) -> Result<()> {
-        self.data_in
-            .send(DataIn::Udp(self.id, dst, data))
+        let shared = self.shared();
+        shared
+            .data_in
+            .send(DataIn::Udp(shared.id, dst, data))
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))
     }
 
     pub async fn close(&self) {
-        let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
+        let shared = self.shared();
+        let _ = shared.data_in.send(DataIn::UdpClose(shared.id)).await;
     }
 }
 
@@ -260,9 +299,17 @@ impl Drop for UdpSender {
         // Safety net for the socket-leak class of bugs (H1): the netstack only
         // frees a UDP socket on an explicit UdpClose, so a sender dropped
         // without close() used to leak the socket + its buffers until the
-        // MAX_UDP_CONNECTIONS cap permanently broke DNS/proxying. try_send so
-        // we never block in drop; explicit close() calls remain authoritative.
-        let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
+        // MAX_UDP_CONNECTIONS cap permanently broke DNS/proxying. `try_send` so
+        // drop never blocks; explicit close() calls remain authoritative.
+        //
+        // Taking the `Arc` out first makes this fire on the *last* handle only:
+        // the SOCKS UDP resolver clones the sender, and closing per-clone tore
+        // down an association that was still carrying traffic.
+        let Some(shared) = self.inner.take() else { return };
+        if std::sync::Arc::strong_count(&shared) != 1 {
+            return;
+        }
+        let _ = shared.data_in.try_send(DataIn::UdpClose(shared.id));
     }
 }
 
@@ -316,6 +363,12 @@ struct TcpState {
     pending: Vec<u8>,
     established: bool,
     half_closed: bool,
+    /// Set when the flow is finished from the app's point of view (dropped for
+    /// exceeding `MAX_PENDING_PER_CONN`, aborted, or removed). `TcpSender::send`
+    /// is otherwise an unacknowledged channel push, so a burst larger than the
+    /// pending budget was reported as written and then thrown away — a
+    /// truncated HTTP body or TLS record with no error anywhere.
+    dead: Arc<AtomicBool>,
 }
 
 struct UdpState {
@@ -766,6 +819,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                     pending: Vec::new(),
                     established: false,
                     half_closed: false,
+                    dead: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -823,6 +877,7 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
                 if st.pending.len().saturating_add(data.len()) > MAX_PENDING_PER_CONN {
                     log::warn!("netstack TCP {id} exceeded pending-data limit; closing");
                     st.half_closed = true;
+                    st.dead.store(true, Ordering::Relaxed);
                 } else {
                     st.pending.extend_from_slice(&data);
                 }
@@ -876,6 +931,7 @@ fn service_tcp(s: &mut NetStack) {
                 st.established = true;
                 if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
                     let conn = TcpConn {
+                        dead: s.tcp_conns[&id].dead.clone(),
                         id,
                         from_stack: rx,
                         data_in: data_in_tx.clone(),
@@ -894,7 +950,9 @@ fn service_tcp(s: &mut NetStack) {
                 }
             }
             s.sockets.remove(handle);
-            s.tcp_conns.remove(&id);
+            if let Some(st) = s.tcp_conns.remove(&id) {
+                st.dead.store(true, Ordering::Relaxed);
+            }
             continue;
         }
 
@@ -961,7 +1019,9 @@ fn service_tcp(s: &mut NetStack) {
         }
         if matches!(st_state, tcp::State::Closed) && s.tcp_conns[&id].established {
             s.sockets.remove(handle);
-            s.tcp_conns.remove(&id);
+            if let Some(st) = s.tcp_conns.remove(&id) {
+                st.dead.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1026,6 +1086,49 @@ fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    /// A discarded flow must stop acknowledging writes as if they were sent:
+    /// an over-budget burst used to be dropped while `send()` still said `Ok`.
+    #[tokio::test]
+    async fn writing_to_a_dead_flow_reports_an_error() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let dead = Arc::new(AtomicBool::new(false));
+        let conn = TcpConn {
+            id: 3,
+            from_stack: mpsc::channel(1).1,
+            data_in: tx,
+            dead: dead.clone(),
+        };
+        let (sender, _rx) = conn.into_split();
+
+        sender.send(vec![1]).await.expect("live flow accepts data");
+        assert!(matches!(rx.recv().await, Some(DataIn::Tcp(3, _))));
+
+        dead.store(true, Ordering::Relaxed);
+        assert!(
+            sender.send(vec![2]).await.is_err(),
+            "a dead flow reported the write as successful"
+        );
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// The resolver's clone of a UDP sender must not tear down the association
+    /// it was cloned from: only the last handle may close it.
+    #[tokio::test]
+    async fn last_udp_sender_handle_closes_the_association() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sender = UdpSender::new(7, tx);
+        let clone = sender.clone();
+        drop(clone);
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a cloned sender closed a live association"
+        );
+        drop(sender);
+        assert!(matches!(rx.try_recv(), Ok(DataIn::UdpClose(7))));
+    }
+
     use super::*;
 
     #[tokio::test]
