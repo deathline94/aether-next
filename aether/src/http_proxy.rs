@@ -38,10 +38,37 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     }
 }
 
+/// One boundary rule: the header block must be CRLF-delimited throughout.
+///
+/// `str::lines()` (used to pick the request line and the `Host` header) also
+/// accepts a bare LF, while the URI rewrite locates the request line by `\r\n`.
+/// A client that mixed the two therefore made the proxy read one request
+/// locally and forward a different one: `GET http://a/\nHost: b\r\n\r\n` had its
+/// first *two* lines replaced by the rewritten request line, dropping the Host
+/// header the upstream would otherwise have honoured.
+fn assert_strict_crlf(block: &[u8]) -> Result<()> {
+    let mut i = 0;
+    while i < block.len() {
+        match block[i] {
+            b'\r' => {
+                if block.get(i + 1) != Some(&b'\n') {
+                    return Err(AetherError::Other("HTTP header: bare CR".into()));
+                }
+                i += 2;
+            }
+            b'\n' => return Err(AetherError::Other("HTTP header: bare LF".into())),
+            b'\0' => return Err(AetherError::Other("HTTP header: NUL byte".into())),
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
 async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     let header = read_header(&mut client).await?;
     let header_end =
         find_header_end(&header).ok_or_else(|| AetherError::Other("invalid HTTP header".into()))?;
+    assert_strict_crlf(&header[..header_end])?;
     let text = std::str::from_utf8(&header[..header_end])
         .map_err(|_| AetherError::Other("invalid HTTP header".into()))?;
     let first = text
@@ -49,9 +76,19 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
         .next()
         .ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
     if first.len() > MAX_REQUEST_LINE { return Err(AetherError::Other("HTTP request line too long".into())); }
-    let mut request = first.split_whitespace();
+    // `split_whitespace` would also fold a tab or vertical space into a
+    // separator, so a request line is only ever three SP-delimited tokens.
+    let mut request = first.split(' ');
     let method = request.next().unwrap_or("");
     let target = request.next().unwrap_or("");
+    let version = request.next().unwrap_or("");
+    if request.next().is_some()
+        || method.is_empty()
+        || target.is_empty()
+        || !(version.eq_ignore_ascii_case("HTTP/1.1") || version.eq_ignore_ascii_case("HTTP/1.0"))
+    {
+        return Err(AetherError::Other("malformed HTTP request line".into()));
+    }
 
     let (host, port) = if method.eq_ignore_ascii_case("CONNECT") {
         parse_authority(target, 443)?
@@ -237,10 +274,20 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
         .ok_or_else(|| AetherError::Other("invalid HTTP request line".into()))?;
     let first = std::str::from_utf8(&header[..end])
         .map_err(|_| AetherError::Other("invalid HTTP request line".into()))?;
-    let mut parts = first.split_whitespace();
+    let mut parts = first.split(' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("HTTP/1.1");
+    // Defence in depth: this function splices `..end`, so it must never be
+    // handed a "request line" that swallowed a header, and no control character
+    // may sit inside the three space-delimited tokens.
+    if first.chars().any(char::is_control)
+        || method.is_empty()
+        || target.is_empty()
+        || parts.next().is_some()
+    {
+        return Err(AetherError::Other("invalid HTTP request line".into()));
+    }
     if target.len() >= 7 && target[..7].eq_ignore_ascii_case("http://") {
         let rest = &target[7..];
         let authority_end = match (rest.find('/'), rest.find('?')) {
@@ -296,13 +343,37 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_header_end, rewrite_absolute_uri};
+    use super::{assert_strict_crlf, find_header_end, rewrite_absolute_uri};
 
     #[test]
     fn separates_pipelined_connect_payload() {
         let request = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLS";
         let end = find_header_end(request).unwrap();
         assert_eq!(&request[end..], b"TLS");
+    }
+
+    #[test]
+    fn bare_line_terminators_are_rejected() {
+        assert!(assert_strict_crlf(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());
+        // A bare LF is the one that used to parse locally and differ upstream.
+        assert!(assert_strict_crlf(b"GET http://a/\nHost: b\r\n\r\n").is_err());
+        assert!(assert_strict_crlf(b"GET / HTTP/1.1\r\r\nHost: a").is_err());
+        assert!(assert_strict_crlf(b"GET / HTTP/1.1\r\nHost: a\r\n\0").is_err());
+    }
+
+    #[test]
+    fn rewrite_only_ever_touches_the_request_line() {
+        // `handle()` rejects this block first, but the rewriter splices
+        // `..end`, so on its own it must refuse rather than absorb a header.
+        let evil = b"GET http://a/\nX-Injected: 1\r\nHost: a\r\n\r\n".to_vec();
+        assert!(
+            rewrite_absolute_uri(evil).is_err(),
+            "a request line containing a bare LF must not be rewritten"
+        );
+
+        let ok = b"GET http://a/x?y=1 HTTP/1.1\r\nHost: a\r\n\r\n".to_vec();
+        let out = rewrite_absolute_uri(ok).unwrap();
+        assert!(out.starts_with(b"GET /x?y=1 HTTP/1.1\r\nHost: a"));
     }
 
     #[test]

@@ -11,6 +11,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The mechanical cross-cutting invariants (BC-03/04/05/09/10/11/14/20). These
+  # are cheap, whole-repo checks that no per-crate test would ever notice:
+  # a kill-switch reappearing in `tls.rs`, a `lock().unwrap()` on the shell
+  # lifecycle path, or a className with no rule behind it.
+  invariants:
+    name: Invariant gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+      - name: Every gate must pass
+        run: node scripts/verify-invariants.mjs
+      - name: Every gate must be able to fail
+        # Guards against a gate that reports green because it stopped looking.
+        run: node scripts/verify-invariants.mjs --selftest-fail
+
   engine:
     name: Rust engine
     runs-on: ubuntu-latest
