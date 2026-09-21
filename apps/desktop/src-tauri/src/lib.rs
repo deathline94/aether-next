@@ -981,7 +981,16 @@ include!(concat!(env!("OUT_DIR"), "/release_hashes.rs"));
 
 #[derive(Debug, Clone)]
 pub struct TrustedBinaryPolicy {
-    pub allow_unsigned_in_debug: bool,
+    /// Compiles *only* into a debug build.
+    ///
+    /// This used to be a plain `allow_unsigned_in_debug: bool` that
+    /// `for_engine()` set to `true`, so the decision to skip Authenticode for
+    /// the binary that receives the DPAPI master key lived in runtime data on
+    /// every build, and only the extra `cfg!(debug_assertions)` at the use site
+    /// kept a release build honest. There is now no field, and no code path, in
+    /// a release binary that can decline a signature check.
+    #[cfg(debug_assertions)]
+    pub allow_unsigned_for_dev: bool,
     pub expected_publisher_cn: &'static str,
     pub embedded_hashes: &'static [(&'static str, &'static str)],
     pub enforce_hash_match: bool,
@@ -996,7 +1005,8 @@ impl Default for TrustedBinaryPolicy {
 impl TrustedBinaryPolicy {
     pub fn for_engine() -> Self {
         Self {
-            allow_unsigned_in_debug: true,
+            #[cfg(debug_assertions)]
+            allow_unsigned_for_dev: true,
             expected_publisher_cn: "deathline94",
             embedded_hashes: EMBEDDED_RELEASE_HASHES,
             enforce_hash_match: !cfg!(debug_assertions),
@@ -1005,7 +1015,8 @@ impl TrustedBinaryPolicy {
 
     pub fn for_wintun() -> Self {
         Self {
-            allow_unsigned_in_debug: false,
+            #[cfg(debug_assertions)]
+            allow_unsigned_for_dev: false,
             expected_publisher_cn: "WireGuard LLC",
             embedded_hashes: EMBEDDED_RELEASE_HASHES,
             enforce_hash_match: !cfg!(debug_assertions),
@@ -1051,8 +1062,9 @@ impl std::error::Error for BinaryTrustError {}
 pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(), BinaryTrustError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_DATA, WINTRUST_FILE_INFO,
-        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
+        WinVerifyTrust, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
+        WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE,
+        WTD_STATEACTION_IGNORE, WTD_UI_NONE,
     };
 
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -1080,10 +1092,20 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
         Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
             pFile: &mut file_info,
         },
+        // IGNORE, not CLOSE: `WTD_STATEACTION_CLOSE` only releases the cached
+        // state, and releasing requires a *second* WinVerifyTrust call with the
+        // same hWVTStateData — a single CLOSE call would leak it.
         dwStateAction: WTD_STATEACTION_IGNORE,
         hWVTStateData: 0 as _,
         pwszURLReference: std::ptr::null_mut(),
-        dwProvFlags: 0x00000080, // WTD_REVOCATION_CHECK_NONE
+        // 0x80 is WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, not ..._NONE, so the
+        // value written here asked for a whole-chain CRL/OCSP walk on every
+        // launch — which fails closed on an offline machine and, in CI, against
+        // a just-issued certificate whose CRL is not published yet. Ask for no
+        // revocation walk, but do refuse the broken legacy digests.
+        dwProvFlags: WTD_REVOCATION_CHECK_NONE
+            | WTD_DISABLE_MD2_MD4
+            | WTD_CACHE_ONLY_URL_RETRIEVAL,
         dwUIContext: 0,
         pSignatureSettings: std::ptr::null_mut(),
     };
@@ -1181,11 +1203,15 @@ pub fn verify_elevated_binary(
         match auth_res {
             Ok(()) => {}
             Err(e) => {
-                if policy.allow_unsigned_in_debug && cfg!(debug_assertions) {
-                    eprintln!("[warn] Authenticode check skipped in debug mode: {e}");
-                } else {
-                    return Err(e);
+                // Exactly one outcome exists in a release binary: refuse.
+                #[cfg(debug_assertions)]
+                if policy.allow_unsigned_for_dev {
+                    eprintln!("[warn] debug build only, Authenticode check skipped: {e}");
+                    return Ok(());
                 }
+                #[cfg(not(debug_assertions))]
+                let _ = &e;
+                return Err(e);
             }
         }
     }
@@ -1239,6 +1265,11 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
     // invisible env route to the same decision is how "which binary did the
     // shell actually launch" stops being answerable from the saved settings.
     if let Some(path) = resolve_resource(app, "aether.exe") {
+        // Verified here, on every branch, rather than by each caller
+        // remembering to: this function is the only way the shell learns which
+        // binary to launch, and a returned path that skipped the checks turned
+        // "we always validate the engine" into a claim about one call site.
+        validate_trusted_binary(&path, "aether.exe")?;
         return Ok(path);
     }
     // Portable layout (Windows is case-insensitive: avoid "Aether.exe" vs "aether.exe")
@@ -1252,6 +1283,7 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
             ] {
                 let path = dir.join(rel);
                 if path.exists() {
+                    validate_trusted_binary(&path, "aether.exe")?;
                     return Ok(path);
                 }
             }
@@ -1262,10 +1294,15 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
     }
     let repo_build =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../aether/target/release/aether.exe");
-    repo_build
-        .exists()
-        .then_some(repo_build)
-        .ok_or("aether.exe not found. Build engine or choose it in Settings > Advanced.".into())
+    let Some(path) = repo_build.exists().then_some(repo_build) else {
+        return Err("aether.exe not found. Build engine or choose it in Settings > Advanced.".into());
+    };
+    // The repository-build fallback is a development convenience. `validate_trusted_binary`
+    // tolerates an unsigned local build only in a debug binary (see
+    // `allow_unsigned_for_dev`), so in a release build this path cannot be used
+    // to launch an engine nobody signed.
+    validate_trusted_binary(&path, "aether.exe")?;
+    Ok(path)
 }
 
 fn wintun_path(app: &AppHandle) -> Option<PathBuf> {
