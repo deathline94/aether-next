@@ -189,6 +189,9 @@ pub enum VerifyCost {
 }
 
 /// Per-probe budget floors/ceilings for expensive (QUIC/BoringSSL) verification.
+/// Ceiling on an adaptive scan budget: past this the user is better served by
+    /// the Stop button than by a scan that keeps running.
+const MAX_SCAN_DEADLINE: Duration = Duration::from_secs(300);
 const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis(6000);
 const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
 const EXPENSIVE_MAX_CONCURRENCY: usize = 16;
@@ -536,6 +539,33 @@ pub async fn hunt_best(
     );
 
     let total_candidates = candidates.len();
+    // A fixed 30/60 s budget against 1 400-20 000 candidates covered ~5 % of
+    // the pool while `scan_start` announced the whole count: the progress bar
+    // and the "no clean endpoint" verdict were both describing a scan that had
+    // never happened. Size the budget from the queued work (waves of
+    // `concurrency`, each costing at most `per_probe`), plus two waves of
+    // slack, and clamp so an enormous pool still cannot hang a connect.
+    if !exhaustive {
+        let waves = total_candidates.div_ceil(st.concurrency.max(1)) as u64;
+        let needed = st
+            .per_probe_timeout
+            .saturating_mul(waves.saturating_add(2) as u32);
+        let before = st.overall_deadline;
+        st.overall_deadline = needed
+            .max(before)
+            .min(MAX_SCAN_DEADLINE);
+        if st.overall_deadline > before {
+            log::debug!(
+                "[prober] {} candidates / {} concurrent at {:?} => deadline {:?} (was {:?}, cap {:?})",
+                total_candidates,
+                st.concurrency,
+                st.per_probe_timeout,
+                st.overall_deadline,
+                before,
+                MAX_SCAN_DEADLINE,
+            );
+        }
+    }
     crate::session_event::emit(crate::session_event::SessionEvent::ScanStart {
         mode: mode.label().to_string(),
         total: total_candidates,
@@ -566,6 +596,10 @@ pub async fn hunt_best(
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
     let mut scanned = 0usize;
+    // `(ip, port)` already reported. Without it a drill-down that reached the
+    // same neighbour as the main sweep counted one working gateway as two, and
+    // `target_successes` stopped the scan early on phantom hits.
+    let mut reported: std::collections::HashSet<(IpAddr, u16)> = std::collections::HashSet::new();
     let mut quiet_until: Option<Instant> = None;
     let mut hot_subnets = HashSet::<u128>::new();
 
@@ -618,8 +652,10 @@ pub async fn hunt_best(
                         match res {
                             None => continue,
                             Some(pr) => {
-                                log::info!("[+] {} candidate ok {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
-                                emit_scan_hit(label, pr.ip, pr.port, pr.rtt);
+                                if reported.insert((pr.ip, pr.port)) {
+                                    log::info!("[+] {} candidate ok {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
+                                    emit_scan_hit(label, pr.ip, pr.port, pr.rtt);
+                                }
                                 best = Some(match best {
                                     Some(cur) if cur.rtt <= pr.rtt => cur,
                                     _ => pr,
@@ -637,7 +673,11 @@ pub async fn hunt_best(
                                     // bounded: drill-downs probe a small fixed
                                     // neighbor list at min(concurrency,16).
                                     let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency, cancel_token.clone()).await;
+                                    scanned += 1;
                                     for h_pr in hot_hits {
+                                        if !reported.insert((h_pr.ip, h_pr.port)) {
+                                            continue;
+                                        }
                                         log::info!("[🔥] Hot subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
                                         emit_scan_hit(label, h_pr.ip, h_pr.port, h_pr.rtt);
                                         best = Some(match best {
@@ -718,6 +758,29 @@ pub async fn hunt_best(
 // Hot-subnet drill-down (shared)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Host offsets Stage-2 probes around a hit inside its /24.
+const STAGE2_OFFSETS: [u32; 21] = [
+    1, 2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 90, 100, 120, 150, 180, 200,
+];
+
+/// Both directions from `current`, saturating and confined to usable hosts.
+///
+/// Saturating rather than `% 254` is the fix: a hit on `.250` used to wrap its
+/// upward neighbours onto `.6/.7`, and `wrapping_sub` sent its downward
+/// neighbours to pseudo-random hosts, so "dense enumeration" re-probed some
+/// addresses while never looking at the rest of the /24.
+fn v4_neighbor_hosts(current: u32, offsets: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(offsets.len() * 2);
+    for &offset in offsets {
+        for h in [current.saturating_add(offset), current.saturating_sub(offset)] {
+            if h != current && (1..=254).contains(&h) && !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
 async fn drill_down_hot_subnet(
     verify: &VerifyFn<'_>,
     ip: IpAddr,
@@ -732,16 +795,10 @@ async fn drill_down_hot_subnet(
         IpAddr::V4(v4) => {
             let base = u32::from(v4) & 0xFFFFFF00;
             let current_host = v4.octets()[3] as u32;
-            for offset in [1, 2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 90, 100, 120, 150, 180, 200] {
-                let host1 = (current_host + offset) % 254 + 1;
-                let host2 = (current_host.wrapping_sub(offset)) % 254 + 1;
-                for h in [host1, host2] {
-                    if h != current_host && h > 0 && h < 255 {
-                        let neighbor_ip = IpAddr::V4(Ipv4Addr::from(base + h));
-                        if !neighbors.contains(&(neighbor_ip, port)) {
-                            neighbors.push((neighbor_ip, port));
-                        }
-                    }
+            for h in v4_neighbor_hosts(current_host, &STAGE2_OFFSETS) {
+                let neighbor_ip = IpAddr::V4(Ipv4Addr::from(base + h));
+                if !neighbors.contains(&(neighbor_ip, port)) {
+                    neighbors.push((neighbor_ip, port));
                 }
             }
         }
@@ -749,8 +806,8 @@ async fn drill_down_hot_subnet(
             let segs = v6.segments();
             let current_last = segs[7];
             for offset in [1, 2, 3, 4, 5, 10, 20, 50, 100] {
-                let last = current_last.wrapping_add(offset);
-                if last != current_last {
+                let last = current_last.saturating_add(offset);
+                if last != current_last && last != 0 {
                     let neighbor_ip = IpAddr::V6(Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], last));
                     if !neighbors.contains(&(neighbor_ip, port)) {
                         neighbors.push((neighbor_ip, port));
@@ -1412,6 +1469,38 @@ pub async fn hunt_best_wg_endpoint(probe: &WgProbe, mode: ScanMode) -> Result<Pr
 
 #[cfg(test)]
 mod candidate_tests {
+    use crate::prober::v4_neighbor_hosts;
+
+    /// Stage-2 must enumerate *both* directions inside the /24 and must never
+    /// wrap a neighbour onto the other side of the subnet.
+    #[test]
+    fn stage2_neighbours_saturate_inside_the_subnet() {
+        let offsets: Vec<u32> = vec![1, 2, 3, 5, 10, 20, 50, 100, 150, 200];
+
+        let near_top = v4_neighbor_hosts(250, &offsets);
+        assert!(!near_top.contains(&6), "250 + offset wrapped onto .6");
+        assert!(near_top.contains(&249) && near_top.contains(&248));
+        assert!(
+            near_top.iter().all(|h| (1..=254).contains(h)),
+            "a stage-2 neighbour left the usable host range: {near_top:?}"
+        );
+        assert!(!near_top.contains(&250), "the hit itself must not be re-probed");
+
+        let near_bottom = v4_neighbor_hosts(3, &offsets);
+        assert!(!near_bottom.contains(&0) && !near_bottom.contains(&255));
+        assert!(near_bottom.contains(&4) && near_bottom.contains(&5));
+        // Saturating clamps: every offset past the edge collapses onto .1, so the
+        // enumeration stops at the subnet boundary instead of teleporting.
+        assert_eq!(near_bottom.iter().filter(|h| **h == 1).count(), 1);
+
+        let mid = v4_neighbor_hosts(100, &offsets);
+        assert!(mid.contains(&99) && mid.contains(&101));
+        assert_eq!(
+            mid.len(),
+            mid.iter().collect::<std::collections::HashSet<_>>().len(),
+            "duplicate neighbour probed twice"
+        );
+    }
     use super::*;
     use std::net::IpAddr;
 
