@@ -12,6 +12,7 @@ pub mod dns;
 pub mod engine_config;
 pub mod error;
 pub mod h3_probe;
+pub mod keyhandoff;
 pub mod http_proxy;
 pub mod cache;
 pub mod masque;
@@ -36,6 +37,8 @@ pub mod trust;
 pub mod tunnel;
 pub mod tunnelping;
 pub mod wireguard;
+#[cfg(windows)]
+pub mod win_acl;
 
 pub use engine_config::EngineConfig;
 pub use error::{AetherError, Result};

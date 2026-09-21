@@ -6,5 +6,9 @@
 
 disallowed-methods = [
   { path = "std::env::var", reason = "pass explicit configuration to the engine; never read ambient env in the shell" },
-  { path = "std::process::Command::spawn", reason = "spawn through the engine supervisor so every child is assigned to a kill-on-close job" },
+  # `Command::spawn` is deliberately NOT disallowed: the shell *is* the engine
+  # supervisor, and a blanket ban pushed the only legal spawn sites behind an
+  # allow attribute while leaving the real rule — every child must be assigned
+  # to the kill-on-close job object — unenforced. That rule lives in
+  # `engine_job::Job::create()` + `assign_child()` immediately after each spawn.
 ]

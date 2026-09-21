@@ -113,7 +113,16 @@ use zeroize::Zeroize;
 
 #[cfg(windows)]
 pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
-    if let Ok(user) = std::env::var("USERNAME") {
+    // Fail closed. The previous `if let Ok(user)` skipped the whole ACL whenever
+    // `%USERNAME%` was unavailable, so the file that gates every other secret
+    // kept whatever the directory handed out. A SID-derived principal is the
+    // follow-up (the engine already does this); the name is unambiguous for the
+    // non-elevated case that reads these files.
+    #[allow(clippy::disallowed_methods)]
+    let user = std::env::var("USERNAME").map_err(|e| {
+        CommandError::new("internal", format!("cannot determine ACL principal: {e}"))
+    })?;
+    {
         let is_dir = path.is_dir();
         let user_perm = if is_dir {
             format!("{user}:(OI)(CI)F")
@@ -292,11 +301,56 @@ pub mod dpapi {
         envelope.extend_from_slice(DPAPI_MAGIC);
         envelope.extend_from_slice(&ciphertext);
 
-        let tmp_file = app_data_dir.join(format!("config_key.dpapi.{}.tmp", std::process::id()));
+        let tmp_file = app_data_dir.join(format!(
+            "config_key.dpapi.{}.{}.tmp",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         std::fs::create_dir_all(app_data_dir)
             .map_err(|e| format!("cannot create dir {}: {e}", app_data_dir.display()))?;
-        std::fs::write(&tmp_file, &envelope)
-            .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+        {
+            // Created exclusively and, off Windows, owner-only from the first
+            // byte: `restrict_directory_acl` is a no-op there, so without an
+            // explicit mode the master key landed with the process umask
+            // (0644 is the common case) while `encrypt()` was the identity
+            // function — every user on the machine could read the thing that
+            // decrypts every identity on disk.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp_file)
+                    .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+                std::io::Write::write_all(&mut f, &envelope)
+                    .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+                f.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                let mut f = opts
+                    .open(&tmp_file)
+                    .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+                std::io::Write::write_all(&mut f, &envelope)
+                    .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
+                f.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            use std::io::Write as _;
+            // Say it out loud rather than letting the filename imply a
+            // protection that does not exist off Windows (T096 lands the real
+            // Keychain / libsecret sources).
+            eprintln!(
+                "[aether] WARNING: no OS credential store on this platform yet; the master key in                  {} is protected only by file permissions.",
+                app_data_dir.display()
+            );
+        }
 
         // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
         if let Err(e) = super::restrict_directory_acl(&tmp_file) {
@@ -1047,7 +1101,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
         return Err(BinaryTrustError::Authenticode(
             status,
             format!("WinVerifyTrust returned error code: 0x{status:08x}"),
-        ).into());
+        ));
     }
 
     if !expected_cn.is_empty() {
@@ -1064,7 +1118,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
             return Err(BinaryTrustError::Validation(format!(
                 "failed to read signer certificate: {}",
                 String::from_utf8_lossy(&out.stderr)
-            )).into());
+            )))
         }
 
         let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1073,7 +1127,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
             return Err(BinaryTrustError::PublisherMismatch {
                 expected: expected_cn.to_string(),
                 found: subject,
-            }.into());
+            });
         }
     }
 
@@ -1110,7 +1164,7 @@ pub fn verify_elevated_binary(
                     filename: filename.to_string(),
                     expected: expected_hash.to_string(),
                     actual: actual_hash,
-                }.into());
+                });
             }
         }
     }
@@ -1118,7 +1172,7 @@ pub fn verify_elevated_binary(
     if policy.enforce_hash_match && !found_hash {
         return Err(BinaryTrustError::MissingHash {
             filename: filename.to_string(),
-        }.into());
+        });
     }
 
     #[cfg(windows)]
@@ -1137,6 +1191,35 @@ pub fn verify_elevated_binary(
     }
 
     Ok(())
+}
+
+/// Hand the configuration key to the engine over its control stdin.
+///
+/// A child process environment stays readable for the whole lifetime of that
+/// process — crash collectors, profilers, monitoring agents and (on a debuggable
+/// Android build) `adb` all see it — so passing the envelope key as
+/// `AETHER_CONFIG_KEY` meant the key to every identity on disk sat in a
+/// process-wide, long-lived, world-adjacent place. One line down the pipe this
+/// parent already owns carries the same bytes with a far shorter exposure, and
+/// the key is zeroized immediately after.
+fn handoff_config_key(child: &mut Child, key: &str) -> Result<(), CommandError> {
+    use std::io::Write as _;
+    let Some(stdin) = child.stdin.as_mut() else {
+        return Err(CommandError::new(
+            "internal",
+            "engine stdin is not piped; refusing to launch an engine that cannot receive its key",
+        ));
+    };
+    let written = stdin
+        .write_all(b"key ")
+        .and_then(|()| stdin.write_all(key.as_bytes()))
+        .and_then(|()| stdin.write_all(b"
+"))
+        .and_then(|()| stdin.flush());
+    match written {
+        Ok(()) => Ok(()),
+        Err(e) => Err(CommandError::new("handoff_failed", format!("config key handoff: {e}"))),
+    }
 }
 
 fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandError> {
@@ -1468,7 +1551,12 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                 let wintun_policy = TrustedBinaryPolicy::for_wintun();
                 verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
                     .map_err(CommandError::from)?;
-                // Optional pin: set AETHER_WINTUN_SHA256 to require exact file hash.
+                // Optional pin: set AETHER_WINTUN_SHA256 to require an exact file
+                // hash. Read from the ambient environment on purpose, and note
+                // that it can only ever *add* verification — leaving it unset
+                // still requires a passing Authenticode chain, so there is no
+                // value this key can take that weakens the check.
+                #[allow(clippy::disallowed_methods)]
                 if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
                     let expected = expected.trim().to_ascii_lowercase();
                     if !expected.is_empty() {
@@ -1487,7 +1575,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         let mut command = Command::new(&executable);
         command
             .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
-            .env("AETHER_CONFIG_KEY", &dpapi_key)
+            .env("AETHER_CONFIG_KEY_STDIN", "1")
             .env("AETHER_PROTOCOL", &settings.protocol)
             .env("AETHER_SCAN", &settings.scan_mode)
             .env("AETHER_IP", &settings.ip_version)
@@ -1560,6 +1648,14 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
                 dpapi_key.zeroize();
                 format!("Could not start aether.exe: {e}")
             })?;
+        // The key travels on stdin, then is wiped: the child never holds it in
+        // its environment and neither does this process for longer than a call.
+        if let Err(e) = handoff_config_key(&mut child, &dpapi_key) {
+            dpapi_key.zeroize();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
         dpapi_key.zeroize();
         let pid = child.id();
         // M8: put the engine into a kill-on-close job so it can never outlive us.
@@ -1754,7 +1850,7 @@ fn scan(
     let mut command = Command::new(&executable);
     command
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
-        .env("AETHER_CONFIG_KEY", &dpapi_key)
+        .env("AETHER_CONFIG_KEY_STDIN", "1")
         .env("AETHER_PROTOCOL", engine_protocol)
         .env("AETHER_SCAN", "balanced")
         .env("AETHER_SCAN_EXHAUSTIVE", "1")
@@ -1796,6 +1892,12 @@ fn scan(
             dpapi_key.zeroize();
             format!("Could not start scan: {e}")
         })?;
+    if let Err(e) = handoff_config_key(&mut child, &dpapi_key) {
+        dpapi_key.zeroize();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     dpapi_key.zeroize();
 
     let stdout = child.stdout.take();

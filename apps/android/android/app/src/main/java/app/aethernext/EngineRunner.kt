@@ -100,7 +100,10 @@ open class EngineRunner(
             "AETHER_SOCKS" to "127.0.0.1:${settings.socksPort}",
             "AETHER_HTTP" to "127.0.0.1:${settings.httpPort}",
             "AETHER_CONFIG" to configPath,
-            "AETHER_CONFIG_KEY" to ConfigKeyStore.loadOrCreate(context),
+            // The key is handed over on the child's stdin (see
+            // handoffConfigKey); a process environment lives as long as the
+            // process and is readable by anything that can open it.
+            "AETHER_CONFIG_KEY_STDIN" to "1",
             "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
             "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
             "AETHER_TUN" to "0",
@@ -120,6 +123,26 @@ open class EngineRunner(
             env["AETHER_NOIZE_INTERVAL_MS"] = settings.noizeIntervalMs.toString()
         }
         return env
+    }
+
+    /**
+     * Send the envelope key down the control pipe the engine already listens on.
+     * Returns false when the write failed; the caller must then tear the child
+     * down, because it will otherwise sit waiting for a key until its own
+     * handoff deadline expires.
+     */
+    private fun handoffConfigKey(proc: Process): Boolean = try {
+        val key = ConfigKeyStore.loadOrCreate(context)
+        val stream = proc.outputStream
+        stream.write("key ".toByteArray(Charsets.US_ASCII))
+        stream.write(key.toByteArray(Charsets.US_ASCII))
+        stream.write("
+".toByteArray(Charsets.US_ASCII))
+        stream.flush()
+        true
+    } catch (e: Exception) {
+        Log.e(TAG, "config key handoff failed: ${e.message}", e)
+        false
     }
 
     fun start(settings: Settings): String? = synchronized(lifecycleLock) {
@@ -146,6 +169,14 @@ open class EngineRunner(
             }
 
             processRef.set(proc)
+            if (!handoffConfigKey(proc)) {
+                proc.destroy()
+                proc.destroyForcibly()
+                running.set(false)
+                supervisorState.set(SupervisorState.IDLE)
+                processRef.set(null)
+                return "Engine started but could not receive its configuration key"
+            }
             Thread({
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
@@ -211,7 +242,10 @@ open class EngineRunner(
             "AETHER_SCAN_CONCURRENCY" to concurrency.toString(),
             "AETHER_SCAN_TIMEOUT_MS" to timeoutMs.toString(),
             "AETHER_CONFIG" to configPath,
-            "AETHER_CONFIG_KEY" to ConfigKeyStore.loadOrCreate(context),
+            // The key is handed over on the child's stdin (see
+            // handoffConfigKey); a process environment lives as long as the
+            // process and is readable by anything that can open it.
+            "AETHER_CONFIG_KEY_STDIN" to "1",
             "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
             "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
             "AETHER_TUN" to "0",
@@ -249,6 +283,14 @@ open class EngineRunner(
 
             val proc = launcher.launch(command, env)
             processRef.set(proc)
+            if (!handoffConfigKey(proc)) {
+                proc.destroy()
+                proc.destroyForcibly()
+                running.set(false)
+                supervisorState.set(SupervisorState.IDLE)
+                processRef.set(null)
+                return "Engine started but could not receive its configuration key"
+            }
             Thread({
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->

@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::KeyInit;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use crate::account::Identity;
 use crate::error::{AetherError, Result};
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedIdentity {
     pub device_id: String,
     pub access_token: String,
@@ -49,100 +51,252 @@ impl TryFrom<PersistedIdentity> for Identity {
     type Error = AetherError;
 
     fn try_from(p: PersistedIdentity) -> Result<Self> {
-        let wg_priv = base64::engine::general_purpose::STANDARD
-            .decode(&p.wg_private_key)
-            .map_err(|e| AetherError::Other(format!("decode wg private key: {e}")))?;
-        let wg_peer = base64::engine::general_purpose::STANDARD
-            .decode(&p.wg_peer_public_key)
-            .map_err(|e| AetherError::Other(format!("decode wg peer public key: {e}")))?;
-        if wg_priv.len() != 32 {
-            return Err(AetherError::Other(format!(
-                "wg private key length {} (want 32)",
-                wg_priv.len()
-            )));
-        }
-        if wg_peer.len() != 32 {
-            return Err(AetherError::Other(format!(
-                "wg peer public key length {} (want 32)",
-                wg_peer.len()
-            )));
-        }
+        let wg_priv = decode_key(&p.wg_private_key, "wg private key")?;
+        let wg_peer = decode_key(&p.wg_peer_public_key, "wg peer public key")?;
         let mut wg_private_key = [0u8; 32];
         let mut wg_peer_public_key = [0u8; 32];
-        let mut client_id_arr = [0u8; 3];
         wg_private_key.copy_from_slice(&wg_priv);
         wg_peer_public_key.copy_from_slice(&wg_peer);
+
+        let mut client_id_arr = [0u8; 3];
         if !p.client_id.is_empty() {
-            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&p.client_id) {
-                if decoded.len() == 3 {
-                    client_id_arr.copy_from_slice(&decoded);
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&p.client_id)
+                .map_err(|e| AetherError::Other(format!("decode client id: {e}")))?;
+            if decoded.len() != 3 {
+                return Err(AetherError::Other(format!(
+                    "client id length {} (want 3)",
+                    decoded.len()
+                )));
+            }
+            client_id_arr.copy_from_slice(&decoded);
+        }
+
+        // Address fields become parsed types here. They used to be carried as
+        // `String` all the way into packet construction, so a corrupted config
+        // produced a malformed tunnel rather than a rejection at load time.
+        let ipv4: Ipv4Addr = p
+            .ipv4
+            .trim()
+            .parse()
+            .map_err(|e| AetherError::Other(format!("invalid ipv4 address {:?}: {e}", p.ipv4)))?;
+        let ipv6: Ipv6Addr = p
+            .ipv6
+            .trim()
+            .parse()
+            .map_err(|e| AetherError::Other(format!("invalid ipv6 address {:?}: {e}", p.ipv6)))?;
+        let masque_endpoint = match p.masque_endpoint.as_deref() {
+            None => None,
+            Some(raw) => {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    let addr: SocketAddr = raw
+                        .parse()
+                        .map_err(|e| {
+                            AetherError::Other(format!("invalid masque endpoint {raw:?}: {e}"))
+                        })?;
+                    Some(addr.to_string())
                 }
             }
-        }
+        };
+
         Ok(Identity {
             device_id: p.device_id,
             access_token: p.access_token,
             cert_pem: p.cert_pem.into_bytes(),
             key_pem: p.key_pem.into_bytes(),
-            ipv4: p.ipv4,
-            ipv6: p.ipv6,
+            ipv4: ipv4.to_string(),
+            ipv6: ipv6.to_string(),
             wg_private_key,
             wg_peer_public_key,
             client_id: client_id_arr,
-            masque_endpoint: p.masque_endpoint,
+            masque_endpoint,
         })
     }
 }
 
+fn decode_key(value: &str, label: &str) -> Result<[u8; 32]> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|e| AetherError::Other(format!("decode {label}: {e}")))?;
+    if decoded.len() != 32 {
+        return Err(AetherError::Other(format!(
+            "{label} length {} (want 32)",
+            decoded.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&decoded);
+    Ok(out)
+}
+
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAGIC: &[u8] = b"AETHERCFG1\n";
+/// Version 1 wrapped the payload with a nonce but no additional authenticated
+/// data, so one file's ciphertext was valid at *any* path. Kept only to open
+/// existing installs; every write produces v2.
+const MAGIC_V1: &[u8] = b"AETHERCFG1\n";
+/// v2 = `AETHERCFG2\n` | schema: u8 | nonce: 12 | ciphertext+tag, with the
+/// canonicalised file path as additional authenticated data.
+const MAGIC_V2: &[u8] = b"AETHERCFG2\n";
+const SCHEMA_VERSION: u8 = 1;
+const NONCE_LEN: usize = 12;
+
+/// Where the envelope key came from. The engine never holds a key hierarchy of
+/// its own: the shell resolves DPAPI / AndroidKeyStore / Keychain / libsecret
+/// and hands the 32 bytes over. What the engine *can* say is whether it got one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Injected,
+    None,
+}
+
+pub fn key_source() -> KeySource {
+    match crate::runtime_env::var("AETHER_CONFIG_KEY") {
+        Some(v) if !v.trim().is_empty() => KeySource::Injected,
+        _ => KeySource::None,
+    }
+}
 
 fn key() -> Result<Option<[u8; 32]>> {
-    // Read through `runtime_env`, the single reader for every `AETHER_*` key.
-    // `std::env::var_os` here made the key a second, ambient source of truth: a
-    // value the GUI injected in-process was invisible to it (and vice versa), so
-    // the same config file decrypted for one caller and not the other.
-    let Some(v) = crate::runtime_env::var("AETHER_CONFIG_KEY") else { return Ok(None) };
-    let b = base64::engine::general_purpose::STANDARD.decode(v.trim())
-        .map_err(|_| AetherError::Other("invalid config key".into()))?;
-    if b.len() != 32 { return Err(AetherError::Other("config key must be 32 bytes".into())); }
-    let mut k=[0u8;32]; k.copy_from_slice(&b); Ok(Some(k))
+    let Some(v) = crate::runtime_env::var("AETHER_CONFIG_KEY") else {
+        return Ok(None);
+    };
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let b = base64::engine::general_purpose::STANDARD
+        .decode(&v)
+        .map_err(|_| AetherError::Other("invalid config key encoding".into()))?;
+    if b.len() != 32 {
+        return Err(AetherError::Other("config key must be 32 bytes".into()));
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&b);
+    Ok(Some(k))
 }
-fn encode(plain: &[u8]) -> Result<Vec<u8>> {
-    let Some(mut k)=key()? else { return Ok(plain.to_vec()) };
-    let cipher=ChaCha20Poly1305::new((&k).into());
-    let mut nonce=[0u8;12]; rand::thread_rng().fill_bytes(&mut nonce);
-    let ct=cipher.encrypt(Nonce::from_slice(&nonce), plain)
+
+/// The path this envelope is bound to, in a spelling that survives a `cd`.
+///
+/// Without it, copying `aether-masque.toml`'s ciphertext over `aether.toml`
+/// authenticated perfectly — the same key, the same plaintext, and the identity
+/// (device id, token, WireGuard private key) cloned onto another config.
+fn path_aad(path: &str) -> Vec<u8> {
+    let p = Path::new(path);
+    let parent = p.parent().unwrap_or_else(|| Path::new(""));
+    let canonical: PathBuf = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    out.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
+    out.push(0);
+    if let Some(name) = p.file_name() {
+        out.extend_from_slice(name.as_encoded_bytes());
+    }
+    if cfg!(windows) {
+        // NTFS names are case-insensitive: `Aether.toml` and `aether.toml` are
+        // the same file, and the bind must not depend on which spelling a
+        // caller happened to pass.
+        out.make_ascii_lowercase();
+    }
+    out
+}
+
+fn seal(path: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    let Some(mut k) = key()? else {
+        return Err(AetherError::Other(
+            "no configuration key available: refusing to write identity material in plaintext. \
+             Launch through the Aether app, or set AETHER_CONFIG_KEY to a base64-encoded 32-byte key."
+                .into(),
+        ));
+    };
+    let cipher = ChaCha20Poly1305::new((&k).into());
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let aad = path_aad(path);
+    let ct = seal_with(&cipher, &nonce, &aad, plain)?;
+    k.fill(0);
+    let mut out = Vec::with_capacity(MAGIC_V2.len() + 1 + NONCE_LEN + ct.len());
+    out.extend_from_slice(MAGIC_V2);
+    out.push(SCHEMA_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn seal_with(
+    cipher: &ChaCha20Poly1305,
+    nonce: &[u8],
+    aad: &[u8],
+    plain: &[u8],
+) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::AeadInPlace;
+    let mut buf = plain.to_vec();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(nonce), aad, &mut buf)
         .map_err(|_| AetherError::Other("config encryption failed".into()))?;
-    k.fill(0); let mut out=MAGIC.to_vec(); out.extend_from_slice(&nonce); out.extend_from_slice(&ct); Ok(out)
+    Ok(buf)
 }
-fn read_text(path: &str) -> Result<String> {
-    let raw=std::fs::read(path)?;
-    let plain=if let Some(body)=raw.strip_prefix(MAGIC) {
-        if body.len()<12 { return Err(AetherError::Other("truncated encrypted config".into())); }
-        let Some(mut k)=key()? else { return Err(AetherError::Other("encrypted config key unavailable".into())); };
-        let cipher=ChaCha20Poly1305::new((&k).into());
-        let p=cipher.decrypt(Nonce::from_slice(&body[..12]), &body[12..])
-            .map_err(|_| AetherError::Other("config authentication failed".into()))?;
-        k.fill(0); p
-    } else { raw };
-    String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))
+
+fn open_with(
+    cipher: &ChaCha20Poly1305,
+    nonce: &[u8],
+    aad: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::AeadInPlace;
+    let mut buf = body.to_vec();
+    cipher
+        .decrypt_in_place(Nonce::from_slice(nonce), aad, &mut buf)
+        .map_err(|_| AetherError::Other("config authentication failed".into()))?;
+    Ok(buf)
 }
-#[cfg(windows)]
-pub static ACL_FAIL_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns `None` when the bytes are a pre-envelope plaintext config.
+fn open(path: &str, raw: &[u8], k: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+    let cipher = ChaCha20Poly1305::new(k.into());
+    if let Some(body) = raw.strip_prefix(MAGIC_V2) {
+        let Some(&version) = body.first() else {
+            return Err(AetherError::Other("truncated config envelope header".into()));
+        };
+        if version > SCHEMA_VERSION {
+            return Err(AetherError::Other(format!(
+                "config schema version {version} is newer than this build understands ({SCHEMA_VERSION})"
+            )));
+        }
+        let rest = &body[1..];
+        if rest.len() < NONCE_LEN + 16 {
+            return Err(AetherError::Other("truncated encrypted config".into()));
+        }
+        return Ok(Some(open_with(&cipher, &rest[..NONCE_LEN], &path_aad(path), &rest[NONCE_LEN..])?));
+    }
+    if let Some(body) = raw.strip_prefix(MAGIC_V1) {
+        if body.len() < NONCE_LEN + 16 {
+            return Err(AetherError::Other("truncated encrypted config".into()));
+        }
+        // v1 had no AAD; authenticating it is enough to read it, and the caller
+        // re-seals it as v2 immediately.
+        return Ok(Some(open_with(
+            &cipher,
+            &body[..NONCE_LEN],
+            b"",
+            &body[NONCE_LEN..],
+        )?));
+    }
+    Ok(None)
+}
+
+pub static ACL_FAIL_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
 fn restrict_windows_acl(path: &str) -> Result<()> {
     if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(AetherError::Other("forced ACL failure for test".into()));
     }
-    // OS environment fact, not app configuration: `runtime_env` only owns
-    // `AETHER_*` keys, so routing this through it would return `None`.
-    #[allow(clippy::disallowed_methods)]
-    let user = std::env::var("USERNAME")
-        .map_err(|e| AetherError::Other(format!("cannot determine USERNAME for ACL: {e}")))?;
+    let principal = crate::win_acl::current_user_sid()?;
     let output = std::process::Command::new("icacls")
-        .args([path, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+        .args([path, "/inheritance:r", "/grant:r", &format!("*{principal}:F")])
         .output()
         .map_err(|e| AetherError::Other(format!("failed to run icacls on {path}: {e}")))?;
     if !output.status.success() {
@@ -155,71 +309,77 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// H5 fix: atomic + locked-down write for secret files (identity TOML, session
-/// tickets). The Windows path previously wrote full secret content to a
-/// DEFAULT-ACL temp file and only restricted permissions after renaming into
-/// place — leaving the WG private key / access token world-readable for the
-/// icacls process spawn window (~100ms+) or forever if icacls failed. Now the
-/// temp file is created EMPTY, its ACL is restricted BEFORE any secret byte hits
-/// disk, and the final file is re-restricted as belt-and-braces.
+#[cfg(not(windows))]
+fn restrict_windows_acl(_path: &str) -> Result<()> {
+    Ok(())
+}
+
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique, exclusively created temp name — a fixed `{path}.{pid}.tmp` lets two
+/// processes of the same pid family (or a hostile local user who guessed the
+/// name ahead of time) race on one file that carries secret bytes.
+fn temp_name(path: &str) -> String {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rand: u32 = rand::random();
+    format!(
+        "{path}.{}.{}.{}.tmp",
+        std::process::id(),
+        seq,
+        rand
+    )
+}
+
+/// Atomic + locked-down write for secret files (identity TOML, session
+/// tickets). The temp file is created empty and exclusively, its ACL is
+/// restricted **before** any secret byte hits disk, and the final file is
+/// re-restricted after the rename.
 pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = format!("{path}.{}.tmp", std::process::id());
-    #[cfg(unix)]
+    let tmp = temp_name(path);
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        {
-            let _ = std::fs::File::create(&tmp)?;
-        }
-        if let Err(e) = restrict_windows_acl(&tmp) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
         use std::io::Write as _;
-        let mut f = match std::fs::OpenOptions::new()
-            .truncate(true)
-            .write(true)
-            .open(&tmp)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
         {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = f.write_all(data) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
-        if let Err(e) = f.sync_all() {
+        let mut f = opts.open(&tmp).map_err(|e| {
+            AetherError::Other(format!("cannot create private temp file for {path}: {e}"))
+        })?;
+        #[cfg(windows)]
+        {
+            // Nothing has been written yet: restrict first, then write.
+            drop(f);
+            if let Err(e) = restrict_windows_acl(&tmp) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            f = match std::fs::OpenOptions::new().append(true).open(&tmp) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
+            };
+        }
+        if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
     }
+
     #[cfg(windows)]
     {
         if Path::new(path).exists() {
-            let bak = format!("{path}.bak");
             use std::os::windows::ffi::OsStrExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-                REPLACEFILE_WRITE_THROUGH,
+                ReplaceFileW, REPLACEFILE_IGNORE_MERGE_ERRORS, REPLACEFILE_WRITE_THROUGH,
             };
-
             let target_wide: Vec<u16> = Path::new(path)
                 .as_os_str()
                 .encode_wide()
@@ -230,94 +390,142 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
                 .encode_wide()
                 .chain(Some(0))
                 .collect();
-            let bak_wide: Vec<u16> = Path::new(&bak)
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-
+            // `lpBackupFileName = NULL`: a backup copy of the previous identity
+            // sitting next to the live file, outside the restricted writer and
+            // readable by anything that can read the directory, is a secret
+            // leak *and* the thing `load()` used to restore without question.
             let ret = unsafe {
                 ReplaceFileW(
                     target_wide.as_ptr(),
                     tmp_wide.as_ptr(),
-                    bak_wide.as_ptr(),
-                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 )
             };
             if ret == 0 {
-                let _ = std::fs::copy(path, &bak);
-                let ret2 = unsafe {
-                    MoveFileExW(
-                        tmp_wide.as_ptr(),
-                        target_wide.as_ptr(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                    )
-                };
-                if ret2 == 0 {
-                    let err = std::io::Error::last_os_error();
-                    return Err(AetherError::Other(format!("atomic replace failed: {err}")));
-                }
+                let err = std::io::Error::last_os_error();
+                let _ = std::fs::remove_file(&tmp);
+                return Err(AetherError::Other(format!("atomic replace failed: {err}")));
             }
-            let _ = std::fs::remove_file(&bak);
-        } else {
-            std::fs::rename(&tmp, path)?;
+        } else if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
         }
-        restrict_windows_acl(path)?;
+        if let Err(e) = restrict_windows_acl(path) {
+            let _ = e;
+            // The bytes are already in place and ACL-restricted from the temp
+            // phase; failing the second pass must not lose the config.
+            log::warn!("[config] could not re-restrict ACL on {path}");
+        }
     }
     #[cfg(not(windows))]
     {
         std::fs::rename(&tmp, path)?;
+        sync_dir(Path::new(path).parent().unwrap_or_else(|| Path::new(".")));
     }
     Ok(())
 }
 
-pub fn load(path: &str) -> Result<Option<Identity>> {
-    let resolved_path = if !Path::new(path).exists() {
-        let bak = format!("{path}.bak");
-        if Path::new(&bak).exists() {
-            log::warn!("[config] Primary config missing, recovering from backup: {bak}");
-            let _ = std::fs::copy(&bak, path);
-            path
-        } else {
-            return Ok(None);
-        }
-    } else {
-        path
-    };
+/// Make a rename survive a power loss: the directory entry, not just the file.
+#[cfg(all(unix, not(windows)))]
+fn sync_dir(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
 
-    let meta = std::fs::metadata(resolved_path)?;
+/// Move a leftover `<path>.bak` out of the way without ever reading it.
+///
+/// It used to be the recovery source: whatever landed at `<path>.bak` was
+/// copied over the live config with the error ignored, so any local write of
+/// that one filename replaced the identity the tunnel authenticates with.
+fn quarantine_backup(path: &str) {
+    let bak = format!("{path}.bak");
+    if !Path::new(&bak).exists() {
+        return;
+    }
+    let doomed = format!("{path}.quarantined");
+    match std::fs::rename(&bak, &doomed) {
+        Ok(()) => log::error!(
+            "[config] ignored and quarantined unauthenticated backup {bak} -> {doomed}"
+        ),
+        Err(e) => {
+            log::error!("[config] could not quarantine {bak}: {e}; removing instead");
+            let _ = std::fs::remove_file(&bak);
+        }
+    }
+}
+
+pub fn load(path: &str) -> Result<Option<Identity>> {
+    quarantine_backup(path);
+    if !Path::new(path).exists() {
+        return Ok(None);
+    }
+    let identity = read_identity(path)?;
+
+    // A config that is not in the current envelope is rewritten immediately and
+    // then read back through the same code path, so "migrated" is something the
+    // process proved rather than something it hoped for.
+    let raw = std::fs::read(path)?;
+    if !raw.starts_with(MAGIC_V2) {
+        if key()?.is_none() {
+            return Err(AetherError::Other(
+                "config is stored unencrypted and no key is available to seal it: refusing to keep \
+                 identity material in plaintext. Launch through the Aether app or set \
+                 AETHER_CONFIG_KEY."
+                    .into(),
+            ));
+        }
+        save(path, &identity)?;
+        let after = read_identity(path)?;
+        if after.device_id != identity.device_id || after.ipv4 != identity.ipv4 {
+            return Err(AetherError::Other(
+                "config migration read back a different identity".into(),
+            ));
+        }
+        log::info!("[config] migrated {path} into the v2 envelope");
+    }
+
+    Ok(Some(identity))
+}
+
+/// Read, authenticate and validate the identity at `path`.
+fn read_identity(path: &str) -> Result<Identity> {
+    let meta = std::fs::metadata(path)?;
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(AetherError::Other(format!(
             "config too large ({} bytes)",
             meta.len()
         )));
     }
-    let raw = std::fs::read(resolved_path)?;
-    let is_plaintext = !raw.starts_with(MAGIC);
-    let text = read_text(resolved_path)?;
+    let raw = std::fs::read(path)?;
+    let encrypted = raw.starts_with(MAGIC_V2) || raw.starts_with(MAGIC_V1);
+    let plain = match key()? {
+        Some(k) => match open(path, &raw, &k)? {
+            Some(bytes) => bytes,
+            None => raw,
+        },
+        None if encrypted => {
+            return Err(AetherError::Other(
+                "config is encrypted but no key is available for this process".into(),
+            ))
+        }
+        None => raw,
+    };
+    let text =
+        String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))?;
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
-    let identity = Identity::try_from(persisted)?;
-
-    if is_plaintext && key()?.is_some() {
-        log::info!("[config] Migrating plaintext config to encrypted format at {resolved_path}");
-        save(resolved_path, &identity).map_err(|e| {
-            AetherError::Other(format!(
-                "Failed to migrate plaintext config to encrypted format at {resolved_path}: {e}"
-            ))
-        })?;
-    }
-
-    Ok(Some(identity))
+    Identity::try_from(persisted)
 }
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
-    let text = toml::to_string_pretty(&persisted)
-        .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
-    let data = encode(text.as_bytes())?;
+    let text =
+        toml::to_string_pretty(&persisted).map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
+    let data = seal(path, text.as_bytes())?;
     write_private_file(path, &data)
 }
 
@@ -372,6 +580,41 @@ mod tests {
         assert!(cfg.contains("Jmax = 128"));
         assert!(cfg.contains("PrivateKey = "));
     }
+
+    #[test]
+    fn aad_tracks_the_file_not_its_directory() {
+        let a = path_aad("/var/lib/aether/aether.toml");
+        let b = path_aad("/var/lib/aether/aether-masque.toml");
+        let same = path_aad("/var/lib/aether/aether.toml");
+        assert_ne!(a, b, "two configs in one directory must not share a bind");
+        assert_eq!(a, same);
+    }
+
+    #[test]
+    fn unknown_fields_and_bad_addresses_are_rejected_at_load() {
+        let mut p = PersistedIdentity {
+            device_id: "d".into(),
+            access_token: "t".into(),
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            ipv4: "172.16.0.2".into(),
+            ipv6: "2606::1".into(),
+            wg_private_key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+            wg_peer_public_key: base64::engine::general_purpose::STANDARD.encode([2u8; 32]),
+            client_id: String::new(),
+            masque_endpoint: None,
+        };
+        assert!(Identity::try_from(p.clone()).is_ok());
+
+        p.ipv4 = "not-an-address".into();
+        assert!(Identity::try_from(p.clone()).is_err(), "a corrupt ipv4 must not start a tunnel");
+
+        p.ipv4 = "172.16.0.2".into();
+        p.masque_endpoint = Some("162.159.198.2:not-a-port".into());
+        assert!(Identity::try_from(p.clone()).is_err(), "endpoint must be a parsed SocketAddr");
+
+        p.masque_endpoint = None;
+        p.wg_private_key = "short".into();
+        assert!(Identity::try_from(p).is_err(), "a mistyped key must error, not default");
+    }
 }
-
-

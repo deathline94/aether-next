@@ -62,3 +62,19 @@ Desktop forwards to `session://state` / `session://log` / `scan://event`. Androi
 | Malformed event ⇒ counter increments | `_ => {}` discards silently. |
 | Android: an event stream with no prose still reaches `connected` | Status depends on log substring matching. |
 | Forged `detail` containing `","x":"y"` still yields valid JSON | Manual interpolation into the event line. |
+
+## Engine stdin: control channel
+
+One line per command, `
+` terminated, read only when `AETHER_CONTROL_STDIN=1`.
+
+| Line | Effect |
+| --- | --- |
+| `key <base64>` | **Must be the first line when `AETHER_CONFIG_KEY_STDIN=1`.** Carries the 32-byte config-envelope key, base64 as the engine's `AETHER_CONFIG_KEY` value would be. The engine installs it into `runtime_env` and zeroizes the local copy; anything that is not a valid 32-byte key aborts startup with an explicit error. The parent writes it immediately after `spawn` and zeroizes its own copy, so the key never enters the child's environment — which is readable for the whole life of the process by crash collectors, profilers and monitoring agents. |
+| `shutdown` | Ask the engine to close the tunnel and exit cleanly. |
+| `cancel` | Cooperative scan cancel: the in-flight scan finalises with its best result and persists it, instead of being killed mid-write. |
+| anything else | Logged at `warn` and ignored. A silently dropped control token was indistinguishable from a token that never arrived. |
+
+Ordering: the key line is consumed by `EngineConfig::from_env()` **before** any
+other reader touches stdin, so it cannot be mistaken for a control command, and
+no control command is honoured before the key has been delivered or refused.

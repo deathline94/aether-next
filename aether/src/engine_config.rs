@@ -38,6 +38,9 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     pub fn from_env() -> Result<Self> {
+        // First thing, before any code touches the config file: the parent hands
+        // over the envelope key on stdin rather than in the environment.
+        crate::keyhandoff::receive_if_requested()?;
         let mut cfg = Self::default();
         if let Some(v) = crate::runtime_env::var("AETHER_PROTOCOL") {
             if !v.trim().is_empty() {

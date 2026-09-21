@@ -26,6 +26,10 @@ fn compute_sha256(path: &Path) -> Option<String> {
 fn main() {
     tauri_build::build();
 
+    // A build script's entire interface *is* the process environment (cargo
+    // documents OUT_DIR/TARGET/CARGO_*); the engine's single-reader rule for
+    // `AETHER_*` keys does not apply here.
+    #[allow(clippy::disallowed_methods)]
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into());
     #[cfg(windows)]
     {
