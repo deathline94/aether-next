@@ -357,6 +357,35 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'trust-anchor-not-self-generated',
+    invariant: 'BC-02',
+    summary: 'the shell digests come from the committed anchor, never from the artifact being shipped',
+    scan(api) {
+      const v = [];
+      for (const f of api.files('apps/desktop/src-tauri', /^build\.rs$/)) {
+        const t = api.read(f);
+        if (!/engine-trust\.json/.test(t)) {
+          v.push(`${rel(f)} derives no digest from packaging/trust/engine-trust.json — the runtime comparison has nothing independent to compare against`);
+        }
+        for (const m of t.matchAll(/(?:compute_sha256|file_sha256_hex|\bsha256_hex)\s*\(([^)]*)\)/g)) {
+          if (/resources|target[\\/]release|aether\.exe|wintun\.dll/.test(m[1])) {
+            v.push(`${locate(f, t, m.index)} hashes the shipped artifact (${m[1].trim()}) — the check can then only ever succeed`);
+          }
+        }
+        for (const m of t.matchAll(/unwrap_or_default\s*\(\)|\.unwrap_or\s*\(\s*""/g)) {
+          v.push(`${locate(f, t, m.index)} a missing digest defaults to nothing — that is how an empty allow-list ships green`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/build.rs',
+        content: 'fn main() {\n    let h = compute_sha256(Path::new("resources/aether.exe")).unwrap_or_default();\n    println!("{h}");\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

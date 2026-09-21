@@ -74,6 +74,7 @@ impl From<BinaryTrustError> for CommandError {
             BinaryTrustError::PublisherMismatch { .. } => "publisher_mismatch",
             BinaryTrustError::HashMismatch { .. } => "hash_mismatch",
             BinaryTrustError::MissingHash { .. } => "missing_hash",
+            BinaryTrustError::AnchorNotPublished { .. } => "anchor_not_published",
             BinaryTrustError::Validation(_) => "validation",
         };
         Self { code, message: e.to_string() }
@@ -986,6 +987,24 @@ pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
 
 include!(concat!(env!("OUT_DIR"), "/release_hashes.rs"));
 
+/// Which witness this binary was built against, for logs and for support output:
+/// the anchor's verbatim bytes, its own digest, the table derived from it, and
+/// whether any entry is still the un-published placeholder.
+pub fn engine_trust_anchor(
+) -> (&'static [u8], &'static str, &'static [(&'static str, &'static str)], bool) {
+    (
+        ENGINE_TRUST_ANCHOR_BYTES,
+        ENGINE_TRUST_ANCHOR_SHA256,
+        EMBEDDED_RELEASE_HASHES,
+        ENGINE_TRUST_ANCHOR_HAS_PLACEHOLDER,
+    )
+}
+
+/// The all-zero digest `engine-trust.json` carries for an artifact whose witness
+/// the release job has not published yet. It is unsatisfiable by construction, so
+/// treating it as an ordinary mismatch would report a real file as tampered with.
+const PLACEHOLDER_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[derive(Debug, Clone)]
 pub struct TrustedBinaryPolicy {
     /// Compiles *only* into a debug build.
@@ -1038,6 +1057,7 @@ pub enum BinaryTrustError {
     PublisherMismatch { expected: String, found: String },
     HashMismatch { filename: String, expected: String, actual: String },
     MissingHash { filename: String },
+    AnchorNotPublished { filename: String },
 }
 
 impl std::fmt::Display for BinaryTrustError {
@@ -1059,6 +1079,14 @@ impl std::fmt::Display for BinaryTrustError {
             Self::MissingHash { filename } => {
                 write!(f, "Missing release hash in embedded policy for {filename}")
             }
+            Self::AnchorNotPublished { filename } => write!(
+                f,
+                "No trust anchor published for {filename}: packaging/trust/engine-trust.json \
+                 still carries its placeholder digest for this artifact, so nothing can be \
+                 compared against. Record the signed build's sha256 there (see that file's \
+                 $comment and packaging/trust/README.md); this is a release-pipeline gap, not a \
+                 damaged install."
+            ),
         }
     }
 }
@@ -1173,6 +1201,17 @@ pub fn verify_elevated_binary(
     label: &str,
     policy: &TrustedBinaryPolicy,
 ) -> Result<(), BinaryTrustError> {
+    // Which witness the running binary holds has to be recoverable from the logs
+    // alone, otherwise a refusal is indistinguishable from an old build.
+    static ANCHOR_LOGGED: std::sync::Once = std::sync::Once::new();
+    let (_, anchor_sha, table, has_placeholder) = engine_trust_anchor();
+    ANCHOR_LOGGED.call_once(|| {
+        eprintln!(
+            "[trust] engine-trust.json sha256={anchor_sha} entries={} placeholder_digest_present={has_placeholder}",
+            table.len()
+        );
+    });
+
     let path_buf = path.to_path_buf();
     validate_trusted_binary(&path_buf, label)
         .map_err(|e| BinaryTrustError::Validation(e.message))?;
@@ -1188,13 +1227,26 @@ pub fn verify_elevated_binary(
     for &(expected_name, expected_hash) in policy.embedded_hashes {
         if expected_name.eq_ignore_ascii_case(filename) || expected_name.eq_ignore_ascii_case(label) {
             found_hash = true;
-            if !actual_hash.eq_ignore_ascii_case(expected_hash) {
-                return Err(BinaryTrustError::HashMismatch {
-                    filename: filename.to_string(),
-                    expected: expected_hash.to_string(),
-                    actual: actual_hash,
-                });
+            if actual_hash.eq_ignore_ascii_case(expected_hash) {
+                continue;
             }
+            if expected_hash == PLACEHOLDER_SHA256 {
+                // Nothing has been witnessed for this artifact yet, so this is a
+                // pipeline gap rather than tampering. A debug build asserts
+                // nothing about release provenance and may proceed; a release
+                // build refuses, because "no comparison possible" is not a pass.
+                if policy.enforce_hash_match {
+                    return Err(BinaryTrustError::AnchorNotPublished {
+                        filename: filename.to_string(),
+                    });
+                }
+                continue;
+            }
+            return Err(BinaryTrustError::HashMismatch {
+                filename: filename.to_string(),
+                expected: expected_hash.to_string(),
+                actual: actual_hash,
+            });
         }
     }
 

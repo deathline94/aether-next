@@ -133,11 +133,29 @@ jobs:
           New-Item -ItemType Directory -Force -Path $res | Out-Null
           Copy-Item -Force "aether/target/release/aether.exe" "$res/aether.exe"
           Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
-          # Provenance pin for packaged Wintun (update if you replace packaging/wintun.dll).
-          $want = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
-          $got = (Get-FileHash "packaging/wintun.dll" -Algorithm SHA256).Hash.ToLower()
-          if ($got -ne $want) { throw "wintun.dll hash mismatch: $got" }
-          Write-Host "wintun.dll sha256 ok"
+
+      # The trust anchor has to be written between the engine build and the app
+      # build: build.rs embeds it into the shell, so the shell ends up vouching
+      # for the exact bytes this run produced and verified. It is still not the
+      # same process as the comparison — hashing resources/aether.exe inside
+      # build.rs made the runtime check structurally unable to fail.
+      - name: Publish trust anchor for this run
+        shell: pwsh
+        run: |
+          $eng = "apps/desktop/src-tauri/resources/aether.exe"
+          $sig = Get-AuthenticodeSignature -FilePath $eng
+          if ($sig.Status -ne "Valid") { throw "refusing to witness an engine whose signature is not Valid: $($sig.StatusMessage)" }
+          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "refusing to witness an engine from the wrong publisher: $($sig.SignerCertificate.Subject)" }
+          $certSha = (([Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
+          node scripts/publish-engine-trust.mjs --name aether.exe --file $eng --cert-sha $certSha --cn $sig.SignerCertificate.Subject
+          node scripts/publish-engine-trust.mjs --name wintun.dll --file packaging/wintun.dll
+
+      - name: Verify staged binaries against the trust anchor
+        shell: pwsh
+        run: |
+          node scripts/publish-engine-trust.mjs --check --name aether.exe --file apps/desktop/src-tauri/resources/aether.exe
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file apps/desktop/src-tauri/resources/wintun.dll
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file packaging/wintun.dll
 
       - name: Build app
         working-directory: apps/desktop
@@ -189,6 +207,11 @@ jobs:
           Copy-Item "packaging/wintun.dll" "$out/portable/wintun.dll"
           Copy-Item "packaging/wintun.dll" "$out/portable/engine/wintun.dll"
           "Run AetherNext-Desktop.exe" | Set-Content "$out/portable/README.txt"
+          # Ship the witness this build was compiled against: every digest the
+          # running shell accepts, and the certificate it accepted, have to be
+          # readable next to the binaries they describe.
+          Copy-Item -Force "packaging/trust/engine-trust.json" "$out/portable/engine-trust.json"
+          Copy-Item -Force "packaging/trust/engine-trust.json" "$out/engine-trust.json"
           Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext-portable-windows-x64.zip" -Force
 
       - name: Verify all packaged Windows binaries
@@ -205,6 +228,11 @@ jobs:
             if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for ${b}: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
           }
+          # Same witness, later in the pipeline: nothing between staging and the
+          # upload may move the bytes the shell was compiled to accept.
+          node scripts/publish-engine-trust.mjs --check --name aether.exe --file dist-windows/portable/engine/aether.exe
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file dist-windows/portable/engine/wintun.dll
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file dist-windows/portable/wintun.dll
 
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
@@ -212,6 +240,7 @@ jobs:
           path: |
             dist-windows/AetherNext-windows-x64-setup.exe
             dist-windows/AetherNext-portable-windows-x64.zip
+            dist-windows/engine-trust.json
           if-no-files-found: error
 
       - name: Remove signing key material
