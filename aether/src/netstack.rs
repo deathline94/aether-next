@@ -604,6 +604,60 @@ fn alloc_unique_port(s: &NetStack) -> Option<u16> {
     None
 }
 
+
+/// Destinations the tunnel must never reach, whatever a web page asks for.
+///
+/// A local HTTP/SOCKS proxy is an amplification point: a browser can make it
+/// connect anywhere, including the machine it runs on. That is how a proxy
+/// becomes a loopback port scanner, a way to read the cloud instance metadata
+/// service over `169.254.169.254`, and a route into carrier-grade-NAT
+/// infrastructure. Checking here rather than in each proxy is deliberate: this
+/// is the one place every tunnel flow passes through, and it sees the
+/// *post-resolution* address, so a DNS record pointing at an internal host
+/// cannot rebind past a name check.
+pub fn forbidden_destination(ip: IpAddr) -> Option<&'static str> {
+    let blocked_lan = crate::runtime_env::flag("AETHER_BLOCK_LAN_TARGETS");
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if v4.is_loopback() {
+                Some("loopback")
+            } else if o[0] == 0 {
+                // 0.0.0.0/8: "this host", which routes to the local machine.
+                Some("unspecified/this-network")
+            } else if v4.is_link_local() || (o[0] == 169 && o[1] == 254) {
+                Some("link-local (instance metadata)")
+            } else if o[0] == 100 && o[1] >= 64 && o[1] <= 127 {
+                Some("carrier-grade NAT (100.64.0.0/10)")
+            } else if v4.is_multicast() {
+                Some("multicast")
+            } else if blocked_lan
+                && (o[0] == 10
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 168))
+            {
+                Some("private (AETHER_BLOCK_LAN_TARGETS)")
+            } else {
+                None
+            }
+        }
+        IpAddr::V6(v6) => {
+            let f = v6.segments();
+            if v6.is_loopback() {
+                Some("loopback (::1)")
+            } else if f[0] & 0xfe00 == 0xfc00 {
+                Some("unique local (fc00::/7)")
+            } else if f[0] & 0xffc0 == 0xfe80 {
+                Some("link-local (fe80::/10)")
+            } else if f[0] == 0xff02 || v6.is_multicast() {
+                Some("multicast")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 async fn run(
     mut s: NetStack,
     mut cmd_rx: mpsc::Receiver<Cmd>,
@@ -770,6 +824,10 @@ async fn sleep_opt(delay: Option<std::time::Duration>) {
 fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     match cmd {
         Cmd::OpenTcp { dst, resp } => {
+            if let Some(reason) = forbidden_destination(dst.ip()) {
+                let _ = resp.send(Err(format!("destination {dst} is not reachable through the tunnel: {reason}")));
+                return;
+            }
             if s.tcp_conns.len() >= MAX_TCP_CONNECTIONS {
                 let _ = resp.send(Err("too many TCP connections".into()));
                 return;
@@ -889,6 +947,10 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
             }
         }
         DataIn::Udp(id, dst, data) => {
+            if let Some(reason) = forbidden_destination(dst.ip()) {
+                log::debug!("netstack: dropped UDP to {dst} ({reason})");
+                return;
+            }
             if let Some(st) = s.udp_conns.get(&id) {
                 let sock = s.sockets.get_mut::<udp::Socket>(st.handle);
                 let _ = sock.send_slice(&data, to_ip_endpoint(dst));
@@ -1086,6 +1148,26 @@ fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tunnel_destinations_are_confined_to_routable_space() {
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        for (addr, why) in [
+            (v4(127, 0, 0, 1), "loopback"),
+            (v4(0, 0, 0, 0), "unspecified/this-network"),
+            (v4(169, 254, 169, 254), "link-local (instance metadata)"),
+            (v4(100, 64, 0, 1), "carrier-grade NAT (100.64.0.0/10)"),
+            (v4(224, 0, 0, 1), "multicast"),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), "loopback (::1)"),
+            (IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), "unique local (fc00::/7)"),
+            (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), "link-local (fe80::/10)"),
+        ] {
+            assert_eq!(forbidden_destination(addr), Some(why), "{addr}");
+        }
+        for addr in [v4(93, 184, 216, 34), v4(10, 0, 0, 5), IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1))] {
+            assert_eq!(forbidden_destination(addr), None, "{addr} must be reachable");
+        }
+    }
+
     use tokio::sync::mpsc::error::TryRecvError;
 
     /// A discarded flow must stop acknowledging writes as if they were sent:

@@ -13,9 +13,8 @@ const MAX_REQUEST_LINE: usize = 4096;
 const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
-    if !listen.ip().is_loopback() && crate::runtime_env::var("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
-        return Err(AetherError::Other("refusing non-loopback HTTP proxy bind".into()));
-    }
+    // Centralised in `engine_config`: both listeners are validated together, so
+    // one knob decides whether a remote-facing proxy is allowed at all.
     Ok(TcpListener::bind(listen).await?)
 }
 

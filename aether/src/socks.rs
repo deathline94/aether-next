@@ -84,9 +84,9 @@ enum Target {
 }
 
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
-    if !listen.ip().is_loopback() && crate::runtime_env::var("AETHER_UNSAFE_PUBLIC_PROXY").is_none() {
-        return Err(AetherError::Other("refusing non-loopback SOCKS bind".into()));
-    }
+    // Non-loopback binds are already rejected centrally in `engine_config`
+    // (one knob, checked for both listeners before anything binds); a second
+    // variable here was a second source of truth that could disagree with it.
     Ok(TcpListener::bind(listen).await?)
 }
 
