@@ -11,6 +11,12 @@ use crate::error::{AetherError, Result};
 use crate::netstack::StackHandle;
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+/// How long a destination may still receive relayed datagrams after the client
+/// last sent to it. A QUIC connection migrates and idles; a NAT binding does
+/// not survive much past a couple of minutes, so keeping origins forever only
+/// widens the window in which an unsolicited source reaches the client.
+const UDP_ORIGIN_TTL: Duration = Duration::from_secs(120);
+const UDP_ORIGIN_MAX: usize = 2048;
 const RELAY_BUF: usize = 256 * 1024;
 const MAX_CLIENTS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -646,7 +652,8 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     // handed to a dedicated resolver task so the data path never blocks on DNS.
     let (res_tx, mut res_rx) = tokio::sync::mpsc::channel::<(String, u16, Vec<u8>, SocketAddr)>(64);
     let resolver_sender = sender.clone();
-    let routes: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    let routes: Arc<Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let resolver_routes = routes.clone();
     tokio::spawn(async move {
         while let Some((name, port, payload, from)) = res_rx.recv().await {
@@ -655,10 +662,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                     let dst = SocketAddr::new(ip, port);
                     {
                         let mut map = resolver_routes.lock();
-                        map.insert(dst, from);
-                        if map.len() > 2048 {
-                            map.clear();
-                        }
+                        note_origin(&mut map, dst, from);
                     }
                     let _ = resolver_sender
                         .send_to(dst, payload)
@@ -701,10 +705,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                         let dst = SocketAddr::new(ip, payload.0);
                         {
                             let mut map = routes.lock();
-                            map.insert(dst, from);
-                            if map.len() > 2048 {
-                                map.clear();
-                            }
+                            note_origin(&mut map, dst, from);
                         }
                         let _ = sender.send_to(dst, payload.1).await;
                     }
@@ -718,9 +719,27 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
 
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
+                // Reply filtering, not forwarding: a datagram from a peer the
+                // client never sent to is dropped. The previous `.or(client)`
+                // handed the client *anything* that arrived, labelled with the
+                // attacker-chosen source address.
                 let target_client = {
-                    routes.lock().get(&src).copied().or(client)
+                    let mut map = routes.lock();
+                    match map.get_mut(&src) {
+                        Some((from, seen)) if seen.elapsed() < UDP_ORIGIN_TTL => {
+                            *seen = Instant::now();
+                            Some(*from)
+                        }
+                        Some(_) => {
+                            map.remove(&src);
+                            None
+                        }
+                        None => None,
+                    }
                 };
+                if target_client.is_none() {
+                    log::debug!("socks udp: dropping unsolicited datagram from {src}");
+                }
                 if let Some(c) = target_client {
                     let pkt = build_udp_reply(src, &data);
                     let _ = relay.send_to(&pkt, c).await;
@@ -783,6 +802,27 @@ fn parse_udp_request(buf: &[u8]) -> Option<(Target, (u16, Vec<u8>))> {
     Some((target, (port, buf[pos..].to_vec())))
 }
 
+/// Record that the client just talked to `dst`, so replies may come back, and
+/// keep the table bounded by age rather than by wiping every flow at once
+/// (`clear()` dropped thousands of live origins on a burst).
+fn note_origin(map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>, dst: SocketAddr, from: SocketAddr) {
+    let now = Instant::now();
+    map.insert(dst, (from, now));
+    if map.len() <= UDP_ORIGIN_MAX {
+        return;
+    }
+    map.retain(|_, (_, seen)| seen.elapsed() < UDP_ORIGIN_TTL);
+    if map.len() > UDP_ORIGIN_MAX {
+        // Still over budget: the oldest half goes, newest conversations stay.
+        let mut by_age: Vec<(Instant, SocketAddr)> =
+            map.iter().map(|(k, (_, v))| (*v, *k)).collect();
+        by_age.sort_unstable_by_key(|(seen, _)| *seen);
+        for (_, key) in by_age.iter().take(by_age.len() - UDP_ORIGIN_MAX / 2) {
+            map.remove(key);
+        }
+    }
+}
+
 fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
     let mut pkt = vec![0x00, 0x00, 0x00];
     match src.ip() {
@@ -803,12 +843,12 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dns_query, decode_qname, evict_lru, parse_dns_answer_id, parse_domain_name,
-        parse_udp_request, select_auth_method, DnsCache, DNS_CACHE_MAX,
+        build_dns_query, decode_qname, evict_lru, note_origin, parse_dns_answer_id, parse_domain_name,
+        parse_udp_request, select_auth_method, DnsCache, DNS_CACHE_MAX, UDP_ORIGIN_MAX,
     };
     use std::{
         collections::HashMap,
-        net::IpAddr,
+        net::{IpAddr, SocketAddr},
         time::{Duration, Instant},
     };
 
@@ -899,6 +939,35 @@ mod tests {
         full.extend_from_slice(&with_ptr);
         assert_eq!(decode_qname(&full, 12).as_deref(), Some("www.example.com"));
         assert_eq!(decode_qname(&full, full.len() - 2).as_deref(), Some("www.example.com"));
+    }
+
+    /// `clear()` at the cap wiped every live origin at once, so an in-flight
+    /// QUIC connection suddenly had no permitted peer to reply to.
+    #[test]
+    fn origin_table_ages_out_instead_of_wiping_every_flow() {
+        let client = SocketAddr::from(([127, 0, 0, 1], 5150));
+        let peer = |i: usize| {
+            SocketAddr::new(IpAddr::from([1, 2, (i / 251) as u8, (i % 251) as u8]), 443)
+        };
+        let mut map: HashMap<SocketAddr, (SocketAddr, Instant)> = HashMap::new();
+        for i in 0..UDP_ORIGIN_MAX + 500 {
+            map.insert(peer(i), (client, Instant::now()));
+        }
+        assert!(map.len() > UDP_ORIGIN_MAX);
+        note_origin(&mut map, peer(UDP_ORIGIN_MAX + 500), client);
+        assert!(
+            map.len() <= UDP_ORIGIN_MAX,
+            "origin table still over budget: {}",
+            map.len()
+        );
+        assert!(
+            map.contains_key(&peer(UDP_ORIGIN_MAX + 500)),
+            "the newest origin must survive eviction"
+        );
+        assert!(
+            map.len() >= UDP_ORIGIN_MAX / 2,
+            "eviction wiped live flows instead of ageing entries out"
+        );
     }
 
     /// The old builder `continue`d past an over-long label, so a client asking
