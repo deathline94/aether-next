@@ -26,6 +26,24 @@ pub async fn run() -> Result<()> {
 
     install_panic_guard();
 
+    // Host-state repair, before anything else can touch the routing table.
+    //
+    // It used to live only inside the TUN bring-up, so an abandoned journal was
+    // never replayed when the crash happened in system-proxy mode (or when the
+    // user never enabled TUN again): the machine stayed black-holed through a
+    // route owned by a process that no longer exists. The journal is
+    // pid-guarded, so this is a no-op while a live engine holds the routes.
+    #[cfg(windows)]
+    {
+        if std::env::args().any(|a| a == "--repair-routes") {
+            crate::tun_win::recover_stale_routes();
+            return Ok(());
+        }
+        if !crate::runtime_env::flag("AETHER_SCAN_ONLY") {
+            crate::tun_win::recover_stale_routes();
+        }
+    }
+
     let session = crate::session::run_session(EngineConfig::from_env()?);
     let result = if crate::runtime_env::flag("AETHER_CONTROL_STDIN") {
         tokio::select! {

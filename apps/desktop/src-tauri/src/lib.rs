@@ -563,6 +563,13 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
 }
 
 #[cfg(windows)]
+/// `--repair-proxy`: recovery entry point for a user whose system proxy still
+/// points at an engine that died. The app restores the registry state and exits
+/// instead of opening a window they would have to fight with.
+fn repair_proxy_requested() -> bool {
+    std::env::args().any(|a| a == "--repair-proxy")
+}
+
 fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
     Ok(config_dir(app)?.join("proxy-recovery.json"))
 }
@@ -2375,6 +2382,19 @@ pub fn run() {
                         format!("Windows proxy recovery failed: {error}"),
                     ),
                 }
+            }
+            if repair_proxy_requested() {
+                // Everything that can be restored has been: the proxy journal
+                // above and the route journal the engine replays at its own
+                // startup. Exit without a tray, a window or an engine child, so
+                // the command is usable as a repair and not only as a side
+                // effect of opening the app.
+                #[cfg(windows)]
+                eprintln!("--repair-proxy: Windows proxy state restored (see messages above)");
+                #[cfg(not(windows))]
+                eprintln!("--repair-proxy: nothing to do; the system proxy integration is Windows-only");
+                let _ = std::io::stderr().flush();
+                std::process::exit(0);
             }
             watch_child(app.handle().clone());
             let settings = load_settings_file(app.handle());
