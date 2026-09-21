@@ -309,7 +309,10 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unix restricts by file mode at create time (0600), so this hook is only
+/// called from Windows paths; the stub exists to keep the call sites uniform.
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn restrict_windows_acl(_path: &str) -> Result<()> {
     Ok(())
 }

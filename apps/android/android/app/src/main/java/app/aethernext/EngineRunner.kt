@@ -136,8 +136,7 @@ open class EngineRunner(
         val stream = proc.outputStream
         stream.write("key ".toByteArray(Charsets.US_ASCII))
         stream.write(key.toByteArray(Charsets.US_ASCII))
-        stream.write("
-".toByteArray(Charsets.US_ASCII))
+        stream.write(byteArrayOf(0x0A)) // line terminator for the control channel
         stream.flush()
         true
     } catch (e: Exception) {
