@@ -77,6 +77,7 @@ fn every_validation_failure_names_a_field() {
         ("ipVersion", |s| s.ip_version = "auto-detect".into()),
         ("noize", |s| s.noize = "volcano".into()),
         ("routingMode", |s| s.routing_mode = "bridge".into()),
+        ("enginePath", |s| s.engine_path = "C:\\definitely-not-here\\aether.exe".into()),
         ("noizeJmax", |s| {
             s.noize = "custom".into();
             s.noize_jmin = 3000;
@@ -108,4 +109,33 @@ fn every_validation_failure_names_a_field() {
 fn the_display_form_stays_the_message() {
     let err = CommandError::new("not_found", "wintun.dll is missing");
     assert_eq!(format!("{err}"), "wintun.dll is missing");
+}
+
+/// Existence, not trust: the path a user typed is refused only because nothing is
+/// there. Whether a file that *is* there may be executed is the allow-list and the
+/// anchor's business, and this check must not pretend to decide it.
+#[test]
+fn a_custom_engine_path_must_exist_and_may_be_blank() {
+    let dir = std::env::temp_dir().join(format!("aether-engine-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let file = dir.join("aether.exe");
+    std::fs::write(&file, b"MZ placeholder, not executed by this test").expect("write");
+
+    let existing = settings_with(|s| s.engine_path = file.to_string_lossy().into_owned());
+    validate_settings(&existing).expect("a path that exists is a legitimate choice");
+
+    let blank = settings_with(|s| s.engine_path = "   ".into());
+    validate_settings(&blank).expect("blank means the default location, not a bad path");
+
+    let missing = settings_with(|s| s.engine_path = dir.join("nowhere.exe").to_string_lossy().into_owned());
+    let err = validate_settings(&missing).expect_err("a half-typed path must not be saved");
+    assert_eq!(err.code, "validation");
+    assert_eq!(err.field, Some("enginePath"));
+
+    let dir_as_target = settings_with(|s| s.engine_path = dir.to_string_lossy().into_owned());
+    validate_settings(&dir_as_target)
+        .expect_err("an engine is a file; a directory is not one, and `is_file` is the check");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

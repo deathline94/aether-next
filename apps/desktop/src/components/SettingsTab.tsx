@@ -10,9 +10,24 @@ import {
   Wifi,
   X,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import type { Settings } from "../types";
 import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
+
+/**
+ * A free-text path commits on blur or Enter, not on every keystroke.
+ *
+ * The form auto-saves 400 ms after the last change, so per-character patching
+ * wrote "C:", then "C:\Use", then the real path to disk: an aborted edit
+ * left a nonsense engine path saved, and the next connect failed over a
+ * half-typed string nobody meant to keep. Null means nothing changed, so a blur
+ * on an untouched field does not write at all.
+ */
+export function commitPath(draft: string, current: string): string | null {
+  const next = draft.trim();
+  return next === current.trim() ? null : next;
+}
 
 interface SettingsTabProps {
   settings: Settings;
@@ -40,6 +55,14 @@ export function SettingsTab({
   // `field` is the machine-readable half of the rejection: the shell says which
   // setting it refused, so the input itself can be marked, not just the log.
   const rejected = (field: string) => saveError?.field === field;
+  const [pathDraft, setPathDraft] = useState(settings.enginePath);
+  // Keep the draft honest when something else moves the value (hydration, a
+  // retry, a profile preset); leave it alone while the user is editing it.
+  useEffect(() => {
+    setPathDraft((draft) =>
+      commitPath(draft, settings.enginePath) === null ? settings.enginePath : draft,
+    );
+  }, [settings.enginePath]);
 
   return (
     <div className="settings-view">
@@ -495,8 +518,17 @@ export function SettingsTab({
               aria-label="Engine path"
               placeholder="Auto-detect bundled binary"
               className="tactical-text-input"
-              value={settings.enginePath}
-              onChange={(e) => patchSettings({ enginePath: e.target.value })}
+              value={pathDraft}
+              onChange={(e) => setPathDraft(e.target.value)}
+              onBlur={() => {
+                const next = commitPath(pathDraft, settings.enginePath);
+                if (next !== null) patchSettings({ enginePath: next });
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                const next = commitPath(pathDraft, settings.enginePath);
+                if (next !== null) patchSettings({ enginePath: next });
+              }}
             />
           </div>
         </div>

@@ -823,6 +823,20 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         &settings.routing_mode,
         &["proxy-only", "system-proxy", "tun"],
     )?;
+    // A custom engine path is checked for existence here rather than at connect,
+    // where the allow-list would refuse it and the user would be left with a
+    // "binary is not trusted" error for a path they typed themselves. It used to
+    // be validated nowhere: the settings form persists on a 400 ms debounce, so a
+    // half-typed path reached the disk as the configured engine.
+    if !settings.engine_path.trim().is_empty() && !Path::new(settings.engine_path.trim()).is_file() {
+        return Err(CommandError::validation(
+            "enginePath",
+            format!(
+                "engine path does not exist as a file: {}",
+                settings.engine_path.trim()
+            ),
+        ));
+    }
     Ok(())
 }
 
