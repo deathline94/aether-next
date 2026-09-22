@@ -785,6 +785,35 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T190 [US6] Restore motion correctness in `apps/desktop/src/App.css`: define `.spin`/`.spin-icon` keyframes **outside** the `prefers-reduced-motion` block (they currently appear **only** inside it, so both "working" spinners are frozen and a healthy engine looks hung), and make the reduced-motion block cover the 7 animations that actually loop (`radar-sweep-spin`, `ping-ring-pulse`, `breathing-glow`, `sparkline-jitter`, `pulse`, `save-sync-pulse`) instead of naming two non-existent selectors.
 - [x] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
 - [ ] T192 [US6] Complete the CSS integrity pass in `apps/desktop/src/App.css` + `packages/ui/tokens.css`: add the missing rendered classes (`.metric-icon` + `.blue/.coral/.green/.yellow`, `.btn-secondary`, `.retry-btn`, `.status-text`, `.tactile-badge`); delete ~9 orphaned pre-rewrite selectors (`.activity-view`, `.log-line`, `.metrics-grid`, `.status-chip`, `.power-button`, `.save-bar`, …); delete the duplicate `.tactile-copy-btn` block at `:2277` whose equal-specificity position silently kills the emerald hover on all five copy buttons; collapse 8 panel definitions into one `.panel` + modifiers and un-double-class the 6 elements carrying two conflicting panel classes; replace 17 `transition: all`; raise `--muted-dark` `#47535e` (2.40–2.60:1) to ≥4.5:1 and floor labels at 11 px (`.stat-label` is 8.5 px today); unify 6 disabled opacities / 12 radii / 15 border alphas; add `scrollbar-gutter: stable`; make `.sparkline-bar` animate `transform: scaleY()`.
+  <!-- Re-measured against the tree, 2026-09-22, item by item.
+       Closed: every named orphan is gone or was only ever a comment
+       (`.power-button` survives solely inside the T190 note explaining that it
+       was deleted; `.log-line`, `.metrics-grid`, `.status-chip` have 0
+       occurrences in either sheet or the markup; `.sparkline-bar` no longer
+       exists, so its animation ask is moot); the duplicate `.tactile-copy-btn`
+       block is gone and `css-no-conflicting-duplicate-selectors` now fails on
+       the whole class of defect (same-level repeats and overrides, while an
+       @media override or a repeated @keyframes step is left alone); `transition:
+       all` is a banned pattern; `--muted-dark` and the 11 px floor are gates
+       (`type-scale-floor`, `wcag-pair-contrast`); `scrollbar-gutter` landed in
+       `be06ca8`. The double-classing half closed in `3c7c42e`: ten elements
+       carried `.settings-section .tactical-panel`, where `.tactical-panel` was a
+       near-copy of the grouped panel rule differing only in shadow alpha and sat
+       later in the sheet, so file order - not design - decided the render; no
+       element ever used that class on its own, so it was retired and the
+       rendered values were proved identical (computed-style hash 4ac11a97
+       before and after). Five more dead declarations came out of the new gate
+       with it (`f436ed5`).
+       Still open, and it is a design pass rather than a repair: the 12 distinct
+       `border-radius` values (4/6/7/8/10/12/14/999 and four more) and the six
+       disabled opacities are a scale nobody chose, but collapsing them moves
+       pixels on ~200 rules, and the 8 panel definitions could fold into one
+       `.panel` + modifiers the same way - all three want eyes on a renderer.
+       `.activity-view` is the one remaining double-classed element
+       (`ActivityTab.tsx:144`) and is *not* the same defect: it is defined only
+       inside the ≤680 band and sets properties its sibling does not, so nothing
+       is silently overridden - it is untidy, not wrong. -->
+
 - [ ] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
 - [x] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
   <!-- Closed 2026-09-22 (`8eaec25`, `72a0886`), with one deliberate deviation.
