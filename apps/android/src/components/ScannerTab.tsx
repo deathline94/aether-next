@@ -2,6 +2,10 @@ import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
+// The ceiling the engine will actually run, not the number the slider was set to:
+// this field used to offer 1-2000 while the shell clamped to 500, so the "Workers
+// Active" chip contradicted the input the user had just filled in.
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
 
@@ -246,12 +250,12 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Concurrency (Workers)</strong>
-                <span className="field-hint">1–2000 active</span>
+                <span className="field-hint">{SCAN_MIN_CONCURRENCY}–{SCAN_MAX_CONCURRENCY} active</span>
               </div>
               <NumberField
                 label="Scan concurrency"
-                min={SCAN_LIMITS.minConcurrency}
-                max={SCAN_LIMITS.maxConcurrency}
+                min={SCAN_MIN_CONCURRENCY}
+                max={SCAN_MAX_CONCURRENCY}
                 step={10}
                 value={concurrency}
                 disabled={active}

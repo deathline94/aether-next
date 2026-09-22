@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node ../../scripts/sync-tokens.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "stage-engine": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/stage-engine.ps1",

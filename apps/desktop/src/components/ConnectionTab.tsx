@@ -443,7 +443,11 @@ export function ConnectionTab({
             </div>
             <div className="spec-badge">
               <span>SECURITY CIPHER</span>
-              <strong>CHACHA20-POLY1305</strong>
+              {/* WireGuard's suite is fixed by the protocol; MASQUE negotiates a
+                  TLS 1.3 suite with the peer and nothing here observes which one,
+                  so naming ChaCha20-Poly1305 was a claim about an unmeasured
+                  property. Identical text lived in the Android sheet's twin. */}
+              <strong>{settings.protocol === "masque" ? "NEGOTIATED (not observed)" : "CHACHA20-POLY1305"}</strong>
             </div>
           </div>
 

@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2020",
     "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "skipLibCheck": true,
 
@@ -21,6 +21,13 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
-  "exclude": ["src/**/*.test.ts"],
+  /*
+   * Nothing is excluded: `npm run build` runs `tsc`, and the previous pattern only
+   * named `*.test.ts`, so the build type-checked the component tests and skipped
+   * the hook ones — the half of the suite that least looked like it was checked.
+   * Vitest strips types rather than checking them, so this is the only place a
+   * test file's types are verified.
+   */
+  "exclude": ["src-tauri", "node_modules", "dist"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

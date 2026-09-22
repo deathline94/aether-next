@@ -10,7 +10,7 @@ use aether_desktop_lib::scan_terminal_event;
 #[test]
 fn a_scan_that_reported_its_own_ending_gets_no_invented_one() {
     assert_eq!(
-        scan_terminal_event(true, 3),
+        scan_terminal_event(true, 3, false),
         None,
         "the engine said scan_done; a second terminal event is a double report"
     );
@@ -21,7 +21,7 @@ fn a_scan_that_reported_its_own_ending_gets_no_invented_one() {
 /// found a dozen endpoints as having found none.
 #[test]
 fn an_abandoned_scan_is_reported_as_a_failure_not_an_empty_success() {
-    let event = scan_terminal_event(false, 12).expect("the UI needs a terminal event");
+    let event = scan_terminal_event(false, 12, false).expect("the UI needs a terminal event");
     assert_eq!(event["type"], "scan_failed", "got {event}");
     let message = event["message"].as_str().expect("message is a string");
     assert!(
@@ -36,7 +36,7 @@ fn an_abandoned_scan_is_reported_as_a_failure_not_an_empty_success() {
 
 #[test]
 fn an_abandoned_scan_that_found_nothing_says_so() {
-    let event = scan_terminal_event(false, 0).expect("the UI needs a terminal event");
+    let event = scan_terminal_event(false, 0, false).expect("the UI needs a terminal event");
     assert_eq!(event["type"], "scan_failed");
     assert!(
         event["message"]
@@ -45,6 +45,35 @@ fn an_abandoned_scan_that_found_nothing_says_so() {
             .contains("no working endpoint"),
         "got {event}"
     );
+}
+
+/// A pipe this process failed to read is not an engine that had nothing to say.
+///
+/// The pump used to swallow the read error and leave the run reporting "the scan
+/// process ended without reporting a result", which sends a reader to the engine log
+/// for a fault in the shell.
+#[test]
+fn a_broken_output_stream_is_blamed_on_the_shell() {
+    let event = scan_terminal_event(false, 7, true).expect("the UI needs a terminal event");
+    assert_eq!(event["type"], "scan_failed");
+    let message = event["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("output stream failed in the shell"),
+        "the fault has to name its own side: {message}"
+    );
+    assert!(message.contains('7'), "the count survives: {message}");
+    assert!(
+        !message.contains("process ended"),
+        "the process may still be running: {message}"
+    );
+
+    let empty = scan_terminal_event(false, 0, true).expect("the UI needs a terminal event");
+    let empty = empty["message"].as_str().unwrap_or_default();
+    assert!(
+        empty.contains("output stream failed in the shell"),
+        "got {empty}"
+    );
+    assert!(empty.contains("no working endpoint"), "got {empty}");
 }
 
 /// The activity log's level, decided without a running engine.

@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 import { platformLabel } from "../bridge";
 import { profileActive, speedProfiles } from "../types";
 import type { RuntimeState, Settings } from "../types";
+import type { TestOutcome } from "../hooks/useRuntime";
 
 /**
  * Nothing here may claim a property the app has not observed: the engine reports
@@ -33,7 +34,7 @@ interface ConnectionTabProps {
   settingsLoaded: boolean;
   admin: boolean;
   online: boolean;
-  testResult: string | null;
+  testResult: TestOutcome | null;
   appVersion: string;
   toggleConnection: () => void;
   patchSettings: (patch: Partial<Settings>) => void;
@@ -83,10 +84,14 @@ export function ConnectionTab({
   const routingLabel = settings.routingMode === "tun" ? "Full Device VPN" : "Local Proxy Only";
   const routingSub = settings.routingMode === "tun" ? "VpnService + TUN" : "Local Loopback SOCKS5/HTTP";
 
-  // Only a measured round-trip may be shown as a number: the engine reports no
-  // latency of its own, so anything else here would be invented telemetry.
-  const parsedLatency = testResult?.match(/(\d+)\s*ms/i)?.[1];
-  const displayLatency = parsedLatency ? `${parsedLatency} ms` : "not measured";
+  // Only a measured round-trip may be shown as a number: the value is now a field
+  // the native layer sets when it timed something, never a digit scraped out of a
+  // sentence.
+  const measured = testResult?.latencyMs;
+  const displayLatency =
+    typeof measured === "number" && Number.isFinite(measured) && measured > 0
+      ? `${Math.round(measured)} ms`
+      : "not measured";
   const displayLoss = "not measured";
 
   return (
@@ -322,7 +327,13 @@ export function ConnectionTab({
             </div>
             <div className="spec-badge">
               <span>SECURITY CIPHER</span>
-              <strong>CHACHA20-POLY1305</strong>
+              {/* WireGuard's cipher suite is fixed by the protocol, so naming it is
+                  a statement about the transport. MASQUE runs TLS 1.3 over QUIC or
+                  H2: the suite is negotiated by the peer (frequently an AES-GCM one)
+                  and nothing here observes which, so asserting ChaCha20 was a
+                  property the app never measured — the same class of invention as
+                  scraping a latency out of a sentence that has no number in it. */}
+              <strong>{settings.protocol === "masque" ? "NEGOTIATED (not observed)" : "CHACHA20-POLY1305"}</strong>
             </div>
           </div>
 
@@ -439,8 +450,8 @@ export function ConnectionTab({
           </button>
         </div>
         {testResult && (
-          <code className={`test-result ${testResult.startsWith("OK") ? "ok" : "err"}`}>
-            {testResult}
+          <code className={`test-result ${testResult.detail.startsWith("OK") ? "ok" : "err"}`}>
+            {testResult.detail}
           </code>
         )}
       </section>

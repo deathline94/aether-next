@@ -5,6 +5,20 @@ import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
+/**
+ * What a connectivity check actually knows.
+ *
+ * `latencyMs` is null unless the native layer measured a round trip. The UI used
+ * to scrape a number out of the result sentence with `(\d+)\s*ms`, which never
+ * matched the success text (the tile read "not measured" forever) and did match
+ * the timeout inside a failure (printing a failure's 12000 ms as a latency). An
+ * absent measurement is now displayed as absent rather than guessed.
+ */
+export type TestOutcome = {
+  detail: string;
+  latencyMs: number | null;
+};
+
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
 /** If the engine stays "connecting" past this, surface a timeout instead of hanging forever. */
@@ -24,7 +38,7 @@ export function useRuntime(
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<IpcError | null>(null);
   const [admin, setAdmin] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<TestOutcome | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -239,12 +253,14 @@ export function useRuntime(
     setTestBusy(true);
     setTestResult(null);
     try {
-      const result = await invoke<string>("test_connection", { settings });
+      const result = await invoke<TestOutcome>("test_connection", { settings });
       setTestResult(result);
-      appendLog({ level: "info", message: result });
+      appendLog({ level: "info", message: result.detail });
     } catch (error) {
       const msg = errorMessage(error);
-      setTestResult(msg);
+      // A failure has no latency. Reporting the error text as if it were a
+      // measurement is what made the old regex able to print a timeout as RTT.
+      setTestResult({ detail: msg, latencyMs: null });
       appendLog({ level: "error", message: msg });
     } finally {
       setTestBusy(false);

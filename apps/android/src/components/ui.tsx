@@ -171,9 +171,13 @@ export function Badge({
   className?: string;
 }) {
   return (
+    // One badge, not a badge inside a badge: the inner `.tactile-badge` gave every
+    // pill a second border, second padding and a second uppercase transform, and
+    // the class was declared twice with a 4px and a 999px radius, so which one a
+    // badge looked like depended on stylesheet order.
     <span className={`tactile-badge ${variant} ${className}`}>
       <span className="tactile-badge-dot" aria-hidden="true" />
-      <span className="tactile-badge">{children}</span>
+      {children}
     </span>
   );
 }

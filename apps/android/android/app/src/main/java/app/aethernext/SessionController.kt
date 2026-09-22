@@ -439,7 +439,7 @@ class SessionController(
         return null
     }
 
-    fun testConnection(s: Settings): String {
+    fun testConnection(s: Settings): JSONObject {
         val proxy = "http://127.0.0.1:${s.httpPort}"
         val client = okhttp3.OkHttpClient.Builder()
             .proxy(
@@ -454,14 +454,28 @@ class SessionController(
             .url("https://www.cloudflare.com/cdn-cgi/trace")
             .get()
             .build()
+        // Timed across the whole proxied exchange — connect, TLS, response — from a
+        // monotonic clock, so a wall-clock adjustment cannot change the number.
+        val startedAt = android.os.SystemClock.elapsedRealtime()
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw Exception("proxy test failed: HTTP ${resp.code}")
             val body = resp.body?.string().orEmpty()
+            val latencyMs = android.os.SystemClock.elapsedRealtime() - startedAt
             val ip = body.lineSequence().firstOrNull { it.startsWith("ip=") }?.removePrefix("ip=")
                 ?: "unknown"
             val loc = body.lineSequence().firstOrNull { it.startsWith("loc=") }?.removePrefix("loc=")
                 ?: "?"
-            return "OK via $proxy - ip=$ip loc=$loc"
+            // The round-trip time is a measured number, so it is returned as one.
+            // It used to be folded into the prose (`... - ip=… loc=…`, no `ms` at
+            // all) and the UI scraped it back out with `(\d+)\s*ms`, which never
+            // matched the success line — the tile read "not measured" forever — and
+            // *could* match a timeout digits inside a failure string, printing a
+            // failure's 12000 ms as if it were a latency.
+            return JSONObject()
+                .put("detail", "OK via $proxy - ip=$ip loc=$loc")
+                .put("latencyMs", latencyMs)
+                .put("ip", ip)
+                .put("loc", loc)
         }
     }
 
