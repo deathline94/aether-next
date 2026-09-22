@@ -260,6 +260,83 @@ pub type VerifyFn<'a> = dyn Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Futur
     + Sync
     + 'a;
 
+/// What the cached-endpoint race came back with.
+#[derive(Debug)]
+pub enum Tier0Outcome {
+    Winner(ProbeResult),
+    Cancelled,
+    Miss,
+}
+
+/// Re-verify the cached endpoints before paying for a scan.
+///
+/// A cached endpoint may be **re-verified**, never preferred over verification:
+/// this call used to pass `ironclad = false` unconditionally, so in Ironclad mode
+/// a cache hit was accepted on a bare handshake — the one path where "this
+/// address answered once, weeks ago" outranked "prove you still forward traffic",
+/// which is the entire reason Ironclad exists.
+pub async fn race_cached_endpoints(
+    cached: Vec<(SocketAddr, u32)>,
+    verify: &VerifyFn<'_>,
+    cache_kind: &CacheKind,
+    config_path: &str,
+    timeout: Duration,
+    ironclad: bool,
+    cancel: CancellationToken,
+) -> Tier0Outcome {
+    if cached.is_empty() {
+        return Tier0Outcome::Miss;
+    }
+    // Checked before anything is spawned: a cancel that arrives between "press
+    // Connect" and here used to still fire up to five live probes.
+    if cancel.is_cancelled() {
+        return Tier0Outcome::Cancelled;
+    }
+    let race_count = cached.len().min(5); // Race top-5 by trust score.
+    let race_futures: Vec<_> = cached
+        .into_iter()
+        .take(race_count)
+        .map(|(addr, _rtt)| {
+            let tok = cancel.clone();
+            async move {
+                tokio::select! {
+                    _ = tok.cancelled() => None,
+                    res = verify(addr.ip(), addr.port(), timeout, ironclad) => res,
+                }
+            }
+        })
+        .collect();
+
+    let mut set = futures::stream::FuturesUnordered::new();
+    for fut in race_futures {
+        set.push(fut);
+    }
+    use futures::StreamExt;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Tier0Outcome::Cancelled,
+            res = set.next() => {
+                match res {
+                    Some(Some(pr)) => {
+                        log::info!("[⚡] Tier-0 race winner {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        let rtt_ms = pr.rtt.as_millis() as u32;
+                        cache_kind.write_with_rtt(
+                            config_path,
+                            vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
+                        );
+                        return Tier0Outcome::Winner(pr);
+                    }
+                    Some(None) => continue,
+                    None => {
+                        log::info!("[-] Tier-0 race: all cached endpoints failed, falling back to full scan");
+                        return Tier0Outcome::Miss;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Unified scan engine
 // ─────────────────────────────────────────────────────────────────────────────
@@ -463,56 +540,28 @@ pub async fn hunt_best(
     } else {
         config.cache_kind.read_sorted(&config.config_path)
     };
-    if !cached.is_empty() {
-        // M3 fix: the tier-0 race used a hardcoded 600ms budget while expensive
-        // (H3) verification needs >=5s — every cached endpoint "failed" on any
-        // network with >600ms handshake time, evicting good entries and forcing
-        // a pointless full scan on every connect. Race with the same per-probe
-        // budget the strategy settled on (first-hit-wins is unchanged).
-        let tier0_timeout = st.per_probe_timeout;
-        let race_count = cached.len().min(5); // Race top-5 by trust score.
-        let race_child = cancel_token.clone();
-        let race_futures: Vec<_> = cached
-            .into_iter()
-            .take(race_count)
-            .map(|(addr, _rtt)| {
-                let tok = race_child.clone();
-                async move {
-                    tokio::select! {
-                        _ = tok.cancelled() => None,
-                        res = verify(addr.ip(), addr.port(), tier0_timeout, false) => res,
-                    }
-                }
-            })
-            .collect();
-
-        // Race: return the first successful result.
-        let mut set = futures::stream::FuturesUnordered::new();
-        for fut in race_futures {
-            set.push(fut);
+    // M3 fix: the tier-0 race used a hardcoded 600ms budget while expensive
+    // (H3) verification needs >=5s — every cached endpoint "failed" on any
+    // network with >600ms handshake time, evicting good entries and forcing
+    // a pointless full scan on every connect. Race with the same per-probe
+    // budget the strategy settled on (first-hit-wins is unchanged).
+    match race_cached_endpoints(
+        cached,
+        verify,
+        &config.cache_kind,
+        &config.config_path,
+        st.per_probe_timeout,
+        ironclad,
+        cancel_token.clone(),
+    )
+    .await
+    {
+        Tier0Outcome::Winner(pr) => return Ok(pr),
+        Tier0Outcome::Cancelled => {
+            log::info!("[*] scan cancelled during Tier-0 race");
+            return Err(AetherError::NoCleanEndpoint);
         }
-        use futures::StreamExt;
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    log::info!("[*] scan cancelled during Tier-0 race");
-                    return Err(AetherError::NoCleanEndpoint);
-                }
-                res = set.next() => {
-                    match res {
-                        Some(Some(pr)) => {
-                            log::info!("[⚡] Tier-0 race winner {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
-                            let rtt_ms = pr.rtt.as_millis() as u32;
-                            config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
-                            return Ok(pr);
-                        }
-                        Some(None) => continue,
-                        None => break,
-                    }
-                }
-            }
-        }
-        log::info!("[-] Tier-0 race: all cached endpoints failed, falling back to full scan");
+        Tier0Outcome::Miss => {}
     }
 
     let mut effective_ip = ip;
@@ -1618,5 +1667,132 @@ mod candidate_tests {
             "cancelled scan must persist its best-so-far endpoint; cache was {cached:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tier0_tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    /// A cache entry is a memory of a proof, not a substitute for one. Tier-0 used
+    /// to call `verify(.., false)` unconditionally, so in Ironclad mode a cached
+    /// address was accepted on a bare handshake while a freshly generated candidate
+    /// had to complete a real HTTP round trip — the mode's whole guarantee applied
+    /// to the endpoints nobody had ever connected to, and not to the one from last
+    /// week.
+    #[tokio::test]
+    async fn a_cache_hit_must_pass_the_proof_the_mode_asks_for() {
+        let dir = std::env::temp_dir().join(format!("aether_tier0_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let gw: SocketAddr = "162.159.193.1:443".parse().unwrap();
+        let seen: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
+
+        let recorder = seen.clone();
+        let verify = move |ip: IpAddr, port: u16, _t: Duration, ironclad: bool|
+         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                recorder.lock().push(ironclad);
+                Some(ProbeResult {
+                    ip,
+                    port,
+                    rtt: Duration::from_millis(25),
+                })
+            })
+        };
+
+        let out = race_cached_endpoints(
+            vec![(gw, 25)],
+            &verify,
+            &CacheKind::Masque,
+            &base,
+            Duration::from_secs(1),
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(out, Tier0Outcome::Winner(ref pr) if pr.ip == gw.ip()),
+            "the race must still take a cached hit when it passes: {out:?}"
+        );
+        let flags: Vec<bool> = seen.lock().iter().copied().collect();
+        assert_eq!(flags.len(), 1);
+        assert!(
+            flags[0],
+            "Tier-0 asked for a handshake-only proof while Ironclad was on"
+        );
+
+        // The same call with the mode off must not start demanding HTTP proofs.
+        seen.lock().clear();
+        let out = race_cached_endpoints(
+            vec![(gw, 25)],
+            &verify,
+            &CacheKind::Masque,
+            &base,
+            Duration::from_secs(1),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(out, Tier0Outcome::Winner(_)));
+        assert_eq!(seen.lock().as_slice(), &[false]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_cache_is_a_miss_not_a_hang() {
+        let seen: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
+        let recorder = seen.clone();
+        let verify = move |_ip: IpAddr, _port: u16, _t: Duration, _ironclad: bool|
+         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                recorder.lock().push(true);
+                None
+            })
+        };
+        let out = race_cached_endpoints(
+            Vec::new(),
+            &verify,
+            &CacheKind::Masque,
+            "unused",
+            Duration::from_millis(50),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(out, Tier0Outcome::Miss));
+        assert!(seen.lock().is_empty(), "no entries, no probes");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_the_race_is_reported_as_cancelled() {
+        let recorder: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
+        let verify = move |ip: IpAddr, port: u16, _t: Duration, _ironclad: bool|
+         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+            let recorder = recorder.clone();
+            Box::pin(async move {
+                recorder.lock().push(true);
+                let _ = (ip, port);
+                None
+            })
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+        let out = race_cached_endpoints(
+            vec![("162.159.193.1:443".parse().unwrap(), 25)],
+            &verify,
+            &CacheKind::Masque,
+            "unused",
+            Duration::from_millis(50),
+            false,
+            token,
+        )
+        .await;
+        assert!(matches!(out, Tier0Outcome::Cancelled), "{out:?}");
     }
 }
