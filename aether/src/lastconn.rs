@@ -9,7 +9,16 @@ pub struct LastConnection {
 
 pub fn load(path: &str) -> Option<LastConnection> {
     let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
+    match toml::from_str(&text) {
+        Ok(conn) => Some(conn),
+        // A file that exists but does not parse is a different fact from "no
+        // cache": it means the next connect pays for a full scan and nothing in the
+        // log says why.
+        Err(e) => {
+            log::warn!("[lastconn] {path} is unreadable ({e}); reconnecting will rescan");
+            None
+        }
+    }
 }
 
 pub fn save(path: &str, peer: &str, profile: &str) {
@@ -19,11 +28,15 @@ pub fn save(path: &str, peer: &str, profile: &str) {
     };
     match toml::to_string_pretty(&conn) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(path, text) {
-                log::debug!("[lastconn] failed to save {path}: {e}");
+            // The same locked-down atomic writer the identity file uses: a plain
+            // `fs::write` left a truncated file if the process died mid-write, and
+            // a truncated file parses as "no cache", so quick reconnect silently
+            // paid for a full scan with nothing logged at a level anyone reads.
+            if let Err(e) = crate::config::write_private_file(path, text.as_bytes()) {
+                log::warn!("[lastconn] failed to save {path}: {e}");
             }
         }
-        Err(e) => log::debug!("[lastconn] failed to encode: {e}"),
+        Err(e) => log::warn!("[lastconn] failed to encode: {e}"),
     }
 }
 

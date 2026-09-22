@@ -247,6 +247,16 @@ pub async fn run_fingerprint(spec: &str, identity: &Identity) -> Result<()> {
     let cert = identity.cert_pem.clone();
     let key = identity.key_pem.clone();
     let targets = expand_targets(spec);
+    if targets.is_empty() {
+        // A `/16`, a typo, or a list of unparsable entries expands to nothing. The
+        // scan then logged "scanning 0 candidates", probed nothing, and exited 0 —
+        // indistinguishable from "probed the whole list, found nothing reachable",
+        // which is exactly how a broken spec reads as a negative result.
+        return Err(crate::error::AetherError::Other(format!(
+            "h3-fingerprint: target spec {spec:?} expands to no candidates \
+             (want a comma-separated ip:port list or an A.B.C.0/24 base)"
+        )));
+    }
     log::info!(
         "[h3-fp] scanning {} candidates (sni={sni}, {} concurrent, {:?} each)",
         targets.len(),
