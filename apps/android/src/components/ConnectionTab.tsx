@@ -8,6 +8,7 @@ import { platformLabel } from "../bridge";
 import { profileActive, speedProfiles } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import type { TestOutcome } from "../hooks/useRuntime";
+import { noiseIsInert } from "../../../../packages/ui/src";
 
 /**
  * Nothing here may claim a property the app has not observed: the engine reports
@@ -319,7 +320,15 @@ export function ConnectionTab({
             </div>
             <div className="spec-badge">
               <span>OBFUSCATION</span>
-              <strong>NOISE: {settings.noize.toUpperCase()}</strong>
+              {/* MASQUE over HTTP/2 is a TCP CONNECT tunnel: no QUIC Initial to
+                  fragment and no handshake for junk frames to precede, so the
+                  stored profile is inert. Showing it as active claimed an effect
+                  the transport cannot have. Same predicate as the desktop tile. */}
+              <strong>
+                {noiseIsInert(settings.protocol, settings.transport)
+                  ? "INACTIVE (H2 tunnel)"
+                  : `NOISE: ${settings.noize.toUpperCase()}`}
+              </strong>
             </div>
             <div className="spec-badge">
               <span>ANTI-DPI FRAG</span>

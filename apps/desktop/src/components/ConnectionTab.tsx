@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { RuntimeState, Settings } from "../types";
+import { noiseIsInert } from "../../../../packages/ui/src";
 
 const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = [
   { id: "masque-h3", label: "MASQUE H3", hint: "MASQUE h3 · noise off · balanced scan · system proxy", patch: { protocol: "masque", transport: "h3", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "system-proxy" } },
@@ -435,7 +436,14 @@ export function ConnectionTab({
             </div>
             <div className="spec-badge">
               <span>OBFUSCATION</span>
-              <strong>NOISE: {settings.noize.toUpperCase()}</strong>
+              {/* On MASQUE/H2 there is no QUIC Initial to hide and no handshake for
+                  junk frames to precede, so the stored profile does nothing: naming
+                  it as if it were active was a claim about an inert setting. */}
+              <strong>
+                {noiseIsInert(settings.protocol, settings.transport)
+                  ? "INACTIVE (H2 tunnel)"
+                  : `NOISE: ${settings.noize.toUpperCase()}`}
+              </strong>
             </div>
             <div className="spec-badge">
               <span>ANTI-DPI FRAG</span>

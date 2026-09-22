@@ -13,6 +13,7 @@ import {
 import { useEffect, useState } from "react";
 import type { NoizeProfile, Settings } from "../types";
 import { NOIZE_OPTIONS, NOIZE_PROFILES, SCAN_MODE_OPTIONS, oneOf } from "../../../../packages/ui/src/enums";
+import { noiseIsInert } from "../../../../packages/ui/src";
 import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
 
@@ -42,7 +43,7 @@ export function commitPath(draft: string, current: string): string | null {
  * showable.
  */
 export function noiseFieldState(settings: Settings): { blocked: boolean; showMatrix: boolean } {
-  const blocked = settings.protocol === "masque" && settings.transport === "h2";
+  const blocked = noiseIsInert(settings.protocol, settings.transport);
   return { blocked, showMatrix: !blocked && settings.noize === "custom" };
 }
 

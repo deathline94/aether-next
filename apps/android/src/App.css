@@ -2901,6 +2901,29 @@ code, kbd, pre {
 }
 
 /* Color Coding Levels */
+/* Second channel for log severity. The level dots and badges were distinguished
+   by hue alone — a 5px emerald/yellow/coral/violet dot on a near-black field —
+   so warn vs error was invisible to colour-blind users and to anyone reading a
+   grey-scaled or high-contrast display. Each level now has a distinct shape as
+   well, and the dot is large enough for the shape to be legible. */
+.gutter-dot {
+  width: 7px;
+  height: 7px;
+}
+.terminal-log-row.info .gutter-dot {
+  clip-path: circle(50%);
+}
+.terminal-log-row.warn .gutter-dot {
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+.terminal-log-row.error .gutter-dot {
+  clip-path: inset(0);
+  border-radius: 1px;
+}
+.terminal-log-row.debug .gutter-dot {
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+
 .terminal-log-row.info .gutter-dot {
   background: var(--emerald);
 }
