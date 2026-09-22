@@ -4,4 +4,9 @@
          identity master packages/ui/brand/aether-mark.svg and themes.xml. -->
     <color name="ic_launcher_background">#0B0F11</color>
     <color name="ic_launcher_foreground">#66E3A4</color>
+
+    <!-- The one app canvas: window background, status bar, navigation bar and the
+         WebView's own background all read this, so the chrome cannot end up three
+         shades apart as the system theme changes. -->
+    <color name="app_canvas">#0D1113</color>
 </resources>

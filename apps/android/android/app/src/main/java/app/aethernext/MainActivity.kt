@@ -3,7 +3,6 @@ package app.aethernext
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
-import android.graphics.Color
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -61,7 +60,10 @@ class MainActivity : AppCompatActivity() {
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
         webView = WebView(this).apply {
-            setBackgroundColor(Color.parseColor("#0D1113"))
+            // The theme's canvas, not a second copy of the hex: this is the colour
+            // visible before the WebView's own stylesheet paints, and a literal
+            // here is how the chrome drifted three shades apart.
+            setBackgroundColor(getColor(R.color.app_canvas))
         }
         setContentView(webView)
 
