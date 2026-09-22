@@ -1,35 +1,15 @@
 //! The engine-event mirror and its dispatch.
 //!
 //! One place decides what a line from the engine means for the UI: the structured
-//! `AETHER_EVENT` payload first, the legacy prose markers second, and the log
-//! level for the activity stream out of both.
+//! `AETHER_EVENT` payload for every state the shell acts on, the log level for
+//! the activity stream, and prose only where the wording *is* the payload (a
+//! failed probe reported inside a session that is still alive).
 use crate::settings::{RoutingMode, Settings};
 use crate::state::{emit_log, emit_state, AppState};
 use crate::supervision::{cleanup_routing, mark_connected};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
-
-pub(crate) fn parse_endpoint(line: &str) -> Option<String> {
-    for marker in [
-        "selected MASQUE gateway ",
-        "selected WireGuard endpoint ",
-        "using cloudflare edge ",
-        "using forced peer ",
-    ] {
-        if let Some(rest) = line.split(marker).nth(1) {
-            let token = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches(|c: char| c == '(' || c == ')' || c == ',');
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
-}
 
 /// Mirror of the engine's `session_event::SessionEvent`
 /// (`aether/src/session_event.rs`), deserialised rather than probed field by
@@ -223,31 +203,17 @@ pub(crate) fn handle_engine_line(
             emit_state(app, &state, "error", msg, None, None);
         }
     }
-    if line.contains("socks5 listening on")
-        || line.contains("socks5 server listening")
-        || line.contains("http proxy listening")
-    {
-        socks_seen.store(true, Ordering::SeqCst);
-    }
-    if line.contains("data-plane verified") {
-        tunnel_seen.store(true, Ordering::SeqCst);
-    }
-    // Handshake alone is NOT enough for TUN mode (WG handshake fires before WinTUN).
-    if !want_tun && line.contains("handshake successful") {
-        tunnel_seen.store(true, Ordering::SeqCst);
-    }
-    if line.contains("[tun] bridge active") || line.contains("TUN mode enabled") {
-        tun_seen.store(true, Ordering::SeqCst);
-        tunnel_seen.store(true, Ordering::SeqCst);
-    }
-    if let Some(endpoint) = parse_endpoint(line) {
-        let state = app.state::<AppState>();
-        let mut rt = state.runtime.lock();
-        rt.endpoint = Some(endpoint);
-        let snap = rt.clone();
-        drop(rt);
-        let _ = app.emit("session://state", snap);
-    }
+    // Readiness has exactly one source: the structured `ProxyReady`,
+    // `TunnelReady` and `TunReady` events handled above, which the engine emits
+    // on every path that reaches those states. Below this line used to sit a
+    // second, parallel answer — `socks5 listening on`, `data-plane verified`,
+    // `handshake successful`, `[tun] bridge active`, and four English phrases that
+    // mined the endpoint out of a log line — and it was load-bearing only because
+    // it agreed by luck. A reword on the engine's side did not fail anything: it
+    // left the endpoint out of the UI, or a tunnel marked ready before its
+    // data-plane existed, with no error on either side of the boundary. Prose is
+    // still read for one thing only, above: the banner for a failed probe inside
+    // a live session, where the wording is the payload.
 
     // Proxy + tunnel always. TUN mode also requires tun_ready / bridge active.
     let ready = socks_seen.load(Ordering::SeqCst)
