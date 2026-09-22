@@ -155,7 +155,7 @@ export function ActivityTab({
       : 0;
 
   return (
-    <div className="activity-view tactical-activity-view">
+    <div className="tactical-activity-view">
       {scanState.active && (
         <div className="tactical-scan-card">
           <div className="scan-card-header">
@@ -292,7 +292,7 @@ export function ActivityTab({
         {/* Terminal Screen Console */}
         <section
           ref={consoleRef}
-          className="activity-console tactical-terminal-screen font-mono"
+          className="tactical-terminal-screen font-mono"
           onScroll={handleScroll}
           aria-label="Engine log output"
           // A scroll region the keyboard cannot reach: `tabIndex={0}` is what lets

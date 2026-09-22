@@ -186,11 +186,20 @@ const GATES = [
     invariant: 'BC-10',
     summary: 'every className token resolves to a rule',
     scan(api) {
-      const sheets = ['apps/desktop/src/App.css', 'apps/android/src/App.css', 'packages/ui/tokens.css']
-        .filter(existsRel)
-        .map((p) => readFileSync(join(ROOT, p), 'utf8'))
-        .join('\n');
-      const defined = new Set([...sheets.matchAll(/\.([A-Za-z][\w-]*)/g)].map((m) => m[1]));
+      const sheet = (p) => (existsRel(p) ? readFileSync(join(ROOT, p), 'utf8') : '');
+      const tokens = sheet('packages/ui/tokens.css');
+      const defined = (src) =>
+        new Set([...src.matchAll(/\.([A-Za-z][\w-]*)/g)].map((m) => m[1]));
+      const FOR_APP = {
+        'apps/desktop': defined(sheet('apps/desktop/src/App.css') + '\n' + tokens),
+        'apps/android': defined(sheet('apps/android/src/App.css') + '\n' + tokens),
+      };
+      /*
+       * Per app, not a union. Unioning the two sheets is how a class that only
+       * the *other* surface styles slipped through: `apps/desktop` markup could
+       * point at a selector living in Android's copy and the gate read it as
+       * resolved, while the desktop element rendered with no rule at all.
+       */
       /*
        * Tailwind generates utilities at build time, so they never appear as a
        * literal `.class` in the source sheets. The list is deliberately
@@ -200,6 +209,9 @@ const GATES = [
       const BUILD_GENERATED = new Set(['font-mono', 'tabular-nums', 'text-red-400']);
       const v = [];
       for (const f of api.files('apps', /\.(tsx|jsx)$/)) {
+        const app = Object.keys(FOR_APP).find((a) => rel(f).startsWith(`${a}/`));
+        if (!app) continue;
+        const definedFor = FOR_APP[app];
         const t = api.read(f);
         for (const m of t.matchAll(/className=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
           const raw = (m[1] ?? m[2] ?? '').replace(/\$\{[^}]*\}/g, ' ');
@@ -209,10 +221,10 @@ const GATES = [
             // at least one `badge-*` rule actually exists.
             if (tok.endsWith('-')) {
               let hit = false;
-              for (const c of defined) if (c.startsWith(tok)) { hit = true; break; }
+              for (const c of definedFor) if (c.startsWith(tok)) { hit = true; break; }
               if (hit) continue;
             }
-            if (!defined.has(tok)) v.push(`${locate(f, t, m.index)} className "${tok}" has no rule`);
+            if (!definedFor.has(tok)) v.push(`${locate(f, t, m.index)} className "${tok}" has no rule in ${app}/src`);
           }
         }
       }

@@ -480,7 +480,7 @@ export function SettingsTab({
           <HardDrive size={20} className="panel-head-icon" aria-hidden="true" />
         </div>
 
-        <div className="setting-row input-row">
+        <div className="setting-row">
           <div className="port-field-block">
             <label>
               <div className="field-meta">
@@ -530,7 +530,7 @@ export function SettingsTab({
           </div>
         )}
 
-        <div className="setting-row path-row">
+        <div className="setting-row">
           <div>
             <div className="setting-label-row">
               <strong>Engine Binary Path</strong>
@@ -562,7 +562,7 @@ export function SettingsTab({
       </section>
 
       {/* ─── Save Dock ───────────────────────────────────────────────────── */}
-      <div className="save-bar tactical-save-dock">
+      <div className="tactical-save-dock">
         <div className="save-bar-status" role="status" aria-live="polite">
           <span className="save-status-indicator-dot" />
           <span className="save-status-text">
