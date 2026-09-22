@@ -520,7 +520,18 @@
 
 - [ ] T172 [US6] Replace the stringly allowlists in `apps/desktop/src-tauri/src/lib.rs:512-545` with real enums (`IpVersion::{Auto,V4,V6,Dual}`, `ScanMode`, `Protocol`, `TransportKind`, `RoutingMode`) so `"both"` and the `"thorogh"` typo become non-representable, and align `aether/src/prober.rs:42` with the single meaning. The defect being removed: the Settings option is rejected by `validate_settings` (hard-breaking Connect) while the Scanner's identical label works.
 - [ ] T173 [US6] Add `#[serde(default)]` to `Settings` fields (`apps/desktop/src-tauri/src/lib.rs:228-258`) and merge hydration over defaults in `apps/desktop/src/hooks/useRuntime.ts:74`,`:231` (Android already does at `apps/android/src/hooks/useRuntime.ts:71`), so a dropped or renamed field cannot produce `undefined` and a render-time throw.
-- [ ] T174 [US6] Give the desktop UI watchdog parity in `apps/desktop/src/hooks/useRuntime.ts` (T121's shell-side watchdog plus a UI mirror) and delete the resulting desktop-only failure where `settingsLocked` keeps the entire Settings tab locked forever.
+- [x] T174 [US6] Give the desktop UI watchdog parity in `apps/desktop/src/hooks/useRuntime.ts` (T121's shell-side watchdog plus a UI mirror) and delete the resulting desktop-only failure where `settingsLocked` keeps the entire Settings tab locked forever.
+  The failure is gone and the mirror is deliberately not built. `settingsLocked` is
+  `running || !settingsLoaded` and `running` is `connecting || connected`, so the tab unlocks
+  the moment anything moves the session out of `connecting` — which is exactly what T121's
+  shell watchdog now guarantees within 90 s, without a reload. A second timer in the page
+  would be the same design T121 rejected: WebView2 throttles timers in a window hidden to the
+  tray, so a page-side watchdog is the one place this cannot be relied on, and two timers with
+  the same budget disagree about which of them fired.
+  Guard instead of mirror: `releases the Settings lock as soon as the session reaches a
+  terminal state` drives `connecting` → `error` through the state channel and asserts the lock
+  releases, so a future change that stops a terminal state from reaching the UI goes red.
+  10 desktop UI tests pass.
 - [ ] T175 [US6] Scope scan events by `run_id` end to end (on T020's typed pipeline): mint in `startScan`, echo through the shell, drop non-matching in both layers, and make the synthetic terminal event a typed `scan_failed { run_id }` instead of `{"type":"scan_done","addr":"","rtt":""}` at `apps/desktop/src-tauri/src/lib.rs:1736-1741`, which today reports "no working endpoints found" after a scan that found dozens and can deactivate a live scan.
 - [ ] T176 [US6] Clear `endpoints`, counters and `bestRtt` unconditionally in `apps/desktop/src/hooks/useScanner.ts:startScan` and key rows on `addr + protocol` (fixes T166).
 - [ ] T177 [US6] Delete `apps/desktop/src/types.ts:111-112`'s `scan_failed`/`scan_done.working` **or** emit them — with the generated type as arbiter (fixes the dead arm at `useScanner.ts:88-91`) — and carry `best_rtt_ms: Option<u32>` so completion stops logging `best: 1.1.1.1:443 ()` (`aether/src/session.rs:187,203,254,261,297` emit `rtt: String::new()`).

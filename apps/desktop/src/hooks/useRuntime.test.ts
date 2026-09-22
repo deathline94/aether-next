@@ -142,4 +142,31 @@ describe("desktop useRuntime hook", () => {
     });
     expect(result.current.saveError).toBeNull();
   });
+
+  it("releases the Settings lock as soon as the session reaches a terminal state", async () => {
+    // The desktop-only failure this guards: a connect that never finished left
+    // `running` true forever, which kept the whole Settings tab locked, because
+    // nothing ever moved the session out of `connecting`. The shell's 90 s
+    // watchdog emits `error`, and the lock has to follow it without a reload.
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") {
+        return { protocol: "masque", routingMode: "proxy-only", socksPort: 1080, httpPort: 8080 };
+      }
+      return null;
+    });
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.settingsLocked).toBe(false);
+
+    act(() => {
+      result.current.setRuntime({ status: "connecting", detail: "x", pid: 1, endpoint: null });
+    });
+    expect(result.current.settingsLocked).toBe(true);
+
+    act(() => {
+      result.current.setRuntime({ status: "error", detail: "Connection timed out", pid: null, endpoint: null });
+    });
+    expect(result.current.settingsLocked).toBe(false);
+  });
 });
