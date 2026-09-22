@@ -228,6 +228,10 @@ jobs:
             if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for ${b}: $($sig.SignerCertificate.Subject)" }
             Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
           }
+          # The outer signature only says the container was signed when it was
+          # built; NSIS payloads are not hash-sealed, so extract and check what a
+          # user actually ends up running.
+          & "./scripts/verify-installers.ps1" -Installer "dist-windows/AetherNext-windows-x64-setup.exe" -Portable "dist-windows/AetherNext-portable-windows-x64.zip" -Anchor "packaging/trust/engine-trust.json"
           # Same witness, later in the pipeline: nothing between staging and the
           # upload may move the bytes the shell was compiled to accept.
           node scripts/publish-engine-trust.mjs --check --name aether.exe --file dist-windows/portable/engine/aether.exe

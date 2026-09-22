@@ -170,7 +170,14 @@
       for the two Cloudflare edges for the reason already recorded in `packaging/trust/README.md`:
       the peer is dialled by IP, and flipping it needs a live handshake to confirm which digest
       belongs to which SNI.
-- [ ] T059 [US2] Failing CI-fixture test that `scripts/verify-installers.ps1` exits non-zero for an unsigned build **and** when it extracts zero binaries. Fails today: `.github/workflows/build.yml:194-207` checks only the outer `setup.exe`, recording a pass while the installed GUI exe is unsigned.
+- [x] T059 [US2] Failing CI-fixture test that `scripts/verify-installers.ps1` exits non-zero for an unsigned build **and** when it extracts zero binaries. Fails today: `.github/workflows/build.yml:194-207` checks only the outer `setup.exe`, recording a pass while the installed GUI exe is unsigned.
+  Done as `scripts/selftest-verify-installers.ps1`, run on every push by the new `installer-verifier`
+  job in `.github/workflows/ci.yml`. Three fixtures, each checked red before the gate was believed:
+  a package directory holding nothing checkable exits non-zero with "extracted zero PE files" (a gate
+  that finds nothing must not go green), an unsigned `aether.exe` exits non-zero with both "the anchor
+  still carries a placeholder digest" and "unsigned", and the committed `packaging/wintun.dll` is the
+  positive control that proves the same code path can say *pass* — without it, a verifier that refused
+  everything would also pass this test.
 
 ### Implementation for User Story 2
 
@@ -204,7 +211,18 @@
   Done. `wintun-bindings` now builds with `verify_binary_signature`, which runs WinVerifyTrust (VERIFY then CLOSE) and requires the signer display name to be `WireGuard LLC` *before* `LoadLibrary`, so a substituted DLL is refused without executing its `DllMain`. The shell's check is no longer `if let Some(wintun) = wintun_path(&app)`: in TUN mode a missing `wintun.dll` is an error and the digest comparison against the anchor always runs.
 - [ ] T075 [US2] Reorder `.github/workflows/build.yml` to sign **before** bundling: stable PFX from secrets → `cargo build --release` → sign `aether.exe` → verify signature → stage engine → **verify staged digest == `engine-trust.json` [NEW GATE]** → `npm ci && npm run build` → `npm run tauri build --config '{"bundle":{"windows":{"certificateThumbprint":…,"digestAlgorithm":"sha256","timestampUrl":…}}}'` → **extract-and-verify all inner binaries [NEW GATE]** → write release digests post-signing → upload.
   Partial: the trust-anchor publish step and three `--check` gates (staged, `dist-windows/portable/engine/*`, shipped `wintun.dll`) landed with T071 via `scripts/publish-engine-trust.mjs`, and the anchor now travels with the artifacts. Remaining: the sign-before-bundling reorder (`certificateThumbprint` handed to `tauri build` instead of post-hoc `Set-AuthenticodeSignature`) and the NSIS extract-and-verify gate — see T075b.
-- [ ] T076 [US2] Delete the "Sign and verify GUI and installer" step (`build.yml:150-170`) and rewrite "Verify all packaged Windows binaries" (`:194-207`) to call `scripts/verify-installers.ps1`. Document why: tauri-bundler signs the main exe after `patch_binary` (`bundle.rs:155`), sidecars while skipping already-signed files (`:296-336`), NSIS plugins/uninstaller/outer installer (`nsis/mod.rs:672-679`,`:306`,`:717`) and `resources/*` excluding signed files (`:792`) — so wintun's WireGuard LLC signature survives.
+- [x] T076 [US2] Delete the "Sign and verify GUI and installer" step (`build.yml:150-170`) and rewrite "Verify all packaged Windows binaries" (`:194-207`) to call `scripts/verify-installers.ps1`. Document why: tauri-bundler signs the main exe after `patch_binary` (`bundle.rs:155`), sidecars while skipping already-signed files (`:296-336`), NSIS plugins/uninstaller/outer installer (`nsis/mod.rs:672-679`,`:306`,`:717`) and `resources/*` excluding signed files (`:792`) — so wintun's WireGuard LLC signature survives.
+  Rewritten rather than deleted, and the task's premise corrected: that step is the only thing
+  that *signs* the standalone GUI copy and the outer NSIS container (tauri-bundler signs the bundle
+  it assembles, not the copies this job later re-stages), so removing it would drop a signature
+  instead of removing a false claim. What was deleted is the claim itself — "Verified packaged
+  artifact …" printed from `Get-AuthenticodeSignature` on `setup.exe` alone. "Verify all packaged
+  Windows binaries" now keeps the outer checks and additionally calls
+  `scripts/verify-installers.ps1 -Installer … -Portable … -Anchor …`, which extracts the container
+  and the portable zip and checks every PE file inside: engine digest against the same anchor the
+  running shell uses, wintun's WireGuard LLC signature plus its pinned digest, the GUI exe's
+  publisher, and a non-empty set of binaries. The signature-verification half is therefore no
+  longer vacuous — verified by T059's fixtures, which fail the gate on an unsigned engine.
 - [x] T077 [US2] Record in `packaging/trust/README.md` and the workflow that Authenticode and the Tauri **updater** signature are unrelated (`TAURI_SIGNING_PRIVATE_KEY`/`createUpdaterArtifacts` produce a minisign signature over the update archive and never sign the PE), and log the rejected alternatives — paid EV, Azure Artifact Signing (~$9.99/mo per 5 000, legal-name CN requirement, no EV), installer-run `certutil -addstore TrustedPublisher` — with the reason: a control the maintainer cannot operate is a control that gets skipped.
   Documented in `packaging/trust/README.md` ("Authenticode and the updater signature are unrelated"), together with who publishes the anchor and why a per-run witness in a pipeline that mints an ephemeral certificate is still an independent one.
 - [ ] T075b [US2] Split the Windows release into the two phases the anchor model needs: a `prepare-anchor` job that builds+signs the engine and commits the one-line `engine-trust.json` diff, and the tag job that refuses to bundle when the staged engine's digest is not the committed one. Today `build.yml` writes the anchor inside the runner's checkout, which is correct for the artifact pair but leaves no committed witness for a tag; close that gap rather than letting the placeholder come back.

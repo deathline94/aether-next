@@ -90,6 +90,16 @@ jobs:
       - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path aether/Cargo.toml
 
+  installer-verifier:
+    name: Installer verifier can fail
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # The gate that verifies packaged binaries is only worth having if it
+      # refuses an empty package and an unsigned engine, so run those fixtures on
+      # every push instead of trusting that they still fail.
+      - run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/selftest-verify-installers.ps1
+
   android-ui:
     name: Android UI
     runs-on: ubuntu-latest

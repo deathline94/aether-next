@@ -5,6 +5,8 @@
 
 This is a **validation** guide, not a build guide. Its purpose is to prove each remediated class of defect stays fixed — and, just as importantly, to prove that each check is capable of failing. A gate that cannot fail is the defect this feature exists to eliminate.
 
+**Reading the `Today:` clauses:** they describe the tree as the audit found it, not the tree now. Each one is the behaviour the corresponding check must refuse, and several have since been fixed — the per-task notes in [tasks.md](tasks.md) record what landed, what deviated from the task text, and what is still open. Do not re-verify a `Today:` clause as though it were current.
+
 ## Falsifiability protocol (applies to every section)
 
 For each fix, run all three steps. A fix that passes only step 3 is **not done**:
@@ -79,9 +81,10 @@ apps/desktop/src-tauri/tests: cargo test -p aether-desktop --test proxy_restore 
 ## 2. Binary trust and release pipeline (US2, FR-005…008) — contracts/trust-verification-policy.md
 
 ```bash
-cargo test -p aether --test trust_verification           # pinned-leaf acceptance/rejection
-cargo test -p aether-desktop --test elevation_trust      # extended, non-tautological
-powershell -File scripts/verify-installers.ps1 -DistPath dist-windows
+cargo test --manifest-path aether/Cargo.toml --test tls_pin_chain       # pinned-leaf acceptance/rejection
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --test elevation_trust_test
+powershell -NoProfile -File scripts/selftest-verify-installers.ps1      # proves the packaged-binary gate can fail
+powershell -NoProfile -File scripts/verify-installers.ps1 -Installer dist-windows/AetherNext-windows-x64-setup.exe -Portable dist-windows/AetherNext-portable-windows-x64.zip -Anchor packaging/trust/engine-trust.json
 ```
 
 **Scenario A — pin is reachable (T-A2/A3).** Build release signed with certificate **A**; run TUN with an engine re-signed by a different `CN=deathline94` certificate **B**.

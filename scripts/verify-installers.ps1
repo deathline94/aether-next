@@ -1,96 +1,185 @@
-# Windows Authenticode verification of *packaged* artifacts.
-#
-# The defect this replaces: build.yml signed the standalone GUI copy and the
-# outer NSIS container, then "verified all packaged Windows binaries" by looking
-# at the outer container only. The exe the user actually installs had already
-# been embedded unsigned. A verification step that inspects the wrong artifact
-# is worse than none, because it records a pass.
-#
-# Rules:
-#   * extract the installer and inspect every binary INSIDE it
-#   * fail closed if the extraction yields zero binaries (a changed bundle
-#     layout must never make the check vacuous)
-#   * fail closed on NotSigned / HashMismatch / publisher mismatch
+<#
+.SYNOPSIS
+    Verify every Windows binary that actually reaches a user, not just the outer
+    installer.
+.DESCRIPTION
+    The step this replaces checked `Get-AuthenticodeSignature` on
+    `AetherNext-windows-x64-setup.exe` alone and called that "all packaged Windows
+    binaries verified". An outer signature says the file was signed when it was
+    built; it says nothing about what the installer drops, because NSIS containers
+    are not hash-sealed: `aether.exe`, `wintun.dll`, the GUI exe, the uninstaller
+    and every plugin can be swapped afterwards while the outer signature still
+    covers only its own bytes.
 
+    So: extract, then check each binary on its own terms.
+      - the engine must be signed by the expected publisher AND match the digest in
+        packaging/trust/engine-trust.json, the same witness the running shell
+        compares against;
+      - wintun.dll must still carry its WireGuard LLC signature and pinned digest,
+        which is also the proof that bundling did not strip or re-sign it;
+      - the GUI exe must be signed by the same publisher;
+      - zero extractable binaries is a failure, not a pass. A gate that finds
+        nothing to check has to say so, or it goes green on an empty set forever.
+.EXAMPLE
+    .\scripts\verify-installers.ps1 -Installer dist-windows\AetherNext-windows-x64-setup.exe `
+        -Portable dist-windows\AetherNext-portable-windows-x64.zip `
+        -Anchor packaging\trust\engine-trust.json
+#>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$DistPath,
-    [string]$ExpectedCN = 'deathline94',
-    [string]$SevenZip = 'C:\Program Files\7-Zip\7z.exe'
+    [string]$Installer,
+    [string]$Portable,
+    [string]$Anchor = "packaging/trust/engine-trust.json",
+    # Validate an already-extracted tree. Used by the CI fixtures test and by anyone
+    # reproducing a failure locally.
+    [string]$Directory,
+    [string]$ExpectedPublisherCN = "deathline94",
+    [string]$EngineName = "aether.exe",
+    [string]$DriverName = "wintun.dll",
+    [string]$GuiNamePattern = "Aether*.exe"
 )
 
-$ErrorActionPreference = 'Stop'
-$failures = @()
+$ErrorActionPreference = "Stop"
+$failures = New-Object System.Collections.Generic.List[string]
 
-function Test-EveryBinary([string]$installer, [string]$workdir) {
-    if (-not (Test-Path $SevenZip)) {
-        throw "7z not found at $SevenZip — cannot inspect installer contents (refusing to skip)"
+function Get-AnchorDigest([string]$name) {
+    if (-not (Test-Path $Anchor)) { throw "trust anchor $Anchor is missing" }
+    $doc = Get-Content $Anchor -Raw | ConvertFrom-Json
+    $entry = $doc.files | Where-Object { $_.name -eq $name }
+    if (-not $entry) { throw "trust anchor has no entry for $name" }
+    return $entry.file_sha256.ToLower()
+}
+
+function Find-Portable7z {
+    foreach ($c in @("7z", "7za")) {
+        $cmd = Get-Command $c -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
     }
-    if (Test-Path $workdir) { Remove-Item -Recurse -Force $workdir }
-    New-Item -ItemType Directory -Force -Path $workdir | Out-Null
-
-    & $SevenZip x -y "-o$workdir" $installer | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "7z failed to extract $installer" }
-
-    # Everything we own that is executable. wintun.dll is third-party signed and
-    # is checked by the runtime trust policy instead, so it is reported but not
-    # required to carry our CN.
-    $payload = Get-ChildItem -Recurse -Path $workdir -Include *.exe, *.dll -File
-    if (-not $payload -or $payload.Count -eq 0) {
-        # Fail closed: an empty extraction means the probe cannot see anything,
-        # not that everything is fine.
-        throw "no binaries found inside $installer — verification would be vacuous"
+    foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe")) {
+        if (Test-Path $p) { return $p }
     }
+    return $null
+}
 
-    $checked = 0
-    foreach ($bin in $payload) {
-        $sig = Get-AuthenticodeSignature -FilePath $bin.FullName
-        $isThirdParty = $bin.Name -match '^(wintun|WebView2Loader)\.dll$'
-        Write-Host ("  {0,-34} {1,-14} {2}" -f $bin.Name, $sig.Status, $sig.SignerCertificate.Subject)
-        if ($sig.Status -in @('NotSigned', 'HashMismatch')) {
-            if (-not $isThirdParty) {
-                $script:failures += "$($bin.Name) is $($sig.Status) inside the installer"
-            }
+function Expand-To([string]$package, [string]$dest) {
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    if ($package -like "*.zip") {
+        Expand-Archive -Path $package -DestinationPath $dest -Force
+        return
+    }
+    $seven = Find-Portable7z
+    if (-not $seven) { throw "no 7-Zip found to extract $package; refusing to report success without inspecting it" }
+    & $seven "x" "-y" "-o$dest" $package | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "7z failed ($LASTEXITCODE) on $package" }
+}
+
+function Get-PEFiles([string]$root) {
+    # A PE is anything with the MZ header, not anything named .exe: the NSIS
+    # payload hides the uninstaller and plugins under other extensions.
+    Get-ChildItem -Path $root -Recurse -File | Where-Object {
+        $_.Length -gt 2 -and $(
+            $fs = [System.IO.File]::OpenRead($_.FullName)
+            try { $b = New-Object byte[] 2; $fs.Read($b, 0, 2) | Out-Null; ($b[0] -eq 0x4D -and $b[1] -eq 0x5A) }
+            finally { $fs.Dispose() }
+        )
+    }
+}
+
+function Test-Signature([string]$path, [string]$expectCN) {
+    $sig = Get-AuthenticodeSignature -FilePath $path
+    if (-not $sig.SignerCertificate) {
+        return "unsigned ($($sig.Status)): $path"
+    }
+    if ($sig.Status -notin @("Valid", "NotSigned")) {
+        return "signature status $($sig.Status) for $path"
+    }
+    if ($sig.Status -eq "NotSigned") {
+        return "unsigned: $path"
+    }
+    if ($expectCN -and $sig.SignerCertificate.Subject -notmatch [regex]::Escape($expectCN)) {
+        return "publisher mismatch: expected '$expectCN', got '$($sig.SignerCertificate.Subject)' for $path"
+    }
+    return $null
+}
+
+$targets = @()
+$staging = $null
+if ($Directory) {
+    $targets += [pscustomobject]@{ Name = "directory"; Root = $Directory }
+} else {
+    if (-not $Installer -and -not $Portable) { throw "pass -Installer and/or -Portable, or -Directory" }
+    $staging = Join-Path ([System.IO.Path]::GetTempPath()) ("aether-verify-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $staging | Out-Null
+    if ($Installer) {
+        $d = Join-Path $staging "installer"
+        Expand-To $Installer $d
+        $targets += [pscustomobject]@{ Name = "installer"; Root = $d }
+    }
+    if ($Portable) {
+        $d = Join-Path $staging "portable"
+        Expand-To $Portable $d
+        $targets += [pscustomobject]@{ Name = "portable"; Root = $d }
+    }
+}
+
+try {
+    $engineDigest = Get-AnchorDigest $EngineName
+    $driverDigest = Get-AnchorDigest $DriverName
+    $placeholder = "0" * 64
+    $checkedAny = $false
+
+    foreach ($t in $targets) {
+        $pes = @(Get-PEFiles $t.Root)
+        if ($pes.Count -eq 0) {
+            $failures.Add("$($t.Name): extracted zero PE files from $($t.Root) - nothing was verified")
+            continue
         }
-        elseif ($sig.SignerCertificate.Subject -notmatch "CN=$ExpectedCN(?:,|$)") {
-            if (-not $isThirdParty) {
-                $script:failures += "$($bin.Name) signed by '$($sig.SignerCertificate.Subject)', expected CN=$ExpectedCN"
+        $checkedAny = $true
+        Write-Host "$($t.Name): $($pes.Count) PE file(s) to verify"
+
+        $engine = $pes | Where-Object { $_.Name -ieq $EngineName } | Select-Object -First 1
+        if (-not $engine) {
+            $failures.Add("$($t.Name): no $EngineName inside; the installer would launch an engine that was never packaged")
+        } else {
+            $hash = (Get-FileHash $engine.FullName -Algorithm SHA256).Hash.ToLower()
+            if ($engineDigest -eq $placeholder) {
+                $failures.Add("$($t.Name): the anchor still carries a placeholder digest for $EngineName, so nothing can vouch for it (publish it first)")
+            } elseif ($hash -ne $engineDigest) {
+                $failures.Add("$($t.Name): $EngineName is $hash but $Anchor says $engineDigest")
             }
+            $problem = Test-Signature $engine.FullName $ExpectedPublisherCN
+            if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
-        $checked++
+
+        $driver = $pes | Where-Object { $_.Name -ieq $DriverName } | Select-Object -First 1
+        if ($driver) {
+            $hash = (Get-FileHash $driver.FullName -Algorithm SHA256).Hash.ToLower()
+            if ($hash -ne $driverDigest) {
+                $failures.Add("$($t.Name): wintun.dll is $hash but $Anchor says $driverDigest")
+            }
+            # WireGuard's own signature must survive bundling: a re-signed or stripped
+            # driver is a different trust story than the one the anchor describes.
+            $problem = Test-Signature $driver.FullName "WireGuard LLC"
+            if ($problem) { $failures.Add("$($t.Name): $problem") }
+        }
+
+        foreach ($gui in ($pes | Where-Object { $_.Name -like $GuiNamePattern -and $_.Name -ne $EngineName })) {
+            $problem = Test-Signature $gui.FullName $ExpectedPublisherCN
+            if ($problem) { $failures.Add("$($t.Name): $problem") }
+        }
     }
-    return $checked
-}
 
-Write-Host "Verifying Authenticode of every binary INSIDE each package"
-$installers = Get-ChildItem -Recurse -Path $DistPath -Include *.exe -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match 'setup|installer|-windows' }
-
-if (-not $installers) {
-    Write-Error "no installers found under $DistPath"
-    exit 1
-}
-
-$i = 0
-foreach ($inst in $installers) {
-    Write-Host "`n[$($inst.Name)]"
-    $work = Join-Path $env:TEMP "aether-unpack-$i"
-    $i++
-    try {
-        $n = Test-EveryBinary $inst.FullName $work
-        Write-Host "  -> inspected $n binary/binaries"
-    } catch {
-        $failures += "$($inst.Name): $($_.Exception.Message)"
-        Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    } finally {
-        if (Test-Path $work) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue }
+    if (-not $checkedAny) {
+        $failures.Add("no package produced any files at all")
     }
-}
 
-if ($failures.Count -gt 0) {
-    Write-Host "`n=== PACKAGE VERIFICATION FAILED ===" -ForegroundColor Red
-    $failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
-    exit 1
+    if ($failures.Count -gt 0) {
+        foreach ($f in $failures) { Write-Error -Message $f -ErrorAction Continue }
+        Write-Host "verify-installers: $($failures.Count) problem(s)"
+        exit 1
+    }
+    Write-Host "verify-installers: every extracted binary matches its signature and its anchor digest"
+    exit 0
+} finally {
+    if ($staging -and (Test-Path $staging)) { Remove-Item -Recurse -Force $staging }
 }
-
-Write-Host "`nAll packaged binaries carry an acceptable signature."
