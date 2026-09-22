@@ -269,14 +269,16 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             };
             // Feed the real connect outcome into the trust cache so endpoint
             // ranking learns from actual connections, not just scan reachability.
-            if result.is_ok() {
-                if crate::cache::record_success(&base_config, peer, true).was_skipped() {
-                    log::warn!("[cache] update for {peer} was skipped: another process holds the cache lock");
-                }
+            let mutation = if result.is_ok() {
+                crate::cache::record_success(&base_config, peer, true)
             } else {
-                if crate::cache::record_failure(&base_config, peer, true).was_skipped() {
-                    log::warn!("[cache] failure record for {peer} was skipped: another process holds the cache lock");
-                }
+                crate::cache::record_failure(&base_config, peer, true)
+            };
+            if mutation.was_skipped() {
+                log::warn!(
+                    "[cache] {} record for {peer} was skipped: another process holds the cache lock",
+                    if result.is_ok() { "success" } else { "failure" }
+                );
             }
             result
         }
