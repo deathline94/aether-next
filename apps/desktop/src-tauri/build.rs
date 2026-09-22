@@ -56,7 +56,10 @@ fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
     }
     let doc: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
-        Err(e) => die(&format!("{} is not valid JSON", path.display()), &e.to_string()),
+        Err(e) => die(
+            &format!("{} is not valid JSON", path.display()),
+            &e.to_string(),
+        ),
     };
     let files = doc
         .get("files")
@@ -70,7 +73,10 @@ fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
             .and_then(|n| n.as_str())
             .unwrap_or_else(|| {
                 die(
-                    &format!("{} has a `files[]` entry with no string `name`", path.display()),
+                    &format!(
+                        "{} has a `files[]` entry with no string `name`",
+                        path.display()
+                    ),
                     "",
                 )
             });
@@ -88,7 +94,10 @@ fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
             });
         if !is_hex64(digest) {
             die(
-                &format!("{}: entry `{name}` has file_sha256 `{digest}`", path.display()),
+                &format!(
+                    "{}: entry `{name}` has file_sha256 `{digest}`",
+                    path.display()
+                ),
                 "want exactly 64 hexadecimal characters",
             );
         }

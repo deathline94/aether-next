@@ -12,9 +12,7 @@
 #[link(name = "resource", kind = "static")]
 extern "C" {}
 
-use aether_desktop_lib::{
-    connect_watchdog_action, WatchdogAction, CONNECT_WATCHDOG_TIMEOUT,
-};
+use aether_desktop_lib::{connect_watchdog_action, WatchdogAction, CONNECT_WATCHDOG_TIMEOUT};
 use std::time::Duration;
 
 const TIMEOUT: Duration = CONNECT_WATCHDOG_TIMEOUT;
@@ -66,7 +64,12 @@ fn only_a_connect_that_outstays_the_budget_is_a_timeout() {
         "the budget is inclusive: a 90 s connect is already not going to make it"
     );
     assert_eq!(
-        connect_watchdog_action(Some((4, TIMEOUT + Duration::from_secs(1))), 4, "connecting", TIMEOUT),
+        connect_watchdog_action(
+            Some((4, TIMEOUT + Duration::from_secs(1))),
+            4,
+            "connecting",
+            TIMEOUT
+        ),
         WatchdogAction::TimedOut
     );
 }

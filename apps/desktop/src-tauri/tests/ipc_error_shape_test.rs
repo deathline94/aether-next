@@ -28,7 +28,10 @@ type Breaker = fn(&mut Settings);
 /// branch on was prose, which is the defect BC-20 was written to prevent.
 #[test]
 fn a_serialised_error_carries_its_code_beside_its_message() {
-    let err = CommandError::new("disconnect_incomplete", "system proxy could not be restored");
+    let err = CommandError::new(
+        "disconnect_incomplete",
+        "system proxy could not be restored",
+    );
     let json = to_json(&err);
     assert_eq!(json["code"], "disconnect_incomplete", "got {json}");
     assert_eq!(json["message"], "system proxy could not be restored");
@@ -74,7 +77,9 @@ fn every_validation_failure_names_a_field() {
         ("socksPort", |s| s.socks_port = 1),
         ("httpPort", |s| s.http_port = s.socks_port),
         ("noize", |s| s.noize = "volcano".into()),
-        ("enginePath", |s| s.engine_path = "C:\\definitely-not-here\\aether.exe".into()),
+        ("enginePath", |s| {
+            s.engine_path = "C:\\definitely-not-here\\aether.exe".into()
+        }),
         ("noizeJmax", |s| {
             s.noize = "custom".into();
             s.noize_jmin = 3000;
@@ -96,7 +101,10 @@ fn every_validation_failure_names_a_field() {
         };
         assert_eq!(err.code, "validation", "for {field}: {err:?}");
         assert_eq!(err.field, Some(field), "for {field}: {err:?}");
-        assert!(!err.message.is_empty(), "an error with no prose is unshowable");
+        assert!(
+            !err.message.is_empty(),
+            "an error with no prose is unshowable"
+        );
     }
 }
 
@@ -125,7 +133,8 @@ fn a_custom_engine_path_must_exist_and_may_be_blank() {
     let blank = settings_with(|s| s.engine_path = "   ".into());
     validate_settings(&blank).expect("blank means the default location, not a bad path");
 
-    let missing = settings_with(|s| s.engine_path = dir.join("nowhere.exe").to_string_lossy().into_owned());
+    let missing =
+        settings_with(|s| s.engine_path = dir.join("nowhere.exe").to_string_lossy().into_owned());
     let err = validate_settings(&missing).expect_err("a half-typed path must not be saved");
     assert_eq!(err.code, "validation");
     assert_eq!(err.field, Some("enginePath"));

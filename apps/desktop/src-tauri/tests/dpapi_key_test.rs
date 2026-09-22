@@ -24,8 +24,8 @@ fn an_unavailable_key_service_refuses_rather_than_echoing_the_plaintext() {
     } else {
         let wrapped = encrypt_with(&key, service()).expect("a real service wraps the key");
         assert_ne!(&wrapped[..], &key[..], "the key went to disk as plaintext");
-        let back = aether_desktop_lib::dpapi::decrypt_with(&wrapped, service())
-            .expect("unwrap succeeds");
+        let back =
+            aether_desktop_lib::dpapi::decrypt_with(&wrapped, service()).expect("unwrap succeeds");
         assert_eq!(&back[..], &key[..]);
         // Asking the unavailable service explicitly must still refuse, even on
         // the platform where production never selects it.
@@ -77,7 +77,8 @@ fn test_dpapi_get_or_create_key() {
 #[test]
 fn test_dpapi_tampered_envelope() {
     use std::fs;
-    let temp_dir = std::env::temp_dir().join(format!("aether_test_dpapi_tamper_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("aether_test_dpapi_tamper_{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("create temp dir");
 

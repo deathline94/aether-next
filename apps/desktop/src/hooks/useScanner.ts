@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
 import { errorMessage } from "../ipcError";
@@ -32,6 +32,41 @@ export function scanCompletionMessage(addr: string, rtt: string, bestRttMs?: num
   return measured ? `Scan complete — best: ${addr} (${measured})` : `Scan complete — best: ${addr}`;
 }
 
+/**
+ * The round-trip of the fastest row, or `null` when nothing answered.
+ *
+ * "Best" is a property of the list on screen, not of the last event to arrive. It
+ * used to be accumulated in state as `ev.rtt || prev.bestRtt`, which is "the most
+ * recent hit's RTT": a 240 ms answer landing after a 12 ms one rewrote the chip to
+ * "Best: 240 ms" directly above a table whose first row read 12 ms. Deriving it
+ * means the chip cannot disagree with the rows, and a new run that clears the list
+ * clears the claim with it.
+ */
+export function bestRttOf(endpoints: readonly DiscoveredEndpoint[]): string | null {
+  let fastest: DiscoveredEndpoint | null = null;
+  for (const e of endpoints) {
+    if (typeof e.rttMs !== "number" || !Number.isFinite(e.rttMs)) continue;
+    if (fastest === null || e.rttMs < fastest.rttMs) fastest = e;
+  }
+  if (!fastest) return null;
+  // The engine's own text wins when it carried one; a measured number is the
+  // fallback, and an empty string is neither.
+  return rttLike(fastest.rtt) ?? `${fastest.rttMs} ms`;
+}
+
+/**
+ * The verdict line at the end of a run.
+ *
+ * `working` arrives on `scan_progress`, which the engine only republishes every
+ * fifty probes, so the final batch of hits can be missing from it. A run whose
+ * list is non-empty found something whatever the lagging counter says, and an empty
+ * list with no address is the honest "0 found" — the Android fork's unconditional
+ * `phase: "Verified"` read an empty scan as a verified one (T199).
+ */
+export function scanVerdict(hitCount: number, addr: string, working: number): string {
+  return hitCount > 0 || working > 0 || Boolean(addr) ? "Verified" : "Completed (0 found)";
+}
+
 export function useScanner(
   appendLog: (entry: LogInput) => void,
   running: boolean,
@@ -48,12 +83,23 @@ export function useScanner(
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
   const [busy, setBusy] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // Mirror of `endpoints` the event handler reads. The listener is registered once
+  // for the component's life, so a closure over `endpoints` would see the empty
+  // array forever; a ref gives the handler the list as it actually stands, which is
+  // what the dedupe and the end-of-run verdict need.
+  const endpointsRef = useRef<DiscoveredEndpoint[]>([]);
   // The run this window started. Events from any other run are dropped rather
   // than merged, so a late terminal event from a cancelled scan cannot end the
   // one that is actually running.
   const runIdRef = useRef<string>("");
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
+  // `bestRtt` on the stored state is never read: the chip is the minimum of the
+  // rows below it, so it is computed here and nowhere else.
+  const displayedScanState = useMemo<ScanState>(
+    () => ({ ...scanState, bestRtt: bestRttOf(endpoints) }),
+    [scanState, endpoints],
+  );
 
   // Listen for structured scan events from the Tauri backend
   useEffect(() => {
@@ -76,6 +122,11 @@ export function useScanner(
           });
           break;
         case "scan_progress":
+          // The engine's own tally. Nothing else writes `working`: the per-hit
+          // `prev.working + 1` below used to race this one — the list grew by a hit,
+          // the next progress frame overwrote the count with a number that is right
+          // as of fifty probes ago — so the "N Healthy Gateways" chip oscillated
+          // downwards while a scan was still finding endpoints.
           setScanState((prev) => ({
             ...prev,
             scanned: ev.scanned,
@@ -83,12 +134,7 @@ export function useScanner(
             working: ev.working,
           }));
           break;
-        case "scan_hit":
-          setScanState((prev) => ({
-            ...prev,
-            working: prev.working + 1,
-            bestRtt: ev.rtt || prev.bestRtt,
-          }));
+        case "scan_hit": {
           // The log's Hits filter reads this key rather than recognising the hit
           // from prose, so the scanner's count and the Activity tab's agree by
           // construction and survive an engine that rewords its own lines.
@@ -97,25 +143,30 @@ export function useScanner(
             message: `Working endpoint ${ev.addr}${ev.protocol ? ` (${ev.protocol})` : ""}`,
             hitKey: hitAddressKey(ev.addr),
           });
-          setEndpoints((prev) => {
-            // One IP:port can answer on h2 and on h3; keyed on the address alone the
-            // second protocol's hit was discarded as a duplicate of the first.
-            if (prev.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) return prev;
-            return [...prev, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
-              (a, b) => a.rttMs - b.rttMs,
-            );
-          });
+          // Keyed on addr + protocol: one address can answer the h2 handshake and
+          // the h3 one, and keying on the address alone threw the second protocol's
+          // hit away as a duplicate of the first — the row kept the protocol and the
+          // RTT of whichever transport happened to answer first.
+          const current = endpointsRef.current;
+          if (current.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) break;
+          const next = [...current, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }]
+            .sort((a, b) => a.rttMs - b.rttMs);
+          endpointsRef.current = next;
+          setEndpoints(next);
           break;
+        }
         case "scan_done": {
           // The engine's terminal event names the endpoint it settled on; how many
-          // answered is what the run's own counter says (`scan_progress` keeps it
-          // current), not a field on this event — the `working?` here was always
+          // answered is the run's own list plus the counter `scan_progress` keeps
+          // current — not a field on this event, where `working?` was always
           // undefined, so the "0 found" verdict rested on `addr` alone.
           setScanState((prev) => ({
             ...prev,
             active: false,
-            phase: prev.working > 0 || Boolean(ev.addr) ? "Verified" : "Completed (0 found)",
-            bestRtt: (rttLike(ev.rtt) ?? rttLike(ev.bestRttMs)) ?? prev.bestRtt,
+            phase: scanVerdict(endpointsRef.current.length, ev.addr, prev.working),
+            // bestRtt is derived from `endpoints` (see `bestRttOf`), so nothing is
+            // written here: a run that displayed rows shows the fastest of them and
+            // a run that measured nothing shows no "Best" chip at all.
           }));
           appendLog({
             level: "info",
@@ -142,7 +193,9 @@ export function useScanner(
     clearLogs?.();
     setBusy(true);
     // The counters and `bestRtt` restart with the run, so the list has to as well:
-    // keeping earlier protocols' rows meant a table of nine under "3 working".
+    // keeping earlier protocols' rows meant a table of nine under "3 working", and
+    // a heading that described the previous scan rather than this one.
+    endpointsRef.current = [];
     setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
@@ -184,7 +237,7 @@ export function useScanner(
     concurrency, setConcurrency,
     timeoutMs, setTimeoutMs,
     noize, setNoize,
-    endpoints, active, scanState, busy,
+    endpoints, active, scanState: displayedScanState, busy,
     startScan, stopScan,
   };
 }

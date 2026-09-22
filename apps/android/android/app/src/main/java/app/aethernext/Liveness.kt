@@ -129,3 +129,114 @@ fun backoffFor(attempt: Int): Long = when (attempt) {
     1 -> 8_000L
     else -> 30_000L
 }
+
+/** Whether a decision means "this tunnel cannot be trusted any more". */
+val LivenessDecision.isDead: Boolean
+    get() = this == LivenessDecision.DeadRxOnly || this == LivenessDecision.DeadSilent
+
+/**
+ * The window counter the service polls every [WINDOW_MS] from `TProxyGetStats()`.
+ *
+ * [decideLiveness] is a single window: it needs the previous snapshot, the elapsed
+ * time and the two streak counters. This class is the only thing that may hold
+ * those across windows, so it is kept free of Android types ([android.os.SystemClock]
+ * included) and the whole watchdog — streaks, budget, baseline handling — is
+ * assertable on a JVM (T203/T209).
+ *
+ * A tracker starts *unbaselined*: `TProxyGetStats()` is zeroed on every
+ * `hev_socks5_tunnel_main()` entry, so a sample taken before the service is
+ * running is not a baseline, and neither is one taken at the same instant as the
+ * start. [baseline] must be called after `TProxyStartService()` returns, and a
+ * tracker that never got one reports [LivenessDecision.Alive] forever rather than
+ * inventing a delta out of a zeroed array.
+ */
+class LivenessTracker(
+    private val maxAttempts: Int = MAX_ATTEMPTS,
+) {
+    /** Supervised restarts already spent for this user-initiated session. */
+    var attempt: Int = 0
+        private set
+
+    @Volatile
+    private var prev: LongArray? = null
+
+    @Volatile
+    private var prevAtMs: Long = 0L
+
+    private var frozenWindows = 0
+    private var silentWindows = 0
+
+    fun baseline(sample: LongArray, atMs: Long) {
+        prev = sample.clone()
+        prevAtMs = atMs
+        frozenWindows = 0
+        silentWindows = 0
+    }
+
+    fun hasBaseline(): Boolean = prev != null
+
+    /** A new session (a fresh tunnel, a user tap) starts a fresh budget and streaks. */
+    fun reset(attempt: Int = 0) {
+        prev = null
+        prevAtMs = 0L
+        frozenWindows = 0
+        silentWindows = 0
+        this.attempt = attempt
+    }
+
+    /**
+     * Fold one poll into the window state.
+     *
+     * @param sample the raw `TProxyGetStats()` array
+     * @param atMs monotonic time of this sample
+     * @param probeFailed whether an active check of the underlying network failed
+     * @return the decision for the window that just closed, or [LivenessDecision.Alive]
+     *   while the window is still open (the sample is then kept, not discarded).
+     */
+    fun onSample(
+        sample: LongArray,
+        atMs: Long,
+        probeFailed: Boolean = false,
+    ): LivenessDecision {
+        val before = prev ?: run {
+            // No baseline yet: adopt this sample as one rather than diff against
+            // an array that predates the tunnel.
+            baseline(sample, atMs)
+            return LivenessDecision.Alive
+        }
+        val elapsed = atMs - prevAtMs
+        if (elapsed < WINDOW_MS) return LivenessDecision.Alive
+
+        val decision = decideLiveness(
+            prev = before,
+            now = sample,
+            elapsedMs = elapsed,
+            attempt = attempt,
+            frozenWindows = frozenWindows,
+            silentWindows = silentWindows,
+            probeFailed = probeFailed,
+        )
+        frozenWindows = nextFrozenWindows(before, sample, frozenWindows)
+        silentWindows = nextSilentWindows(before, sample, silentWindows)
+        prev = sample.clone()
+        prevAtMs = atMs
+        return decision
+    }
+
+    /** Consecutive frozen-tx windows, exposed for logs and tests. */
+    fun frozenWindowCount(): Int = frozenWindows
+
+    /** Consecutive fully-silent windows, exposed for logs and tests. */
+    fun silentWindowCount(): Int = silentWindows
+
+    /**
+     * A verdict that costs one restart from the budget. Returns the plan the
+     * caller must carry out — [RestartPlan.GiveUp] once [maxAttempts] is spent, so
+     * a flapping radio cannot turn into an endless re-registration loop.
+     */
+    fun consumeRestart(): RestartPlan {
+        val plan = if (attempt >= maxAttempts) RestartPlan.GiveUp else RestartPlan.RetryAfter(backoffFor(attempt), attempt + 1)
+        if (plan is RestartPlan.RetryAfter) attempt = plan.attempt
+        return plan
+    }
+}

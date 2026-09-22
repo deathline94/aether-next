@@ -5,9 +5,7 @@
 #[link(name = "resource", kind = "static")]
 extern "C" {}
 
-use aether_desktop_lib::{
-    IpVersion, Protocol, RoutingMode, ScanMode, Settings, TransportKind,
-};
+use aether_desktop_lib::{IpVersion, Protocol, RoutingMode, ScanMode, Settings, TransportKind};
 use serde_json::Value;
 
 /// `Settings` gained fields over releases (`peer`, the QUIC fragmentation pair, the
@@ -26,7 +24,10 @@ fn a_config_from_an_older_release_loads_and_keeps_what_it_declares() {
         serde_json::from_str(older).expect("a pre-QUIC-frag config must still load");
     assert_eq!(settings.protocol, Protocol::Gool);
     assert_eq!(settings.http_port, 18080);
-    assert!(settings.launch_at_login, "the flag the user set survives the upgrade");
+    assert!(
+        settings.launch_at_login,
+        "the flag the user set survives the upgrade"
+    );
     // The fields that file predates come from `Default`, not from nothing.
     assert_eq!(settings.scan_mode, ScanMode::Stealth);
     assert_eq!(settings.noize_jmax, 128);
@@ -35,7 +36,10 @@ fn a_config_from_an_older_release_loads_and_keeps_what_it_declares() {
         settings.quic_initial_frag, defaults.quic_initial_frag,
         "an absent field takes the documented default"
     );
-    assert_eq!(settings.peer, "", "and a forced peer stays unset, not garbage");
+    assert_eq!(
+        settings.peer, "",
+        "and a forced peer stays unset, not garbage"
+    );
 }
 
 #[test]
@@ -110,7 +114,11 @@ fn legacy_spellings_load_and_unknown_ones_fall_back_instead_of_failing() {
     let settings: Settings = serde_json::from_str(legacy)
         .expect("a legacy spelling must not turn the user's config into a load error");
     assert_eq!(settings.ip_version, IpVersion::Dual);
-    assert_eq!(settings.scan_mode, ScanMode::Thorough, "trimmed and case-folded");
+    assert_eq!(
+        settings.scan_mode,
+        ScanMode::Thorough,
+        "trimmed and case-folded"
+    );
     assert_eq!(settings.protocol, Protocol::Warp);
     assert_eq!(settings.routing_mode, RoutingMode::Tun);
 
@@ -118,8 +126,8 @@ fn legacy_spellings_load_and_unknown_ones_fall_back_instead_of_failing() {
     // reads as the default the `#[serde(default)]` path produced — not as a
     // rejection of the whole file, and not as a mode that does not exist.
     let typo = r#"{"scanMode":"thorogh","ipVersion":"auto-detect","protocol":"teleport"}"#;
-    let settings: Settings = serde_json::from_str(typo)
-        .expect("an unknown value is a stale file, not a corrupt one");
+    let settings: Settings =
+        serde_json::from_str(typo).expect("an unknown value is a stale file, not a corrupt one");
     assert_eq!(settings.scan_mode, ScanMode::default());
     assert_eq!(settings.ip_version, IpVersion::default());
     assert_eq!(settings.protocol, Protocol::default());

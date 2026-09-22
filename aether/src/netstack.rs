@@ -15,16 +15,70 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{AetherError, Result};
 
 // Keep per-flow memory bounded. Large fixed buffers multiplied by browser connection
-// counts caused multi-gigabyte growth and allocator aborts on desktop.
-const TCP_BUF: usize = 512 * 1024;
+// counts caused multi-gigabyte growth and allocator aborts on desktop; the size of a
+// new socket's buffers is now decided by the global admission budget below (T145).
 const UDP_BUF: usize = 128 * 1024;
 const UDP_META: usize = 128;
 const APP_QUEUE: usize = 256;
 const MAX_INGEST_PER_TICK: usize = 256;
 const MAX_CMDS_PER_TICK: usize = 64;
-const MAX_APPDATA_PER_TICK: usize = 64;
+/// App-side writes per pass. Higher than the command budget because one flow
+/// bursts many writes per command it was opened with, but still bounded so a
+/// single client blasting uploads cannot keep the loop away from `iface.poll`
+/// (T147).
+const MAX_APPDATA_PER_TICK: usize = 128;
 const MAX_RECV_CHUNKS: usize = 64;
 const MAX_PENDING_PER_CONN: usize = 512 * 1024;
+
+/// Global admission budget for socket buffers (T145).
+///
+/// Buffers used to be allocated eagerly at a fixed size per socket, so the
+/// advertised ceiling was `512 sockets x 2 x 1 MB` = 1 GB. That kills an 8 GB
+/// laptop — and any Android device — long before `MAX_TCP_*` is a useful limit,
+/// and it kills it in the allocator rather than in a refusal the client can see.
+/// The budget is charged per socket and released with it, and it decides the
+/// *size* of the next flow's buffers: a connection is degraded before it is
+/// refused, and refused only once there is no pair left worth having.
+const MEM_BUDGET_TOTAL: usize = 128 * 1024 * 1024;
+/// While at least this much of the budget is still uncommitted a new flow gets
+/// full-size buffers; below it, every flow gets the degraded pair.
+const MEM_BUDGET_HEADROOM: usize = 16 * 1024 * 1024;
+const TCP_RX_FULL: usize = 1024 * 1024;
+const TCP_TX_FULL: usize = 256 * 1024;
+const TCP_RX_LOW: usize = 128 * 1024;
+const TCP_TX_LOW: usize = 64 * 1024;
+/// The smallest TCP pair worth admitting: below this the socket cannot hold an
+/// MSS in one direction and a window in the other, so the flow is refused
+/// explicitly instead of silently crawling.
+const TCP_MIN_PAIR: usize = TCP_RX_LOW + TCP_TX_LOW;
+/// One UDP association's footprint: `UDP_BUF` in each direction, unchanged from
+/// before the budget existed — datagrams are capped by the MTU, so shrinking the
+/// buffer would only drop traffic rather than throttle it.
+const UDP_PAIR: usize = UDP_BUF * 2;
+
+/// The buffer pair a new TCP flow is granted for the memory already committed.
+///
+/// Pure — the tiers, the headroom rule and the refusal are all reachable from a
+/// unit test without opening 512 sockets.
+fn tcp_admission(reserved: usize) -> Option<(usize, usize)> {
+    let free = MEM_BUDGET_TOTAL.saturating_sub(reserved);
+    if free >= MEM_BUDGET_HEADROOM {
+        Some((TCP_RX_FULL, TCP_TX_FULL))
+    } else if free >= TCP_MIN_PAIR {
+        Some((TCP_RX_LOW, TCP_TX_LOW))
+    } else {
+        None
+    }
+}
+
+/// UDP is admitted whole or not at all; see [`tcp_admission`].
+fn udp_admission(reserved: usize) -> Option<usize> {
+    if MEM_BUDGET_TOTAL.saturating_sub(reserved) >= UDP_PAIR {
+        Some(UDP_BUF)
+    } else {
+        None
+    }
+}
 
 // Per-class socket budgets (T137/T149).
 //
@@ -515,6 +569,9 @@ struct TcpState {
     handle: SocketHandle,
     /// Budget this flow was admitted against; see `SocketClass`.
     class: SocketClass,
+    /// Buffer bytes this flow is charged to the global admission budget;
+    /// released when the entry goes, whatever path removed it (T145).
+    reserved: usize,
     to_app: mpsc::Sender<Vec<u8>>,
     from_stack_rx: Option<mpsc::Receiver<Vec<u8>>>,
     connect_resp: Option<OpenTcpResp>,
@@ -533,6 +590,8 @@ struct UdpState {
     handle: SocketHandle,
     /// Budget this association was admitted against; see `SocketClass`.
     class: SocketClass,
+    /// Buffer bytes charged to the global admission budget (T145).
+    reserved: usize,
     to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
@@ -546,6 +605,9 @@ pub struct NetStack {
     next_port: u16,
     /// Odd step used to walk the ephemeral band (see `alloc_port`).
     port_stride: u16,
+    /// Buffer bytes currently committed to live sockets (T145); see
+    /// [`tcp_admission`] for what a new flow may take from it.
+    mem_reserved: usize,
     data_in_tx: mpsc::Sender<DataIn>,
 }
 
@@ -752,7 +814,8 @@ pub fn spawn(
         next_id: 1,
         next_port: port_seed().0,
         port_stride: port_seed().1,
-        data_in_tx: data_in_tx.clone(),
+        mem_reserved: 0,
+        data_in_tx: data_in_tx.clone(),,
     };
 
     let task = tokio::spawn(run(
@@ -1162,8 +1225,21 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 let _ = resp.send(Err(format!("too many TCP connections ({label})")));
                 return;
             }
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+            let (rx_cap, tx_cap) = match tcp_admission(s.mem_reserved) {
+                Some(pair) => pair,
+                None => {
+                    // Same prefix as the class refusal above: `session::local_stack_broken`
+                    // matches "too many TCP connections" to tell a local refusal apart
+                    // from one that came back through the tunnel.
+                    let label = class.label();
+                    let _ = resp.send(Err(format!(
+                        "too many TCP connections ({label}): memory admission budget is full"
+                    )));
+                    return;
+                }
+            };
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; rx_cap]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; tx_cap]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket.set_nagle_enabled(false);
             // H2 fix: without a connect timeout a SYN to a black-holed address
@@ -1197,6 +1273,10 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             let handle = s.sockets.add(socket);
             let id = s.next_id;
             s.next_id += 1;
+            // Charged only once the socket is in the set: the refusals above drop
+            // the buffers they allocated, so an attempted connect costs nothing.
+            let reserved = rx_cap + tx_cap;
+            s.mem_reserved += reserved;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(APP_QUEUE);
 
@@ -1205,6 +1285,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 TcpState {
                     handle,
                     class,
+                    reserved,
                     to_app: to_app_tx,
                     from_stack_rx: Some(to_app_rx),
                     connect_resp: Some(resp),
@@ -1222,10 +1303,20 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 let _ = resp.send(Err(format!("too many UDP associations ({label})")));
                 return;
             }
+            let cap = match udp_admission(s.mem_reserved) {
+                Some(cap) => cap,
+                None => {
+                    let label = class.label();
+                    let _ = resp.send(Err(format!(
+                        "too many UDP associations ({label}): memory admission budget is full"
+                    )));
+                    return;
+                }
+            };
             let rx_meta = vec![udp::PacketMetadata::EMPTY; UDP_META];
             let tx_meta = vec![udp::PacketMetadata::EMPTY; UDP_META];
-            let rx_buf = udp::PacketBuffer::new(rx_meta, vec![0u8; UDP_BUF]);
-            let tx_buf = udp::PacketBuffer::new(tx_meta, vec![0u8; UDP_BUF]);
+            let rx_buf = udp::PacketBuffer::new(rx_meta, vec![0u8; cap]);
+            let tx_buf = udp::PacketBuffer::new(tx_meta, vec![0u8; cap]);
             let mut socket = udp::Socket::new(rx_buf, tx_buf);
 
             let local_port = match alloc_unique_port(s) {
@@ -1246,6 +1337,8 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             let handle = s.sockets.add(socket);
             let id = s.next_id;
             s.next_id += 1;
+            let reserved = cap * 2;
+            s.mem_reserved += reserved;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(APP_QUEUE);
             s.udp_conns.insert(
@@ -1253,6 +1346,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 UdpState {
                     handle,
                     class,
+                    reserved,
                     to_app: to_app_tx,
                 },
             );
@@ -1305,6 +1399,7 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
         }
         DataIn::UdpClose(id) => {
             if let Some(st) = s.udp_conns.remove(&id) {
+                s.mem_reserved = s.mem_reserved.saturating_sub(st.reserved);
                 remove_socket(&mut s.sockets, st.handle);
             }
         }
@@ -1326,6 +1421,10 @@ fn retire_tcp(s: &mut NetStack, id: usize, reason: Option<&str>) {
     }
     if let Some(st) = s.tcp_conns.remove(&id) {
         st.dead.store(true, Ordering::Relaxed);
+        // One release per admission, wherever the flow was dropped from the map
+        // (T145): a budget that only ever grows is a permanent outage with a
+        // nicer name.
+        s.mem_reserved = s.mem_reserved.saturating_sub(st.reserved);
     }
 }
 
@@ -1612,6 +1711,7 @@ mod tests {
             next_id: 1,
             next_port: port_seed().0,
             port_stride: port_seed().1,
+            mem_reserved: 0,
             data_in_tx,
         };
 
@@ -1678,6 +1778,7 @@ mod tests {
             next_id: 1,
             next_port: port_seed().0,
             port_stride: port_seed().1,
+            mem_reserved: 0,
             data_in_tx,
         };
 
@@ -1994,6 +2095,7 @@ mod tests {
             next_id: 1,
             next_port: port_seed().0,
             port_stride: port_seed().1,
+            mem_reserved: 0,
             data_in_tx,
         }
     }

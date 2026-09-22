@@ -29,14 +29,22 @@ pub struct CommandError {
 
 impl CommandError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), field: None }
+        Self {
+            code,
+            message: message.into(),
+            field: None,
+        }
     }
 
     /// A rejected setting. `field` is the camelCase key of the `Settings` value
     /// that failed, which is the only way the UI can show it anywhere but in a
     /// log line.
     pub fn validation(field: &'static str, message: impl Into<String>) -> Self {
-        Self { code: "validation", message: message.into(), field: Some(field) }
+        Self {
+            code: "validation",
+            message: message.into(),
+            field: Some(field),
+        }
     }
 }
 
@@ -50,31 +58,51 @@ impl std::error::Error for CommandError {}
 
 impl From<String> for CommandError {
     fn from(message: String) -> Self {
-        Self { code: "internal", message, field: None }
+        Self {
+            code: "internal",
+            message,
+            field: None,
+        }
     }
 }
 
 impl From<&str> for CommandError {
     fn from(message: &str) -> Self {
-        Self { code: "internal", message: message.to_string(), field: None }
+        Self {
+            code: "internal",
+            message: message.to_string(),
+            field: None,
+        }
     }
 }
 
 impl From<serde_json::Error> for CommandError {
     fn from(e: serde_json::Error) -> Self {
-        Self { code: "encode", message: e.to_string(), field: None }
+        Self {
+            code: "encode",
+            message: e.to_string(),
+            field: None,
+        }
     }
 }
 
 impl From<tauri::Error> for CommandError {
     fn from(e: tauri::Error) -> Self {
-        Self { code: "shell", message: e.to_string(), field: None }
+        Self {
+            code: "shell",
+            message: e.to_string(),
+            field: None,
+        }
     }
 }
 
 impl From<ureq::Error> for CommandError {
     fn from(e: ureq::Error) -> Self {
-        Self { code: "network", message: e.to_string(), field: None }
+        Self {
+            code: "network",
+            message: e.to_string(),
+            field: None,
+        }
     }
 }
 
@@ -88,7 +116,11 @@ impl From<BinaryTrustError> for CommandError {
             BinaryTrustError::AnchorNotPublished { .. } => "anchor_not_published",
             BinaryTrustError::Validation(_) => "validation",
         };
-        Self { code, message: e.to_string(), field: None }
+        Self {
+            code,
+            message: e.to_string(),
+            field: None,
+        }
     }
 }
 
@@ -100,7 +132,11 @@ impl From<std::io::Error> for CommandError {
             std::io::ErrorKind::AlreadyExists => "already_exists",
             _ => "io",
         };
-        Self { code, message: e.to_string(), field: None }
+        Self {
+            code,
+            message: e.to_string(),
+            field: None,
+        }
     }
 }
 
@@ -161,7 +197,8 @@ pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
                 "icacls failed to restrict permissions on {}: {}",
                 path.display(),
                 err.trim()
-            ).into());
+            )
+            .into());
         }
     }
     Ok(())
@@ -184,7 +221,7 @@ pub mod dpapi {
     use windows_sys::Win32::Foundation::LocalFree;
     #[cfg(windows)]
     use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN,
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
 
     /// Which OS secret store can wrap the master key right now.
@@ -305,8 +342,10 @@ pub mod dpapi {
 
                 unsafe {
                     if !out_blob.pbData.is_null() && out_blob.cbData > 0 {
-                        let slice =
-                            std::slice::from_raw_parts_mut(out_blob.pbData, out_blob.cbData as usize);
+                        let slice = std::slice::from_raw_parts_mut(
+                            out_blob.pbData,
+                            out_blob.cbData as usize,
+                        );
                         slice.zeroize();
                     }
                     LocalFree(out_blob.pbData as _);
@@ -337,7 +376,11 @@ pub mod dpapi {
             let raw = std::fs::read(&key_file)
                 .map_err(|e| format!("failed reading {}: {e}", key_file.display()))?;
             if !raw.starts_with(DPAPI_MAGIC) {
-                return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()).into());
+                return Err(format!(
+                    "invalid DPAPI key envelope header in {}",
+                    key_file.display()
+                )
+                .into());
             }
             let mut decrypted = decrypt(&raw[DPAPI_MAGIC.len()..])?;
             if decrypted.len() != 32 {
@@ -383,7 +426,8 @@ pub mod dpapi {
                     .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
                 std::io::Write::write_all(&mut f, &envelope)
                     .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
-                f.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
+                f.sync_all()
+                    .map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
             }
             #[cfg(not(unix))]
             {
@@ -394,7 +438,8 @@ pub mod dpapi {
                     .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
                 std::io::Write::write_all(&mut f, &envelope)
                     .map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
-                f.sync_all().map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
+                f.sync_all()
+                    .map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
             }
         }
         // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
@@ -642,6 +687,10 @@ struct RuntimeState {
     detail: String,
     pid: Option<u32>,
     endpoint: Option<String>,
+    /// RTT of the probe that proved the endpoint this session selected, in ms.
+    /// `None` until something has actually been measured -- the UI renders that
+    /// as "not measured" rather than 0 ms, which would read as an excellent link.
+    handshake_rtt_ms: Option<u32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -673,6 +722,9 @@ struct AppState {
     /// to be silent for the whole multi-second endpoint hunt, which from the GUI
     /// side is indistinguishable from a hang; absence of pulses now says so.
     last_beat: Mutex<Option<(String, std::time::Instant)>>,
+    /// Kept outside `RuntimeState` so the many `emit_state` callers cannot drop a
+    /// measurement that arrived after they were written.
+    handshake_rtt_ms: Mutex<Option<u32>>,
     operation: Mutex<()>,
     #[cfg(windows)]
     job: Mutex<Option<engine_job::Job>>,
@@ -752,6 +804,7 @@ impl Default for AppState {
                 detail: "Ready".into(),
                 pid: None,
                 endpoint: None,
+                handshake_rtt_ms: None,
             }),
             proxy_enabled: AtomicBool::new(false),
             #[cfg(windows)]
@@ -763,6 +816,7 @@ impl Default for AppState {
             generation: AtomicU64::new(0),
             connect_since: Mutex::new(None),
             last_beat: Mutex::new(None),
+            handshake_rtt_ms: Mutex::new(None),
             operation: Mutex::new(()),
             #[cfg(windows)]
             job: Mutex::new(None),
@@ -837,6 +891,7 @@ fn emit_state(
         detail: detail.into(),
         pid,
         endpoint,
+        handshake_rtt_ms: *state.handshake_rtt_ms.lock(),
     };
     *state.runtime.lock() = value.clone();
     let _ = app.emit("session://state", value);
@@ -936,13 +991,19 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         if settings.noize_jc > 64 {
             return Err(CommandError::validation(
                 "noizeJc",
-                format!("custom obfuscation: junk packet count must be <= 64 (got {})", settings.noize_jc),
+                format!(
+                    "custom obfuscation: junk packet count must be <= 64 (got {})",
+                    settings.noize_jc
+                ),
             ));
         }
         if settings.noize_jmax > 2048 {
             return Err(CommandError::validation(
                 "noizeJmax",
-                format!("custom obfuscation: max size must be <= 2048 (got {})", settings.noize_jmax),
+                format!(
+                    "custom obfuscation: max size must be <= 2048 (got {})",
+                    settings.noize_jmax
+                ),
             ));
         }
         if settings.noize_interval_ms > 5000 {
@@ -962,7 +1023,8 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     // "binary is not trusted" error for a path they typed themselves. It used to
     // be validated nowhere: the settings form persists on a 400 ms debounce, so a
     // half-typed path reached the disk as the configured engine.
-    if !settings.engine_path.trim().is_empty() && !Path::new(settings.engine_path.trim()).is_file() {
+    if !settings.engine_path.trim().is_empty() && !Path::new(settings.engine_path.trim()).is_file()
+    {
         return Err(CommandError::validation(
             "enginePath",
             format!(
@@ -972,6 +1034,90 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         ));
     }
     Ok(())
+}
+
+/// Mirror of the engine's `session_event::SessionEvent`
+/// (`aether/src/session_event.rs`), deserialised rather than probed field by
+/// field.
+///
+/// The shell cannot depend on the engine crate -- that would drag `boring-sys`
+/// into the GUI build -- so this is a copy, and the copy is what makes a new or
+/// malformed variant visible: the old `Value` + `match ty` shape fell through to
+/// `_ => {}`, which meant the engine adding an event was indistinguishable from
+/// the shell ignoring it. An unparseable line is counted and reported instead.
+/// Most fields are read by only one arm; the mirror declares the whole engine
+/// shape on purpose, because the value of the type is that an unrecognised or
+/// malformed payload cannot slip past unnoticed.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum EngineEvent {
+    IdentityReady {
+        device_id: String,
+        ipv4: String,
+    },
+    EndpointSelected {
+        addr: String,
+        protocol: String,
+        #[serde(default)]
+        rtt_ms: Option<f64>,
+    },
+    ProxyReady {
+        socks: String,
+        http: String,
+    },
+    TunnelReady {
+        transport: String,
+    },
+    TunReady,
+    Connected {
+        detail: String,
+    },
+    Error {
+        message: String,
+    },
+    Heartbeat {
+        seq: u64,
+        phase: String,
+    },
+    ScanStart {
+        mode: String,
+        total: usize,
+        concurrency: usize,
+    },
+    ScanProgress {
+        scanned: usize,
+        total: usize,
+        working: usize,
+    },
+    ScanHit {
+        addr: String,
+        rtt: String,
+        rtt_ms: f64,
+        protocol: String,
+    },
+    ScanDone {
+        addr: String,
+        rtt: String,
+        protocol: String,
+        #[serde(default)]
+        best_rtt_ms: Option<f64>,
+    },
+}
+
+/// Number of engine event lines that did not parse. Reported with the first
+/// offending payload so a contract drift is noticed on the day it happens.
+static MALFORMED_ENGINE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_malformed_event(app: &AppHandle, detail: String) {
+    let n = MALFORMED_ENGINE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Loud once, then every 50th: the count is the point, not the volume.
+    if n == 1 || n.is_multiple_of(50) {
+        emit_log(
+            app,
+            format!("Ignored {n} malformed engine event(s); latest: {detail}"),
+        );
+    }
 }
 
 /// Prefer structured `AETHER_EVENT {...}` lines; fall back to log markers.
@@ -985,56 +1131,48 @@ fn handle_engine_line(
 ) {
     let want_tun = settings.routing_mode == RoutingMode::Tun;
     if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
-            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match ty {
-                "endpoint_selected" => {
-                    if let Some(addr) = v.get("addr").and_then(|a| a.as_str()) {
-                        let state = app.state::<AppState>();
-                        let mut rt = state.runtime.lock();
-                        rt.endpoint = Some(addr.to_string());
-                        let snap = rt.clone();
-                        drop(rt);
-                        let _ = app.emit("session://state", snap);
+        match serde_json::from_str::<EngineEvent>(json.trim()) {
+            Ok(event) => match event {
+                EngineEvent::EndpointSelected { addr, rtt_ms, .. } => {
+                    let state = app.state::<AppState>();
+                    if let Some(ms) = rtt_ms.map(|r| r.round().max(0.0) as u32) {
+                        *state.handshake_rtt_ms.lock() = Some(ms);
                     }
+                    let mut rt = state.runtime.lock();
+                    rt.endpoint = Some(addr.to_string());
+                    rt.handshake_rtt_ms = *state.handshake_rtt_ms.lock();
+                    let snap = rt.clone();
+                    drop(rt);
+                    let _ = app.emit("session://state", snap);
                 }
-                "heartbeat" => {
+                EngineEvent::Heartbeat { phase, .. } => {
                     // Only the phase is kept: a pulse resets the stall timer.
-                    let phase = v
-                        .get("phase")
-                        .and_then(|p| p.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
                     let state = app.state::<AppState>();
                     *state.last_beat.lock() = Some((phase, std::time::Instant::now()));
                 }
-                "proxy_ready" => {
+                EngineEvent::ProxyReady { .. } => {
                     socks_seen.store(true, Ordering::SeqCst);
                 }
-                "tunnel_ready" => {
+                EngineEvent::TunnelReady { .. } => {
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
-                "tun_ready" => {
+                EngineEvent::TunReady => {
                     tun_seen.store(true, Ordering::SeqCst);
                     // Full-system path: TUN up implies kernel bridge is usable.
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
-                "connected" => {
+                EngineEvent::Connected { .. } => {
                     // Crypto + proxies only. Never treat as TUN-ready (false "connected"
                     // when WinTUN routes are still missing).
                     socks_seen.store(true, Ordering::SeqCst);
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
-                "error" => {
-                    let msg = v
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("Connection failed")
-                        .to_string();
+                EngineEvent::Error { message } => {
+                    let msg = message;
                     emit_log(app, format!("engine error: {msg}"));
                     let state = app.state::<AppState>();
                     let endpoint = state.runtime.lock().endpoint.clone();
-                    
+
                     // 1) Paint the banner.
                     emit_state(app, &state, "error", &msg, None, endpoint);
 
@@ -1055,8 +1193,15 @@ fn handle_engine_line(
                     }
                     cleanup_routing(app, &state);
                 }
-                _ => {}
-            }
+                EngineEvent::IdentityReady { .. } => {}
+                // Scan traffic belongs to the scan child's own stream, which
+                // parses it in `pump_scan_stream`.
+                EngineEvent::ScanStart { .. }
+                | EngineEvent::ScanProgress { .. }
+                | EngineEvent::ScanHit { .. }
+                | EngineEvent::ScanDone { .. } => {}
+            },
+            Err(e) => note_malformed_event(app, format!("{e}: {}", json.trim())),
         }
     }
 
@@ -1075,7 +1220,10 @@ fn handle_engine_line(
             cleanup_routing(app, &state);
         }
     }
-    if line.contains("socks5 listening on") || line.contains("socks5 server listening") || line.contains("http proxy listening") {
+    if line.contains("socks5 listening on")
+        || line.contains("socks5 server listening")
+        || line.contains("http proxy listening")
+    {
         socks_seen.store(true, Ordering::SeqCst);
     }
     if line.contains("data-plane verified") {
@@ -1184,7 +1332,8 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), Comman
     Err(format!(
         "{label} rejected: must live under the app install directory (got {})",
         path.display()
-    ).into())
+    )
+    .into())
 }
 
 /// Only allow safe host tokens into Windows ProxyOverride (no `;` injection).
@@ -1198,9 +1347,10 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
         return None;
     }
     // IPv4 / hostname / simple IPv6 without zone or separators that break registry lists.
-    let ok = host.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_')
-    }) && !host.contains(';')
+    let ok = host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+        && !host.contains(';')
         && !host.contains('<')
         && !host.contains('>');
     ok.then(|| host.to_string())
@@ -1219,11 +1369,7 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
 pub fn allowed_binary_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(dir) = exe_dir {
-        for candidate in [
-            dir.to_path_buf(),
-            dir.join("resources"),
-            dir.join("engine"),
-        ] {
+        for candidate in [dir.to_path_buf(), dir.join("resources"), dir.join("engine")] {
             roots.push(candidate.canonicalize().unwrap_or(candidate));
         }
     }
@@ -1232,7 +1378,11 @@ pub fn allowed_binary_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
     // shell binary happens to be.
     let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../aether/target/release")
-        .join(if cfg!(windows) { "aether.exe" } else { "aether" });
+        .join(if cfg!(windows) {
+            "aether.exe"
+        } else {
+            "aether"
+        });
     roots.push(repo_build.canonicalize().unwrap_or(repo_build));
     roots
 }
@@ -1240,11 +1390,14 @@ pub fn allowed_binary_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
 pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut file = fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = file.read(&mut buf).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -1264,8 +1417,12 @@ include!(concat!(env!("OUT_DIR"), "/release_hashes.rs"));
 /// Which witness this binary was built against, for logs and for support output:
 /// the anchor's verbatim bytes, its own digest, the table derived from it, and
 /// whether any entry is still the un-published placeholder.
-pub fn engine_trust_anchor(
-) -> (&'static [u8], &'static str, &'static [(&'static str, &'static str)], bool) {
+pub fn engine_trust_anchor() -> (
+    &'static [u8],
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    bool,
+) {
     (
         ENGINE_TRUST_ANCHOR_BYTES,
         ENGINE_TRUST_ANCHOR_SHA256,
@@ -1328,10 +1485,21 @@ impl TrustedBinaryPolicy {
 pub enum BinaryTrustError {
     Validation(String),
     Authenticode(i32, String),
-    PublisherMismatch { expected: String, found: String },
-    HashMismatch { filename: String, expected: String, actual: String },
-    MissingHash { filename: String },
-    AnchorNotPublished { filename: String },
+    PublisherMismatch {
+        expected: String,
+        found: String,
+    },
+    HashMismatch {
+        filename: String,
+        expected: String,
+        actual: String,
+    },
+    MissingHash {
+        filename: String,
+    },
+    AnchorNotPublished {
+        filename: String,
+    },
 }
 
 impl std::fmt::Display for BinaryTrustError {
@@ -1342,9 +1510,16 @@ impl std::fmt::Display for BinaryTrustError {
                 write!(f, "Authenticode verification failed (0x{code:08x}): {msg}")
             }
             Self::PublisherMismatch { expected, found } => {
-                write!(f, "Publisher mismatch: expected '{expected}', found '{found}'")
+                write!(
+                    f,
+                    "Publisher mismatch: expected '{expected}', found '{found}'"
+                )
             }
-            Self::HashMismatch { filename, expected, actual } => {
+            Self::HashMismatch {
+                filename,
+                expected,
+                actual,
+            } => {
                 write!(
                     f,
                     "Hash mismatch for {filename}: expected {expected}, actual {actual}"
@@ -1368,7 +1543,10 @@ impl std::fmt::Display for BinaryTrustError {
 impl std::error::Error for BinaryTrustError {}
 
 #[cfg(windows)]
-pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(), BinaryTrustError> {
+pub fn verify_authenticode_signature(
+    path: &Path,
+    expected_cn: &str,
+) -> Result<(), BinaryTrustError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
@@ -1412,9 +1590,7 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
         // launch — which fails closed on an offline machine and, in CI, against
         // a just-issued certificate whose CRL is not published yet. Ask for no
         // revocation walk, but do refuse the broken legacy digests.
-        dwProvFlags: WTD_REVOCATION_CHECK_NONE
-            | WTD_DISABLE_MD2_MD4
-            | WTD_CACHE_ONLY_URL_RETRIEVAL,
+        dwProvFlags: WTD_REVOCATION_CHECK_NONE | WTD_DISABLE_MD2_MD4 | WTD_CACHE_ONLY_URL_RETRIEVAL,
         dwUIContext: 0,
         pSignatureSettings: std::ptr::null_mut(),
     };
@@ -1443,13 +1619,15 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
         let out = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .output()
-            .map_err(|e| BinaryTrustError::Validation(format!("failed to query signer certificate: {e}")))?;
-        
+            .map_err(|e| {
+                BinaryTrustError::Validation(format!("failed to query signer certificate: {e}"))
+            })?;
+
         if !out.status.success() {
             return Err(BinaryTrustError::Validation(format!(
                 "failed to read signer certificate: {}",
                 String::from_utf8_lossy(&out.stderr)
-            )))
+            )));
         }
 
         let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -1466,7 +1644,10 @@ pub fn verify_authenticode_signature(path: &Path, expected_cn: &str) -> Result<(
 }
 
 #[cfg(not(windows))]
-pub fn verify_authenticode_signature(_path: &Path, _expected_cn: &str) -> Result<(), BinaryTrustError> {
+pub fn verify_authenticode_signature(
+    _path: &Path,
+    _expected_cn: &str,
+) -> Result<(), BinaryTrustError> {
     Ok(())
 }
 
@@ -1490,16 +1671,14 @@ pub fn verify_elevated_binary(
     validate_trusted_binary(&path_buf, label)
         .map_err(|e| BinaryTrustError::Validation(e.message))?;
 
-    let filename = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(label);
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or(label);
 
-    let actual_hash = file_sha256_hex(path)
-        .map_err(|e| BinaryTrustError::Validation(e.message))?;
+    let actual_hash = file_sha256_hex(path).map_err(|e| BinaryTrustError::Validation(e.message))?;
 
     let mut found_hash = false;
     for &(expected_name, expected_hash) in policy.embedded_hashes {
-        if expected_name.eq_ignore_ascii_case(filename) || expected_name.eq_ignore_ascii_case(label) {
+        if expected_name.eq_ignore_ascii_case(filename) || expected_name.eq_ignore_ascii_case(label)
+        {
             found_hash = true;
             if actual_hash.eq_ignore_ascii_case(expected_hash) {
                 continue;
@@ -1636,7 +1815,10 @@ fn handoff_preamble(
     zeroize::Zeroize::zeroize(&mut buf);
     match written {
         Ok(()) => Ok(()),
-        Err(e) => Err(CommandError::new("handoff_failed", format!("handoff write: {e}"))),
+        Err(e) => Err(CommandError::new(
+            "handoff_failed",
+            format!("handoff write: {e}"),
+        )),
     }
 }
 
@@ -1687,7 +1869,9 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
     let repo_build =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../aether/target/release/aether.exe");
     let Some(path) = repo_build.exists().then_some(repo_build) else {
-        return Err("aether.exe not found. Build engine or choose it in Settings > Advanced.".into());
+        return Err(
+            "aether.exe not found. Build engine or choose it in Settings > Advanced.".into(),
+        );
     };
     // The repository-build fallback is a development convenience. `validate_trusted_binary`
     // tolerates an unsigned local build only in a debug binary (see
@@ -1783,14 +1967,7 @@ fn stream_output<R: std::io::Read + Send + 'static>(
                 if state.generation.load(Ordering::SeqCst) != generation {
                     break;
                 }
-                handle_engine_line(
-                    &app,
-                    &line,
-                    &settings,
-                    &socks_seen,
-                    &tunnel_seen,
-                    &tun_seen,
-                );
+                handle_engine_line(&app, &line, &settings, &socks_seen, &tunnel_seen, &tun_seen);
             }
             emit_log(&app, line);
         }
@@ -1872,7 +2049,10 @@ pub fn heartbeat_stall_action(
         return Some("no progress event received".to_string());
     };
     if elapsed >= interval * miss_limit {
-        Some(format!("{phase} ({} s since the last pulse)", elapsed.as_secs()))
+        Some(format!(
+            "{phase} ({} s since the last pulse)",
+            elapsed.as_secs()
+        ))
     } else {
         None
     }
@@ -1921,12 +2101,10 @@ fn watch_child(app: AppHandle) {
             last_coherence = std::time::Instant::now();
             if state.proxy_enabled.load(Ordering::SeqCst) {
                 if let Some(want) = state.proxy_applied.lock().clone() {
-                    match windows_proxy::read_current()
-                        .and_then(|current| {
-                            windows_proxy::verify_readback_values(&want, &current)?;
-                            Ok(current)
-                        })
-                    {
+                    match windows_proxy::read_current().and_then(|current| {
+                        windows_proxy::verify_readback_values(&want, &current)?;
+                        Ok(current)
+                    }) {
                         Ok(_) => {}
                         // Something else wrote over our values. Re-asserting is the
                         // only honest response: leaving it means the user thinks
@@ -1962,8 +2140,12 @@ fn watch_child(app: AppHandle) {
             let beat = state.last_beat.lock().take();
             if let Some((phase, at)) = beat {
                 let since = at.elapsed();
-                let stalled =
-                    heartbeat_stall_action(Some((&phase, since)), armed, HEARTBEAT_MISS_LIMIT, HEARTBEAT_INTERVAL);
+                let stalled = heartbeat_stall_action(
+                    Some((&phase, since)),
+                    armed,
+                    HEARTBEAT_MISS_LIMIT,
+                    HEARTBEAT_INTERVAL,
+                );
                 match stalled {
                     Some(detail) => {
                         emit_log(
@@ -1989,7 +2171,10 @@ fn watch_child(app: AppHandle) {
                 // 500 ms and a teardown that outlives one tick must not re-fire.
                 *state.connect_since.lock() = None;
                 let detail = "Connection timed out after 90 s: the engine reported no ready route.";
-                emit_log(&app, format!("{detail} Stopping it so the next connect can start."));
+                emit_log(
+                    &app,
+                    format!("{detail} Stopping it so the next connect can start."),
+                );
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 state.connecting.store(false, Ordering::SeqCst);
                 if let Some(mut child) = state.child.lock().take() {
@@ -2027,11 +2212,7 @@ fn watch_child(app: AppHandle) {
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 let ever_connected = state.connected_once.load(Ordering::SeqCst);
                 let problems = cleanup_routing(&app, &state);
-                let already_error = state
-                    .runtime
-                    .lock()
-                    .status
-                    .eq_ignore_ascii_case("error");
+                let already_error = state.runtime.lock().status.eq_ignore_ascii_case("error");
                 if already_error {
                     // Structured error event already set UI; keep it.
                     for problem in &problems {
@@ -2072,11 +2253,7 @@ fn watch_child(app: AppHandle) {
                 for problem in cleanup_routing(&app, &state) {
                     eprintln!("[aether] {problem}");
                 }
-                let already_error = state
-                    .runtime
-                    .lock()
-                    .status
-                    .eq_ignore_ascii_case("error");
+                let already_error = state.runtime.lock().status.eq_ignore_ascii_case("error");
                 if already_error {
                     continue;
                 }
@@ -2129,7 +2306,11 @@ fn is_admin() -> bool {
 }
 
 #[tauri::command]
-fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<(), CommandError> {
+fn connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> Result<(), CommandError> {
     let _operation = state.operation.lock();
     if state
         .connecting
@@ -2236,7 +2417,11 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             // builds can still opt out by setting the env var themselves.
             .env(
                 "AETHER_MASQUE_HTTP2",
-                if settings.transport == TransportKind::H2 { "1" } else { "0" },
+                if settings.transport == TransportKind::H2 {
+                    "1"
+                } else {
+                    "0"
+                },
             )
             .env(
                 "AETHER_QUIC_INITIAL_FRAG",
@@ -2287,12 +2472,10 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             command.creation_flags(0x08000000);
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| {
-                dpapi_key.zeroize();
-                format!("Could not start aether.exe: {e}")
-            })?;
+        let mut child = command.spawn().map_err(|e| {
+            dpapi_key.zeroize();
+            format!("Could not start aether.exe: {e}")
+        })?;
         // The key travels on stdin, then is wiped: the child never holds it in
         // its environment and neither does this process for longer than a call.
         if let Err(e) = handoff_preamble(&mut child, &dpapi_key, wintun_for_handoff.as_deref()) {
@@ -2322,6 +2505,10 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         let tunnel_seen = Arc::new(AtomicBool::new(false));
         let tun_seen = Arc::new(AtomicBool::new(false));
         state.connected_once.store(false, Ordering::SeqCst);
+        // A new session has measured nothing yet. Carrying the last run's
+        // numbers over would be a fabricated stat wearing a real label.
+        *state.handshake_rtt_ms.lock() = None;
+        *state.last_beat.lock() = None;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -2508,8 +2695,12 @@ fn diagnostics(
         ));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let value: serde_json::Value = serde_json::from_str(text.trim())
-        .map_err(|e| CommandError::new("bad_output", format!("Engine diagnostics were not JSON: {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
+        CommandError::new(
+            "bad_output",
+            format!("Engine diagnostics were not JSON: {e}"),
+        )
+    })?;
     Ok(value)
 }
 
@@ -2635,12 +2826,10 @@ fn scan(
         command.creation_flags(0x08000000);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| {
-            dpapi_key.zeroize();
-            format!("Could not start scan: {e}")
-        })?;
+    let mut child = command.spawn().map_err(|e| {
+        dpapi_key.zeroize();
+        format!("Could not start scan: {e}")
+    })?;
     // A scan child never brings the tunnel up, so it gets the key line and no
     // driver line — the engine only waits for the second when AETHER_TUN is on.
     if let Err(e) = handoff_preamble(&mut child, &dpapi_key, None) {
@@ -2751,52 +2940,97 @@ fn pump_scan_stream(
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
             if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
-                    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match ty {
-                        "scan_start" => {
-                            emit_scan_event(&app, &run_id, serde_json::json!({
-                                "type": "scan_start",
-                                "mode": v.get("mode").and_then(|m| m.as_str()).unwrap_or(""),
-                                "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
-                                "concurrency": v.get("concurrency").and_then(|c| c.as_u64()).unwrap_or(0),
-                            }));
+                match serde_json::from_str::<EngineEvent>(json.trim()) {
+                    Err(e) => note_malformed_event(&app, format!("{e}: {}", json.trim())),
+                    Ok(v) => {
+                        match v {
+                            EngineEvent::ScanStart {
+                                mode,
+                                total,
+                                concurrency,
+                            } => {
+                                emit_scan_event(
+                                    &app,
+                                    &run_id,
+                                    serde_json::json!({
+                                        "type": "scan_start",
+                                        "mode": mode,
+                                        "total": total,
+                                        "concurrency": concurrency,
+                                    }),
+                                );
+                            }
+                            EngineEvent::ScanProgress {
+                                scanned,
+                                total,
+                                working,
+                            } => {
+                                emit_scan_event(
+                                    &app,
+                                    &run_id,
+                                    serde_json::json!({
+                                        "type": "scan_progress",
+                                        "scanned": scanned,
+                                        "total": total,
+                                        "working": working,
+                                    }),
+                                );
+                            }
+                            EngineEvent::ScanHit {
+                                addr,
+                                rtt,
+                                rtt_ms,
+                                protocol,
+                            } => {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                emit_scan_event(
+                                    &app,
+                                    &run_id,
+                                    serde_json::json!({
+                                        "type": "scan_hit",
+                                        "addr": addr,
+                                        "rtt": rtt,
+                                        "rttMs": rtt_ms,
+                                        "protocol": protocol,
+                                    }),
+                                );
+                            }
+                            EngineEvent::ScanDone {
+                                addr,
+                                rtt,
+                                protocol,
+                                best_rtt_ms,
+                            } => {
+                                terminal_sent.store(true, Ordering::SeqCst);
+                                // Re-keyed rather than forwarded raw like the other arms used to be
+                                // done to them: the engine's `best_rtt_ms` is snake_case while every
+                                // other field on this channel is camelCase, and an empty `rtt` used
+                                // to reach the UI as `best: 1.1.1.1:443 ()` — a pair of brackets
+                                // around nothing, which reads as a measurement of zero. Absent stays
+                                // absent (`null`), never a fabricated 0.
+                                emit_scan_event(
+                                    &app,
+                                    &run_id,
+                                    serde_json::json!({
+                                        "type": "scan_done",
+                                        "addr": addr,
+                                        "rtt": rtt,
+                                        "protocol": protocol,
+                                        "bestRttMs": best_rtt_ms,
+                                    }),
+                                );
+                            }
+                            // Session-level events on a scan child are not this
+                            // stream's business; the scan process does not emit them.
+                            EngineEvent::IdentityReady { .. }
+                            | EngineEvent::EndpointSelected { .. }
+                            | EngineEvent::ProxyReady { .. }
+                            | EngineEvent::TunnelReady { .. }
+                            | EngineEvent::TunReady
+                            | EngineEvent::Connected { .. }
+                            | EngineEvent::Error { .. }
+                            | EngineEvent::Heartbeat { .. } => {}
                         }
-                        "scan_progress" => {
-                            emit_scan_event(&app, &run_id, serde_json::json!({
-                                "type": "scan_progress",
-                                "scanned": v.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0),
-                                "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
-                                "working": v.get("working").and_then(|w| w.as_u64()).unwrap_or(0),
-                            }));
-                        }
-                        "scan_hit" => {
-                            hits.fetch_add(1, Ordering::SeqCst);
-                            emit_scan_event(&app, &run_id, serde_json::json!({
-                                "type": "scan_hit",
-                                "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
-                                "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
-                                "rttMs": v.get("rtt_ms").and_then(|r| r.as_f64()).unwrap_or(0.0),
-                                "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
-                            }));
-                        }
-                        "scan_done" => {
-                            terminal_sent.store(true, Ordering::SeqCst);
-                            // Re-keyed rather than forwarded raw like the other arms used to be
-                            // done to them: the engine's `best_rtt_ms` is snake_case while every
-                            // other field on this channel is camelCase, and an empty `rtt` used
-                            // to reach the UI as `best: 1.1.1.1:443 ()` — a pair of brackets
-                            // around nothing, which reads as a measurement of zero. Absent stays
-                            // absent (`null`), never a fabricated 0.
-                            emit_scan_event(&app, &run_id, serde_json::json!({
-                                "type": "scan_done",
-                                "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
-                                "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
-                                "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
-                                "bestRttMs": v.get("best_rtt_ms").and_then(|b| b.as_f64()),
-                            }));
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -3017,10 +3251,14 @@ pub mod windows_proxy {
         let key = key()?;
         let server = want.server.clone().unwrap_or_default();
         let bypass = want.bypass.clone().unwrap_or_default();
-        key.set_value("ProxyServer", &server).map_err(CommandError::from)?;
-        key.set_value("ProxyOverride", &bypass).map_err(CommandError::from)?;
+        key.set_value("ProxyServer", &server)
+            .map_err(CommandError::from)?;
+        key.set_value("ProxyOverride", &bypass)
+            .map_err(CommandError::from)?;
         match want.auto_config_url.as_ref() {
-            Some(v) => key.set_value("AutoConfigURL", v).map_err(CommandError::from)?,
+            Some(v) => key
+                .set_value("AutoConfigURL", v)
+                .map_err(CommandError::from)?,
             None => match key.delete_value("AutoConfigURL") {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -3053,8 +3291,7 @@ pub mod windows_proxy {
             let json = serde_json::to_vec_pretty(&snapshot)
                 .map_err(|e| (format!("proxy recovery encode: {e}"), None))?;
             let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, json)
-                .map_err(|e| (format!("proxy recovery write: {e}"), None))?;
+            std::fs::write(&tmp, json).map_err(|e| (format!("proxy recovery write: {e}"), None))?;
             std::fs::rename(&tmp, path)
                 .map_err(|e| (format!("proxy recovery commit: {e}"), None))?;
         }
@@ -3062,8 +3299,10 @@ pub mod windows_proxy {
         let result = (|| -> Result<(), CommandError> {
             let server = applied.server.clone().unwrap_or_default();
             let bypass = applied.bypass.clone().unwrap_or_default();
-            key.set_value("ProxyServer", &server).map_err(CommandError::from)?;
-            key.set_value("ProxyOverride", &bypass).map_err(CommandError::from)?;
+            key.set_value("ProxyServer", &server)
+                .map_err(CommandError::from)?;
+            key.set_value("ProxyOverride", &bypass)
+                .map_err(CommandError::from)?;
             // Take the PAC out of the way while our proxy is active, but only
             // because it has been snapshotted: `restore` puts it back.
             match key.delete_value("AutoConfigURL") {
@@ -3116,7 +3355,11 @@ pub mod windows_proxy {
         for (name, want, got) in [
             ("ProxyServer", &expected.server, &actual.server),
             ("ProxyOverride", &expected.bypass, &actual.bypass),
-            ("AutoConfigURL", &expected.auto_config_url, &actual.auto_config_url),
+            (
+                "AutoConfigURL",
+                &expected.auto_config_url,
+                &actual.auto_config_url,
+            ),
         ] {
             if want != got {
                 return Err(format!(

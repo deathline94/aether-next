@@ -135,7 +135,12 @@ fn test_readback_verification_detects_proxy_override_mismatch() {
 /// really in the path.
 #[test]
 fn readback_verification_detects_the_pac_url_being_left_behind() {
-    let snapshot = snap(1, Some("127.0.0.1:8080"), None, Some("https://corp/proxy.pac"));
+    let snapshot = snap(
+        1,
+        Some("127.0.0.1:8080"),
+        None,
+        Some("https://corp/proxy.pac"),
+    );
 
     let err = verify(&snapshot, 1, Some("127.0.0.1:8080"), None, None).unwrap_err();
     assert!(
@@ -207,7 +212,10 @@ fn test_recover_deletes_file_on_restore_success() {
 
     let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| Ok(()));
 
-    assert!(matches!(res, Ok(true)), "restored file should report success");
+    assert!(
+        matches!(res, Ok(true)),
+        "restored file should report success"
+    );
     // File MUST be deleted
     assert!(
         !path.exists(),
@@ -237,11 +245,16 @@ fn test_read_optional_reg_value_error_discrimination() {
 
     // PermissionDenied / AccessDenied -> Err (must NOT be treated as None!)
     let denied_err = aether_desktop_lib::windows_proxy::read_optional_reg_value(
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "access denied")),
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "access denied",
+        )),
         "ProxyServer",
     )
     .unwrap_err();
-    assert!(denied_err.message.contains("verify read ProxyServer: access denied"));
+    assert!(denied_err
+        .message
+        .contains("verify read ProxyServer: access denied"));
 
     // Other errors (e.g. BrokenPipe) -> Err
     let other_err = aether_desktop_lib::windows_proxy::read_optional_reg_value(
@@ -305,7 +318,10 @@ fn the_mirror_survives_being_stored_as_one_registry_string() {
     };
     let json = serde_json::to_string(&mirror).expect("encode");
     let back: JournalMirror = serde_json::from_str(&json).expect("decode");
-    assert_eq!(back, mirror, "a mirror that cannot round-trip cannot restore");
+    assert_eq!(
+        back, mirror,
+        "a mirror that cannot round-trip cannot restore"
+    );
 }
 
 /// The coherence check compares the registry against *this* value, so it has to be
@@ -339,12 +355,15 @@ fn the_applied_expectation_is_what_the_writer_writes() {
 
     // And the same value compares equal to itself through the read-back path.
     assert_eq!(
-        verify_readback_values(&want, &ProxySnapshot {
-            enabled: 1,
-            server: want.server.clone(),
-            bypass: want.bypass.clone(),
-            auto_config_url: None,
-        }),
+        verify_readback_values(
+            &want,
+            &ProxySnapshot {
+                enabled: 1,
+                server: want.server.clone(),
+                bypass: want.bypass.clone(),
+                auto_config_url: None,
+            }
+        ),
         Ok(())
     );
 }

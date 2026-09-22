@@ -12,6 +12,11 @@ pub enum SessionEvent {
     EndpointSelected {
         addr: String,
         protocol: String,
+        /// RTT of the probe that proved this endpoint, in milliseconds.
+        /// `None` when the peer was forced from config or reused from the
+        /// quick-reconnect cache without a fresh measurement — the UI shows
+        /// "not measured", never 0 ms.
+        rtt_ms: Option<f64>,
     },
     ProxyReady {
         socks: String,
