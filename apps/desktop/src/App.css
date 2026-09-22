@@ -10,6 +10,15 @@
   --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 
+  /* Smallest size any text may use. Both sheets carried five sub-11px values
+     (8.5/9/9.5/10/10.5) across 44 declarations, and they were the *status*
+     layer — stat labels, timestamps, version, field hints, the empty state. At
+     8.5px, uppercase, letter-spaced and monospaced on a 100%-zoom Windows
+     desktop they are below any legible floor, and on Android the webview does
+     not scale px text with the OS font size at all. One token so the floor is
+     a decision in one place rather than 44 accidents. */
+  --text-micro: 11px;
+
   /* Surfaces */
   --bg-app: #07090b;
   --bg-sidebar: #090c0f;
@@ -256,7 +265,7 @@ code, kbd, pre {
   display: block;
   margin-top: 3px;
   color: var(--muted);
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   letter-spacing: 0.12em;
   font-weight: 600;
 }
@@ -322,7 +331,7 @@ code, kbd, pre {
   border: 1px solid var(--emerald-border);
   border-radius: 999px;
   color: var(--emerald);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 600;
 }
 .nav-shortcut {
@@ -335,7 +344,7 @@ code, kbd, pre {
   border: 1px solid var(--edge);
   border-radius: 4px;
   color: var(--muted-dark);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 600;
   transition: color 0.15s, border-color 0.15s;
 }@media (hover: hover) and (pointer: fine){
@@ -457,7 +466,7 @@ code, kbd, pre {
   color: #ffffff;
 }
 .beacon-tag {
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 700;
   padding: 1px 5px;
   border-radius: 4px;
@@ -471,7 +480,7 @@ code, kbd, pre {
 .beacon-detail {
   display: block;
   margin-top: 2px;
-  font-size: 10px;
+  font-size: var(--text-micro);
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -483,7 +492,7 @@ code, kbd, pre {
   align-items: center;
   justify-content: space-between;
   padding: 0 4px;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 600;
   color: var(--muted-dark);
   letter-spacing: 0.06em;
@@ -521,7 +530,7 @@ code, kbd, pre {
 .topbar-eyebrow {
   margin: 0;
   color: var(--muted);
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -547,7 +556,7 @@ code, kbd, pre {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -672,7 +681,7 @@ code, kbd, pre {
   display: inline-flex;
   gap: 8px;
   align-items: center;
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -889,7 +898,7 @@ code, kbd, pre {
   gap: 6px;
   padding: 3px 9px;
   border-radius: 999px;
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   font-family: var(--font-mono);
@@ -921,7 +930,7 @@ code, kbd, pre {
   box-shadow: 0 0 6px currentColor;
 }
 .switch-action-hint {
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.1em;
   color: var(--muted-dark);
@@ -972,7 +981,7 @@ code, kbd, pre {
 }
 .bento-category {
   display: block;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -994,7 +1003,7 @@ code, kbd, pre {
 .bento-chip, .bento-chip-cyan {
   padding: 3px 8px;
   border-radius: 4px;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   font-family: var(--font-mono);
@@ -1040,7 +1049,7 @@ code, kbd, pre {
   gap: 2px;
 }
 .stat-label {
-  font-size: 8.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   color: var(--muted-dark);
   letter-spacing: 0.08em;
@@ -1065,7 +1074,7 @@ code, kbd, pre {
   margin-top: auto;
 }
 .bento-subtext {
-  font-size: 10px;
+  font-size: var(--text-micro);
   color: var(--muted);
   font-family: var(--font-mono);
 }
@@ -1090,7 +1099,7 @@ code, kbd, pre {
   gap: 2px;
 }
 .spec-badge span {
-  font-size: 8.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   color: var(--muted);
   letter-spacing: 0.08em;
@@ -1124,7 +1133,7 @@ code, kbd, pre {
 .topology-detail-row span {
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 700;
 }
 .topology-detail-row strong {
@@ -1177,7 +1186,7 @@ code, kbd, pre {
   border-radius: 6px;
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-family: var(--font-mono);
   color: var(--muted);
 }
@@ -1297,7 +1306,7 @@ code, kbd, pre {
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
-  font-size: 9px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   font-family: var(--font-mono);
@@ -1342,7 +1351,7 @@ code, kbd, pre {
 }
 .section-heading p {
   margin: 0;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -1381,7 +1390,7 @@ code, kbd, pre {
 .endpoint-kind span {
   display: block;
   margin-top: 2px;
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   color: var(--muted);
 }
 .endpoint-row code {
@@ -1489,7 +1498,7 @@ code, kbd, pre {
 .about-panel p {
   margin: 0 0 3px;
   color: var(--muted-dark);
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.1em;
 }
@@ -1577,7 +1586,7 @@ code, kbd, pre {
 }
 .panel-eyebrow {
   margin: 0 0 4px;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.12em;
   color: var(--emerald);
@@ -1624,7 +1633,7 @@ code, kbd, pre {
 }
 
 .tactical-chip {
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   padding: 1px 7px;
   border-radius: 4px;
@@ -1671,7 +1680,7 @@ code, kbd, pre {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   color: var(--yellow);
   letter-spacing: 0.1em;
@@ -1685,7 +1694,7 @@ code, kbd, pre {
 .matrix-cell label {
   display: grid;
   gap: 6px;
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   color: var(--muted);
   font-weight: 600;
 }
@@ -1715,7 +1724,7 @@ code, kbd, pre {
 }
 .field-hint {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--text-micro);
   color: var(--muted-dark);
 }
 .port-collision-alert {
@@ -1943,7 +1952,7 @@ code, kbd, pre {
 .stepper-suffix {
   padding-right: 8px;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--text-micro);
   color: var(--muted-dark);
   font-weight: 600;
   text-transform: uppercase;
@@ -2131,7 +2140,7 @@ code, kbd, pre {
 .scope-phase-tag {
   padding: 1px 7px;
   border-radius: 4px;
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   font-family: var(--font-mono);
   background: var(--emerald-dim);
@@ -2200,7 +2209,7 @@ code, kbd, pre {
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--emerald);
-  font-size: 10px;
+  font-size: var(--text-micro);
 }
 .progress-metric {
   color: #ffffff;
@@ -2233,7 +2242,7 @@ code, kbd, pre {
 .stat-chip-pill {
   padding: 3px 10px;
   border-radius: 6px;
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   font-weight: 600;
   font-family: var(--font-mono);
   background: rgba(255, 255, 255, 0.04);
@@ -2301,7 +2310,7 @@ code, kbd, pre {
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.08);
   color: var(--muted-light);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   font-family: var(--font-mono);
 }
@@ -2349,7 +2358,7 @@ code, kbd, pre {
   text-overflow: ellipsis;
 }
 .discovered-proto {
-  font-size: 10px;
+  font-size: var(--text-micro);
   padding: 2px 7px;
   border-radius: 4px;
   background: var(--emerald-dim);
@@ -2618,7 +2627,7 @@ code, kbd, pre {
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
-  font-size: 10px;
+  font-size: var(--text-micro);
   font-weight: 700;
   font-family: var(--font-mono);
   letter-spacing: 0.04em;
@@ -2638,7 +2647,7 @@ code, kbd, pre {
   border: 1px solid var(--border-card);
   background: var(--panel-nested);
   color: var(--muted-light);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   font-weight: 600;
   font-family: var(--font-mono);
 }
@@ -2729,7 +2738,7 @@ code, kbd, pre {
 .terminal-center-telemetry .status-dot { margin: 0; }
 .stream-count {
   font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   color: var(--muted);
   white-space: nowrap;
 }
@@ -2820,7 +2829,7 @@ code, kbd, pre {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.05);
   color: var(--muted);
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   text-align: center;
   font-family: var(--font-mono);
 }
@@ -2829,7 +2838,7 @@ code, kbd, pre {
   color: var(--emerald);
 }
 .terminal-mode-indicator .mode-tag {
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   color: var(--emerald);
   background: var(--emerald-dim);
@@ -2866,7 +2875,7 @@ code, kbd, pre {
 }}
 .terminal-log-row time {
   color: var(--muted-dark);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
 }
 .row-gutter {
   display: grid;
@@ -2880,7 +2889,7 @@ code, kbd, pre {
   display: inline-block;
 }
 .log-level-badge {
-  font-size: 9.5px;
+  font-size: var(--text-micro);
   font-weight: 700;
   text-align: center;
   border-radius: 4px;
@@ -3003,7 +3012,7 @@ code, kbd, pre {
   padding: 8px 14px;
   text-align: center;
   color: var(--muted-dark);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   border-bottom: 1px solid var(--border-subtle);
 }
 .activity-hint {
@@ -3012,7 +3021,7 @@ code, kbd, pre {
   gap: 8px;
   padding: 4px 4px 0;
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: var(--text-micro);
 }
 
 /*
@@ -3145,7 +3154,7 @@ code, kbd, pre {
     gap: 3px;
     padding: 0;
   }
-  .nav-pill-label { display: block; font-size: 9px; }
+  .nav-pill-label { display: block; font-size: var(--text-micro); }
   .nav-active-pill { display: none; }
   .workspace { height: auto; min-height: calc(100dvh - 60px); }
   .topbar {
@@ -3297,7 +3306,7 @@ code, kbd, pre {
   padding: 2px 8px;
   border: 1px solid var(--edge);
   border-radius: 999px;
-  font-size: 10.5px;
+  font-size: var(--text-micro);
   font-weight: 600;
   font-family: var(--font-mono);
   letter-spacing: 0.04em;

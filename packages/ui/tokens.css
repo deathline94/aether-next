@@ -32,6 +32,15 @@
   --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 
+  /* Smallest size any text may use. Both sheets carried five sub-11px values
+     (8.5/9/9.5/10/10.5) across 44 declarations, and they were the *status*
+     layer — stat labels, timestamps, version, field hints, the empty state. At
+     8.5px, uppercase, letter-spaced and monospaced on a 100%-zoom Windows
+     desktop they are below any legible floor, and on Android the webview does
+     not scale px text with the OS font size at all. One token so the floor is
+     a decision in one place rather than 44 accidents. */
+  --text-micro: 11px;
+
   /* Surfaces */
   --bg-app: #07090b;
   --bg-sidebar: #090c0f;
