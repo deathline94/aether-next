@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 import type { Settings } from "../types";
+import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
 
 interface SettingsTabProps {
@@ -20,6 +21,8 @@ interface SettingsTabProps {
   settingsLoadError?: boolean;
   retrySettings?: () => void | Promise<void>;
   saved: boolean;
+  /** The last save the shell refused, if one is still outstanding. */
+  saveError?: IpcError | null;
   patchSettings: (patch: Partial<Settings>) => void;
 }
 
@@ -30,9 +33,13 @@ export function SettingsTab({
   settingsLoadError,
   retrySettings,
   saved,
+  saveError,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
+  // `field` is the machine-readable half of the rejection: the shell says which
+  // setting it refused, so the input itself can be marked, not just the log.
+  const rejected = (field: string) => saveError?.field === field;
 
   return (
     <div className="settings-view">
@@ -57,6 +64,18 @@ export function SettingsTab({
               Retry
             </button>
           )}
+        </div>
+      )}
+      {/* A rejected save used to be only a log line, so the status text below
+          stayed on "Synchronizing changes…" over a value that would never be
+          accepted. The shell's own sentence is the message; `field` marks the
+          input it is about. */}
+      {saveError && (
+        <div className="error-banner" role="alert">
+          <div className="error-banner-content">
+            <AlertTriangle size={18} aria-hidden="true" />
+            <span>AUTO-SAVE REJECTED — {saveError.message}</span>
+          </div>
         </div>
       )}
       {settingsLocked && (
@@ -425,6 +444,7 @@ export function SettingsTab({
                 step={1}
                 disabled={settingsLocked}
                 value={settings.httpPort}
+                invalid={rejected("httpPort")}
                 onCommit={(httpPort) => patchSettings({ httpPort })}
               />
             </label>
@@ -443,6 +463,7 @@ export function SettingsTab({
                 step={1}
                 disabled={settingsLocked}
                 value={settings.socksPort}
+                invalid={rejected("socksPort")}
                 onCommit={(socksPort) => patchSettings({ socksPort })}
               />
             </label>
@@ -492,17 +513,24 @@ export function SettingsTab({
               ? "Interface locked — disconnect tunnel to commit changes"
               : portsCollide
               ? "Save blocked — resolve HTTP/SOCKS port collision"
+              : saveError
+              ? "Last save was rejected — see the message above"
               : saved
               ? "All parameters synchronized with runtime daemon"
               : "Synchronizing changes…"}
           </span>
         </div>
 
-        <div className={`save-indicator ${portsCollide ? "blocked" : ""}`}>
+        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : ""}`}>
           {portsCollide ? (
             <>
               <X size={15} aria-hidden="true" />
               <span>Collision Conflict</span>
+            </>
+          ) : saveError ? (
+            <>
+              <X size={15} aria-hidden="true" />
+              <span>Save Rejected</span>
             </>
           ) : saved ? (
             <>

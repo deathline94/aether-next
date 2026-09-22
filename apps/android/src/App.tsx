@@ -29,7 +29,7 @@ function App() {
   } = useLogs();
 
   const {
-    settings, runtime, busy, testBusy, saved, admin, testResult, appVersion,
+    settings, runtime, busy, testBusy, saved, saveError, admin, testResult, appVersion,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   } = useRuntime(appendLog, clearLogs);
@@ -170,7 +170,7 @@ function App() {
             settingsLoaded={settingsLoaded}
             settingsLoadError={settingsLoadError}
             retrySettings={retrySettings}
-            saved={saved} admin={admin}
+            saved={saved} saveError={saveError} admin={admin}
             patchSettings={patchSettings}
           />
         )}

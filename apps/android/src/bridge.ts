@@ -7,6 +7,7 @@
  * trust the returned shape instead of sprinkling `as T` casts everywhere.
  */
 import { defaults, type Settings, type RuntimeState } from "./types";
+import { IpcRejection } from "./ipcError";
 
 type LogPayload = { level: "info" | "warn" | "error"; message: string };
 
@@ -58,7 +59,18 @@ function unwrapEnvelope<T>(raw: string): T {
     throw new Error("native bridge returned an unexpected shape");
   }
   if (!parsed.ok) {
-    const msg = typeof parsed.error === "string" && parsed.error ? parsed.error : "native error";
+    // Kotlin reports prose today; the shell reports {code, message, field}. Keep
+    // the structure when it is there so a caller can branch on the code instead
+    // of matching sentences, and fall back to the message when it is not.
+    const reported = parsed.error;
+    if (isRecord(reported) && typeof reported.message === "string") {
+      throw new IpcRejection({
+        code: typeof reported.code === "string" ? reported.code : "unknown",
+        message: reported.message,
+        field: typeof reported.field === "string" ? reported.field : undefined,
+      });
+    }
+    const msg = typeof reported === "string" && reported ? reported : "native error";
     throw new Error(msg);
   }
   // `data` may legitimately be null/undefined for void commands.

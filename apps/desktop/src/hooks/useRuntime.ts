@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime } from "../types";
 import type { RuntimeState, Settings } from "../types";
+import { errorMessage, ipcError } from "../ipcError";
+import type { IpcError } from "../ipcError";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
@@ -20,6 +22,9 @@ export function useRuntime(
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  // The last save the shell refused. Without this the form's only signal is a
+  // log line, and the status text stays on "Synchronizing changes…" forever.
+  const [saveError, setSaveError] = useState<IpcError | null>(null);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -59,12 +64,12 @@ export function useRuntime(
         if (disposed) { unlistenLog(); return; }
         cleanup.push(unlistenLog);
       } catch (error) {
-        appendLog({ level: "warn", message: String(error) });
+        appendLog({ level: "warn", message: errorMessage(error) });
       }
 
       try {
         const [loadedSettings, state, isAdmin, info] = await Promise.all([
-          invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${String(e)}` }); return null; }),
+          invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${errorMessage(e)}` }); return null; }),
           invoke<RuntimeState>("get_state").catch(() => null),
           invoke<boolean>("is_admin").catch(() => false),
           invoke<{ version?: string }>("app_info").catch(() => null),
@@ -126,8 +131,8 @@ export function useRuntime(
     try {
       await invoke("disconnect");
     } catch (error) {
-      const detail = String(error);
-      appendLog({ level: "error", message: `Disconnect reported a problem: ${detail}` });
+      const err = ipcError(error);
+      appendLog({ level: "error", message: `Disconnect reported a problem: ${err.message}` });
     }
   }, [appendLog]);
 
@@ -149,17 +154,22 @@ export function useRuntime(
       }
       try {
         await invoke("save_settings", { settings: toSave });
+        setSaveError(null);
         setSaved(true);
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
       } catch (error) {
-        appendLog({ level: "error", message: String(error) });
+        const err = ipcError(error);
+        setSaveError(err);
+        appendLog({ level: "error", message: err.message });
       }
     }, SAVE_DEBOUNCE_MS);
   }, [appendLog]);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     if (settingsLocked) return;
+    // A validation error describes the value being replaced, not the new one.
+    setSaveError(null);
     setSettings((prev) => ({ ...prev, ...patch }));
   }, [settingsLocked]);
 
@@ -184,7 +194,7 @@ export function useRuntime(
         await invoke("connect", { settings });
       }
     } catch (error) {
-      const detail = String(error);
+      const detail = errorMessage(error);
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
@@ -208,7 +218,7 @@ export function useRuntime(
       setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
-      const detail = String(error);
+      const detail = errorMessage(error);
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: `Direct connect error: ${detail}` });
     } finally {
@@ -225,7 +235,7 @@ export function useRuntime(
       setTestResult(result);
       appendLog({ level: "info", message: result });
     } catch (error) {
-      const msg = String(error);
+      const msg = errorMessage(error);
       setTestResult(msg);
       appendLog({ level: "error", message: msg });
     } finally {
@@ -252,13 +262,13 @@ export function useRuntime(
       }
     } catch (error) {
       setSettingsLoadError(true);
-      appendLog({ level: "error", message: `Retry load settings failed: ${String(error)}` });
+      appendLog({ level: "error", message: `Retry load settings failed: ${errorMessage(error)}` });
     }
   }, [appendLog]);
 
   return {
     settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
-    saved, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
+    saved, saveError, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };

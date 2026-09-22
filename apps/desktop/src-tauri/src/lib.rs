@@ -4,22 +4,39 @@ use parking_lot::Mutex;
 
 /// Structured shell/IPC error.
 ///
-/// Every shell helper used to return `Result<_, CommandError>`, so a caller could only
+/// Every shell helper used to return a bare message, so a caller could only
 /// branch on prose (`msg.contains("not found")`) and the frontend received an
-/// opaque rejection it had to stringify. `code` is the machine-readable half.
+/// opaque rejection it had to read as text. `code` is the machine-readable half.
 ///
-/// It serialises as the message string on purpose: the shipped frontend still
-/// does `String(e)`, so the wire shape stays compatible until typed
-/// (`tauri-specta`) bindings replace those calls in spec 016.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// It serialises as `{code, message, field?}` — the contract in
+/// `specs/015-full-audit-remediation/contracts/ipc-contract.md` (C-IPC-2). The
+/// earlier shape was the message string, chosen so `String(e)` in the shipped
+/// frontend kept working; that is what made the code unreachable, and a code no
+/// caller can read is the same as no code. Both UIs now unwrap the object through
+/// `lib/ipcError.ts`, which still accepts a bare string because the Android
+/// bridge rejects with prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
+    /// Which `Settings` field the command rejected, using the name the frontend
+    /// state uses (`httpPort`, not `http_port`) so the form can attach the error
+    /// to the input that caused it. `None` for everything that is not about a
+    /// field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<&'static str>,
 }
 
 impl CommandError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), field: None }
+    }
+
+    /// A rejected setting. `field` is the camelCase key of the `Settings` value
+    /// that failed, which is the only way the UI can show it anywhere but in a
+    /// log line.
+    pub fn validation(field: &'static str, message: impl Into<String>) -> Self {
+        Self { code: "validation", message: message.into(), field: Some(field) }
     }
 }
 
@@ -31,39 +48,33 @@ impl std::fmt::Display for CommandError {
 
 impl std::error::Error for CommandError {}
 
-impl Serialize for CommandError {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.message)
-    }
-}
-
 impl From<String> for CommandError {
     fn from(message: String) -> Self {
-        Self { code: "internal", message }
+        Self { code: "internal", message, field: None }
     }
 }
 
 impl From<&str> for CommandError {
     fn from(message: &str) -> Self {
-        Self { code: "internal", message: message.to_string() }
+        Self { code: "internal", message: message.to_string(), field: None }
     }
 }
 
 impl From<serde_json::Error> for CommandError {
     fn from(e: serde_json::Error) -> Self {
-        Self { code: "encode", message: e.to_string() }
+        Self { code: "encode", message: e.to_string(), field: None }
     }
 }
 
 impl From<tauri::Error> for CommandError {
     fn from(e: tauri::Error) -> Self {
-        Self { code: "shell", message: e.to_string() }
+        Self { code: "shell", message: e.to_string(), field: None }
     }
 }
 
 impl From<ureq::Error> for CommandError {
     fn from(e: ureq::Error) -> Self {
-        Self { code: "network", message: e.to_string() }
+        Self { code: "network", message: e.to_string(), field: None }
     }
 }
 
@@ -77,7 +88,7 @@ impl From<BinaryTrustError> for CommandError {
             BinaryTrustError::AnchorNotPublished { .. } => "anchor_not_published",
             BinaryTrustError::Validation(_) => "validation",
         };
-        Self { code, message: e.to_string() }
+        Self { code, message: e.to_string(), field: None }
     }
 }
 
@@ -89,7 +100,7 @@ impl From<std::io::Error> for CommandError {
             std::io::ErrorKind::AlreadyExists => "already_exists",
             _ => "io",
         };
-        Self { code, message: e.to_string() }
+        Self { code, message: e.to_string(), field: None }
     }
 }
 
@@ -407,36 +418,36 @@ pub mod dpapi {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Settings {
-    protocol: String,
-    transport: String,
-    scan_mode: String,
-    ip_version: String,
-    noize: String,
+pub struct Settings {
+    pub protocol: String,
+    pub transport: String,
+    pub scan_mode: String,
+    pub ip_version: String,
+    pub noize: String,
     /// Custom obfuscation: junk packet count (when noize == custom).
-    noize_jc: u32,
+    pub noize_jc: u32,
     /// Custom obfuscation: min junk size.
-    noize_jmin: u32,
+    pub noize_jmin: u32,
     /// Custom obfuscation: max junk size.
-    noize_jmax: u32,
+    pub noize_jmax: u32,
     /// Custom obfuscation: interval between junk packets (ms).
-    noize_interval_ms: u32,
-    routing_mode: String,
-    socks_port: u16,
-    http_port: u16,
-    start_minimized: bool,
-    launch_at_login: bool,
-    engine_path: String,
+    pub noize_interval_ms: u32,
+    pub routing_mode: String,
+    pub socks_port: u16,
+    pub http_port: u16,
+    pub start_minimized: bool,
+    pub launch_at_login: bool,
+    pub engine_path: String,
     /// Forced peer endpoint (set by Scanner "Connect Direct").
     #[serde(default)]
-    peer: String,
+    pub peer: String,
     /// H3 anti-DPI: split the QUIC Initial ClientHello across two datagrams so
     /// on-path DPI can't read the SNI from the first Initial packet.
     #[serde(default)]
-    quic_initial_frag: bool,
+    pub quic_initial_frag: bool,
     /// H3 anti-DPI: bytes of ClientHello CRYPTO carried in the first Initial.
     #[serde(default = "default_quic_frag_size")]
-    quic_initial_frag_size: u32,
+    pub quic_initial_frag_size: u32,
 }
 
 fn default_quic_frag_size() -> u32 {
@@ -687,23 +698,36 @@ fn parse_endpoint(line: &str) -> Option<String> {
     None
 }
 
-fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
-    for (name, port) in [
-        ("HTTP", settings.http_port),
-        ("SOCKS5", settings.socks_port),
+pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
+    for (field, name, port) in [
+        ("httpPort", "HTTP", settings.http_port),
+        ("socksPort", "SOCKS5", settings.socks_port),
     ] {
         if !(1024..=65535).contains(&port) {
-            return Err(format!("{name} port must be 1024–65535 (got {port})").into());
+            return Err(CommandError::validation(
+                field,
+                format!("{name} port must be 1024–65535 (got {port})"),
+            ));
         }
     }
     if settings.http_port == settings.socks_port {
-        return Err("HTTP and SOCKS5 ports must differ".into());
+        return Err(CommandError::validation(
+            "httpPort",
+            "HTTP and SOCKS5 ports must differ",
+        ));
     }
-    let allow = |field: &str, val: &str, opts: &[&str]| -> Result<(), CommandError> {
+    // The first argument is the `Settings` key in the name the frontend uses,
+    // because that is what the form needs in order to mark the right input: a
+    // rejected `scanMode` otherwise has nowhere to go but the log, and the save
+    // spinner never stops.
+    let allow = |field: &'static str, val: &str, opts: &[&str]| -> Result<(), CommandError> {
         if opts.iter().any(|o| o.eq_ignore_ascii_case(val.trim())) {
             Ok(())
         } else {
-            Err(format!("{field} must be one of: {}", opts.join(", ")).into())
+            Err(CommandError::validation(
+                field,
+                format!("{field} must be one of: {}", opts.join(", ")),
+            ))
         }
     };
     allow(
@@ -713,7 +737,7 @@ fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     )?;
     allow("transport", &settings.transport, &["h3", "h2", "auto"])?;
     allow(
-        "scan_mode",
+        "scanMode",
         &settings.scan_mode,
         &[
             "turbo",
@@ -728,7 +752,7 @@ fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         ],
     )?;
     allow(
-        "ip_version",
+        "ipVersion",
         &settings.ip_version,
         &["auto", "4", "6", "v4", "v6", "ipv4", "ipv6", "dual"],
     )?;
@@ -754,15 +778,37 @@ fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     )?;
     if settings.noize.eq_ignore_ascii_case("custom") {
         if settings.noize_jmax < settings.noize_jmin {
-            return Err("custom obfuscation: max size must be >= min size".into());
+            return Err(CommandError::validation(
+                "noizeJmax",
+                "custom obfuscation: max size must be >= min size",
+            ));
         }
-        if settings.noize_jc > 64 || settings.noize_jmax > 2048 || settings.noize_interval_ms > 5000
-        {
-            return Err("custom obfuscation values out of range".into());
+        // One message for three different inputs is a message nobody can act on,
+        // so each bound reports the field it broke.
+        if settings.noize_jc > 64 {
+            return Err(CommandError::validation(
+                "noizeJc",
+                format!("custom obfuscation: junk packet count must be <= 64 (got {})", settings.noize_jc),
+            ));
+        }
+        if settings.noize_jmax > 2048 {
+            return Err(CommandError::validation(
+                "noizeJmax",
+                format!("custom obfuscation: max size must be <= 2048 (got {})", settings.noize_jmax),
+            ));
+        }
+        if settings.noize_interval_ms > 5000 {
+            return Err(CommandError::validation(
+                "noizeIntervalMs",
+                format!(
+                    "custom obfuscation: interval must be <= 5000 ms (got {})",
+                    settings.noize_interval_ms
+                ),
+            ));
         }
     }
     allow(
-        "routing_mode",
+        "routingMode",
         &settings.routing_mode,
         &["proxy-only", "system-proxy", "tun"],
     )?;

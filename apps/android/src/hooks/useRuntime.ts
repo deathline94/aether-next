@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
 import { defaults, initialRuntime } from "../types";
 import type { RuntimeState, Settings } from "../types";
+import { errorMessage, ipcError } from "../ipcError";
+import type { IpcError } from "../ipcError";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
@@ -21,6 +23,7 @@ export function useRuntime(
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<IpcError | null>(null);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -57,7 +60,7 @@ export function useRuntime(
         if (disposed) { unlistenLog(); return; }
         cleanup.push(unlistenLog);
       } catch (error) {
-        appendLog({ level: "warn", message: String(error) });
+        appendLog({ level: "warn", message: errorMessage(error) });
       }
 
       try {
@@ -124,7 +127,7 @@ export function useRuntime(
     try {
       await invoke("disconnect");
     } catch (error) {
-      const detail = String(error);
+      const detail = errorMessage(error);
       appendLog({ level: "error", message: `Disconnect reported a problem: ${detail}` });
     }
   }, [appendLog]);
@@ -139,17 +142,22 @@ export function useRuntime(
       if (!toSave) return;
       try {
         await invoke("save_settings", { settings: toSave });
+        setSaveError(null);
         setSaved(true);
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
       } catch (error) {
-        appendLog({ level: "error", message: `Save settings failed: ${String(error)}` });
+        const err = ipcError(error);
+        setSaveError(err);
+        appendLog({ level: "error", message: `Save settings failed: ${err.message}` });
       }
     }, SAVE_DEBOUNCE_MS);
   }, [appendLog]);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     if (settingsLocked) return;
+    // A validation error describes the value being replaced, not the new one.
+    setSaveError(null);
     setSettings((prev) => ({ ...prev, ...patch }));
   }, [settingsLocked]);
 
@@ -178,7 +186,7 @@ export function useRuntime(
         await invoke("connect", { settings: fresh });
       }
     } catch (error) {
-      const detail = String(error);
+      const detail = errorMessage(error);
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
@@ -205,7 +213,7 @@ export function useRuntime(
       setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: peer });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
-      const detail = `Direct connect error: ${String(error)}`;
+      const detail = `Direct connect error: ${errorMessage(error)}`;
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
@@ -222,7 +230,7 @@ export function useRuntime(
       setTestResult(result);
       appendLog({ level: "info", message: result });
     } catch (error) {
-      const msg = String(error);
+      const msg = errorMessage(error);
       setTestResult(msg);
       appendLog({ level: "error", message: msg });
     } finally {
@@ -247,12 +255,12 @@ export function useRuntime(
       }
     } catch (error) {
       setSettingsLoadError(true);
-      appendLog({ level: "error", message: `Retry load settings failed: ${String(error)}` });
+      appendLog({ level: "error", message: `Retry load settings failed: ${errorMessage(error)}` });
     }
   }, [appendLog]);
 
   return {
-    settings, runtime, busy, testBusy, saved, admin, testResult,
+    settings, runtime, busy, testBusy, saved, saveError, admin, testResult,
     appVersion: appVersion ?? "…",
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,

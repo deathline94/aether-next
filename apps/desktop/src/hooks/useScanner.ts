@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
+import { errorMessage } from "../ipcError";
 
 function isProtocolMatch(endpointProtocol: string, scanProtocol: string): boolean {
   const norm = (endpointProtocol || "").toLowerCase();
@@ -94,7 +95,7 @@ export function useScanner(
       if (disposed) { unlisten(); return; }
       unlistenRef.current = unlisten;
     }).catch((err) => {
-      appendLog({ level: "error", message: `Scan event listener failed to start: ${String(err)}` });
+      appendLog({ level: "error", message: `Scan event listener failed to start: ${errorMessage(err)}` });
     });
     return () => { disposed = true; unlistenRef.current?.(); };
   }, [appendLog]);
@@ -116,7 +117,7 @@ export function useScanner(
       const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
       await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
-      appendLog({ level: "error", message: `Scan error: ${String(error)}` });
+      appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
     } finally {
       setBusy(false);
@@ -132,7 +133,7 @@ export function useScanner(
     } catch (error) {
       // Engine may have already finished; don't leave the UI stuck either way.
       setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
-      appendLog({ level: "warn", message: `Stop scan: ${String(error)}` });
+      appendLog({ level: "warn", message: `Stop scan: ${errorMessage(error)}` });
     }
   }, [appendLog]);
 

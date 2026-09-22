@@ -75,6 +75,7 @@ export function NumberField({
   label,
   id,
   suffix,
+  invalid,
 }: {
   value: number;
   min: number;
@@ -85,6 +86,9 @@ export function NumberField({
   label: string;
   id?: string;
   suffix?: string;
+  /** The shell rejected the current value; marks the input for assistive tech,
+   *  because "which field" must not live only in the message prose. */
+  invalid?: boolean;
 }) {
   const [draft, setDraft] = useState(String(value));
 
@@ -126,6 +130,7 @@ export function NumberField({
         value={draft}
         disabled={disabled}
         aria-label={label}
+        aria-invalid={invalid || undefined}
         className="clean-number-input"
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => commit()}

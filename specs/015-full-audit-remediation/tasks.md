@@ -125,9 +125,43 @@
       leaving unproxied, because the alternative is a Connected badge over raw traffic.
 - [x] T051 [US1] Make `disconnect()` in `apps/desktop/src-tauri/src/lib.rs` report partial failure (`disconnect_incomplete`) instead of unconditionally setting `disconnected/Ready`; final state comes from the teardown path that actually ran.
   Done. `cleanup_routing` returns what it could not undo instead of printing it, so a failed system-proxy restore can no longer be reported as `disconnected / Ready` while Windows is still pointed at a dead port; `disconnect` returns `disconnect_incomplete` with the joined reasons, and `watch_child` appends them to the status line rather than swallowing them. Both UIs gained `safeDisconnect`, because the remedy the message recommends (reconnect) must not be blocked by the error that recommends it.
-- [ ] T051b [US2] `CommandError` serialises as `self.message` alone, so the machine-readable `code` — `disconnect_incomplete`, `anchor_not_published`, `key_service_unavailable`, the field name for a validation failure — never reaches either UI. Contract C-IPC-2 asks for `{code, message, field}`; until that lands, every frontend branch that would distinguish an error has to match on prose. Serialise the struct, update both bridges and the parity gate,
+- [x] T051b [US2] `CommandError` serialises as `self.message` alone, so the machine-readable `code` — `disconnect_incomplete`, `anchor_not_published`, `key_service_unavailable`, the field name for a validation failure — never reaches either UI. Contract C-IPC-2 asks for `{code, message, field}`; until that lands, every frontend branch that would distinguish an error has to match on prose. Serialise the struct, update both bridges and the parity gate,
   and keep the string form for anything that still renders an error as text.
+  Landed. `CommandError` is `{code, message, field?}` on the wire (`Display` still yields the
+  message, so every log line, `emit_log` and `format!` site is unchanged) and `validate_settings`
+  names the `Settings` key it rejected in the camelCase the frontend state uses — including splitting
+  "custom obfuscation values out of range", one sentence covering three inputs, into one error per
+  bound. Both UIs read it through a new `src/ipcError.ts` (`ipcError/errorMessage/errorCode/errorField`),
+  which also accepts a bare string or an `Error` because the Android bridge rejects with prose; all
+  22 `String(error)` sites go through it. That helper was the load-bearing part, not the serde change:
+  with the object shape and no helper, every one of those printed `[object Object]`, which is how a
+  "typed error" fix normally ships broken. `SettingsTab` now keeps a rejected save visible in an
+  `error-banner`, the status text stops reading "Synchronizing changes…" over a value that will never
+  be accepted, and the offending input is marked `aria-invalid` so `field` has a consumer rather than
+  being a spare key.
+  Tests: `apps/desktop/src-tauri/tests/ipc_error_shape_test.rs` (4), `ipcError.test.ts` in both apps,
+  plus one hook test per app asserting a rejected save surfaces code+field and clears on the next edit.
+  Falsified rather than assumed: re-adding the string `Serialize` and dropping `Some(field)` turned 3
+  of the 4 Rust tests red against the prose shapes. The first version of the hook test was blind in
+  exactly the audit's own style — it rejected an HTTP port, which the form never sends, so it stayed
+  green without the shell ever being reached; it now uses a value only the shell can refuse.
+  Deviations: the contract says `kind`, the struct always said `code` — `code` won and the contract
+  line is stale, not the wire. The parity gate needed no new check (`ipc-typed-errors` already forbids
+  message-typed commands, and it caught this work on the first run by reading a doc comment as a
+  `Result<_, String>` claim). Still open, filed as T051c: the Android envelope's `error` is a plain
+  string, so the structure `bridge.ts` now preserves has no producer on that side yet.
+- [ ] T051c [US2] Emit `{code, message, field}` from the Android native envelope in
+  `apps/android/android/app/src/main/java/app/aethernext/AetherBridge.kt` (`error` is a bare message
+  string at `:120` today) so the code the TypeScript side preserves has a producer. Map the codes the
+  shell already uses; `ipcError.ts`'s prose fallback can stay.
 
+- [ ] T052b [P] Add an invariant gate that every `uses:` pin in `.github/workflows/` is a full
+  40-character commit SHA (and that one action does not carry two different pins). The
+  `engine-windows` job failed three runs in a row with "unable to resolve action
+  `dtolnay/rust-toolchain@02cb101e…`", and the message echoed the *truncated* string, so it read as
+  the same pin the passing jobs use and was written off as a transient runner fault twice before
+  anyone compared the strings: the copy had lost six characters. A typo in a supply-chain pin is
+  invisible to review and only shows up as infrastructure flakiness.
 - [ ] T052 [US1] **Checkpoint**: T031–T036 green; then re-run each with its new guard deleted and confirm all go red again (quickstart step 3). Record both in the PR — a guard nobody has killed is not a guard.
 
 **Checkpoint**: At this point US1 is fully functional and independently testable: the app can no longer leave the host's network misconfigured by any termination path.

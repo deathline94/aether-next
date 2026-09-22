@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { useRuntime } from "./useRuntime";
+import { IpcRejection } from "../ipcError";
 
 vi.mock("../bridge", () => ({
   invoke: vi.fn(),
@@ -105,5 +106,37 @@ describe("android useRuntime hook", () => {
     });
 
     expect(result.current.settingsLoadError).toBe(true);
+  });
+
+  it("keeps the reason a save was rejected instead of only logging it", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") {
+        return { protocol: "masque", routingMode: "proxy-only", socksPort: 1080, httpPort: 8080 };
+      }
+      if (cmd === "save_settings") {
+        throw new IpcRejection({
+          code: "validation",
+          message: "custom obfuscation: max size must be <= 2048 (got 4000)",
+          field: "noizeJmax",
+        });
+      }
+      return null;
+    });
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    act(() => {
+      result.current.patchSettings({ noize: "custom", noizeJmax: 4000 });
+    });
+
+    await waitFor(() => expect(result.current.saveError).not.toBeNull());
+    expect(result.current.saveError?.code).toBe("validation");
+    expect(result.current.saveError?.field).toBe("noizeJmax");
+
+    act(() => {
+      result.current.patchSettings({ noizeJmax: 128 });
+    });
+    expect(result.current.saveError).toBeNull();
   });
 });

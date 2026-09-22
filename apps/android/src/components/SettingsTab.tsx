@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import type { Settings } from "../types";
 import { NumberField, Segmented, Toggle } from "./ui";
+import type { IpcError } from "../ipcError";
 
 interface SettingsTabProps {
   settings: Settings;
@@ -19,6 +20,8 @@ interface SettingsTabProps {
   settingsLoadError?: boolean;
   retrySettings?: () => void | Promise<void>;
   saved: boolean;
+  /** The last save the shell refused, if one is still outstanding. */
+  saveError?: IpcError | null;
   admin: boolean;
   patchSettings: (patch: Partial<Settings>) => void;
 }
@@ -41,10 +44,13 @@ export function SettingsTab({
   settingsLoadError,
   retrySettings,
   saved,
+  saveError,
   admin,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
+  // Which input the shell complained about, so the field itself can say so.
+  const rejected = (field: string) => saveError?.field === field;
 
   return (
     <div className="settings-view">
@@ -408,6 +414,7 @@ export function SettingsTab({
                 step={1}
                 disabled={settingsLocked}
                 value={settings.httpPort}
+                invalid={rejected("httpPort")}
                 onCommit={(httpPort) => patchSettings({ httpPort })}
               />
             </label>
@@ -426,6 +433,7 @@ export function SettingsTab({
                 step={1}
                 disabled={settingsLocked}
                 value={settings.socksPort}
+                invalid={rejected("socksPort")}
                 onCommit={(socksPort) => patchSettings({ socksPort })}
               />
             </label>
@@ -444,6 +452,16 @@ export function SettingsTab({
       </section>
 
       {/* ─── Save Dock ───────────────────────────────────────────────────── */}
+      {/* A rejected save used to be only a log line, so the status text stayed on
+          "Synchronizing changes…" over a value that would never be accepted. */}
+      {saveError && (
+        <div className="error-banner" role="alert">
+          <div className="error-banner-content">
+            <X size={18} aria-hidden="true" />
+            <span>AUTO-SAVE REJECTED — {saveError.message}</span>
+          </div>
+        </div>
+      )}
       <div className="save-bar tactical-save-dock">
         <div className="save-bar-status" role="status" aria-live="polite">
           <span className="save-status-indicator-dot" />
@@ -454,17 +472,24 @@ export function SettingsTab({
               ? "Interface locked — disconnect tunnel to commit changes"
               : portsCollide
               ? "Save blocked — resolve HTTP/SOCKS port collision"
+              : saveError
+              ? "Last save was rejected — see the message above"
               : saved
               ? "All parameters synchronized with runtime daemon"
               : "Synchronizing changes…"}
           </span>
         </div>
 
-        <div className={`save-indicator ${portsCollide ? "blocked" : ""}`}>
+        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : ""}`}>
           {portsCollide ? (
             <>
               <X size={15} aria-hidden="true" />
               <span>Collision Conflict</span>
+            </>
+          ) : saveError ? (
+            <>
+              <X size={15} aria-hidden="true" />
+              <span>Save Rejected</span>
             </>
           ) : saved ? (
             <>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
 import { initialScanState } from "../types";
+import { errorMessage } from "../ipcError";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 
 function isProtocolMatch(endpointProtocol: string, scanProtocol: string): boolean {
@@ -102,7 +103,7 @@ export function useScanner(
       const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
       await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
-      appendLog({ level: "error", message: `Scan error: ${String(error)}` });
+      appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
     } finally {
       setBusy(false);
@@ -115,7 +116,7 @@ export function useScanner(
       await invoke("stop_scan");
       appendLog({ level: "info", message: "Scan stopped." });
     } catch (error) {
-      appendLog({ level: "warn", message: `Stop scan: ${String(error)}` });
+      appendLog({ level: "warn", message: `Stop scan: ${errorMessage(error)}` });
     } finally {
       setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
     }
