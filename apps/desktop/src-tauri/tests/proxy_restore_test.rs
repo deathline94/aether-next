@@ -253,3 +253,98 @@ fn test_read_optional_reg_value_error_discrimination() {
         .message
         .contains("verify read ProxyOverride: pipe broken"));
 }
+
+/// The whole point of the registry mirror is the case where the *file* is gone —
+/// an antivirus quarantining a JSON file a moment after it was written is common
+/// enough, and without a second record the next start sees a machine with a dead
+/// proxy setting and no explanation.
+#[test]
+fn the_sweep_only_restores_when_the_file_is_gone_and_the_holder_is_dead() {
+    use aether_desktop_lib::windows_proxy::{decide_sweep, JournalMirror, Sweep};
+
+    let mirror = JournalMirror {
+        creator_pid: 4242,
+        written_unix: 1_700_000_000,
+        snapshot: snap(1, Some("http=127.0.0.1:1234"), None, None),
+    };
+
+    assert_eq!(
+        decide_sweep(None, false, false),
+        Sweep::Nothing,
+        "no record at all is not this sweep's business"
+    );
+    assert_eq!(
+        decide_sweep(Some(&mirror), true, false),
+        Sweep::Nothing,
+        "the recovery file is the primary record and the caller just consumed it"
+    );
+    assert_eq!(
+        decide_sweep(Some(&mirror), false, true),
+        Sweep::Nothing,
+        "a live session owns the proxy; restoring would cut a working tunnel"
+    );
+    assert_eq!(
+        decide_sweep(Some(&mirror), false, false),
+        Sweep::RestoreFromMirror,
+        "file gone, holder dead: this is the orphan the mirror exists to clean up"
+    );
+}
+
+#[test]
+fn the_mirror_survives_being_stored_as_one_registry_string() {
+    use aether_desktop_lib::windows_proxy::JournalMirror;
+    let mirror = JournalMirror {
+        creator_pid: 7,
+        written_unix: 99,
+        snapshot: snap(
+            1,
+            Some("http=127.0.0.1:1234;https=127.0.0.1:1234"),
+            Some("localhost;127.*;<local>"),
+            Some("https://corp/proxy.pac"),
+        ),
+    };
+    let json = serde_json::to_string(&mirror).expect("encode");
+    let back: JournalMirror = serde_json::from_str(&json).expect("decode");
+    assert_eq!(back, mirror, "a mirror that cannot round-trip cannot restore");
+}
+
+/// The coherence check compares the registry against *this* value, so it has to be
+/// built from the same code the writer uses.
+#[test]
+fn the_applied_expectation_is_what_the_writer_writes() {
+    use aether_desktop_lib::windows_proxy::{applied_expectation, ProxySnapshot};
+
+    let want = applied_expectation(1234, Some("10.0.0.5:8080"));
+    assert_eq!(want.enabled, 1);
+    assert_eq!(
+        want.server.as_deref(),
+        Some("http=127.0.0.1:1234;https=127.0.0.1:1234")
+    );
+    let bypass = want.bypass.clone().expect("bypass is always set");
+    assert!(bypass.starts_with("localhost;127.*;<local>"), "{bypass}");
+    // The bypass entry is a host match, so the port is dropped rather than carried.
+    assert_eq!(bypass, "localhost;127.*;<local>;10.0.0.5", "{bypass}");
+    assert_eq!(
+        want.auto_config_url, None,
+        "we deleted the PAC on purpose; a drift check must not treat its absence as tampering"
+    );
+
+    // A hostile endpoint string must not be able to inject registry syntax.
+    let nasty = applied_expectation(1234, Some("x;ProxyEnable=0"));
+    assert_eq!(
+        nasty.bypass.as_deref(),
+        Some("localhost;127.*;<local>"),
+        "unsanitised endpoint leaked into the bypass list"
+    );
+
+    // And the same value compares equal to itself through the read-back path.
+    assert_eq!(
+        verify_readback_values(&want, &ProxySnapshot {
+            enabled: 1,
+            server: want.server.clone(),
+            bypass: want.bypass.clone(),
+            auto_config_url: None,
+        }),
+        Ok(())
+    );
+}

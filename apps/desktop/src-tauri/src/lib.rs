@@ -492,6 +492,10 @@ struct AppState {
     proxy_enabled: AtomicBool,
     #[cfg(windows)]
     proxy_snapshot: Mutex<Option<windows_proxy::ProxySnapshot>>,
+    /// What this session wrote to the registry, kept so a drift check can tell
+    /// "someone else changed the proxy" from "we never set it".
+    #[cfg(windows)]
+    proxy_applied: Mutex<Option<windows_proxy::ProxySnapshot>>,
     connected_once: AtomicBool,
     connecting: AtomicBool,
     generation: AtomicU64,
@@ -578,6 +582,8 @@ impl Default for AppState {
             proxy_enabled: AtomicBool::new(false),
             #[cfg(windows)]
             proxy_snapshot: Mutex::new(None),
+            #[cfg(windows)]
+            proxy_applied: Mutex::new(None),
             connected_once: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -1480,8 +1486,9 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
                 endpoint.as_deref(),
                 recovery_path.as_deref(),
             ) {
-                Ok(snapshot) => {
+                Ok((snapshot, applied)) => {
                     *state.proxy_snapshot.lock() = Some(snapshot);
+                    *state.proxy_applied.lock() = Some(applied);
                     state.proxy_enabled.store(true, Ordering::SeqCst);
                 }
                 Err((error, snapshot)) => {
@@ -1579,6 +1586,8 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> {
             }
         }
     }
+    #[cfg(windows)]
+    state.proxy_applied.lock().take();
     state.connected_once.store(false, Ordering::SeqCst);
     // M8: drop the job object (closing its handle kills any surviving engine).
     #[cfg(windows)]
@@ -1588,11 +1597,56 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> {
     problems
 }
 
+/// How often to check that the system proxy still says what this session set it to.
+/// A third party that reverts it does so silently, and the failure mode is traffic
+/// leaving the machine while the UI reads Connected.
+#[cfg(windows)]
+const PROXY_COHERENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn watch_child(app: AppHandle) {
+    #[cfg(windows)]
+    let mut last_coherence = std::time::Instant::now();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let state = app.state::<AppState>();
         let _operation = state.operation.lock();
+        #[cfg(windows)]
+        if last_coherence.elapsed() >= PROXY_COHERENCE_INTERVAL {
+            last_coherence = std::time::Instant::now();
+            if state.proxy_enabled.load(Ordering::SeqCst) {
+                if let Some(want) = state.proxy_applied.lock().clone() {
+                    match windows_proxy::read_current()
+                        .and_then(|current| {
+                            windows_proxy::verify_readback_values(&want, &current)?;
+                            Ok(current)
+                        })
+                    {
+                        Ok(_) => {}
+                        // Something else wrote over our values. Re-asserting is the
+                        // only honest response: leaving it means the user thinks
+                        // their traffic is tunneled while it is going out raw.
+                        Err(drift) => {
+                            eprintln!("[proxy] {drift}; re-asserting");
+                            emit_log(
+                                &app,
+                                format!(
+                                    "The Windows proxy was changed outside Aether ({drift});                                      re-asserting it"
+                                ),
+                            );
+                            if let Err(error) = windows_proxy::reassert(&want) {
+                                eprintln!("[proxy] re-assert failed: {error}");
+                                emit_log(
+                                    &app,
+                                    format!(
+                                        "Could not re-assert the Windows proxy: {error}. Traffic may                                          be leaving unproxied - disconnect and reconnect to reset it."
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut child_slot = state.child.lock();
         let Some(child) = child_slot.as_mut() else {
             continue;
@@ -2342,7 +2396,7 @@ pub mod windows_proxy {
     };
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
-    #[derive(Clone, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ProxySnapshot {
         pub enabled: u32,
         pub server: Option<String>,
@@ -2396,26 +2450,83 @@ pub mod windows_proxy {
         }
     }
 
+    /// The four registry values that say "Aether owns the proxy right now".
+    ///
+    /// One definition, used by the writer, by the 30 s coherence check and by any
+    /// later re-assert. Having the expectation computed in two places is how a
+    /// checker ends up validating a string the writer never wrote.
+    pub fn applied_expectation(port: u16, endpoint: Option<&str>) -> ProxySnapshot {
+        let mut bypass = String::from("localhost;127.*;<local>");
+        if let Some(ep) = endpoint {
+            if let Some(host) = super::sanitize_proxy_bypass_host(ep) {
+                bypass.push(';');
+                bypass.push_str(&host);
+            }
+        }
+        ProxySnapshot {
+            enabled: 1,
+            server: Some(format!("http=127.0.0.1:{port};https=127.0.0.1:{port}")),
+            bypass: Some(bypass),
+            // We deleted it on purpose; it must stay deleted while we own the proxy.
+            auto_config_url: None,
+        }
+    }
+
+    /// Read the proxy state as it is right now. Every read is hard-fail: a snapshot
+    /// that silently lost a value is a snapshot that will delete that value on
+    /// restore.
+    fn read_snapshot(key: &RegKey) -> Result<ProxySnapshot, CommandError> {
+        Ok(ProxySnapshot {
+            enabled: read_enable(key)?,
+            server: read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")?,
+            bypass: read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")?,
+            auto_config_url: read_optional_reg_value(
+                key.get_value("AutoConfigURL"),
+                "AutoConfigURL",
+            )?,
+        })
+    }
+
+    /// What the registry says now, for the coherence check and for reports.
+    pub fn read_current() -> Result<ProxySnapshot, CommandError> {
+        read_snapshot(&key()?)
+    }
+
+    /// Write `want` over the current values and confirm it stuck. Used when a third
+    /// party (another VPN client, a login script, GPO) has changed the proxy out
+    /// from under a session that still claims to own it.
+    pub fn reassert(want: &ProxySnapshot) -> Result<(), CommandError> {
+        let key = key()?;
+        let server = want.server.clone().unwrap_or_default();
+        let bypass = want.bypass.clone().unwrap_or_default();
+        key.set_value("ProxyServer", &server).map_err(CommandError::from)?;
+        key.set_value("ProxyOverride", &bypass).map_err(CommandError::from)?;
+        match want.auto_config_url.as_ref() {
+            Some(v) => key.set_value("AutoConfigURL", v).map_err(CommandError::from)?,
+            None => match key.delete_value("AutoConfigURL") {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("delete AutoConfigURL: {e}").into()),
+            },
+        }
+        key.set_value("ProxyEnable", &want.enabled)
+            .map_err(CommandError::from)?;
+        let actual = read_snapshot(&key)?;
+        verify_readback_values(want, &actual)?;
+        refresh();
+        Ok(())
+    }
+
     pub fn enable(
         port: u16,
         endpoint: Option<&str>,
         recovery_path: Option<&Path>,
-    ) -> Result<ProxySnapshot, (String, Option<ProxySnapshot>)> {
+    ) -> Result<(ProxySnapshot, ProxySnapshot), (String, Option<ProxySnapshot>)> {
         let key = key().map_err(|e| (e.to_string(), None))?;
-        // Every read is hard-fail: a snapshot that silently lost a value is a
-        // snapshot that will delete that value on restore.
-        let snapshot = ProxySnapshot {
-            enabled: read_enable(&key).map_err(|e| (e.message, None))?,
-            server: read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")
-                .map_err(|e| (e.message, None))?,
-            bypass: read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")
-                .map_err(|e| (e.message, None))?,
-            auto_config_url: read_optional_reg_value(
-                key.get_value("AutoConfigURL"),
-                "AutoConfigURL",
-            )
-            .map_err(|e| (e.message, None))?,
-        };
+        let snapshot = read_snapshot(&key).map_err(|e| (e.message, None))?;
+        // Registry mirror first: from this moment on, a deleted recovery file is
+        // an inconvenience rather than an unrecoverable loss.
+        write_mirror(&snapshot);
         if let Some(path) = recovery_path {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
@@ -2429,21 +2540,12 @@ pub mod windows_proxy {
             std::fs::rename(&tmp, path)
                 .map_err(|e| (format!("proxy recovery commit: {e}"), None))?;
         }
+        let applied = applied_expectation(port, endpoint);
         let result = (|| -> Result<(), CommandError> {
-            key.set_value(
-                "ProxyServer",
-                &format!("http=127.0.0.1:{port};https=127.0.0.1:{port}"),
-            )
-            .map_err(CommandError::from)?;
-            let mut bypass = String::from("localhost;127.*;<local>");
-            if let Some(ep) = endpoint {
-                if let Some(host) = super::sanitize_proxy_bypass_host(ep) {
-                    bypass.push(';');
-                    bypass.push_str(&host);
-                }
-            }
-            key.set_value("ProxyOverride", &bypass)
-                .map_err(CommandError::from)?;
+            let server = applied.server.clone().unwrap_or_default();
+            let bypass = applied.bypass.clone().unwrap_or_default();
+            key.set_value("ProxyServer", &server).map_err(CommandError::from)?;
+            key.set_value("ProxyOverride", &bypass).map_err(CommandError::from)?;
             // Take the PAC out of the way while our proxy is active, but only
             // because it has been snapshotted: `restore` puts it back.
             match key.delete_value("AutoConfigURL") {
@@ -2456,6 +2558,7 @@ pub mod windows_proxy {
             Ok(())
         })();
         if let Err(error) = result {
+            clear_mirror();
             return match restore(snapshot.clone()) {
                 Ok(()) => {
                     if let Some(path) = recovery_path {
@@ -2470,7 +2573,9 @@ pub mod windows_proxy {
             };
         }
         refresh();
-        Ok(snapshot)
+        // The caller keeps the *applied* values so it can tell, later, whether
+        // something else changed the proxy underneath it.
+        Ok((snapshot, applied))
     }
 
     /// Compare what the registry says now against what was intended, in full.
@@ -2554,6 +2659,9 @@ pub mod windows_proxy {
         };
 
         verify_readback_values(&snapshot, &actual)?;
+        // Only now: the mirror is what a later start restores *from*, and clearing
+        // it before the values are back would lose the only remaining record.
+        clear_mirror();
 
         refresh();
         Ok(())
@@ -2570,6 +2678,155 @@ pub mod windows_proxy {
         }
     }
 
+    /// What this session's proxy journal looks like in `HKCU`, next to the
+    /// recovery *file*.
+    ///
+    /// The file is the primary record and the registry is the copy, because an
+    /// antivirus real-time scan is known to quarantine a JSON file a process just
+    /// wrote while leaving the process running. When that happens the *only* sign
+    /// that Windows is still pointed at a port is the setting itself, and the next
+    /// launch finds nothing to recover from: the user's browser keeps failing with
+    /// no Aether running and no record of why.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct JournalMirror {
+        pub creator_pid: u32,
+        pub written_unix: u64,
+        pub snapshot: ProxySnapshot,
+    }
+
+    const JOURNAL_SUBKEY: &str = "Software\\AetherNext";
+    const JOURNAL_VALUE: &str = "ProxyJournal";
+
+    fn write_mirror(snapshot: &ProxySnapshot) {
+        let mirror = JournalMirror {
+            creator_pid: std::process::id(),
+            written_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            snapshot: snapshot.clone(),
+        };
+        let json = match serde_json::to_string(&mirror) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("[proxy] cannot encode the registry journal mirror: {e}");
+                return;
+            }
+        };
+        match RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(JOURNAL_SUBKEY)
+            .map(|(k, _)| k)
+        {
+            Ok(key) => {
+                if let Err(e) = key.set_value::<String, _>(JOURNAL_VALUE, &json) {
+                    eprintln!("[proxy] cannot write the registry journal mirror: {e}");
+                }
+            }
+            Err(e) => eprintln!("[proxy] cannot open {JOURNAL_SUBKEY} for the journal mirror: {e}"),
+        }
+    }
+
+    fn read_mirror() -> Option<JournalMirror> {
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(JOURNAL_SUBKEY)
+            .ok()?;
+        let raw: String = key.get_value(JOURNAL_VALUE).ok()?;
+        match serde_json::from_str(&raw) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                // Unparseable is not "restore with defaults": a mirror nobody can
+                // read says nothing about what the previous session changed.
+                eprintln!("[proxy] registry journal mirror is unreadable ({e}); clearing it");
+                clear_mirror();
+                None
+            }
+        }
+    }
+
+    fn clear_mirror() {
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(JOURNAL_SUBKEY) {
+            let _ = key.delete_value(JOURNAL_VALUE);
+        }
+    }
+
+    /// Whether a leftover mirror justifies restoring the proxy on this start.
+    ///
+    /// Kept free of I/O so the decision — and the case it exists for, "the file is
+    /// gone, the session that made the change is dead" — is testable on any machine.
+    pub fn decide_sweep(
+        mirror: Option<&JournalMirror>,
+        recovery_file_present: bool,
+        holder_alive: bool,
+    ) -> Sweep {
+        if mirror.is_none() {
+            // No mirror at all: the recovery file, if any, was already consumed by
+            // the caller, and a proxy change with no record anywhere is a different
+            // bug than the one this sweep exists for.
+            return Sweep::Nothing;
+        }
+        if recovery_file_present {
+            return Sweep::Nothing;
+        }
+        if holder_alive {
+            // Another session owns the proxy right now. Restoring would take the
+            // machine off a tunnel that is demonstrably up.
+            return Sweep::Nothing;
+        }
+        Sweep::RestoreFromMirror
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Sweep {
+        Nothing,
+        /// The recovery file is gone, the mirror says a session changed the proxy,
+        /// and the process that did it is no longer alive.
+        RestoreFromMirror,
+    }
+
+    /// Is the pid recorded in the mirror still running? Only ever used to decide
+    /// whether to *leave the proxy alone*, so an unknown answer means "alive".
+    fn holder_alive(pid: u32) -> bool {
+        if pid == 0 || pid == std::process::id() {
+            return true;
+        }
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // ` STILL_ACTIVE` is the exit code a running process reports; windows-sys
+        // does not export the constant, and a magic 259 with no name is unreadable.
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // Access denied means the process exists and is someone else's.
+                return std::io::Error::last_os_error().raw_os_error() == Some(5);
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
+    }
+
+    /// Startup orphan sweep: restore from the mirror when the file was lost.
+    pub fn sweep_orphan() -> Option<ProxySnapshot> {
+        let mirror = read_mirror()?;
+        match decide_sweep(Some(&mirror), false, holder_alive(mirror.creator_pid)) {
+            Sweep::RestoreFromMirror => {
+                eprintln!(
+                    "[proxy] recovery file missing but HKCU\\{JOURNAL_SUBKEY} still records a change \
+                     by dead pid {}; restoring the proxy from the mirror",
+                    mirror.creator_pid
+                );
+                Some(mirror.snapshot)
+            }
+            Sweep::Nothing => None,
+        }
+    }
+
+    /// Consume a recovery file: restore, and only then unlink. A restore that
+    /// reports failure leaves the file in place, so the next start tries again.
     pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), CommandError>>(
         path: &Path,
         restorer: F,
@@ -2613,17 +2870,41 @@ pub fn run() {
                 let _ = dpapi::get_or_create_dpapi_config_key(&dir);
             }
             #[cfg(windows)]
-            if let Ok(path) = proxy_recovery_path(app.handle()) {
-                match windows_proxy::recover(&path) {
-                    Ok(true) => emit_log(
-                        app.handle(),
-                        "Recovered Windows proxy after interrupted session".into(),
-                    ),
-                    Ok(false) => {}
-                    Err(error) => emit_log(
-                        app.handle(),
-                        format!("Windows proxy recovery failed: {error}"),
-                    ),
+            {
+                let mut recovered = false;
+                if let Ok(path) = proxy_recovery_path(app.handle()) {
+                    match windows_proxy::recover(&path) {
+                        Ok(true) => {
+                            recovered = true;
+                            emit_log(
+                                app.handle(),
+                                "Recovered Windows proxy after interrupted session".into(),
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(error) => emit_log(
+                            app.handle(),
+                            format!("Windows proxy recovery failed: {error}"),
+                        ),
+                    }
+                }
+                if !recovered {
+                    // The file was gone but HKCU still said a session had changed the
+                    // proxy, and the process that did it is dead. Restore from the
+                    // mirror; `restore` clears it once the values read back.
+                    if let Some(snapshot) = windows_proxy::sweep_orphan() {
+                        match windows_proxy::restore(snapshot) {
+                            Ok(()) => emit_log(
+                                app.handle(),
+                                "Restored the Windows proxy from the registry journal: the recovery                                  file was missing and the session that set it had ended"
+                                    .into(),
+                            ),
+                            Err(error) => emit_log(
+                                app.handle(),
+                                format!("Registry-journal proxy restore failed: {error}"),
+                            ),
+                        }
+                    }
                 }
             }
             if repair_proxy_requested() {

@@ -109,8 +109,20 @@
   Per-connection `INTERNET_PER_CONN_PROXY_PAC` is not a registry value: it lives in the opaque `Connections\DefaultConnectionSettings` RAS blob and is set through `InternetSetOptionW(INTERNET_PER_CONN_LIST)` on a connection handle this process does not own. Snapshotting it means parsing that blob's versioned layout, which is a task of its own — filed as T048b rather than approximated here.
 - [ ] T048b [US1] Per-connection proxy state: read and restore `Connections\DefaultConnectionSettings` (or `InternetQueryOptionW` with `INTERNET_PER_CONN_LIST`) so a machine whose proxy is configured per dial-up/VPN connection is not restored by half. Needs the blob's versioned layout decoded; the value-level snapshot in T048 does not cover it.
 
-- [ ] T049 [US1] Mirror the proxy journal to `HKCU\Software\AetherNext\ProxyJournal` and implement the startup orphan sweep in `apps/desktop/src-tauri/src/lib.rs` (INV-6), so AV deleting the file cannot hide an enabled proxy.
-- [ ] T050 [US1] Add the 30 s proxy coherence check while connected in `apps/desktop/src-tauri/src/lib.rs`: re-assert or report if a third party changed the setting.
+- [x] T049 [US1] Mirror the proxy journal to `HKCU\Software\AetherNext\ProxyJournal` and implement the startup orphan sweep in `apps/desktop/src-tauri/src/lib.rs` (INV-6), so AV deleting the file cannot hide an enabled proxy.
+  Done. `enable` writes `HKCU\Software\AetherNext\ProxyJournal` (one REG_SZ, the same
+      `ProxySnapshot` as JSON plus the writer's pid and time) *before* the recovery file, and
+      `restore` clears it only after the values read back. Startup consumes the file first and
+      sweeps the mirror only if the file is gone and the recorded pid is dead
+      (`decide_sweep`, pure and table-tested) — restoring while another session is live would
+      cut a working tunnel, and `holder_alive` errs toward "alive" when `OpenProcess` says
+      nothing.
+- [x] T050 [US1] Add the 30 s proxy coherence check while connected in `apps/desktop/src-tauri/src/lib.rs`: re-assert or report if a third party changed the setting.
+  Done. `watch_child` re-reads the four proxy values every 30 s while connected and compares
+      them with `verify_readback_values` against `applied_expectation(port, endpoint)` — the one
+      definition the writer itself uses, so the check cannot validate a string nobody wrote. On
+      drift it re-asserts and says so in the log; if the re-assert fails it says traffic may be
+      leaving unproxied, because the alternative is a Connected badge over raw traffic.
 - [x] T051 [US1] Make `disconnect()` in `apps/desktop/src-tauri/src/lib.rs` report partial failure (`disconnect_incomplete`) instead of unconditionally setting `disconnected/Ready`; final state comes from the teardown path that actually ran.
   Done. `cleanup_routing` returns what it could not undo instead of printing it, so a failed system-proxy restore can no longer be reported as `disconnected / Ready` while Windows is still pointed at a dead port; `disconnect` returns `disconnect_incomplete` with the joined reasons, and `watch_child` appends them to the status line rather than swallowing them. Both UIs gained `safeDisconnect`, because the remedy the message recommends (reconnect) must not be blocked by the error that recommends it.
 - [ ] T051b [US2] `CommandError` serialises as `self.message` alone, so the machine-readable `code` — `disconnect_incomplete`, `anchor_not_published`, `key_service_unavailable`, the field name for a validation failure — never reaches either UI. Contract C-IPC-2 asks for `{code, message, field}`; until that lands, every frontend branch that would distinguish an error has to match on prose. Serialise the struct, update both bridges and the parity gate,
