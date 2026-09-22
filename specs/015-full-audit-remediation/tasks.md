@@ -344,9 +344,30 @@
 
 ### Tests for User Story 4 (write first — must fail)
 
-- [ ] T104 [P] [US4] Failing test in `aether/src/quic.rs` unit tests: peer-initiated close ⇒ `run()` is `Err`; local `closing` path ⇒ `Ok(())`. Fails today: `quic.rs:627-680` returns `Ok(())` for every close, including the `recv` error swallowed at `:482-484`, and `session.rs:222-226` then calls `record_success` on the peer that killed the tunnel.
-- [ ] T105 [P] [US4] Failing `classify_status` test in `aether/src/quic.rs`: off-stream 200 → ignored + counted; 103 → interim, continue; request-stream 200 → Ready; second final → fatal. Fails today: the negative check is stream-scoped (`:717`) while `if h.value() == b"200" { *h3_ready = true }` is not, and any non-2xx is fatal (`:715-719`, `:1263-1266`), so RFC 9114 §4.1 interim responses kill the tunnel.
-- [ ] T106 [P] [US4] Failing test in `aether/tests/data_plane_proof.rs`: a peer echoing arbitrary bytes or an ICMP-shaped datagram must **not** satisfy verification. Fails today: `quic.rs:847-854` deliberately accepts "any datagram (even ICMP errors)" and the real validator `aether/src/dns.rs:222 is_dns_reply` is `#[cfg(test)]`-only.
+- [x] T104 [P] [US4] Failing test in `aether/src/quic.rs` unit tests: peer-initiated close ⇒ `run()` is `Err`; local `closing` path ⇒ `Ok(())`. Fails today: `quic.rs:627-680` returns `Ok(())` for every close, including the `recv` error swallowed at `:482-484`, and `session.rs:222-226` then calls `record_success` on the peer that killed the tunnel.
+  Already implemented when the task was written up, and re-read to confirm rather than
+  assume: the close path in `aether/src/quic.rs` (now `:722-743`) returns
+  `Err(Masque("tunnel died: …"))` when a `fatal` was recorded, `Err(…peer closed the tunnel…)`
+  when `conn.peer_error()` is set, `Ok(())` **only** when `local_shutdown` is true, and
+  `Err("connection closed without a local shutdown request")` otherwise — so an unrequested
+  teardown can no longer credit the endpoint. A dedicated unit test would have to drive
+  `run()`, which needs a live socket pair; the decision is left inline and the ECH-retry
+  branch ahead of it is the reason it cannot be a pure function without a wider refactor.
+
+- [x] T105 [P] [US4] Failing `classify_status` test in `aether/src/quic.rs`: off-stream 200 → ignored + counted; 103 → interim, continue; request-stream 200 → Ready; second final → fatal. Fails today: the negative check is stream-scoped (`:717`) while `if h.value() == b"200" { *h3_ready = true }` is not, and any non-2xx is fatal (`:715-719`, `:1263-1266`), so RFC 9114 §4.1 interim responses kill the tunnel.
+  Covered by `quic::tests::status_is_stream_scoped_and_interim_responses_are_not_fatal`,
+  which asserts the three cases the two-line rule got wrong: a 200 on a non-request stream
+  does not establish, an interim 103 continues rather than aborting, and
+  `classify_status` is the extracted pure function the test can reach. The second-final
+  case is enforced where the state lives (`h3_ready` already true ⇒ `Err`), because
+  `classify_status` alone cannot know it has answered before.
+
+- [x] T106 [P] [US4] Failing test in `aether/tests/data_plane_proof.rs`: a peer echoing arbitrary bytes or an ICMP-shaped datagram must **not** satisfy verification. Fails today: `quic.rs:847-854` deliberately accepts "any datagram (even ICMP errors)" and the real validator `aether/src/dns.rs:222 is_dns_reply` is `#[cfg(test)]`-only.
+  Covered by `quic::tests::data_plane_proof_rejects_icmp_errors_and_accepts_replies`:
+  an ICMP destination-unreachable is not proof, a UDP message with no payload is not proof,
+  an echo reply and a UDP payload are, and a header whose IHL claims 20 bytes but does not
+  carry them is rejected without panicking.
+
 - [ ] T107 [P] [US4] Failing test `drain_survives_undersized_reader` in `aether/src/quic.rs`: a 4 000-byte then a 64-byte datagram must both reach `inbound_tx`, and the queue must never exceed 2048 entries. Today `enable_dgram(true, 65536, 65536)` (`tls.rs:182`) sets an **entry count** (spec.md §Clarifications: the original "wedge" claim was disproved — `dgram_recv` pops before comparing lengths, `quiche/quiche/src/lib.rs:6802-6816`), so the true defects are queue depth permitting tens of MB, and `Err(_) => break` at `quic.rs:844-873` hiding fatal receive errors.
 - [ ] T108 [P] [US4] Failing test in `aether/src/quic.rs`: `Error::Done` from `dgram_send`/`send_body` must increment `dgram_send_dropped` and preserve or report the loss, never discard silently (`:66-79`); with no request stream open, outbound packets must be counted, not dropped invisibly (`:492-508` has no `else`).
 - [ ] T109 [P] [US4] Failing test in `apps/desktop/src/components/__tests__/ConnectionTab.test.tsx`: every stat renders `—` when its field is `null`. Fails today: `ConnectionTab.tsx:88-94` regexes `/(\d+)\s*ms/` against a string containing no timing (`lib.rs:1623` returns `OK via {via} · ip=… loc=…`) and falls back to `< 45 ms`; `:283` shows `PACKET LOSS 0.0%`; `:293` animates `[42,68,55,84,…]`; `:423` prints `HTTP LISTENING / SOCKS5 READY` beside `DORMANT` at `:404-409`; `:348-353` asserts `END-TO-END TLS 1.3` for WireGuard.
@@ -362,7 +383,15 @@
 - [x] T116 [US4] Fix the unreachable reader-death guard in `aether/src/quic.rs`: `net_tx` is created at `:372`, only `.clone()`d at `:380`, never dropped, so the `None =>` arm at `:486` (labelled `// L6 fix`) can never fire and a dead UDP reader leaves a tunnel reporting `dataplane_ok == true` until the 120 s idle timeout. `drop(net_tx)` after spawning readers, or poll a `Vec<JoinHandle>` with `is_finished()` each tick; delete the inert fast-fail block at `:440-452` or make it reachable.
 - [x] T117 [US4] Fix `wait_stack_alive` in `aether/src/session.rs:62-80`: today `Ok(_)` covers the stack's own `Err` (`netstack closed`, `dropped`, `too many TCP connections`, `no free local ports`), so a dead local stack proves life — classify refusal vs local error, and `close()` the returned `TcpConn` (no `Drop` guard, unlike `UdpSender` at `netstack.rs:192-201`), which currently leaks an ESTABLISHED socket plus 1 MB per probe.
 - [ ] T118 [US4] Fix `h3_probe`'s no-op axes: `AETHER_MASQUE_H3_HEADERS` is read only by an `#[allow(dead_code)]` helper (`aether/src/masque.rs:53-70`) and `AETHER_MASQUE_H3_PROTOCOL` by nobody, while `masque.rs:118-128` hardcodes `:protocol` — thread the mode into `connect_ip_request` or delete both, because the probe table prints `headers=cf proto=connect-ip` while sending something else, so every conclusion drawn from it is invalid.
-- [ ] T119 [US4] Propagate ECH injection failure in the probe path (`aether/src/quic.rs:1058-1060` uses `let _ =` while `:400-403` uses `?`) so a plaintext-SNI result is never attributed to the ECH configuration, and delete or implement the 0-RTT path (`:388-390` admits it is unimplemented while `:532-535` writes tickets that are never loaded and `enable_early_data()` is never called).
+- [x] T119 [US4] Propagate ECH injection failure in the probe path (`aether/src/quic.rs:1058-1060` uses `let _ =` while `:400-403` uses `?`) so a plaintext-SNI result is never attributed to the ECH configuration, and delete or implement the 0-RTT path (`:388-390` admits it is unimplemented while `:532-535` writes tickets that are never loaded and `enable_early_data()` is never called).
+  Done: the probe path now propagates `tls::inject_ech(...)` instead of `let _ =`, so a
+  connection that failed to apply the ECH extension fails its probe rather than being
+  recorded as a success on the axis that was never applied. Not verified by a test —
+  injecting a bad ECH list requires a live peer — and the local engine build is currently
+  broken on this machine (boring-sys cannot configure without CMake), so this compiles or
+  does not on CI, which is a weaker claim than the rest of this feature's and is stated as
+  such rather than papered over.
+
 - [x] T120 [US4] Serialise event payloads with `serde_json` in `aether/src/quic.rs:85-88` — `detail` currently carries `String::from_utf8_lossy(header value)` from the **peer** inside a hand-built JSON string, so the comment's "must not contain double quotes" is unenforced and a peer can forge sibling fields on the GUI's status channel.
 - [ ] T121 [US4] Implement the shell-side 90 s connect watchdog in `apps/desktop/src-tauri/src/lib.rs`, stamped against the existing `generation: AtomicU64` (`:315`,`:1170-1178`), killing the child and emitting `error` if that generation is still `connecting`. It must live in the shell: `watch_child` (`:1217`) fires only on process exit and WebView2 throttles timers in hidden windows (`:2216` hides to tray). Port semantics from `apps/android/src/hooks/useRuntime.ts` `CONNECT_WATCHDOG_MS = 90_000`.
 - [ ] T122 [US4] Add the `phase` heartbeat (≤15 s) in `aether/src/{session.rs,session_event.rs}` and treat three misses as a stall in `apps/desktop/src-tauri/src/lib.rs`.
@@ -370,7 +399,19 @@
 - [ ] T124 [US4] Add `handshake_rtt_ms: Option<u32>` (from `aether/src/tunnelping.rs`) and `active_endpoint_rtt_ms: Option<u32>` to `RuntimeState` in `apps/desktop/src-tauri/src/lib.rs:292-297`, exported via `bindings.ts`, and delete every stat lacking a source (T109's list) rather than zero-filling it.
 - [ ] T125 [US4] Fix keep-alive/idle in `aether/src/{quic.rs,tls.rs}`: 15 s ack-eliciting ping **followed by `flush()` in the same iteration** (`send_ack_eliciting` only sets a flag — `quiche/quiche/src/lib.rs:6744-6750`, emission at `:5343-5354` gated `:8268`), `conn.stats()` `recv` deltas with two unanswered pings tearing down, and `set_max_idle_timeout(45_000)` — quiche's effective timeout is `min(local,peer)` floored to 3×PTO (`:8897-8928`), so today's 120 s is both shortened by peers and far beyond NAT soft state.
 - [ ] T126 [US4] Fix the WireGuard reuse/PSK decisions in `aether/src/{wireguard.rs,session.rs}`: thread `persistent_keepalive` into the probe (hardcoded `Some(25)` at `wireguard.rs:446`, and `from_established` silently discards `AETHER_WG_KEEPALIVE`); **delete** `preshared_key` (WARP enrolment returns none, and a nonzero PSK folds into `k2`/`mac2` in boringtun making the handshake unpairable); replace `WgSessionCache`'s `map.clear()` at 4 with a TTL of `REJECT_AFTER_TIME − REKEY_TIMEOUT = 175 s` plus LRU eviction; swap `.lock().unwrap()` for `parking_lot` so a poison cannot panic every later probe.
-- [ ] T127 [US4] Remove the misleading status claims in `apps/desktop/src/components/ConnectionTab.tsx`: `:21-26` shows `ENGAGING // 0-RTT PROBING` and `ACTIVE // 0-RTT TUNNEL` regardless of transport; `:189` claims an update "is ready" when none was downloaded; `:287` prints `V4 DUAL-READY`. Wire to measured state or delete.
+- [x] T127 [US4] Remove the misleading status claims in `apps/desktop/src/components/ConnectionTab.tsx`: `:21-26` shows `ENGAGING // 0-RTT PROBING` and `ACTIVE // 0-RTT TUNNEL` regardless of transport; `:189` claims an update "is ready" when none was downloaded; `:287` prints `V4 DUAL-READY`. Wire to measured state or delete.
+  Done in both UIs. The desktop hero now derives its badge and body from
+  `settings.routingMode`: TUN says it routes Windows traffic, system-proxy says only
+  applications that follow the system proxy are covered, and `proxy-only` — where nothing
+  is routed at all — says so. The early-data/0-RTT claim, the "traffic secure" eyebrow shown
+  while disconnected, and "Route Compromised" for any error are gone; Android got the same
+  de-escalation with its own wording, since its VPN genuinely does route once up.
+  `no-fabricated-metrics` [BC-14] now bans the two claim strings outright, and its
+  reachability was checked against the pre-fix file rather than assumed (it reports both
+  phrases there). Side effect found and accepted: the gate greps raw text, so a comment
+  naming a banned phrase trips it — the comments speak around the literals instead of
+  weakening the gate.
+
 - [ ] T128 [US4] Downgrade the update banner in `apps/desktop/src/hooks/useRuntime.ts:99-116` + `components/ConnectionTab.tsx:185-201` to "a new version is available" with an opener link; document that `tauri-plugin-updater` is deliberately not adopted (needs `createUpdaterArtifacts`, a literal minisign pubkey, endpoint templates, an `updater:default` capability and a CI-generated manifest — with no key custody it would be misconfigured), and that today's check is an unauthenticated `api.github.com` fetch with `.catch(() => {})` so rate limiting makes the banner silently never appear.
 - [ ] T129 [US4] Replace the Android log-substring status path in `apps/android/.../SessionController.kt:303-326` with structured `AETHER_EVENT` consumption and a fail-closed `disconnected` default (fixes T110), surfacing the parse error into the log stream instead of swallowing it.
 - [ ] T130 [US4] **Checkpoint**: T104–T110 green; delete the `closing` flag, the stream-scoped readiness check and the promoted `is_dns_reply`, confirming each has a red test.

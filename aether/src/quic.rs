@@ -1229,7 +1229,11 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     maybe_enable_diagnostics(&mut conn, "verify");
 
     if let Some(ref ech) = p.ech_config_list {
-        let _ = tls::inject_ech(&mut conn, ech);
+        // Not `let _ =`: if the injection failed, this connection is going out
+        // with a plaintext SNI, and a success would then be recorded against the
+        // ECH axis that was never applied — the probe result would be a lie about
+        // which knob worked.
+        tls::inject_ech(&mut conn, ech)?;
     }
 
     let mut h3_config = h3::Config::new()?;

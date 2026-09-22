@@ -19,11 +19,38 @@ function profileActive(settings: Settings, patch: Partial<Settings>) {
 }
 
 const heroCopy: Record<RuntimeState["status"], { eyebrow: string; title: string; badge: string }> = {
-  disconnected: { eyebrow: "SYSTEM READY // ROUTE OPEN", title: "Encrypted Route Ready", badge: "STANDBY // CLICK TO ENGAGE" },
-  connecting: { eyebrow: "NEGOTIATING // ROUTE HANDSHAKE", title: "Establishing Edge Path", badge: "ENGAGING // 0-RTT PROBING" },
-  connected: { eyebrow: "TUNNEL ARMED // TRAFFIC SECURE", title: "Traffic Protected & Routed", badge: "ACTIVE // 0-RTT TUNNEL" },
-  error: { eyebrow: "CRITICAL ALERT // PATH UNREACHABLE", title: "Route Compromised", badge: "LINK COMPROMISED // ERROR" },
+  disconnected: { eyebrow: "LOCAL LISTENERS CLOSED", title: "Not Connected", badge: "STANDBY // CLICK TO ENGAGE" },
+  connecting: { eyebrow: "NEGOTIATING // EDGE HANDSHAKE", title: "Establishing Edge Path", badge: "CONNECTING" },
+  connected: { eyebrow: "SESSION ACTIVE", title: "Connected", badge: "ACTIVE" },
+  error: { eyebrow: "CONNECTION FAILED", title: "Route Unavailable", badge: "ERROR" },
 };
+
+/**
+ * What "connected" covers depends on the routing mode, and the copy used to claim
+ * the widest version of it in all three: "routing Windows traffic" is false in
+ * `proxy-only`, where an application has to point at the local listener itself,
+ * and the early-data claim the badge made is not something the engine reports at
+ * all, so it was never a measurement — it was decoration on a security claim.
+ */
+function connectedCopy(routingMode: Settings["routingMode"]): { badge: string; body: string } {
+  switch (routingMode) {
+    case "tun":
+      return {
+        badge: "ACTIVE // TUN ROUTE",
+        body: "Aether Next is routing Windows traffic through the tunnel device.",
+      };
+    case "system-proxy":
+      return {
+        badge: "ACTIVE // SYSTEM PROXY",
+        body: "Windows is set to the local proxies, so applications that follow the system proxy are covered.",
+      };
+    default:
+      return {
+        badge: "ACTIVE // LOCAL PROXIES",
+        body: "The local listeners are open. Nothing is routed until an application points at them.",
+      };
+  }
+}
 
 interface ConnectionTabProps {
   settings: Settings;
@@ -84,6 +111,8 @@ export function ConnectionTab({
   toggleConnection, patchSettings, runTest, dismissError, appendLog,
 }: ConnectionTabProps) {
   const hero = heroCopy[runtime.status];
+  const active = connectedCopy(settings.routingMode);
+  const badge = runtime.status === "connected" ? active.badge : hero.badge;
 
   // Only a measured round-trip may be shown as a number: the engine reports no
   // latency of its own, so anything else here would be invented telemetry.
@@ -117,10 +146,10 @@ export function ConnectionTab({
 
           <p aria-live="polite">
             {connected
-              ? `Aether Next is routing Windows traffic via ${settings.protocol.toUpperCase()} ${settings.transport.toUpperCase()}${runtime.endpoint ? ` over ${runtime.endpoint}` : ""}.`
+              ? `${active.body}${runtime.endpoint ? ` Edge: ${runtime.endpoint}.` : ""}`
               : running || runtime.status === "error"
                 ? runtime.detail
-                : "Initialize the tunnel to negotiate Cloudflare edge telemetry and secure system sockets."}
+                : "Connect to raise the local listeners and negotiate the edge."}
           </p>
         </div>
 
@@ -158,7 +187,7 @@ export function ConnectionTab({
           <div className="switch-label-zone">
             <span className={`switch-status-pill ${runtime.status}`}>
               <span className="pulse-led" />
-              {hero.badge}
+              {badge}
             </span>
             <span className="switch-action-hint">
               {running ? "CLICK TO DISCONNECT" : "CLICK TO ENGAGE"}

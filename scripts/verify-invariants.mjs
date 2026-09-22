@@ -340,7 +340,7 @@ const GATES = [
     invariant: 'BC-14',
     summary: 'no invented telemetry in shipped UI',
     scan(api) {
-      const banned = /(< 45 ms|0\.0%|HTTP LISTENING|SOCKS5 READY|END-TO-END TLS 1\.3|V4 DUAL-READY)/g;
+      const banned = /(< 45 ms|0\.0%|HTTP LISTENING|SOCKS5 READY|END-TO-END TLS 1\.3|V4 DUAL-READY|0-RTT|TRAFFIC SECURE)/g;
       const v = [];
       const all = api.files('apps/desktop/src', /\.(tsx|ts)$/).concat(api.files('apps/android/src', /\.(tsx|ts)$/));
       for (const f of all) {

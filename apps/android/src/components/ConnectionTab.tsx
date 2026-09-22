@@ -8,11 +8,18 @@ import { platformLabel } from "../bridge";
 import { profileActive, speedProfiles } from "../types";
 import type { RuntimeState, Settings } from "../types";
 
+/**
+ * Nothing here may claim a property the app has not observed: the engine reports
+ * no early-data result, so the previous badge asserted a resumed handshake that
+ * nobody measured, and "Route Open"/"Traffic Secure" were shown while disconnected
+ * and while failed. The VPN does route once it is up, which is what `connected`
+ * says now.
+ */
 const heroCopy: Record<RuntimeState["status"], { eyebrow: string; title: string; badge: string }> = {
-  disconnected: { eyebrow: "SYSTEM READY // ROUTE OPEN", title: "Encrypted Route Ready", badge: "STANDBY // TAP TO ENGAGE" },
-  connecting: { eyebrow: "NEGOTIATING // ROUTE HANDSHAKE", title: "Establishing Edge Path", badge: "ENGAGING // 0-RTT PROBING" },
-  connected: { eyebrow: "TUNNEL ARMED // TRAFFIC SECURE", title: "Traffic Protected & Routed", badge: "ACTIVE // 0-RTT TUNNEL" },
-  error: { eyebrow: "CRITICAL ALERT // PATH UNREACHABLE", title: "Route Compromised", badge: "LINK COMPROMISED // ERROR" },
+  disconnected: { eyebrow: "VPN NOT ACTIVE", title: "Not Connected", badge: "STANDBY // TAP TO ENGAGE" },
+  connecting: { eyebrow: "NEGOTIATING // EDGE HANDSHAKE", title: "Establishing Edge Path", badge: "CONNECTING" },
+  connected: { eyebrow: "VPN ACTIVE", title: "Traffic Routed", badge: "CONNECTED" },
+  error: { eyebrow: "CONNECTION FAILED", title: "Not Connected", badge: "ERROR" },
 };
 
 interface ConnectionTabProps {
