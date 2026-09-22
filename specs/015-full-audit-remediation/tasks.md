@@ -1081,9 +1081,10 @@ cipher-rotation that could never have run.
 - T243's remainder and T224's okhttp 4.x→5.x, T248 (relative `config_path`
   default), T246 (`client_id` as a per-tunnel random tag - a product decision
   about identity correlation, not a bug), T185 (virtualiser on the discovered
-  list), T171 (an axe suite; neither app has `jest-dom` or axe installed),
-  T193/T194's clipped-ring and 900 px collision, T192's `scrollbar-gutter`,
-  panel de-duplication and the double-classed rows, T188's `font-synthesis`,
+  list), T193/T194's clipped ping ring and 900 px window-breakpoint collision,
+  T192's panel de-duplication and the six elements still carrying two
+  panel classes (its `scrollbar-gutter` half landed in `be06ca8`),
+  T188's `font-synthesis`
   T195's `<label>`-wraps-a-compound-control (fixing it means changing the CSS
   selectors that style those wrappers, so it cannot be done honestly in one
   file), T197 closed in `3d307ac` (single dark
