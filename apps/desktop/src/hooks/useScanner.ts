@@ -12,7 +12,12 @@ import type {
 } from "../types";
 import { errorMessage } from "../ipcError";
 import { hitAddressKey } from "./useLogs";
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, effectiveScanTimeout } from "../../../../packages/ui/src";
+import {
+  SCAN_MAX_CONCURRENCY,
+  SCAN_MIN_CONCURRENCY,
+  effectiveScanTimeout,
+  scanVerdict,
+} from "../../../../packages/ui/src";
 import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { ScanProtocol } from "../../../../packages/ui/src/enums";
 
@@ -84,19 +89,6 @@ export function bestRttOf(endpoints: readonly DiscoveredEndpoint[]): string | nu
   // The engine's own text wins when it carried one; a measured number is the
   // fallback, and an empty string is neither.
   return rttLike(fastest.rtt) ?? `${fastest.rttMs} ms`;
-}
-
-/**
- * The verdict line at the end of a run.
- *
- * `working` arrives on `scan_progress`, which the engine only republishes every
- * fifty probes, so the final batch of hits can be missing from it. A run whose
- * list is non-empty found something whatever the lagging counter says, and an empty
- * list with no address is the honest "0 found" — the Android fork's unconditional
- * `phase: "Verified"` read an empty scan as a verified one (T199).
- */
-export function scanVerdict(hitCount: number, addr: string, working: number): string {
-  return hitCount > 0 || working > 0 || Boolean(addr) ? "Verified" : "Completed (0 found)";
 }
 
 export function useScanner(

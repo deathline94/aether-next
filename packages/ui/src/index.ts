@@ -61,6 +61,83 @@ export function noiseIsInert(protocol: string, transport: string): boolean {
 }
 
 /**
+ * The verdict line at the end of a scan run.
+ *
+ * `working` arrives on `scan_progress`, which the engine only republishes every
+ * fifty probes, so the final batch of hits can be missing from it. A run whose
+ * list is non-empty found something whatever the lagging counter says, and an
+ * empty list with no address is the honest "0 found". This rule was forked:
+ * desktop guarded it, Android set `phase: "Verified"` on every `scan_done`, so a
+ * scan that found nothing on the phone reported a verified route (T199).
+ */
+export function scanVerdict(hitCount: number, addr: string, working: number): string {
+  return hitCount > 0 || working > 0 || Boolean(addr) ? "Verified" : "Completed (0 found)";
+}
+
+/** The statuses the interface has copy, colours and a beacon for. */
+export const RUNTIME_STATUSES = ["disconnected", "connecting", "connected", "error"] as const;
+export type RuntimeStatus = (typeof RUNTIME_STATUSES)[number];
+
+export function isRuntimeStatus(value: unknown): value is RuntimeStatus {
+  return typeof value === "string" && (RUNTIME_STATUSES as readonly string[]).includes(value);
+}
+
+/** The part of a `session://state` frame both shells render. */
+export type RuntimeCore = {
+  status: RuntimeStatus;
+  detail: string;
+  pid: number | null;
+  endpoint: string | null;
+};
+
+/**
+ * The `session://state` payload guard, up to each shell's extra fields.
+ *
+ * Both listeners used to do `setRuntime(event.payload)` on whatever arrived. One
+ * build emitting a fifth status, or a truncated frame, was then read through
+ * `heroCopy[status]` — a miss returns `undefined`, the next property access
+ * throws, and a background *event* took the window down. `null` means "this is
+ * not a state", so the caller keeps the last one it understood. Android had no
+ * guard at all, so the same frame that only degraded desktop white-screened the
+ * phone (T186).
+ */
+export function parseRuntimeCore(payload: unknown): RuntimeCore | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const raw = payload as Partial<Record<keyof RuntimeCore, unknown>>;
+  if (!isRuntimeStatus(raw.status)) return null;
+  return {
+    status: raw.status,
+    detail: typeof raw.detail === "string" ? raw.detail : "",
+    pid: typeof raw.pid === "number" && Number.isFinite(raw.pid) ? raw.pid : null,
+    endpoint: typeof raw.endpoint === "string" ? raw.endpoint : null,
+  };
+}
+
+/**
+ * The one word each status is allowed to be called in the interface.
+ *
+ * The desktop sidebar spelled it out of a nested ternary while both topbars
+ * printed the raw Rust enum (`disconnected`, `connected`), so one screen showed
+ * "Standby" beside "disconnected" — two vocabularies for the same fact, one of
+ * them an implementation identifier.
+ */
+export const RUNTIME_STATUS_TAGS: Record<RuntimeStatus, string> = {
+  disconnected: "STANDBY",
+  connecting: "HANDSHAKE",
+  connected: "ACTIVE",
+  error: "ALERT",
+};
+
+/** Why a frame was refused, phrased for the log and deduped per shape. */
+export function describeRejectedState(payload: unknown): string {
+  if (typeof payload !== "object" || payload === null) return `non-object payload (${typeof payload})`;
+  const raw = (payload as Record<string, unknown>).status;
+  if (raw === undefined) return "no status field";
+  if (typeof raw !== "string") return `status is ${typeof raw}`;
+  return `status "${raw}"`;
+}
+
+/**
  * Where the arrow keys take you in a one-of-N control, or `null` when the key is
  * none of theirs.
  *

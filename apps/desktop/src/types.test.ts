@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   defaults,
-  isStatus,
   parseRuntimeState,
   parseSettings,
 } from "./types";
+import { isRuntimeStatus } from "../../../packages/ui/src";
 
 /** Every field the shell's `RuntimeState` serialises, camelCase. */
 const shellPayload = {
@@ -40,7 +40,7 @@ describe("parseRuntimeState", () => {
     expect(parseRuntimeState({ ...shellPayload, status: null })).toBeNull();
     expect(parseRuntimeState("connected")).toBeNull();
     expect(parseRuntimeState(null)).toBeNull();
-    expect(isStatus("bogus")).toBe(false);
+    expect(isRuntimeStatus("bogus")).toBe(false);
   });
 
   it("falls back to the harmless shape for absent optional fields", () => {

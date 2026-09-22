@@ -157,7 +157,6 @@ export function NumberField({
         onClick={() => handleStep(-step)}
         disabled={disabled || (draftNumber(draft, value)) <= min}
         aria-label={`Decrease ${label}`}
-        tabIndex={-1}
       >
         −
       </button>
@@ -184,7 +183,6 @@ export function NumberField({
         onClick={() => handleStep(step)}
         disabled={disabled || (draftNumber(draft, value)) >= max}
         aria-label={`Increase ${label}`}
-        tabIndex={-1}
       >
         +
       </button>

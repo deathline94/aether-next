@@ -3,24 +3,13 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
+import { describeRejectedState } from "../../../../packages/ui/src";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
 const UPDATE_CHECK_URL = "https://api.github.com/repos/deathline94/aether-next/releases/latest";
-
-/**
- * A session frame the guard refused, named without trusting its contents: the
- * log line is for whoever ships the shell, so it has to say what arrived.
- */
-export function describeRejected(payload: unknown): string {
-  if (typeof payload !== "object" || payload === null) return `non-object payload (${typeof payload})`;
-  const raw = (payload as Record<string, unknown>).status;
-  if (raw === undefined) return "no status field";
-  if (typeof raw !== "string") return `status is ${typeof raw}`;
-  return `status "${raw}"`;
-}
 
 /** A state the UI asserts for itself, with nothing measured. */
 function uiState(status: RuntimeState["status"], detail: string): RuntimeState {
@@ -105,7 +94,7 @@ export function useRuntime(
           // through was how one unknown `status` threw inside `heroCopy[status]`
           // and white-screened the window from a background event.
           const seen = rejectedStatuses.current;
-          const key = describeRejected(event.payload);
+          const key = describeRejectedState(event.payload);
           if (!seen.has(key)) {
             seen.add(key);
             appendLog({

@@ -386,6 +386,8 @@ export function ScannerTab({
             id={resultsId}
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
+            // A hundred rows in a fixed-height panel cannot be reached without this.
+            tabIndex={0}
           >
             {filteredEndpoints.map((item) => {
               const { tierClass, badgeText } = getRttTier(item.rttMs);

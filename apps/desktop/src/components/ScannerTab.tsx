@@ -274,7 +274,7 @@ export function ScannerTab({
           />
         </div>
 
-        <div className="setting-row input-row">
+        <div className="setting-row">
           <div className="param-field-block">
             <label>
               <div className="field-meta">
@@ -389,6 +389,10 @@ export function ScannerTab({
             id={resultsId}
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
+            // A hundred rows in a fixed-height panel cannot be reached without this:
+            // the list was mouse-only, so PageUp and the arrows scrolled the page
+            // behind it instead of the endpoints the tab just promised.
+            tabIndex={0}
           >
             {filteredEndpoints.map((item) => {
               const { tierClass, badgeText, text } = rttBadge(item);

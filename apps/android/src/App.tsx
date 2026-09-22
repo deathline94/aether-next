@@ -1,5 +1,6 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useState } from "react";
+import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
 // Same self-hosted faces as the desktop app (T187): Vite hashes the woff2
 // into the bundled assets, so the WebView never reaches a third party.
 import "@fontsource-variable/geist";
@@ -138,7 +139,7 @@ function App() {
           <div className="topbar-actions">
             <div className={`header-status ${runtime.status}`} title={runtime.detail}>
               <span className="status-dot" aria-hidden="true" />
-              <span>{runtime.status}</span>
+              <span>{RUNTIME_STATUS_TAGS[runtime.status]}</span>
             </div>
           </div>
         </header>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
 import { initialScanState, effectiveScanTimeout } from "../types";
 import { errorMessage } from "../ipcError";
+import { scanVerdict } from "../../../../packages/ui/src";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 
 /**
@@ -82,7 +83,13 @@ export function useScanner(
           break;
         }
         case "scan_done":
-          setScanState((prev) => ({ ...prev, active: false, phase: "Verified" }));
+          // A run that found nothing is not a verified route. `scanVerdict` is the
+          // shared rule; this fork used to write "Verified" unconditionally.
+          setScanState((prev) => ({
+            ...prev,
+            active: false,
+            phase: scanVerdict(endpointsRef.current.length, ev.addr, prev.working),
+          }));
           if (ev.addr) appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
           break;
         case "scan_failed":
@@ -96,6 +103,11 @@ export function useScanner(
         return;
       }
       unlistenRef.current = unlisten;
+    }).catch((err) => {
+      // Without this the rejection was unhandled and the panel kept offering a
+      // scan whose events could never arrive: a failed `listen` is silent, so a
+      // run would sit on "Starting" forever with nothing to report.
+      appendLog({ level: "error", message: `Scan event listener failed to start: ${errorMessage(err)}` });
     });
     return () => {
       disposed = true;
@@ -132,7 +144,7 @@ export function useScanner(
     } finally {
       setBusy(false);
     }
-  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog]);
+  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
     // Ask the engine first; report "Stopped" regardless so the UI never sticks.

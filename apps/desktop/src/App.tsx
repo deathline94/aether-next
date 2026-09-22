@@ -1,5 +1,6 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
 // Self-hosted faces: Vite hashes the woff2 into dist/ so the UI loads them
 // same-origin under `font-src 'self'` and never asks a third party pre-tunnel.
 import "@fontsource-variable/geist";
@@ -193,7 +194,7 @@ function App() {
             <div className="beacon-info">
               <div className="beacon-header">
                 <strong className="beacon-status-text">{statusText}</strong>
-                <span className="beacon-tag">{connected ? "ACTIVE" : running ? "HANDSHAKE" : runtime.status === "error" ? "ALERT" : "STANDBY"}</span>
+                <span className="beacon-tag">{RUNTIME_STATUS_TAGS[runtime.status]}</span>
               </div>
               <span className="beacon-detail" title={runtime.detail}>{runtime.detail || "System Ready"}</span>
             </div>
@@ -214,7 +215,7 @@ function App() {
           <div className="topbar-actions">
             <div className={`header-status ${runtime.status}`} title={runtime.detail}>
               <span className="status-dot" aria-hidden="true" />
-              <span>{runtime.status}</span>
+              <span>{RUNTIME_STATUS_TAGS[runtime.status]}</span>
             </div>
           </div>
         </header>

@@ -1,9 +1,9 @@
 /**
- * The wire enums live in `@aether/ui` (`packages/ui/src/enums.ts`) so the desktop
- * and Android shells cannot drift into offering different legal values for the
- * same setting. It is reached by relative path, exactly as the Android front end
- * does (there is no workspace install step yet — see the note in
- * `apps/desktop/README`/T197): the alternative was a fourth private copy.
+ * The shared surface lives in `packages/ui` so the desktop and Android shells
+ * cannot drift into offering different legal values for the same setting — or,
+ * worse, different guards for the same frame. It is reached by relative path:
+ * an npm workspace alias would install nothing here (the apps pin their own
+ * dependencies) and would hide which file the value actually comes from.
  */
 import {
   IP_FAMILIES,
@@ -22,11 +22,14 @@ import type {
   TunnelProtocol,
   Transport,
 } from "../../../packages/ui/src/enums";
+import { parseRuntimeCore } from "../../../packages/ui/src";
+import type { RuntimeStatus } from "../../../packages/ui/src";
 
 export type { IpFamily, NoizeProfile, RoutingMode, ScanMode, TunnelProtocol, Transport };
 
 export type View = "home" | "scanner" | "settings" | "logs";
-export type Status = "disconnected" | "connecting" | "connected" | "error";
+/** The statuses the UI has copy, colours and a beacon for — one list, in `@aether/ui`. */
+export type Status = RuntimeStatus;
 export type LogFilter = "milestones" | "hits" | "errors" | "raw";
 
 export interface DiscoveredEndpoint {
@@ -110,32 +113,18 @@ export type RuntimeState = {
   handshakeRttMs: number | null;
 };
 
-/** The statuses the UI has copy, colours and a beacon for. */
-const STATUSES: readonly Status[] = ["disconnected", "connecting", "connected", "error"];
-
-export function isStatus(value: unknown): value is Status {
-  return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
-}
-
 /**
  * The `session://state` payload guard.
  *
- * The listener used to do `setRuntime(event.payload)` on whatever arrived. One
- * shell build emitting a fifth status, or a truncated payload, was then read
- * through `heroCopy[status]` — an index that misses returns `undefined`, the next
- * property access throws, and a state *update* took the whole window down.
- * Returning `null` means "this is not a state", so the caller keeps the last one
- * it understood instead of rendering a shape it cannot.
+ * The shape check is the shared one — see `parseRuntimeCore`; this adds the
+ * desktop-only measured round-trip.
  */
 export function parseRuntimeState(payload: unknown): RuntimeState | null {
-  if (typeof payload !== "object" || payload === null) return null;
+  const core = parseRuntimeCore(payload);
+  if (!core) return null;
   const raw = payload as Partial<Record<keyof RuntimeState, unknown>>;
-  if (!isStatus(raw.status)) return null;
   return {
-    status: raw.status,
-    detail: typeof raw.detail === "string" ? raw.detail : "",
-    pid: typeof raw.pid === "number" && Number.isFinite(raw.pid) ? raw.pid : null,
-    endpoint: typeof raw.endpoint === "string" ? raw.endpoint : null,
+    ...core,
     // A round-trip is a count of milliseconds or nothing; a stringly or negative
     // one is not a measurement, and "not measured" must not render as `0 ms`.
     handshakeRttMs:

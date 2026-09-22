@@ -1,5 +1,9 @@
+import { parseRuntimeCore } from "../../../packages/ui/src";
+import type { RuntimeStatus } from "../../../packages/ui/src";
+
 export type View = "home" | "scanner" | "settings" | "logs";
-export type Status = "disconnected" | "connecting" | "connected" | "error";
+/** The four statuses the shell has copy, colours and a beacon for — one list, in `packages/ui`. */
+export type Status = RuntimeStatus;
 export type LogFilter = "milestones" | "hits" | "errors" | "raw";
 
 export interface DiscoveredEndpoint {
@@ -64,6 +68,17 @@ export type RuntimeState = {
   pid: number | null;
   endpoint: string | null;
 };
+
+/**
+ * The `session://state` frame guard. `parseRuntimeCore` is shared with desktop
+ * precisely because the listener used to write whatever arrived straight into
+ * state: on the phone an unknown `status` then missed `heroCopy[...]` and threw
+ * during a background event, which blanks the WebView with no way back short of
+ * a restart.
+ */
+export function parseRuntimeState(payload: unknown): RuntimeState | null {
+  return parseRuntimeCore(payload);
+}
 
 export type LogEntry = {
   id: number;

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
-import { defaults, initialRuntime } from "../types";
+import { defaults, initialRuntime, parseRuntimeState } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
+import { describeRejectedState } from "../../../../packages/ui/src";
 
 /**
  * What a connectivity check actually knows.
@@ -41,6 +42,10 @@ export function useRuntime(
   const [testResult, setTestResult] = useState<TestOutcome | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
+  // One log line per distinct refused shape, not one per frame: a shell that
+  // emits a bad status every second must not fill the console with it.
+  const rejectedStates = useRef(new Set<string>());
+
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Settings | null>(null);
@@ -59,9 +64,25 @@ export function useRuntime(
 
     async function initialize() {
       try {
-        const unlistenState = await listen<RuntimeState>("session://state", (event) => {
+        const unlistenState = await listen<unknown>("session://state", (event) => {
           receivedRuntimeEvent.current = true;
-          setRuntime(event.payload);
+          const next = parseRuntimeState(event.payload);
+          if (next) {
+            setRuntime(next);
+            return;
+          }
+          // Not a state: keep showing the last one that was understood, and say why
+          // once. Writing the frame through is how an unknown `status` reached
+          // `heroCopy[status]`, threw inside a background event and blanked the
+          // WebView.
+          const key = describeRejectedState(event.payload);
+          if (!rejectedStates.current.has(key)) {
+            rejectedStates.current.add(key);
+            appendLog({
+              level: "error",
+              message: `Ignored a session state the interface cannot render (${key}); showing the previous one.`,
+            });
+          }
         });
         if (disposed) { unlistenState(); return; }
         cleanup.push(unlistenState);
