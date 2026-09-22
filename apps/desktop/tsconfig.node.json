@@ -4,7 +4,13 @@
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+    /* A referenced project cannot set `noEmit`, so without an outDir `tsc -b` —
+       which is what `npm run build` runs — wrote `vite.config.js` and
+       `vite.config.d.ts` next to the source and left them for `git add .` to
+       find. Keep the emit inside node_modules. */
+    "outDir": "./node_modules/.tmp",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo"
   },
   "include": ["vite.config.ts"]
 }
