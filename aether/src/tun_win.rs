@@ -326,6 +326,11 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
             ))
         }
     };
+    // One host mutation per moment, across processes. Two sessions each install
+    // the same split-default prefixes and each write their own journal for them,
+    // so the second journal silently describes routes the first still believes it
+    // owns — and whichever teardown runs last removes them.
+    let _mutation = crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)?;
     let (physical_if_index, gw) = default_gateway()?;
     let if_index = interface_index(ADAPTER_NAME)?;
     let peer_s = peer_ip.to_string();
@@ -462,7 +467,35 @@ try {{
 /// *every* interface whenever the recorded indexes were 0 — which is the exact
 /// prefix pair OpenVPN/Cisco/AnyConnect use for split tunnelling, so a legacy or
 /// truncated state file let an Aether disconnect take down an unrelated VPN.
+/// Take the host-mutation lock for one removal, or decline to remove.
+///
+/// Declining is not a shrug: the journal stays on disk with our pid in it, and the
+/// next start's stale-route replay (or `--repair-routes`) takes the routes down
+/// once that pid is demonstrably gone. Removing them *unguarded* is what this lock
+/// exists to prevent — a second session mid-install owns the same prefixes, so an
+/// unguarded delete would take down routes that are no longer only ours, and the
+/// machine would lose its tunnel with one still reporting connected.
 fn remove_routes(journal: &RouteJournal) {
+    let _mutation = match crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            log::error!(
+                "[tun] routes left installed: {e}. The journal is kept so the next Aether start                  replays the removal; run `aether --repair-routes` to do it now."
+            );
+            return;
+        }
+    };
+    remove_routes_locked(journal);
+}
+
+/// Remove this journal's routes while holding the host-mutation lock.
+///
+/// Callers that already hold it (the stale-route replay) use this directly;
+/// anything else goes through [`remove_routes`], which takes the lock first. The
+/// split exists because the lock is not re-entrant across a process's own file
+/// descriptors, and a nested acquire would fail and silently skip the removal.
+fn remove_routes_locked(journal: &RouteJournal) {
     let plan = journal.removal_plan();
     if plan.is_empty() {
         log::warn!("[tun] no removal plan for this journal; leaving routes untouched");
@@ -616,6 +649,13 @@ fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
 
 /// Remove routes left by a crashed previous engine process.
 pub fn recover_stale_routes() {
+    // The replay is a host mutation like any other. Holding the lock here also
+    // means `remove_routes_locked` below is called with it already taken.
+    let Ok(_mutation) = crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)
+    else {
+        log::info!("[tun] another session owns host mutation; skipping the stale-route replay");
+        return;
+    };
     let mut handled = false;
     if let Some(path) = crate::route_repair::journal_path() {
         match RouteJournal::load_opt(&path) {
@@ -633,7 +673,7 @@ pub fn recover_stale_routes() {
                         "[tun] recovering stale routes from dead pid {}",
                         journal.creator_pid
                     );
-                    remove_routes(&journal);
+                    remove_routes_locked(&journal);
                     reset_adapter_config(ADAPTER_NAME);
                     handled = true;
                 }
@@ -653,7 +693,7 @@ pub fn recover_stale_routes() {
                             "[tun] recovering legacy routes from dead pid {}",
                             journal.creator_pid
                         );
-                        remove_routes(&journal);
+                        remove_routes_locked(&journal);
                         reset_adapter_config(ADAPTER_NAME);
                         handled = true;
                     }

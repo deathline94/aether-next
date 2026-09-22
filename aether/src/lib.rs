@@ -25,6 +25,7 @@ pub mod obfuscation;
 pub mod prober;
 pub mod quic;
 pub mod routing_plane;
+pub mod host_lock;
 pub mod route_repair;
 pub mod runtime_env;
 pub mod session;
