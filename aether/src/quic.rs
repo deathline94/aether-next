@@ -16,7 +16,6 @@ use crate::tls::{self, TlsParams};
 use crate::{consts, error::AetherError, error::Result};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const NET_QUEUE: usize = 2048;
 /// Outbound IP packets handed to quiche per select wakeup.
 ///
 /// The batch this replaces drained the whole 2048-deep egress queue in one pass,
@@ -264,10 +263,11 @@ impl Internals {
 
 type NetPacket = (SocketAddr, SocketAddr, Vec<u8>);
 
-/// Holds spawned UDP-reader tasks; aborts them on drop so old readers
-/// cannot leak when the tunnel migrates sockets, reconnects, or unwinds.
-/// Without this, a long-lived session that reconnects many times accumulates
-/// orphaned tokio tasks each holding a dedicated read buffer (>=64KB × N leaks).
+/// Holds spawned UDP-reader tasks; aborts them on drop so a reader cannot outlive
+/// the connection that started it - through reconnect, tunnel close, or a panic
+/// unwinding the scope. Without this, a long-lived session that reconnects many
+/// times accumulates orphaned tokio tasks each holding a read buffer
+/// (>=64KB x N leaks).
 struct ReaderGuard {
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -447,13 +447,15 @@ pub async fn run(
         send_version_bait(&init_sock, peer, QUIC_V2_BAIT_WAIT, 2).await;
     }
 
-    let (net_tx, mut net_rx) = mpsc::channel::<NetPacket>(NET_QUEUE);
+    let (net_tx, mut net_rx) = mpsc::channel::<NetPacket>(crate::tunnel::NET_QUEUE);
 
     let mut sockets: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
     sockets.insert(local, init_sock.clone());
     // ReaderGuard aborts ALL spawned readers when this scope exits (reconnect,
-    // tunnel-close, panic). Without it, every Migrate spawns a fresh reader
-    // that holds a 64KB buffer + task slot forever — long sessions leak.
+    // tunnel-close, panic). Without it, every attempt that binds a new socket
+    // leaves its reader behind holding a 64KB buffer and a task slot forever -
+    // long sessions leak. (Not "migration": this engine never migrates a live
+    // path to a new local address, so the leak had no other route in.)
     let mut readers = ReaderGuard::new();
     readers.push(spawn_reader(init_sock, local, net_tx.clone()));
     // Drop our own sender so `net_rx.recv()` yields None once every reader dies.
@@ -1009,6 +1011,16 @@ fn poll_h3(
     Ok(())
 }
 
+/// Consume the MASQUE control capsules this connection has parsed.
+///
+/// The H2 path has a same-named function in `masque_h2.rs` and the resemblance is
+/// a trap for anyone tempted to merge them: this one is **synchronous** because it
+/// runs inside quiche's poll loop, so its delivery is `try_send` and a saturated
+/// inbound queue drops the datagram - visibly, on the `INBOUND_DROPPED` counter,
+/// because the alternative is blocking the event loop that also has to keep the
+/// connection alive. The H2 copy is `async` and awaits the send instead, since its
+/// caller is a plain recv task with an await point already. Same parse, opposite
+/// backpressure, and each is correct only in the loop it sits in.
 fn drain_capsules(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
@@ -1380,6 +1392,11 @@ pub struct VerifyParams {
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
+    // Read once per verification, like `run()` does per connection: the mode is
+    // fixed at startup by `AETHER_MASQUE_H3_DGRAM`, so re-reading it inside the
+    // probe loop cost a parse per iteration and could otherwise disagree with the
+    // data path this same process is already running.
+    let h3_dgram_mode = crate::masque::H3DgramMode::from_env();
     // Use unconnected send_to/recv_from — more reliable on Windows than connect()+recv
     // when intermediate devices rewrite paths.
     let bind: SocketAddr = if p.peer.is_ipv4() {
@@ -1560,7 +1577,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                             p.local_ipv4,
                                             crate::dns::dataplane_probe_target(),
                                         );
-                                        let use_capsule = crate::masque::H3DgramMode::from_env()
+                                        let use_capsule = h3_dgram_mode
                                             .use_capsule(h3c.dgram_enabled_by_peer(&conn));
                                         let mut dp_capsules = CapsuleParser::new();
                                         let mut dp_body = vec![0u8; 65535];

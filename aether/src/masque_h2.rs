@@ -794,6 +794,12 @@ async fn send_ip_batch(send: &mut h2::SendStream<Bytes>, packets: Vec<Vec<u8>>) 
     Ok(())
 }
 
+/// Consume the parsed MASQUE capsules on the H2 path.
+///
+/// Not interchangeable with `quic::drain_capsules` despite the name: that one runs
+/// inside quiche's poll loop and must not block, while this one is `async` and
+/// awaits a full inbound queue rather than dropping the packet. Merging them would
+/// pick one of those two policies for a caller that cannot honour it.
 async fn drain_capsules(
     capsules: &mut CapsuleParser,
     inbound_tx: &mpsc::Sender<Vec<u8>>,

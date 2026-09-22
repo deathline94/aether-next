@@ -1015,6 +1015,35 @@ Checked each part against the current tree rather than assuming the task text wa
 **Purpose**: The long tail of the audit — drift, dead code, silent substitutions and remaining bounds — plus final validation.
 
 - [ ] T242 [P] Sweep dead code and drifted duplicates in `aether/src/`: unify two identical `bytes_to_ip` (`quic.rs:816`, `masque_h2.rs:810`) and two `drain_capsules` with opposite drop policies into `masque.rs`; stop `H3DgramMode::from_env()` being read once in `run` but re-read per probe and per 200 ms tick; fix `ReaderGuard`'s comment citing "every Migrate" while migration is disabled (`tls.rs:181`); replace `session.rs:1094`'s hardcoded 2048 with `tunnel::NET_QUEUE`; delete the dead `ScanCancellationToken` (`prober.rs:310-339`) and `SCAN_GENERATION` (`:341`, stored at `:396`, never read); correct `session.rs:167-169`'s port-tier comment, which is the **reverse** of `MASQUE_PORTS_T1/T2` (`prober.rs:1106-1107`).
+  <!-- Six of the seven are done; the seventh should not be.
+       `bytes_to_ip`/`skip_name` have single owners and `SCAN_GENERATION` is gone
+       (earlier round). This round: the local `const NET_QUEUE: usize = 2048` in
+       `quic.rs` is deleted in favour of `tunnel::NET_QUEUE`, which every other
+       queue in the engine already uses (three sites - session's two channels and
+       tls's `enable_dgram` - had been told the number, quic's had drifted by
+       nobody noticing); `verify_masque` now reads `H3DgramMode` once per
+       verification instead of inside the probe loop, where it could disagree with
+       the data path the same process was already running; `ReaderGuard`'s two
+       comments (it lives in `quic.rs`, not `tls.rs:181` - the line numbers in
+       this task text are three rounds stale) no longer blame a socket migration
+       that does not exist anywhere in the engine, only reconnect/close/panic;
+       the port-tier comment in `session.rs` now matches `MASQUE_PORTS_T1/T2`
+       (443; 500/1701/4500; then 4443/8443/8095) instead of reversing tiers 2
+       and 3 and citing a port (2408) that is in no list; and
+       `ScanCancellationToken` is deleted - it was `#[allow(dead_code)]` on every
+       method, unreferenced, and could not express what `ScanRegistry` does (one
+       token per live scan generation), with its garbled doubled doc comment
+       cleaned up in the same edit.
+       Not done, on purpose: the two `drain_capsules` are not one rule written
+       twice. `quic`'s is synchronous because it runs inside quiche's poll loop
+       and therefore `try_send`s and counts a visible drop; `masque_h2`'s is async
+       and awaits a full queue because its caller is a recv task with an await
+       point. Unifying them picks a backpressure one of the two callers cannot
+       honour - which is a transport decision to make with the engine compiling
+       and a session running, not from an editor. Each definition now says so at
+       the top, so the next dedupe pass does not repeat the mistake this task
+       invited. -->
+
 
   **Partly done, and re-verified against the current tree** (`cf80018`, plus the
   queue/global cleanup in the commit after it): `bytes_to_ip` now lives once in

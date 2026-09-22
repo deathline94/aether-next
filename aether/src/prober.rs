@@ -420,46 +420,18 @@ fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration) {
     });
 }
 
-/// Run the unified endpoint hunt: tier-0 cache → candidate generation → concurrent
-/// probing with hot-subnet drill-down → deadline/quiet-period management.
-/// Cooperative scan cancellation. `hunt_best` checks this each iteration and
-/// stops gracefully (returning the best endpoint found so far), so a scan can be
-/// Cooperative scan cancellation. `hunt_best` checks this each iteration and
-/// stops gracefully (returning the best endpoint found so far), so a scan can be
-/// stopped without killing the process mid-work. Wire `request_scan_cancel` to a
-/// Ctrl-C / SIGTERM handler or an IPC "stop" command.
+// Run the unified endpoint hunt: tier-0 cache → candidate generation → concurrent
+// probing with hot-subnet drill-down → deadline/quiet-period management
+// (`hunt_best`). Cooperative scan cancellation lives in `ScanRegistry` below:
+// `hunt_best` checks the token each iteration and stops gracefully (returning
+// the best endpoint found so far), so a scan can be stopped without killing the
+// process mid-work.
+//
+// `ScanCancellationToken` used to sit here as a wrapper over one
+// `CancellationToken`, `#[allow(dead_code)]` on every method, and unreferenced:
+// the registry keys its tokens per scan generation, which is the thing this
+// wrapper could not express (one slot, one scan). Deleted rather than wired.
 use tokio_util::sync::CancellationToken;
-
-#[derive(Clone, Default)]
-#[allow(dead_code)]
-pub struct ScanCancellationToken {
-    inner: CancellationToken,
-}
-
-#[allow(dead_code)]
-impl ScanCancellationToken {
-    pub fn new() -> Self {
-        Self {
-            inner: CancellationToken::new(),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.inner.cancel();
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.inner.is_cancelled()
-    }
-
-    pub fn child_token(&self) -> CancellationToken {
-        self.inner.child_token()
-    }
-
-    pub async fn cancelled(&self) {
-        self.inner.cancelled().await;
-    }
-}
 
 struct ScanRegistry {
     generation: u64,

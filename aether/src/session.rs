@@ -302,7 +302,11 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 return crate::h3_probe::run_fingerprint(&spec, &identity).await;
             }
             // H3 and H2 both hunt across the shared MASQUE pool (MASQUE_CIDRS + SEEDS)
-            // over the tiered ports (443 -> 8443/4443/8095 -> 2408/500/1701/4500).
+            // over the tiered ports - tier 1 is 443, tier 2 is 500/1701/4500 (the
+            // IPsec-family ports), and tier 3 is the rest of MASQUE_PORTS
+            // (4443/8443/8095). `MASQUE_PORTS_T1/T2` own that split; this line used
+            // to list the tiers in the wrong order, which sent a reader hunting for
+            // 8443 before the ports the edge actually answers on.
             // select_peer honors a forced AETHER_PEER and runs quick-reconnect first.
             // If an H3 scan comes up empty (e.g. every port DPI-dropped in this
             // environment), fall back to the API-assigned endpoint / known anycast VIP
