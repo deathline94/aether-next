@@ -610,6 +610,16 @@
   `noUnusedLocals` would fail on.
 - [ ] T177 [US6] Delete `apps/desktop/src/types.ts:111-112`'s `scan_failed`/`scan_done.working` **or** emit them — with the generated type as arbiter (fixes the dead arm at `useScanner.ts:88-91`) — and carry `best_rtt_ms: Option<u32>` so completion stops logging `best: 1.1.1.1:443 ()` (`aether/src/session.rs:187,203,254,261,297` emit `rtt: String::new()`).
 - [ ] T178 [US6] Add `saveSeqRef` ordering to `apps/desktop/src/hooks/useRuntime.ts:123-135` so a slow older write cannot land last and flip "Synchronized" for the wrong payload; serialise persistence through one owner.
+  **Attempted and reverted, with the reason recorded rather than hidden.** A `saveSeqRef` guard was
+  written (both UIs: bump on issue, compare before `setSaved`/`setSaveError`) and a test was written
+  that held the first `save_settings` open, let a second patch save successfully, then rejected the
+  first. The assertions on `saveError`/`saved` passed *with the guard deleted*, i.e. the stale
+  rejection never reached the branch the guard protects under jsdom timing — so the test could not
+  distinguish fixed from broken, which is the exact defect class this feature exists to eliminate.
+  Rather than commit a blind test or an unverified guard, both were reverted. Still open, and what
+  the next attempt needs: a way to interleave the two writes that is *proved* interleaved (assert the
+  observed order of `invoke` calls and the rejection landing last), or a shell-side serialisation of
+  `save_settings` that makes the ordering question moot.
 - [ ] T179 [US6] Roll back optimistic commits on rejection in `apps/desktop/src/hooks/useRuntime.ts:188-194`: "Connect Direct" persists protocol/transport/pinned peer through the settings effect **and** `lib.rs:1340`, so a failed attempt permanently rewrites the user's carrier protocol and shows "Targeting forced endpoint" for a tunnel that never came up.
 - [ ] T180 [US6] Commit free-text settings on blur/Enter with existence validation in `apps/desktop/src/components/SettingsTab.tsx:472-479` (the 400 ms debounce alone currently persists `C:\Users\SLiM\Desk` half-typed) and add a `saveError` state rendered in the save dock (fixes T168).
 - [x] T181 [US6] Fix `NumberField`'s zero handling in `apps/desktop/src/components/ui.tsx` to `Number.isNaN(parsed) ? value : parsed`.
