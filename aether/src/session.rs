@@ -178,6 +178,11 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
     let http_listen = cfg.http;
     let base_config = cfg.config_path.clone();
 
+    // Pulsed while the session runs; dropped (i.e. aborted) when run_session
+    // returns, including on the error paths.
+    let _heartbeat = session_event::start_heartbeat();
+    session_event::set_phase(session_event::Phase::Identity);
+
     let protocol = if cfg.has_forced_peer() || runtime_env::var("AETHER_PROTOCOL").is_some() {
         Protocol::parse(&cfg.protocol)
     } else {
@@ -220,7 +225,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // If an H3 scan comes up empty (e.g. every port DPI-dropped in this
             // environment), fall back to the API-assigned endpoint / known anycast VIP
             // so we still attempt a connect rather than aborting the session.
-            let peer = match select_peer(
+            let selection = match select_peer(
                 &identity,
                 protocol,
                 &base_config,
@@ -228,7 +233,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             )
             .await
             {
-                Ok(p) => p,
+                Ok(s) => s,
                 Err(e) if scan_only() => {
                     // Standalone scanner: finding nothing is a completed scan, not a
                     // session error. Emit a terminal ScanDone so the GUI stops
@@ -238,11 +243,13 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                         addr: String::new(),
                         rtt: String::new(),
                         protocol: "masque".into(),
+                        best_rtt_ms: None,
                     });
                     return Ok(());
                 }
                 Err(e) => return Err(e),
             };
+            let peer = selection.peer;
             log::info!("[+] using cloudflare edge {peer}");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
@@ -250,13 +257,16 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             });
             // Scan-only mode: report result and exit without tunnel.
             if scan_only() {
+                session_event::set_phase(session_event::Phase::Scan);
                 session_event::emit(SessionEvent::ScanDone {
                     addr: peer.to_string(),
-                    rtt: String::new(),
+                    rtt: selection.human_rtt(),
                     protocol: "masque".into(),
+                    best_rtt_ms: selection.best_rtt_ms(),
                 });
                 return Ok(());
             }
+            session_event::set_phase(session_event::Phase::Handshake);
             let ech = resolve_ech().await;
             let result = run_masque_tunnel(identity.clone(), peer, ech.clone(), listen, http_listen).await;
             // ECH fallback: if the tunnel failed and ECH was active, the network
@@ -307,10 +317,11 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 )
                 .await
                 {
-                    Ok(peer) => session_event::emit(SessionEvent::ScanDone {
-                        addr: peer.to_string(),
-                        rtt: String::new(),
+                    Ok(selection) => session_event::emit(SessionEvent::ScanDone {
+                        addr: selection.peer.to_string(),
+                        rtt: selection.human_rtt(),
                         protocol: "wireguard".into(),
+                        best_rtt_ms: selection.best_rtt_ms(),
                     }),
                     Err(e) => {
                         log::warn!("[-] standalone WireGuard scan found no endpoint: {e}");
@@ -318,11 +329,13 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                             addr: String::new(),
                             rtt: String::new(),
                             protocol: "wireguard".into(),
+                            best_rtt_ms: None,
                         });
                     }
                 }
                 return Ok(());
             }
+            session_event::set_phase(session_event::Phase::Handshake);
             run_wireguard(identity, listen, http_listen, &base_config).await
         }
         Protocol::WarpInWarp => {
@@ -337,13 +350,14 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let peer = select_peer(
+            let selection = select_peer(
                 &primary,
                 Protocol::WireGuard,
                 &base_config,
                 prober::WgSessionCache::new(),
             )
             .await?;
+            let peer = selection.peer;
             log::info!("[+] using cloudflare edge {peer} (outer)");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
@@ -352,11 +366,13 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             if scan_only() {
                 session_event::emit(SessionEvent::ScanDone {
                     addr: peer.to_string(),
-                    rtt: String::new(),
+                    rtt: selection.human_rtt(),
                     protocol: "gool".into(),
+                    best_rtt_ms: selection.best_rtt_ms(),
                 });
                 return Ok(());
             }
+            session_event::set_phase(session_event::Phase::Handshake);
             run_warp_in_warp(primary, secondary, peer, listen, http_listen).await
         }
     }
@@ -478,12 +494,35 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
 
 // ─── Endpoint selection ─────────────────────────────────────────────────────
 
+/// What endpoint selection resolved to.
+///
+/// `rtt` is the measurement that proved the endpoint, or `None` when the peer was
+/// forced from config and nothing was probed. A scan that ends without it must
+/// say so instead of printing an empty RTT next to a real address.
+struct Selection {
+    peer: SocketAddr,
+    rtt: Option<std::time::Duration>,
+}
+
+impl Selection {
+    fn best_rtt_ms(&self) -> Option<f64> {
+        self.rtt.map(|d| d.as_secs_f64() * 1000.0)
+    }
+
+    fn human_rtt(&self) -> String {
+        match self.rtt {
+            Some(d) => format!("{} ms", d.as_secs_f64() * 1000.0),
+            None => String::new(),
+        }
+    }
+}
+
 async fn select_peer(
     identity: &account::Identity,
     protocol: Protocol,
     base_config: &str,
     wg_sessions: prober::WgSessionCache,
-) -> Result<SocketAddr> {
+) -> Result<Selection> {
     let force_peer = match protocol {
         Protocol::Masque => runtime_env::var("AETHER_PEER"),
         Protocol::WireGuard | Protocol::WarpInWarp => runtime_env::var("AETHER_WG_PEER")
@@ -495,10 +534,12 @@ async fn select_peer(
             .parse()
             .map_err(|_| AetherError::Other(format!("bad peer address {p}")))?;
         log::info!("[+] using forced peer {peer} (probe skipped)");
-        return Ok(peer);
+        // Nothing was measured, so the scan reports no RTT rather than a zero.
+        return Ok(Selection { peer, rtt: None });
     }
 
     log::info!("[+] selected protocol: {}", protocol.label());
+    session_event::set_phase(session_event::Phase::SelectingEndpoint);
 
     let mode_str = select_scan_mode_str().await;
     let ip = select_ip_version().await;
@@ -568,7 +609,7 @@ async fn select_peer(
                             )
                             .await
                         };
-                        if let Ok(_rtt) = verified {
+                        if let Ok(rtt) = verified {
                             log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
                             if crate::cache::record_success(base_config, peer_addr, true).was_skipped() {
                                 log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
@@ -577,7 +618,10 @@ async fn select_peer(
                                 addr: peer_addr.to_string(),
                                 protocol: "masque".into(),
                             });
-                            return Ok(peer_addr);
+                            return Ok(Selection {
+                                peer: peer_addr,
+                                rtt: Some(rtt),
+                            });
                         } else {
                             log::warn!("[-] cached gateway {peer_addr} no longer works; scanning fresh");
                             // Evict the dead peer from the trust cache so we stop
@@ -608,7 +652,7 @@ async fn select_peer(
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: "masque".into(),
             });
-            Ok(peer)
+            Ok(Selection { peer, rtt: Some(best.rtt) })
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
             log::info!(
@@ -641,7 +685,10 @@ async fn select_peer(
                 best.port,
                 best.rtt
             );
-            Ok(SocketAddr::new(best.ip, best.port))
+            Ok(Selection {
+                peer: SocketAddr::new(best.ip, best.port),
+                rtt: Some(best.rtt),
+            })
         }
     }
 }

@@ -41,7 +41,7 @@ jobs:
       - name: Run engine tests
         working-directory: aether
         # --release avoids debug CRT mismatch with BoringSSL on VS 18 2026 runners.
-        run: cargo test --release
+        run: cargo test --release --features test-hooks
         env:
           CMAKE_GENERATOR: Ninja
       - name: Run desktop backend tests

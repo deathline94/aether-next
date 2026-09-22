@@ -286,11 +286,16 @@ fn open(path: &str, raw: &[u8], k: &[u8; 32]) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
+/// Test-only seam: forces `restrict_windows_acl` to fail so the fail-closed path
+/// is exercised. Behind the `test-hooks` feature so no shipped binary contains a
+/// switch that skips the private-file ACL.
+#[cfg(any(test, feature = "test-hooks"))]
 pub static ACL_FAIL_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
 fn restrict_windows_acl(path: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-hooks"))]
     if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(AetherError::Other("forced ACL failure for test".into()));
     }

@@ -71,9 +71,18 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Threading",
 ] }
 
+[features]
+# Compiles the ACL-injection hook `config::ACL_FAIL_FOR_TEST` so the
+# fail-closed test can force an `icacls` failure. Off by default, so no shipped
+# binary carries a switch that skips the private-file ACL.
+test-hooks = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+# Load-bearing, not a preference: the netstack's `catch_unwind` containment
+# around per-socket handling (R11) relies on a panic unwinding into that guard.
+# `panic = "abort"` turns a single bad datagram into a whole-engine exit.
 panic = "unwind"
 strip = true

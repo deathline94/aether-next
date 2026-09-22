@@ -167,7 +167,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-hooks"))]
 #[test]
 fn test_write_private_file_fails_closed_on_acl_failure() {
     let _guard = TEST_MUTEX.lock();
