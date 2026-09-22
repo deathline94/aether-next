@@ -32,9 +32,18 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode|screenLayout|smallestScreenSize"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Aether">
+            <!-- singleTask: the persistent notification and the boot notification
+                 both launch this activity with a plain "open the app" intent, and
+                 with the default `standard` mode a tap while the app is already
+                 running stacks a second MainActivity - a second WebView, a second
+                 emitter registered against the same SessionController, and two
+                 surfaces showing the same tunnel. Nothing here reads its launching
+                 intent, so reusing the existing instance loses nothing and no
+                 onNewIntent forwarding is required. -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

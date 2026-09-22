@@ -840,6 +840,30 @@ Checked each part against the current tree rather than assuming the task text wa
 - [ ] T211 [US7] Convert the bridge to async in `apps/android/.../AetherBridge.kt` + `apps/android/src/bridge.ts`: `invoke(cmd, argsJson, requestId)` returns immediately, work dispatches onto `SessionController.scope`, results resolve via `evaluateJavascript("__aetherResolve(<id>,<json>)")`, JS holds a `Map<id, resolver>` with a 30 s timeout (fixes T204). Rejected: Capacitor's plugin runtime (a whole runtime + config for one bridge) and `WebMessageListener` (needs a JS port handshake, unusable before page load).
 - [ ] T212 [US7] Adopt coroutines as the module's single concurrency model in `apps/android/.../{SessionController,AetherVpnService,EngineRunner}.kt`: `SupervisorJob() + Dispatchers.IO`; make `disconnect()`/`testConnection` `suspend`; delete `Thread.sleep` poll loops. `kotlinx-coroutines-android` is already declared and unused — this is the decision that consumes it rather than dropping it.
 - [ ] T213 [US7] Fix the activity lifecycle in `apps/android/.../{MainActivity,SessionController.kt}`: `@Volatile` emitter plus a `CopyOnWriteArrayList` listener registry added in `onStart`/removed in `onStop`, `launchMode="singleTask"` in `AndroidManifest.xml`, `registerForActivityResult` for consent, `pendingConnectAfterVpn` made `@Volatile` and reset inside the posted block, and `onRevoke` only setting flags + posting to the scope (AOSP documents that `onRevoke` "may not happen on the main thread" and requires closing the fd; note `stopProtected()` does **not** exist in AOSP and must not be planned around) (fixes T205).
+  <!-- Checked item by item, 2026-09-22. Four of the five are satisfied, two of
+       them by a different mechanism than this text names. The registry is not a
+       `CopyOnWriteArrayList` attached in `onStart`: `SessionController` keeps an
+       owner-keyed map behind `emitterLock` with a `@Volatile` default emitter,
+       `attachUi(this)` in `onCreate` **and** re-attached in `onResume`, and
+       `detachUi(this)` in `onDestroy` - detaching at `onStop` would unregister a
+       WebView that is still alive and drop engine events while a dialog is on
+       screen, so the resume-reattach shape is the one that holds. `launchMode`
+       was genuinely missing and is now `singleTask`: the notification tap and
+       the boot notification both launch this activity with a plain "open the
+       app" intent, and `standard` stacked a second MainActivity with a second
+       WebView and a second emitter on the same controller; `MainActivity` reads
+       no intent data, so reusing the instance loses nothing and needs no
+       `onNewIntent`. `pendingConnectAfterVpn` is not `@Volatile` on purpose -
+       `requestVpnPermission()` posts its whole body to the UI thread, so the
+       flag has exactly one owner thread, which is the fix the field comment
+       records; a volatile read of a flag that only ever needs one writer would
+       have hid that. What is left here is the Activity Result conversion:
+       `startActivityForResult(REQ_VPN)` still works and its lifecycle-ordering
+       defect is gone, so this is a deprecated-API migration whose only real
+       test is a device showing the consent sheet, which is not this machine.
+       `:app:processDebugMainManifest` merges the new attribute and
+       `:app:testDebugUnitTest` is 102/102. -->
+
 - [x] T214 [US7] Move teardown off the main thread and replace the fixed `Thread.sleep(150)` in `AetherVpnService.kt:291-333` with a bounded join or eventfd ack, so `onRevoke` from Quick Settings cannot ANR behind a lock held across `establish()`'s netd binder call.
 - [x] T215 [US7] Make cross-thread state actually volatile in `AetherVpnService.kt:36-39,65,73` and `SessionController.kt:33`: `tun`, `stopRequested`, `hevStarted`, `settings`, `emit`; read them **inside** `lifecycleLock`; have `getState()` return a snapshot copy (today `toJson()` can serialise `status="connected"` with a previous session's `pid`).
 - [x] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
