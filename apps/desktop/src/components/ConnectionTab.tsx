@@ -7,13 +7,21 @@ import {
 import { useEffect, useRef, useState } from "react";
 import type { RuntimeState, Settings } from "../types";
 import { noiseIsInert } from "../../../../packages/ui/src";
+import { SPEED_PROFILES, speedProfileHint } from "../../../../packages/ui/src/enums";
 
-const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = [
-  { id: "masque-h3", label: "MASQUE H3", hint: "MASQUE h3 · noise off · balanced scan · system proxy", patch: { protocol: "masque", transport: "h3", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "system-proxy" } },
-  { id: "masque-h2", label: "MASQUE H2 (Default)", hint: "MASQUE h2 · noise off · balanced scan · system proxy", patch: { protocol: "masque", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "system-proxy" } },
-  { id: "wireguard", label: "WireGuard", hint: "WireGuard · noise off · balanced scan · system proxy", patch: { protocol: "wireguard", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "system-proxy" } },
-  { id: "gool", label: "Gool", hint: "Gool (WARP-in-WARP) · noise off · balanced scan · system proxy", patch: { protocol: "gool", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "system-proxy" } },
-];
+const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({
+  id: profile.id,
+  label: profile.label,
+  hint: speedProfileHint(profile, "system proxy"),
+  patch: {
+    protocol: profile.protocol,
+    transport: profile.transport,
+    noize: "off",
+    scanMode: "balanced",
+    ipVersion: "v4",
+    routingMode: "system-proxy",
+  },
+}));
 
 function profileActive(settings: Settings, patch: Partial<Settings>) {
   return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);

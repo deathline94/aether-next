@@ -1413,7 +1413,10 @@ const GATES = [
       const BASELINE = new Map([
         ['App.tsx', 66],
         ['components/ActivityTab.tsx', 88],
-        ['components/ConnectionTab.tsx', 71],
+        // 71 before the speed-preset table moved to `packages/ui`: the ratio fell
+        // *because* the duplication did. A floor may drop only for that reason,
+        // and the reviewer has to say so here rather than edit the number quietly.
+        ['components/ConnectionTab.tsx', 69],
         ['components/ErrorBoundary.tsx', 100],
         ['components/ScannerTab.tsx', 80],
         ['components/SettingsTab.tsx', 72],

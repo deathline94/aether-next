@@ -838,6 +838,28 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
 - [x] T197 [US6] Fix Android visual parity in `apps/android/android/app/src/main/res/values/`: add `values-night/themes.xml` (today `Theme.MaterialComponents.DayNight` with a hardcoded `#0D1113` bar paints dark icons on dark in light mode), align `colorPrimary #66E3A4` with `--emerald #00f08a`, and unify the three near-black chrome colours (`#07090b` / `#0D1113` / `#101517`).
 - [ ] T198 [US6] Migrate both UIs onto `packages/ui` for tokens, types and components, converting behavioural differences into props (watchdog enable, hydration merge, scan wording, and `speedProfiles` hint copy which lives inline in `ConnectionTab.tsx` on desktop but in `types.ts` on Android).
+  <!-- Progress measured, not claimed (`5a26ef7`, `7c451bf`, this round).
+       Moved: the whole console fact-extraction layer (`packages/ui/src/logs.ts`
+       - the hit arbiter, the milestone/error predicates and the eviction-aware
+       incremental store), so the two `useLogs` hooks are now byte-identical
+       (29% -> 100% shared code) and the phone no longer counts hits by grepping
+       prose for seven magic words; the connect watchdog's key comparison and the
+       error boundary's recovery decision (`resetKeysChanged`); `LogLevel`, which
+       both apps used to spell inline; and the speed-preset table, which is one
+       list in `packages/ui/src/enums.ts` with `routingMode` as the input - the
+       desktop patches `system-proxy`, the phone `tun` plus a cleared peer, and
+       the hint wording ("balanced scan" vs "balanced") that had already drifted
+       is now derived. The boundary itself is identical in both apps and each tab
+       is guarded on the phone as it was on the desktop (`7c451bf`).
+       Still open, and it is one blocker not many: `react` resolves only inside
+       each app's `node_modules`, so a `.tsx` file placed in `packages/ui` fails
+       to typecheck in both apps (TS2607/TS2786, observed when moving
+       `components/ui.tsx`, which is 100% duplicated code today). Hoisting the
+       dependency to the workspace root plus `resolve.dedupe` in both Vite
+       configs would clear it; that is a dependency-layout change to verify on a
+       running build, not a blind one. Until then `frontend-fork-parity` keeps
+       the remaining thirteen pairs from drifting further. -->
+
 - [x] T199 [US6] Reconcile the Android fork's known divergences while porting: `apps/android/src/hooks/useScanner.ts` sets `phase: "Verified"` unconditionally so an empty scan reads "Verified" (desktop's `hasHits` fix was never back-ported); the `.catch()` on `listen` was dropped; `startScan` calls `clearLogs?.()` but omits `clearLogs` from the deps array (stale closure); `defaults.routingMode` differs (`tun` vs `system-proxy` — intended, keep as a prop).
 - [x] T200 [US6] Remove the `/vite.svg` favicon reference from `apps/desktop/index.html` and `apps/android/index.html` (an absolute path the Android asset host blocks, 403-spamming the WebView log via `MainActivity.kt:104`) and add a real `assets/www/` icon.
 - [ ] T201 [US6] **Checkpoint**: T165–T171 green; run quickstart §6 including measured screenshots at 100/125/150 % and the 2 000-row frame-time assertion.
@@ -897,6 +919,19 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T215 [US7] Make cross-thread state actually volatile in `AetherVpnService.kt:36-39,65,73` and `SessionController.kt:33`: `tun`, `stopRequested`, `hevStarted`, `settings`, `emit`; read them **inside** `lifecycleLock`; have `getState()` return a snapshot copy (today `toJson()` can serialise `status="connected"` with a previous session's `pid`).
 - [x] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
 - [ ] T217 [US7] Add supervision policy in `apps/android/.../{EngineService,AetherVpnService}.kt`: `START_STICKY` + `onTaskRemoved { stopSelf() }`, a partial wake lock only while `status == connected`, a `WorkManager` periodic keep-alive, and `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` offered with an eligibility explanation. Both services are currently `START_NOT_STICKY` with no retry, so a LowMemoryKiller kill ends everything silently and doze can stall QUIC timers.
+  <!-- The "silently" half is closed (`bc2682e`) and the task's `START_STICKY`
+       half is argued against rather than implemented: `EngineService` only keeps
+       the process of a live session alive, and the tunnel, the engine child and
+       the notification all die with that process - so a restarted keeper
+       re-posts "Aether is protecting you" over nothing, which is a worse failure
+       than the honest one. `SessionLedger` now records that a session was up and
+       the first `attachUi` of the next process turns it into one error line plus
+       an `error` state, and 4 Kotlin tests cover it (removing the call turns one
+       red). What remains genuinely needs a device, not an editor: a partial wake
+       lock scoped to `connected`, a WorkManager keep-alive, and the battery
+       optimisation prompt are each a battery/Play-policy trade that cannot be
+       measured here, and reconnecting a VPN unattended is a product decision. -->
+
 - [x] T218 [US7] Fix the boot path in `apps/android/.../BootReceiver.kt`: check `areNotificationsEnabled()` and fall back to a persistent in-app "tap to start" state (today a denied `POST_NOTIFICATIONS` silently drops `notify()` and the `catch` hides the rest, making "Launch at login" a no-op); delete the pre-Q `startActivity` branch that is dead at minSdk 26 on API 29+ devices.
 - [x] T219 [US7] Harden the WebView in `apps/android/.../MainActivity.kt`: HTML-escape `error.description`/`request.url` in `showLoadError` (`:170-185`), gate `invoke()` on the caller origin / `webView.url` host, and `removeJavascriptInterface` before loading any error page — that page still has the bridge attached today. Install `Thread.setDefaultUncaughtExceptionHandler` once from an `Application.onCreate` with an idempotency flag instead of re-chaining it every `onCreate` (`:32-47`).
 - [x] T220 [US7] Bump `compileSdk`/`targetSdk` to 36 with AGP ≥ 8.7 in `apps/android/android/build.gradle.kts` and `apps/android/android/app/build.gradle.kts` — Play requires API 36 for new apps and updates from 2026-08-31 (extendable 2026-11-01), so an API 34 APK is not updatable.

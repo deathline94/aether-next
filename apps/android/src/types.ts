@@ -1,6 +1,7 @@
 import { parseRuntimeCore } from "../../../packages/ui/src";
 import type { RuntimeStatus } from "../../../packages/ui/src";
 import type { LogLevel } from "../../../packages/ui/src/enums";
+import { SPEED_PROFILES, speedProfileHint } from "../../../packages/ui/src/enums";
 
 export type View = "home" | "scanner" | "settings" | "logs";
 /** The four statuses the shell has copy, colours and a beacon for — one list, in `packages/ui`. */
@@ -210,12 +211,24 @@ export function effectiveScanTimeout(protocol: string, timeoutMs: number): numbe
 }
 
 /** One-click speed presets, shared by Connection tab. */
-export const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = [
-  { id: "masque-h3", label: "MASQUE H3", hint: "MASQUE h3 · noise off · balanced · full VPN", patch: { protocol: "masque", transport: "h3", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "tun", peer: "" } },
-  { id: "masque-h2", label: "MASQUE H2 (Default)", hint: "MASQUE h2 · noise off · balanced · full VPN", patch: { protocol: "masque", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "tun", peer: "" } },
-  { id: "wireguard", label: "WireGuard", hint: "WireGuard · noise off · balanced · full VPN", patch: { protocol: "wireguard", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "tun", peer: "" } },
-  { id: "gool", label: "Gool", hint: "Gool (WARP-in-WARP) · noise off · balanced · full VPN", patch: { protocol: "gool", transport: "h2", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "tun", peer: "" } },
-];
+export const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({
+  id: profile.id,
+  label: profile.label,
+  hint: speedProfileHint(profile, "full VPN"),
+  // `peer: ""` is the Android half of the difference this table used to encode by
+  // being written twice: a preset that leaves a pinned carrier in place is not
+  // "full device" coverage, so the phone clears it and the desktop, which patches
+  // `system-proxy` and never pins a peer for the profile path, does not.
+  patch: {
+    protocol: profile.protocol,
+    transport: profile.transport,
+    noize: "off",
+    scanMode: "balanced",
+    ipVersion: "v4",
+    routingMode: "tun",
+    peer: "",
+  },
+}));
 
 export function profileActive(settings: Settings, patch: Partial<Settings>): boolean {
   return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);

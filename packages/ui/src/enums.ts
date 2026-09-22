@@ -116,3 +116,60 @@ export function oneOf<T extends string>(
  */
 export const LOG_LEVELS = ["info", "warn", "error"] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
+
+/**
+ * The four one-tap speed presets, as far as they are the same on both surfaces.
+ *
+ * Each app used to keep its own copy of this table, and they had already begun to
+ * disagree: the same four ids in the same order, but "balanced scan" against
+ * "balanced" in the hint, and `transport` written out per row where a missing key
+ * would silently leave the previous profile's transport in place. What genuinely
+ * differs is where the traffic leaves the device - the desktop patches
+ * `routingMode: "system-proxy"`, the phone `"tun"` with no pinned peer - so that
+ * is the one input, and the ids, labels and protocol/transport pairing are shared.
+ */
+export const SPEED_PROFILES = [
+  {
+    id: "masque-h3",
+    label: "MASQUE H3",
+    hintSubject: "MASQUE H3",
+    protocol: "masque",
+    transport: "h3",
+  },
+  {
+    id: "masque-h2",
+    label: "MASQUE H2 (Default)",
+    hintSubject: "MASQUE H2",
+    protocol: "masque",
+    transport: "h2",
+  },
+  {
+    id: "wireguard",
+    label: "WireGuard",
+    hintSubject: "WireGuard",
+    protocol: "wireguard",
+    transport: "h2",
+  },
+  {
+    id: "gool",
+    label: "Gool",
+    hintSubject: "Gool (WARP-in-WARP)",
+    protocol: "gool",
+    transport: "h2",
+  },
+] as const;
+
+export type SpeedProfile = (typeof SPEED_PROFILES)[number];
+
+/** The row's own words for the hint: `MASQUE H3`, `Gool (WARP-in-WARP)`. */
+export function speedProfileName(profile: SpeedProfile): string {
+  return profile.hintSubject;
+}
+
+/**
+ * The line under the preset's name: what it sets, in the order the settings
+ * screen shows them, ending in where the traffic goes.
+ */
+export function speedProfileHint(profile: SpeedProfile, routingLabel: string): string {
+  return `${speedProfileName(profile)} · noise off · balanced scan · ${routingLabel}`;
+}
