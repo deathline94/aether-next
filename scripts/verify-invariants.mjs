@@ -671,6 +671,67 @@ const GATES = [
     },
   },
   {
+    name: 'css-no-dead-duplicates',
+    invariant: 'BC-11',
+    summary: 'no declaration repeated with the same value inside one rule',
+    scan(api) {
+      // A second identical declaration is not a fallback (that would be a
+      // different value) and not a cascade (same block): it is one of the two
+      // lines doing nothing, and it survives every review because it is
+      // invisible. Both sheets carried `overflow-wrap: anywhere` twice, in the
+      // same rule, in parallel copies of each other.
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const text = api.read(f);
+        // Strip comments' bodies but keep their newlines: replacing a block comment
+        // with nothing shifts every later line number, and a violation that names
+        // the wrong line is worse than no check at all.
+        const code = text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
+        let depth = 0;
+        let props = new Map();
+        let buffer = '';
+        const line = (idx) => code.slice(0, idx).split('\n').length;
+        const flushDeclaration = (decl, at) => {
+          const m = decl.match(/^([a-z-]+)\s*:\s*(.+)$/i);
+          if (!m) return;
+          const key = `${m[1].toLowerCase()}:${m[2].trim().replace(/\s+/g, ' ').toLowerCase()}`;
+          const seen = props.get(key);
+          if (seen !== undefined) {
+            v.push(
+              `${rel(f)}:${line(at)} \`${m[1]}: ${m[2].trim()}\` is declared twice in the same rule (first at line ${seen}); the second one does nothing`,
+            );
+          } else {
+            props.set(key, line(at));
+          }
+        };
+        for (let i = 0; i < code.length; i += 1) {
+          const ch = code[i];
+          if (ch === '{') {
+            depth += 1;
+            props = new Map();
+            buffer = '';
+          } else if (ch === '}') {
+            if (buffer.trim()) flushDeclaration(buffer.trim(), i);
+            depth -= 1;
+            buffer = '';
+          } else if (ch === ';' && depth > 0) {
+            if (buffer.trim()) flushDeclaration(buffer.trim(), i);
+            buffer = '';
+          } else if (ch !== '\n' || buffer.trim()) {
+            buffer += ch;
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: '.a {\n  color: red;\n  color: red;\n}\n',
+      };
+    },
+  },
+  {
     name: 'npm-lock-is-the-one-npm-reads',
     invariant: 'BC-18',
     summary: 'a workspaces root owns the lockfile; no committed lock sits where npm cannot see it',
