@@ -748,7 +748,26 @@ Checked each part against the current tree rather than assuming the task text wa
   viewport + ResizeObserver stub (`src/testing/viewport.ts`) because a windowed
   list mounts nothing when layout is absent, and until then the axe "with results"
   case had been silently checking an empty panel.
-- [ ] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.
+- [x] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.
+  <!-- Closed, and the stale "attempted and reverted" note below is now false.
+       All four halves are in the tree: `ErrorBoundary` is per tab with
+       `label`/`resetKeys`/`onRetry` (`apps/desktop/src/App.tsx:228,242,258`),
+       `noUncheckedIndexedAccess` is on in *both* apps' tsconfigs, and the
+       `session://state` payload is validated at the listener
+       (`parseRuntimeState`/`parseRuntimeCore` in `packages/ui`) instead of at
+       each read site - so `heroCopy[runtime.status]` needs no `?? disconnected`
+       fallback, because an unknown status can no longer reach state at all.
+       That is a different mechanism than this task names and a better one: one
+       choke point rather than one per consumer, with the rejection logged and
+       de-duplicated. The harness problem the note describes was solved the way
+       the note itself prescribed: the per-tab props are asserted without needing
+       a thrown child (`App.test.tsx` "wraps each tab in its own named boundary
+       with reset keys", "gives the Settings boundary a retry"), and the payload
+       guard is tested as the pure function it is
+       (`useRuntime.test.ts`, `useRuntime.stateGuard.test.ts`). What remains
+       genuinely unobserved here is the *fallback rendering* itself, which needs
+       a real browser (see the memory note on jsdom's error-boundary blindness).
+     -->
   **Attempted and reverted, like T178.** `ErrorBoundary` gained `resetKeys`/`onRetry`/`label` and the
   per-tab wiring was ready to go, but three tests for it could not be made to observe the boundary at
   all: under React 19 + @testing-library with jsdom, a child that throws during render is rethrown
@@ -767,7 +786,25 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
 - [ ] T192 [US6] Complete the CSS integrity pass in `apps/desktop/src/App.css` + `packages/ui/tokens.css`: add the missing rendered classes (`.metric-icon` + `.blue/.coral/.green/.yellow`, `.btn-secondary`, `.retry-btn`, `.status-text`, `.tactile-badge`); delete ~9 orphaned pre-rewrite selectors (`.activity-view`, `.log-line`, `.metrics-grid`, `.status-chip`, `.power-button`, `.save-bar`, …); delete the duplicate `.tactile-copy-btn` block at `:2277` whose equal-specificity position silently kills the emerald hover on all five copy buttons; collapse 8 panel definitions into one `.panel` + modifiers and un-double-class the 6 elements carrying two conflicting panel classes; replace 17 `transition: all`; raise `--muted-dark` `#47535e` (2.40–2.60:1) to ≥4.5:1 and floor labels at 11 px (`.stat-label` is 8.5 px today); unify 6 disabled opacities / 12 radii / 15 border alphas; add `scrollbar-gutter: stable`; make `.sparkline-bar` animate `transform: scaleY()`.
 - [ ] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
-- [ ] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
+- [x] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
+  <!-- Closed 2026-09-22 (`8eaec25`, `72a0886`), with one deliberate deviation.
+       The collapse moved to `@media (max-width: 980px)` rather than either
+       number this task names: `(max-width: 899px)` with `minWidth: 900` is
+       unreachable CSS - which is exactly what `css-breakpoint-reachable` now
+       fails on, having been widened from `<` to `<=` because U-F2 forbids the
+       *coincidence* and the old comparison passed it - and raising the app's
+       own window minimum to 901 to satisfy a media query puts the cart under
+       the horse. 980 keeps the rail layout reachable and above the minimum.
+       Checked rather than changed: the phone's 681-900 rail band still hides
+       `.sidebar-bottom`/`.version-bar`, which is not lost information - the
+       topbar carries `.header-status` with the state word in that band and
+       `v{appVersion}` renders in the About panel
+       (`apps/android/src/components/ConnectionTab.tsx:507`), and the desktop's
+       `:594` does the same. `maximum-scale` is gone from both `index.html`; no
+       `100vh` survives (gate); the ≤680 endpoint row stacks with full-width
+       children, so the 36 px notch is gone; the dock now says it scrolls with a
+       trailing fade. -->
+
 - [ ] T195 [US6] Fix control semantics in `apps/desktop/src/components/{ui.tsx,ScannerTab.tsx,SettingsTab.tsx,App.tsx}`: filter chips become an APG radio group (`role="radiogroup"`/`radio`, `aria-checked`, roving `tabIndex`, arrow-key cycling) instead of a `role="tablist"` misuse with no `aria-controls`; `role="tablist"` is reserved for the real tab strip with `aria-controls`/`aria-selected`/`role="tabpanel"`; remove `tabIndex={-1}` from the −/+ steppers (mouse-only today); stop a wrapped `<label>` + `aria-label` giving one control two accessible names; ignore `ctrlKey/metaKey/altKey` in `App.tsx:40-52`; add `tabIndex={0}` + `aria-label` to `.tactical-terminal-screen` and `.discovered-list` (keyboard users cannot scroll them today); add `aria-live="polite"`/`role="status"` on the hero and save dock and transfer focus on tab switch; define `:active` press feedback (only 3 of ~20 controls have it); stop printing the raw `DISCONNECTED` enum beside a "Standby" beacon; make state never colour-only (the 7 px dot at 1.96:1 is currently the sole signal) and exclude `.profile-card.active` from the disabled dim so the ACTIVE profile stays identifiable while connected.
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
 - [x] T197 [US6] Fix Android visual parity in `apps/android/android/app/src/main/res/values/`: add `values-night/themes.xml` (today `Theme.MaterialComponents.DayNight` with a hardcoded `#0D1113` bar paints dark icons on dark in light mode), align `colorPrimary #66E3A4` with `--emerald #00f08a`, and unify the three near-black chrome colours (`#07090b` / `#0D1113` / `#101517`).
@@ -1101,6 +1138,36 @@ one - #66E3A4 is the brand mint the identity master names), and T185 with it
 (`8f9dc7b`, `08407d4`: the endpoint list windowed on both surfaces and the bound
 asserted, which also made the axe "with results" case mean something).
 
+**Third round (2026-09-22, `0f422ae`..`72a0886`) - US6's measurement gap.** The
+findings this round closed were all of one shape: a requirement stated as a
+number, with nothing in the tree able to produce that number. The contrast gates
+now compute WCAG ratios from the CSS the browser would paint (compositing
+translucent layers over every surface they can inherit, and every stop of a
+gradient), so `wcag-pair-contrast` found two real AA failures that the token
+comments had certified as passing - `.nav-shortcut`'s 11px key letter at 4.33:1
+and an empty-state glyph at 1.59:1 in a Tailwind slate that is in no Aether
+palette - and `wcag-state-edges` found nine control boundaries resting on the
+1.71:1 decorative hairline plus `--coral/yellow/blue-border` compositing to
+1.59-2.19:1 where 1.4.11 asks 3:1 (the alphas are now the solved minima).
+`colour-single-source` exists because U-B5's "tokens are the sole colour
+source" was false in 408 places, including 20 still painting the blue the
+palette had retired; every chromatic literal is now defined once in
+`packages/ui/tokens.css` (values carried over unchanged; only the four
+off-palette ones re-pointed), with `token-alpha-triples` keeping each alpha on
+its hue. `declarations-live-in-a-block` was written after the migration script
+put its 105 new tokens *between* two rules - invalid CSS that every text
+scanner in this file read as defined, with 19 of 22 gates green on a build
+whose colours resolved to nothing; the renderer afterwards confirmed 144 tokens
+resolve and 314 painted elements carry no pair under 1.4.3. `touch-target-minimum`
+measures 42 pointer-target classes per app (from the JSX, so a switch knob is
+not mistaken for the switch) against 24px/44px, and FR-033's "never colour
+alone" is now asserted in both apps through the real `session://state`
+listener. T194's breakpoint collision closed too: the collapse moved to 980px
+above `minWidth: 900`, and the gate now fails on `<=` because the old `<`
+comparison passed the exact case the contract names. Gate count 19 → 26, all
+with injections that `--selftest-fail` proves detect their defect; 96 + 38
+frontend tests, both `tsc -b`, both `vite build`.
+
 **Still open, and why - none of these is a code edit that can be verified here:**
 - T039 (netioapi FFI instead of `route.exe`/`netsh`/PowerShell): ~13 shell-outs
   remain, 10 of them writes. A rewrite that cannot be compiled here, cannot be
@@ -1137,8 +1204,10 @@ asserted, which also made the axe "with results" case mean something).
   pass, not a blind one.
 - T243's remainder and T224's okhttp 4.x→5.x, T248 (relative `config_path`
   default), T246 (`client_id` as a per-tunnel random tag - a product decision
-  about identity correlation, not a bug), T193/T194's clipped ping ring and the
-  900 px window-breakpoint collision, T192's panel de-duplication and the six
+  about identity correlation, not a bug), T193's clipped ping ring and the
+  `.profiles-panel` glow clip (both are a ring's rendered diameter against a
+  padded box, which is a renderer measurement, not a grep; T194's own half of
+  that line - the 900 px collision - is closed), T192's panel de-duplication and the six
   elements still carrying two panel classes (its `scrollbar-gutter` half landed
   in `be06ca8`), T188's `font-synthesis` re-tune, which needs eyes on a
   renderer, and T195's `<label>`-wraps-a-compound-control (fixing it means
