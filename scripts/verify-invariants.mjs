@@ -436,6 +436,41 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'no-cross-token-elevation-spawn',
+    invariant: 'BC-05',
+    summary: 'no child is spawned across a token boundary, which the kill-on-close job cannot control',
+    scan(api) {
+      const banned = [
+        [/-Verb\s+RunAs/g, 'Start-Process -Verb RunAs'],
+        [/"runas"|'runas'/g, 'ShellExecute "runas"'],
+        [/CreateProcessWithTokenW|CreateProcessAsUserW/g, 'token-duplicating process creation'],
+        [/\bLogonUser\w*\(/g, 'LogonUser'],
+      ];
+      const v = [];
+      for (const dir of ['apps/desktop/src-tauri/src', 'aether/src']) {
+        for (const f of api.files(dir, /\.(rs|toml|json)$/)) {
+          const t = api.read(f);
+          for (const [re, label] of banned) {
+            let m;
+            while ((m = re.exec(t))) {
+              // The rules that forbid this are documentation, not code.
+              const line = t.slice(0, m.index).split('\n').pop() ?? '';
+              if (/^\s*(\/\/|\/\*|\*)/.test(line)) continue;
+              v.push(`${locate(f, t, m.index)} ${label}: a process created across a token boundary cannot be assigned to the caller's job object, so kill-on-close stops working (see aether/src/trust.rs)`);
+            }
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/__selftest__.rs',
+        content: 'fn escalate() {\n    let args = ["-Verb", "RunAs"];\n    ShellExecuteW(0, "runas", p, 0, 0, 0);\n    CreateProcessWithTokenW(t, 0, 0, 0, 0, 0, 0, 0, 0, 0);\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

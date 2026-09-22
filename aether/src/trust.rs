@@ -11,6 +11,28 @@
 //! * [`AnchorSet`] is loaded from a committed, human-reviewed file rather than
 //!   being computed at build time from the artifact being shipped, so the pin
 //!   is an independent witness instead of a tautology.
+//!
+//! ## Why no process here is ever launched across a token boundary
+//!
+//! TUN needs administrator rights, and there are two ways to get them: elevate the
+//! app, or leave the app unelevated and spawn the worker with `Start-Process -Verb
+//! RunAs` / `ShellExecuteW("runas")`. This project uses the first and forbids the
+//! second, and the reason is a Windows semantics fact rather than a UX preference.
+//!
+//! The shell puts the engine in a kill-on-close **job object** so the tunnel can
+//! never outlive the UI. `AssignProcessToJobObject` cannot put a process into its
+//! caller's job *across a token boundary*: the elevated child is created by the
+//! kernel in the administrator's session and the assignment fails. The result is
+//! the worst combination available — an engine holding routes, the system proxy and
+//! a Wintun adapter, running with a token that nothing in this app can terminate.
+//! Kill-on-close becomes kill-on-what-the-user-remembers, and a crashed UI leaves a
+//! black-holed machine behind.
+//!
+//! So: elevation is requested up front (`AppInfo::application_manifest` /
+//! "Run as administrator"), never per-child. `elevation::is_elevated()` gates TUN
+//! and refuses rather than escalating mid-session, and gate 13 in
+//! `scripts/verify-invariants.mjs` fails CI if a `-Verb RunAs`, `ShellExecute`,
+//! `CreateProcessWithTokenW` or `LogonUser` call ever appears in either binary.
 
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
