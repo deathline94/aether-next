@@ -108,7 +108,11 @@
 
 - [ ] T049 [US1] Mirror the proxy journal to `HKCU\Software\AetherNext\ProxyJournal` and implement the startup orphan sweep in `apps/desktop/src-tauri/src/lib.rs` (INV-6), so AV deleting the file cannot hide an enabled proxy.
 - [ ] T050 [US1] Add the 30 s proxy coherence check while connected in `apps/desktop/src-tauri/src/lib.rs`: re-assert or report if a third party changed the setting.
-- [ ] T051 [US1] Make `disconnect()` in `apps/desktop/src-tauri/src/lib.rs` report partial failure (`disconnect_incomplete`) instead of unconditionally setting `disconnected/Ready`; final state comes from the teardown path that actually ran.
+- [x] T051 [US1] Make `disconnect()` in `apps/desktop/src-tauri/src/lib.rs` report partial failure (`disconnect_incomplete`) instead of unconditionally setting `disconnected/Ready`; final state comes from the teardown path that actually ran.
+  Done. `cleanup_routing` returns what it could not undo instead of printing it, so a failed system-proxy restore can no longer be reported as `disconnected / Ready` while Windows is still pointed at a dead port; `disconnect` returns `disconnect_incomplete` with the joined reasons, and `watch_child` appends them to the status line rather than swallowing them. Both UIs gained `safeDisconnect`, because the remedy the message recommends (reconnect) must not be blocked by the error that recommends it.
+- [ ] T051b [US2] `CommandError` serialises as `self.message` alone, so the machine-readable `code` — `disconnect_incomplete`, `anchor_not_published`, `key_service_unavailable`, the field name for a validation failure — never reaches either UI. Contract C-IPC-2 asks for `{code, message, field}`; until that lands, every frontend branch that would distinguish an error has to match on prose. Serialise the struct, update both bridges and the parity gate,
+  and keep the string form for anything that still renders an error as text.
+
 - [ ] T052 [US1] **Checkpoint**: T031–T036 green; then re-run each with its new guard deleted and confirm all go red again (quickstart step 3). Record both in the PR — a guard nobody has killed is not a guard.
 
 **Checkpoint**: At this point US1 is fully functional and independently testable: the app can no longer leave the host's network misconfigured by any termination path.

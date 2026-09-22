@@ -1555,7 +1555,14 @@ fn stream_output<R: std::io::Read + Send + 'static>(
     });
 }
 
-fn cleanup_routing(app: &AppHandle, state: &AppState) {
+/// Tear the host back down, and report what could not be undone.
+///
+/// The `()` return meant a failed system-proxy restore was an `eprintln!` and
+/// nothing more: the UI went to "disconnected / Ready" while the machine was still
+/// configured to use a port with nothing listening on it. That state is invisible
+/// to the user until the browser stops working.
+fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> {
+    let mut problems = Vec::new();
     #[cfg(windows)]
     if state.proxy_enabled.swap(false, Ordering::SeqCst) {
         let mut snapshot = state.proxy_snapshot.lock();
@@ -1563,7 +1570,10 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) {
             if let Err(error) = windows_proxy::restore(saved.clone()) {
                 *snapshot = Some(saved);
                 state.proxy_enabled.store(true, Ordering::SeqCst);
-                eprintln!("system proxy restore failed: {error}");
+                problems.push(format!(
+                    "system proxy restore failed ({error}); Windows is still routing through the \
+                     tunnel's port - reconnect once or run Aether with --repair-proxy"
+                ));
             } else if let Ok(path) = proxy_recovery_path(app) {
                 let _ = fs::remove_file(path);
             }
@@ -1575,6 +1585,7 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) {
     {
         state.job.lock().take();
     }
+    problems
 }
 
 fn watch_child(app: AppHandle) {
@@ -1593,7 +1604,7 @@ fn watch_child(app: AppHandle) {
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 let ever_connected = state.connected_once.load(Ordering::SeqCst);
-                cleanup_routing(&app, &state);
+                let problems = cleanup_routing(&app, &state);
                 let already_error = state
                     .runtime
                     .lock()
@@ -1601,6 +1612,9 @@ fn watch_child(app: AppHandle) {
                     .eq_ignore_ascii_case("error");
                 if already_error {
                     // Structured error event already set UI; keep it.
+                    for problem in &problems {
+                        eprintln!("[aether] {problem}");
+                    }
                     continue;
                 }
                 let (ui_status, detail) = if status.success() {
@@ -1614,6 +1628,16 @@ fn watch_child(app: AppHandle) {
                 } else {
                     ("disconnected", format!("Engine exited ({status})"))
                 };
+                // What the teardown could not undo belongs in the status line, not
+                // only in a log nobody opens.
+                let detail = if problems.is_empty() {
+                    detail
+                } else {
+                    for problem in &problems {
+                        eprintln!("[aether] {problem}");
+                    }
+                    format!("{detail} · {}", problems.join(" · "))
+                };
                 emit_state(&app, &state, ui_status, &detail, None, None);
             }
             Ok(None) => {}
@@ -1623,7 +1647,9 @@ fn watch_child(app: AppHandle) {
                 state.connecting.store(false, Ordering::SeqCst);
                 state.generation.fetch_add(1, Ordering::SeqCst);
                 let ever_connected = state.connected_once.load(Ordering::SeqCst);
-                cleanup_routing(&app, &state);
+                for problem in cleanup_routing(&app, &state) {
+                    eprintln!("[aether] {problem}");
+                }
                 let already_error = state
                     .runtime
                     .lock()
@@ -1930,6 +1956,7 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandE
     state.generation.fetch_add(1, Ordering::SeqCst);
     state.connecting.store(false, Ordering::SeqCst);
     let mut child = state.child.lock().take();
+    let mut problems: Vec<String> = Vec::new();
     if let Some(child) = child.as_mut() {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(b"shutdown\n");
@@ -1948,7 +1975,12 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandE
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 _ => {
-                    eprintln!("[aether] engine outlived the 15s teardown grace; forcing exit (host state may need repair: run Aether with --repair-proxy, or reconnect once)");
+                    eprintln!("[aether] engine outlived the 15s teardown grace; forcing exit");
+                    problems.push(
+                        "the engine had to be killed after the 15 s teardown grace; the routes it \
+                         journaled may still be installed"
+                            .to_string(),
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
@@ -1956,9 +1988,19 @@ fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandE
             }
         }
     }
-    cleanup_routing(&app, &state);
-    emit_state(&app, &state, "disconnected", "Ready", None, None);
-    Ok(())
+    problems.extend(cleanup_routing(&app, &state));
+
+    if problems.is_empty() {
+        emit_state(&app, &state, "disconnected", "Ready", None, None);
+        return Ok(());
+    }
+    // Partial failure is reported as partial failure. The tunnel *is* down, so the
+    // status says so, but "Ready" would claim the host was put back together when
+    // the teardown path knows it was not.
+    let detail = problems.join(" · ");
+    eprintln!("[aether] disconnect incomplete: {detail}");
+    emit_state(&app, &state, "disconnected", &detail, None, None);
+    Err(CommandError::new("disconnect_incomplete", detail))
 }
 
 #[tauri::command]

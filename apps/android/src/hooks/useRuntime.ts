@@ -113,6 +113,22 @@ export function useRuntime(
     };
   }, [runtime.status, appendLog]);
 
+  /**
+   * Stop the current session without letting a partial teardown block the next
+   * one. `disconnect` reports `disconnect_incomplete` when the engine had to be
+   * killed or the system proxy could not be restored; reconnecting is the remedy
+   * in both cases, so the wording must reach the log without failing the caller
+   * that is trying to reconnect.
+   */
+  const safeDisconnect = useCallback(async () => {
+    try {
+      await invoke("disconnect");
+    } catch (error) {
+      const detail = String(error);
+      appendLog({ level: "error", message: `Disconnect reported a problem: ${detail}` });
+    }
+  }, [appendLog]);
+
   const persistSettings = useCallback((next: Settings) => {
     // Debounced: NumberField commits and toggles arrive in bursts; don't hit
     // storage per event.
@@ -152,7 +168,7 @@ export function useRuntime(
     setTestResult(null);
     try {
       if (running) {
-        await invoke("disconnect");
+        await safeDisconnect();
       } else {
         // Primary "Connect" always does a fresh scan — clear any pinned peer so
         // a previously-dead Connect-Direct endpoint can't block the main flow.
@@ -168,7 +184,7 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs]);
+  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: Settings["protocol"], transport: Settings["transport"]) => {
     if (busy) return;
@@ -180,7 +196,7 @@ export function useRuntime(
         await invoke("stop_scan");
       } catch (_) {}
       if (running) {
-        await invoke("disconnect");
+        await safeDisconnect();
         await new Promise((r) => setTimeout(r, 400));
       }
       // Pin the chosen endpoint so the engine skips scanning and dials it directly.
@@ -195,7 +211,7 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs]);
+  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
 
   const runTest = useCallback(async () => {
     clearLogs?.();

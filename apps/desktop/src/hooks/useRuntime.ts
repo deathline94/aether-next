@@ -115,6 +115,22 @@ export function useRuntime(
       .catch(() => {});
   }, [appVersion]);
 
+  /**
+   * Stop the current session without letting a partial teardown block the next
+   * one. `disconnect` reports `disconnect_incomplete` when the engine had to be
+   * killed or the system proxy could not be restored — the remedy in both cases
+   * is to reconnect, so the message has to be surfaced without failing the
+   * caller that is trying to do exactly that.
+   */
+  const safeDisconnect = useCallback(async () => {
+    try {
+      await invoke("disconnect");
+    } catch (error) {
+      const detail = String(error);
+      appendLog({ level: "error", message: `Disconnect reported a problem: ${detail}` });
+    }
+  }, [appendLog]);
+
   const persistSettings = useCallback((next: Settings) => {
     // Debounced: NumberField commits and toggles can arrive in bursts;
     // don't hit the disk per event.
@@ -162,7 +178,7 @@ export function useRuntime(
     setTestResult(null);
     try {
       if (running) {
-        await invoke("disconnect");
+        await safeDisconnect();
       } else {
         setRuntime({ status: "connecting", detail: "Starting engine", pid: null, endpoint: null });
         await invoke("connect", { settings });
@@ -174,7 +190,7 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs]);
+  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busy) return;
@@ -182,7 +198,7 @@ export function useRuntime(
     setBusy(true);
     try {
       if (running) {
-        await invoke("disconnect");
+        await safeDisconnect();
         await new Promise((r) => setTimeout(r, 400));
       }
       const nextSettings: Settings = { ...settings, protocol: protocol as Settings["protocol"], transport: transport as Settings["transport"], peer };
@@ -198,7 +214,7 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs]);
+  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
 
   const runTest = useCallback(async () => {
     clearLogs?.();
