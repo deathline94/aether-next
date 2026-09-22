@@ -1074,7 +1074,7 @@ mod tests {
             ep("2.2.2.2:443", 1, 9, 0, 20),
             ep("1.1.1.1:443", 10, 0, 0, 20),
         ];
-        let out = sorted(eps);
+        let out = sorted(eps, Measurement::HandshakeProbe);
         assert_eq!(out[0].0.to_string(), "1.1.1.1:443");
     }
 

@@ -112,6 +112,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
+          DEFAULT_BASE: ${{ github.event.inputs.ref }}
         shell: pwsh
         run: |
           $branch = "anchor/$(git rev-parse --short HEAD)-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
@@ -122,7 +123,10 @@ jobs:
           if ((git diff --cached --quiet)) { throw "the anchor did not change - nothing to witness" }
           git commit -m "chore(trust): witness engine bytes from $($env:GITHUB_SHA.Substring(0,7))"
           git push -u origin $branch
-          gh pr create --base $env:DEFAULT_BASE --title "Trust anchor for engine $(git rev-parse --short HEAD)" `
-            --body "Automatically cut by \`.github/workflows/prepare-anchor.yml\` (run \`$env:RUN_ID\`).`n`nMerge this before tagging a release: a tag build refuses to bundle an engine whose bytes are not witnessed by the committed anchor.`n`nA rotation with no diff here is a pipeline bug, not a no-op."
-        env:
-          DEFAULT_BASE: ${{ github.event.inputs.ref }}
+          $body = "Automatically cut by ``.github/workflows/prepare-anchor.yml`` (run $env:RUN_ID)." +
+            "`n`nMerge this before tagging a release: a tag build refuses to bundle an " +
+            "engine whose bytes are not witnessed by the committed anchor." +
+            "`n`nA rotation with no diff here is a pipeline bug, not a no-op."
+          gh pr create --base $env:DEFAULT_BASE `
+            --title "Trust anchor for engine $(git rev-parse --short HEAD)" `
+            --body $body

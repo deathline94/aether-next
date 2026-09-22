@@ -1,5 +1,9 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useState } from "react";
+// Same self-hosted faces as the desktop app (T187): Vite hashes the woff2
+// into the bundled assets, so the WebView never reaches a third party.
+import "@fontsource-variable/geist";
+import "@fontsource-variable/geist-mono";
 import "./App.css";
 import { ActivityTab } from "./components/ActivityTab";
 import { ConnectionTab } from "./components/ConnectionTab";

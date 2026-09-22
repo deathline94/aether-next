@@ -48,6 +48,10 @@ export function useScanner(
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
   const [busy, setBusy] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // The run this window started. Events from any other run are dropped rather
+  // than merged, so a late terminal event from a cancelled scan cannot end the
+  // one that is actually running.
+  const runIdRef = useRef<string>("");
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
 
@@ -57,6 +61,7 @@ export function useScanner(
     listen<ScanEvent>("scan://event", (event) => {
       if (disposed) return;
       const ev = event.payload;
+      if (ev.runId && ev.runId !== runIdRef.current) return;
       switch (ev.type) {
         case "scan_start":
           setScanState({
@@ -149,7 +154,9 @@ export function useScanner(
         await invoke("disconnect");
       }
       const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
-      await invoke("scan", { protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
+      const runId = crypto.randomUUID();
+      runIdRef.current = runId;
+      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));

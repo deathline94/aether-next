@@ -461,28 +461,34 @@ jobs:
           find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) -exec cp -v {} out/ \;
           cd out
           ls -la
-          for f in *; do
+          for f in ./*; do
             [ -f "$f" ] || continue
             sha256sum "$f" | tee "$f.sha256"
           done
-          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          # `./*` rather than `*`: a name beginning with a dash would otherwise be
+          # parsed as an option by sha256sum.
+          sha256sum ./* > SHA256SUMS.txt 2>/dev/null || true
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "tag=${GITHUB_REF_NAME}"
+              echo "title=${GITHUB_REF_NAME}"
+              echo "prerelease=false"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-            echo "title=Latest build" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "tag=latest"
+              echo "title=Latest build"
+              echo "prerelease=true"
+            } >> "$GITHUB_OUTPUT"
           fi
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pack.outputs.tag }}
+          TITLE: ${{ steps.pack.outputs.title }}
+          PRE: ${{ steps.pack.outputs.prerelease }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.pack.outputs.tag }}"
-          TITLE="${{ steps.pack.outputs.title }}"
-          PRE="${{ steps.pack.outputs.prerelease }}"
           NOTES="Windows installer + portable, Android APKs (arm64 / armv7 / x86_64 / universal).
 
           Commit: ${GITHUB_SHA}

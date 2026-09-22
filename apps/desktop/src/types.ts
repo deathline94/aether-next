@@ -159,20 +159,30 @@ export const initialRuntime: RuntimeState = {
  * without saying so (see `scan_terminal_event`), which is why the UI keeps an arm
  * for it.
  */
+/**
+ * Which scan run produced an event. The shell stamps every `scan://event`
+ * with it: a stop/start pair can leave the previous run's terminal event in
+ * flight, and without the id a stale "found nothing" lands on a live scan and
+ * deactivates it.
+ */
+export type ScanRunScope = { runId?: string };
+
 export type ScanEvent =
-  | { type: "scan_start"; mode: string; total: number; concurrency: number }
-  | { type: "scan_progress"; scanned: number; total: number; working: number }
-  | { type: "scan_hit"; addr: string; rtt: string; rttMs: number; protocol: string }
-  | {
-      type: "scan_done";
-      addr: string;
-      rtt: string;
-      protocol: string;
-      /**
-       * Measured RTT of the endpoint the scan settled on. `null`/absent means the
-       * engine measured nothing — a forced peer, for instance — and "not
-       * measured" is rendered as exactly that, never as `()` or as 0 ms.
-       */
-      bestRttMs?: number | null;
-    }
-  | { type: "scan_failed"; message: string };
+  | ({ type: "scan_start"; mode: string; total: number; concurrency: number } & ScanRunScope)
+  | ({ type: "scan_progress"; scanned: number; total: number; working: number } & ScanRunScope)
+  | ({ type: "scan_hit"; addr: string; rtt: string; rttMs: number; protocol: string } & ScanRunScope)
+  | (
+      {
+        type: "scan_done";
+        addr: string;
+        rtt: string;
+        protocol: string;
+        /**
+         * Measured RTT of the endpoint the scan settled on. `null`/absent means
+         * the engine measured nothing — a forced peer, for instance — and "not
+         * measured" is rendered as exactly that, never as `()` or as 0 ms.
+         */
+        bestRttMs?: number | null;
+      } & ScanRunScope
+    )
+  | ({ type: "scan_failed"; message: string } & ScanRunScope);

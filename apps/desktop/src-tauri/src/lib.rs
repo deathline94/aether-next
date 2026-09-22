@@ -2553,6 +2553,7 @@ fn test_connection(settings: Settings) -> Result<String, CommandError> {
 fn scan(
     app: AppHandle,
     state: State<'_, AppState>,
+    run_id: String,
     protocol: String,
     ip_version: IpVersion,
     concurrency: u32,
@@ -2663,10 +2664,22 @@ fn scan(
     let hits = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
     if let Some(o) = stdout {
-        handles.push(pump_scan_stream(app.clone(), Box::new(o), terminal_sent.clone(), hits.clone()));
+        handles.push(pump_scan_stream(
+            app.clone(),
+            run_id.clone(),
+            Box::new(o),
+            terminal_sent.clone(),
+            hits.clone(),
+        ));
     }
     if let Some(e) = stderr {
-        handles.push(pump_scan_stream(app.clone(), Box::new(e), terminal_sent.clone(), hits.clone()));
+        handles.push(pump_scan_stream(
+            app.clone(),
+            run_id.clone(),
+            Box::new(e),
+            terminal_sent.clone(),
+            hits.clone(),
+        ));
     }
     let app_done = app.clone();
     std::thread::spawn(move || {
@@ -2679,7 +2692,7 @@ fn scan(
             terminal_sent.load(Ordering::SeqCst),
             hits.load(Ordering::SeqCst),
         ) {
-            let _ = app_done.emit("scan://event", event);
+            emit_scan_event(&app_done, &run_id, event);
         }
     });
 
@@ -2713,8 +2726,24 @@ pub fn scan_terminal_event(terminal_sent: bool, hits: u64) -> Option<serde_json:
 /// Read one scan output pipe on its own thread, forwarding AETHER_EVENT lines as
 /// `scan://event` and every line to the activity log. Returns a join handle so the
 /// caller can emit the terminal event only after all pipes drain.
+/// Every scan event is stamped with the run that produced it. A stop/start
+/// pair can leave the previous run's terminal event in flight, and without an
+/// id the UI has no way to tell a stale "found nothing" from a live scan's
+/// progress — the one message that decides the outcome.
+fn emit_scan_event(app: &AppHandle, run_id: &str, event: serde_json::Value) {
+    let mut event = event;
+    if let Some(obj) = event.as_object_mut() {
+        obj.insert(
+            "runId".to_string(),
+            serde_json::Value::String(run_id.to_string()),
+        );
+    }
+    let _ = app.emit("scan://event", event);
+}
+
 fn pump_scan_stream(
     app: AppHandle,
+    run_id: String,
     reader: Box<dyn std::io::Read + Send>,
     terminal_sent: Arc<AtomicBool>,
     hits: Arc<AtomicU64>,
@@ -2726,7 +2755,7 @@ fn pump_scan_stream(
                     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     match ty {
                         "scan_start" => {
-                            let _ = app.emit("scan://event", serde_json::json!({
+                            emit_scan_event(&app, &run_id, serde_json::json!({
                                 "type": "scan_start",
                                 "mode": v.get("mode").and_then(|m| m.as_str()).unwrap_or(""),
                                 "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
@@ -2734,7 +2763,7 @@ fn pump_scan_stream(
                             }));
                         }
                         "scan_progress" => {
-                            let _ = app.emit("scan://event", serde_json::json!({
+                            emit_scan_event(&app, &run_id, serde_json::json!({
                                 "type": "scan_progress",
                                 "scanned": v.get("scanned").and_then(|s| s.as_u64()).unwrap_or(0),
                                 "total": v.get("total").and_then(|t| t.as_u64()).unwrap_or(0),
@@ -2743,7 +2772,7 @@ fn pump_scan_stream(
                         }
                         "scan_hit" => {
                             hits.fetch_add(1, Ordering::SeqCst);
-                            let _ = app.emit("scan://event", serde_json::json!({
+                            emit_scan_event(&app, &run_id, serde_json::json!({
                                 "type": "scan_hit",
                                 "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
                                 "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
@@ -2759,7 +2788,7 @@ fn pump_scan_stream(
                             // to reach the UI as `best: 1.1.1.1:443 ()` — a pair of brackets
                             // around nothing, which reads as a measurement of zero. Absent stays
                             // absent (`null`), never a fabricated 0.
-                            let _ = app.emit("scan://event", serde_json::json!({
+                            emit_scan_event(&app, &run_id, serde_json::json!({
                                 "type": "scan_done",
                                 "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
                                 "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
