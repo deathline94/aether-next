@@ -1438,12 +1438,13 @@ pub const WG_SESSION_TTL: Duration = Duration::from_secs(175);
 pub const WG_SESSION_CAPACITY: usize = 4;
 
 fn wg_session_fresh(inserted_at: Instant, now: Instant, ttl: Duration) -> bool {
-    match now.checked_sub(inserted_at) {
-        Some(age) => age < ttl,
-        // The clock moved backwards. Keep the session rather than deleting live
-        // state over a jump nobody asked for.
-        None => true,
+    // `duration_since` panics when the clock went backwards between the two reads,
+    // which is precisely the case this has to survive: keep the session rather than
+    // deleting live state over a jump nobody asked for.
+    if now <= inserted_at {
+        return true;
     }
+    now.duration_since(inserted_at) < ttl
 }
 
 /// Which peers to drop before making room for one more: everything expired, then the
