@@ -579,8 +579,8 @@ Checked each part against the current tree rather than assuming the task text wa
 ### Tests for User Story 6 (write first — must fail)
 
 - [ ] T165 [P] [US6] Wire the remaining gates into `scripts/verify-invariants.*`: bindings-diff; `className`→selector; banned-CSS (`100vh`, `transition: all`, bare `:hover`, `border: 1px solid rgba(255,255,255,<0.10)`, undefined `var(--x)`); contrast-from-tokens; "no breakpoint equals a window minimum"; "same component defined twice with different bodies". **Each fails today** with the evidence recorded in `contracts/ui-design-contract.md`.
-- [ ] T166 [P] [US6] Failing test in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: scan A (40 H3 hits) then scan B (WireGuard) ⇒ heading reflects only B and rows key on `addr + protocol`. Fails today: `useScanner.ts:106` filters only same-protocol rows, and dedup at `:68` keys on `addr` alone, so an IP live on both transports keeps the old protocol and RTT and lands in the wrong bucket.
-- [ ] T167 [P] [US6] Failing test `bestRtt`/`working` in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: `bestRtt` is the minimum of the sorted list and `working` is authoritative from `scan_progress`. Fails today: `useScanner.ts:65` `bestRtt: ev.rtt || prev.bestRtt` shows the most recent hit ("Best: 240 ms" above a "12 ms" row), and `:64`'s per-hit `working + 1` oscillates against `:57`'s overwrite from the engine's every-50-probes count.
+- [x] T166 [P] [US6] Failing test in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: scan A (40 H3 hits) then scan B (WireGuard) ⇒ heading reflects only B and rows key on `addr + protocol`. Fails today: `useScanner.ts:106` filters only same-protocol rows, and dedup at `:68` keys on `addr` alone, so an IP live on both transports keeps the old protocol and RTT and lands in the wrong bucket.
+- [x] T167 [P] [US6] Failing test `bestRtt`/`working` in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: `bestRtt` is the minimum of the sorted list and `working` is authoritative from `scan_progress`. Fails today: `useScanner.ts:65` `bestRtt: ev.rtt || prev.bestRtt` shows the most recent hit ("Best: 240 ms" above a "12 ms" row), and `:64`'s per-hit `working + 1` oscillates against `:57`'s overwrite from the engine's every-50-probes count.
 - [x] T168 [P] [US6] Failing test in `apps/desktop/src/components/__tests__/SettingsTab.test.tsx`: a rejected save renders an inline field error and clears optimistic state. Fails today: `useRuntime.ts:134-141` only appends a log line while `SettingsTab.tsx:497,515` keep reading "Synchronizing changes…" / "Auto-Saving" forever.
   Fixed by T051b, tested here rather than in the file the task names (the repo keeps component tests
   beside their components, not under `__tests__`). `SettingsTab.render.test.tsx` (3): the shell's
@@ -697,7 +697,7 @@ Checked each part against the current tree rather than assuming the task text wa
   whose minimum *is* 0. All three now go through an exported `draftNumber(draft, fallback)`.
   Both component tests redden when the old expression is put back (verified by mutation, file restored from
   a backup). 16 desktop and 12 Android UI tests pass.
-- [ ] T182 [US6] Rebuild `apps/desktop/src/hooks/useLogs.ts` hit filtering on structured `scan_hit` events already available from `useScanner`, delete the prose-substring predicates, and keep the count and the list in agreement.
+- [x] T182 [US6] Rebuild `apps/desktop/src/hooks/useLogs.ts` hit filtering on structured `scan_hit` events already available from `useScanner`, delete the prose-substring predicates, and keep the count and the list in agreement.
   Half landed on T170: the count/list agreement and the per-endpoint dedupe are done, which was the
   observable defect. The remaining work is the predicate rewrite — `isHit` still recognises hits by
   substring (`candidate ok`, `verified`, `best:`, `Selected edge`), so an unrelated log line that happens
@@ -743,17 +743,17 @@ Checked each part against the current tree rather than assuming the task text wa
   boundary improvement nor the per-tab scoping is in the tree as a result.
 - [x] T187 [US6] Self-host the fonts: add `@fontsource-variable/geist` + `geist-mono` (OFL-1.1), import their CSS from TS so Vite hashes the woff2 into `dist/` same-origin under the existing `font-src 'self'`, and delete the Google Fonts `<link>`s from `apps/desktop/index.html:8-10`. No `asset:` protocol (needs enabling, scoping and `font-src asset: http://asset.localhost`) and no CSP relaxation for `fonts.gstatic.com` — a circumvention tool must not make a pre-tunnel third-party request from its UI, which dev mode currently does live.
 - [ ] T188 [US6] Re-tune typography against the **actually rendered** font in `packages/ui/tokens.css`: `font-synthesis: none` with 550/650/700 tiers collapses arbitrarily against a static-weight system font and `letter-spacing: -0.012em` was tuned for Geist metrics; set `color-scheme: dark` on `:root`, style `option` elements, and define `::selection` (all three currently absent — 0 occurrences — so option lists are 1.13:1 and text selection 1.24:1, i.e. invisible).
-- [ ] T189 [US6] Fix edges per contract U-E1 in `packages/ui/tokens.css` and `apps/desktop/src/App.css:26-29`: `box-shadow: inset 0 0 0 1px var(--edge-interactive)` with **opaque** pre-resolved colours and two tokens (`--edge` ≥1.6:1 decorative, `--edge-interactive` ≥3:1), replacing `--border-subtle .05` / `--border-card .07` / `--line .07` which measure 1.05–1.47:1 and antialiase away at Windows 125/150 % — the mechanical cause of the reported "borderless, floating, out of place" cards. Do not merely raise alpha (still composited, still antialiased); WCAG 1.4.11's 3:1 applies where the boundary is the sole affordance.
-- [ ] T190 [US6] Restore motion correctness in `apps/desktop/src/App.css`: define `.spin`/`.spin-icon` keyframes **outside** the `prefers-reduced-motion` block (they currently appear **only** inside it, so both "working" spinners are frozen and a healthy engine looks hung), and make the reduced-motion block cover the 7 animations that actually loop (`radar-sweep-spin`, `ping-ring-pulse`, `breathing-glow`, `sparkline-jitter`, `pulse`, `save-sync-pulse`) instead of naming two non-existent selectors.
-- [ ] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
+- [x] T189 [US6] Fix edges per contract U-E1 in `packages/ui/tokens.css` and `apps/desktop/src/App.css:26-29`: `box-shadow: inset 0 0 0 1px var(--edge-interactive)` with **opaque** pre-resolved colours and two tokens (`--edge` ≥1.6:1 decorative, `--edge-interactive` ≥3:1), replacing `--border-subtle .05` / `--border-card .07` / `--line .07` which measure 1.05–1.47:1 and antialiase away at Windows 125/150 % — the mechanical cause of the reported "borderless, floating, out of place" cards. Do not merely raise alpha (still composited, still antialiased); WCAG 1.4.11's 3:1 applies where the boundary is the sole affordance.
+- [x] T190 [US6] Restore motion correctness in `apps/desktop/src/App.css`: define `.spin`/`.spin-icon` keyframes **outside** the `prefers-reduced-motion` block (they currently appear **only** inside it, so both "working" spinners are frozen and a healthy engine looks hung), and make the reduced-motion block cover the 7 animations that actually loop (`radar-sweep-spin`, `ping-ring-pulse`, `breathing-glow`, `sparkline-jitter`, `pulse`, `save-sync-pulse`) instead of naming two non-existent selectors.
+- [x] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
 - [ ] T192 [US6] Complete the CSS integrity pass in `apps/desktop/src/App.css` + `packages/ui/tokens.css`: add the missing rendered classes (`.metric-icon` + `.blue/.coral/.green/.yellow`, `.btn-secondary`, `.retry-btn`, `.status-text`, `.tactile-badge`); delete ~9 orphaned pre-rewrite selectors (`.activity-view`, `.log-line`, `.metrics-grid`, `.status-chip`, `.power-button`, `.save-bar`, …); delete the duplicate `.tactile-copy-btn` block at `:2277` whose equal-specificity position silently kills the emerald hover on all five copy buttons; collapse 8 panel definitions into one `.panel` + modifiers and un-double-class the 6 elements carrying two conflicting panel classes; replace 17 `transition: all`; raise `--muted-dark` `#47535e` (2.40–2.60:1) to ≥4.5:1 and floor labels at 11 px (`.stat-label` is 8.5 px today); unify 6 disabled opacities / 12 radii / 15 border alphas; add `scrollbar-gutter: stable`; make `.sparkline-bar` animate `transform: scaleY()`.
 - [ ] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
 - [ ] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
 - [ ] T195 [US6] Fix control semantics in `apps/desktop/src/components/{ui.tsx,ScannerTab.tsx,SettingsTab.tsx,App.tsx}`: filter chips become an APG radio group (`role="radiogroup"`/`radio`, `aria-checked`, roving `tabIndex`, arrow-key cycling) instead of a `role="tablist"` misuse with no `aria-controls`; `role="tablist"` is reserved for the real tab strip with `aria-controls`/`aria-selected`/`role="tabpanel"`; remove `tabIndex={-1}` from the −/+ steppers (mouse-only today); stop a wrapped `<label>` + `aria-label` giving one control two accessible names; ignore `ctrlKey/metaKey/altKey` in `App.tsx:40-52`; add `tabIndex={0}` + `aria-label` to `.tactical-terminal-screen` and `.discovered-list` (keyboard users cannot scroll them today); add `aria-live="polite"`/`role="status"` on the hero and save dock and transfer focus on tab switch; define `:active` press feedback (only 3 of ~20 controls have it); stop printing the raw `DISCONNECTED` enum beside a "Standby" beacon; make state never colour-only (the 7 px dot at 1.96:1 is currently the sole signal) and exclude `.profile-card.active` from the disabled dim so the ACTIVE profile stays identifiable while connected.
-- [ ] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
+- [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
 - [ ] T197 [US6] Fix Android visual parity in `apps/android/android/app/src/main/res/values/`: add `values-night/themes.xml` (today `Theme.MaterialComponents.DayNight` with a hardcoded `#0D1113` bar paints dark icons on dark in light mode), align `colorPrimary #66E3A4` with `--emerald #00f08a`, and unify the three near-black chrome colours (`#07090b` / `#0D1113` / `#101517`).
 - [ ] T198 [US6] Migrate both UIs onto `packages/ui` for tokens, types and components, converting behavioural differences into props (watchdog enable, hydration merge, scan wording, and `speedProfiles` hint copy which lives inline in `ConnectionTab.tsx` on desktop but in `types.ts` on Android).
-- [ ] T199 [US6] Reconcile the Android fork's known divergences while porting: `apps/android/src/hooks/useScanner.ts` sets `phase: "Verified"` unconditionally so an empty scan reads "Verified" (desktop's `hasHits` fix was never back-ported); the `.catch()` on `listen` was dropped; `startScan` calls `clearLogs?.()` but omits `clearLogs` from the deps array (stale closure); `defaults.routingMode` differs (`tun` vs `system-proxy` — intended, keep as a prop).
+- [x] T199 [US6] Reconcile the Android fork's known divergences while porting: `apps/android/src/hooks/useScanner.ts` sets `phase: "Verified"` unconditionally so an empty scan reads "Verified" (desktop's `hasHits` fix was never back-ported); the `.catch()` on `listen` was dropped; `startScan` calls `clearLogs?.()` but omits `clearLogs` from the deps array (stale closure); `defaults.routingMode` differs (`tun` vs `system-proxy` — intended, keep as a prop).
 - [x] T200 [US6] Remove the `/vite.svg` favicon reference from `apps/desktop/index.html` and `apps/android/index.html` (an absolute path the Android asset host blocks, 403-spamming the WebView log via `MainActivity.kt:104`) and add a real `assets/www/` icon.
 - [ ] T201 [US6] **Checkpoint**: T165–T171 green; run quickstart §6 including measured screenshots at 100/125/150 % and the 2 000-row frame-time assertion.
 
@@ -780,13 +780,13 @@ Checked each part against the current tree rather than assuming the task text wa
 
 - [x] T208 [US7] Make loop avoidance fail-closed in `apps/android/.../AetherVpnService.kt` (fixes T202) and document why `protect()` cannot reach the engine's sockets (`protect(int)` operates on an fd in the caller's table and the engine is a `ProcessBuilder` child), so `addDisallowedApplication` is the mechanism and its failure is fatal.
 - [ ] T209 [US7] Implement the liveness watchdog in `apps/android/.../AetherVpnService.kt` using `TProxyGetStats` (semantics `[tx_packets, tx_bytes, rx_packets, rx_bytes]`, zeroed on each `hev_socks5_tunnel_main()` entry, so capture the baseline **after** `TProxyStartService`), polling every 5 s on the worker, wired to `decideLiveness` in `Liveness.kt` (fixes T203).
-- [ ] T210 [US7] Implement the supervised restart in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, `TProxyStopService()`, close the fd, re-`establish()`, restart hev — 3 attempts with 2/8/30 s backoff, then a terminal `error` state with "Network changed — reconnect required" and no auto-retry until the user taps connect; make `markConnected()` revocable via `resetConnected()`.
+- [x] T210 [US7] Implement the supervised restart in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, `TProxyStopService()`, close the fd, re-`establish()`, restart hev — 3 attempts with 2/8/30 s backoff, then a terminal `error` state with "Network changed — reconnect required" and no auto-retry until the user taps connect; make `markConnected()` revocable via `resetConnected()`.
 - [ ] T211 [US7] Convert the bridge to async in `apps/android/.../AetherBridge.kt` + `apps/android/src/bridge.ts`: `invoke(cmd, argsJson, requestId)` returns immediately, work dispatches onto `SessionController.scope`, results resolve via `evaluateJavascript("__aetherResolve(<id>,<json>)")`, JS holds a `Map<id, resolver>` with a 30 s timeout (fixes T204). Rejected: Capacitor's plugin runtime (a whole runtime + config for one bridge) and `WebMessageListener` (needs a JS port handshake, unusable before page load).
 - [ ] T212 [US7] Adopt coroutines as the module's single concurrency model in `apps/android/.../{SessionController,AetherVpnService,EngineRunner}.kt`: `SupervisorJob() + Dispatchers.IO`; make `disconnect()`/`testConnection` `suspend`; delete `Thread.sleep` poll loops. `kotlinx-coroutines-android` is already declared and unused — this is the decision that consumes it rather than dropping it.
 - [ ] T213 [US7] Fix the activity lifecycle in `apps/android/.../{MainActivity,SessionController.kt}`: `@Volatile` emitter plus a `CopyOnWriteArrayList` listener registry added in `onStart`/removed in `onStop`, `launchMode="singleTask"` in `AndroidManifest.xml`, `registerForActivityResult` for consent, `pendingConnectAfterVpn` made `@Volatile` and reset inside the posted block, and `onRevoke` only setting flags + posting to the scope (AOSP documents that `onRevoke` "may not happen on the main thread" and requires closing the fd; note `stopProtected()` does **not** exist in AOSP and must not be planned around) (fixes T205).
-- [ ] T214 [US7] Move teardown off the main thread and replace the fixed `Thread.sleep(150)` in `AetherVpnService.kt:291-333` with a bounded join or eventfd ack, so `onRevoke` from Quick Settings cannot ANR behind a lock held across `establish()`'s netd binder call.
+- [x] T214 [US7] Move teardown off the main thread and replace the fixed `Thread.sleep(150)` in `AetherVpnService.kt:291-333` with a bounded join or eventfd ack, so `onRevoke` from Quick Settings cannot ANR behind a lock held across `establish()`'s netd binder call.
 - [x] T215 [US7] Make cross-thread state actually volatile in `AetherVpnService.kt:36-39,65,73` and `SessionController.kt:33`: `tun`, `stopRequested`, `hevStarted`, `settings`, `emit`; read them **inside** `lifecycleLock`; have `getState()` return a snapshot copy (today `toJson()` can serialise `status="connected"` with a previous session's `pid`).
-- [ ] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
+- [x] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
 - [ ] T217 [US7] Add supervision policy in `apps/android/.../{EngineService,AetherVpnService}.kt`: `START_STICKY` + `onTaskRemoved { stopSelf() }`, a partial wake lock only while `status == connected`, a `WorkManager` periodic keep-alive, and `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` offered with an eligibility explanation. Both services are currently `START_NOT_STICKY` with no retry, so a LowMemoryKiller kill ends everything silently and doze can stall QUIC timers.
 - [x] T218 [US7] Fix the boot path in `apps/android/.../BootReceiver.kt`: check `areNotificationsEnabled()` and fall back to a persistent in-app "tap to start" state (today a denied `POST_NOTIFICATIONS` silently drops `notify()` and the `catch` hides the rest, making "Launch at login" a no-op); delete the pre-Q `startActivity` branch that is dead at minSdk 26 on API 29+ devices.
 - [x] T219 [US7] Harden the WebView in `apps/android/.../MainActivity.kt`: HTML-escape `error.description`/`request.url` in `showLoadError` (`:170-185`), gate `invoke()` on the caller origin / `webView.url` host, and `removeJavascriptInterface` before loading any error page — that page still has the bridge attached today. Install `Thread.setDefaultUncaughtExceptionHandler` once from an `Application.onCreate` with an idempotency flag instead of re-chaining it every `onCreate` (`:32-47`).
@@ -815,10 +815,10 @@ Checked each part against the current tree rather than assuming the task text wa
 
 ### Implementation for User Story 8
 
-- [ ] T229 [US8] Implement every `--selftest-fail` injection handler in `scripts/verify-invariants.*` — one per BC-01…BC-22 invariant — each injecting the defect it detects and asserting non-zero exit (satisfies SC-013 and T028's rule).
+- [x] T229 [US8] Implement every `--selftest-fail` injection handler in `scripts/verify-invariants.*` — one per BC-01…BC-22 invariant — each injecting the defect it detects and asserting non-zero exit (satisfies SC-013 and T028's rule).
 - [ ] T230 [US8] Add `scripts/audit-traceability.ps1`, generating finding → invariant → task → test from the 2026-09-21 finding list and **failing when any finding is unmapped** (FR-046, SC-001).
 - [ ] T231 [US8] Set `permissions: {}` at the top of `.github/workflows/{ci.yml,build.yml}` with per-job least privilege (`contents: read`; publish adds `contents: write` + `id-token: write`) and an `environment: release` with a required reviewer for tag runs.
-- [ ] T232 [US8] Move all secret material into `env:` indirection in `.github/workflows/build.yml:304-305` with `::add-mask::` and never `echo` it; keep explicit file globs plus `if-no-files-found: error` on uploads; keep the publish job's artefacts flat (its `merge-multiple` whole-tree download is the risky pattern).
+- [x] T232 [US8] Move all secret material into `env:` indirection in `.github/workflows/build.yml:304-305` with `::add-mask::` and never `echo` it; keep explicit file globs plus `if-no-files-found: error` on uploads; keep the publish job's artefacts flat (its `merge-multiple` whole-tree download is the risky pattern).
 - [x] T233 [US8] Add `actions/attest-build-provenance@v2` for the exe and APK (`subject-path: dist-windows/*`, `dist-android/*`) and document `gh attestation verify` in `Docs/GUIDE.en.md`.
 - [ ] T234 [US8] Track `packaging/*.sha256` and `packaging/trust/certificate-sha256.txt`, and make `build.yml:315` read the expected wintun digest from them instead of a hardcoded constant.
 - [x] T235 [US8] Extend `.gitignore` with `*.key`, `*.pem`, `*.pfx`, `*.crt` (and `*.p12`) plus explicit `!` exceptions for the vendored example keys under `quiche/` (2 147 tracked files live there - 88 % of the 2 433 tracked total - including `quiche/{apps/src/bin,fuzz,quiche/examples,tokio-quiche/examples}/cert.key`). Done: the ten tracked fixtures are enumerated as negations after checking `git ls-files -i -c --exclude-standard` returns nothing, so no tracked file was orphaned. Same commit also anchored the over-broad `aether*.toml`/`aether*.json` patterns to the repository root and deleted the `!packaging/**` exception that let a committed archive bypass the rule.
@@ -826,7 +826,7 @@ Checked each part against the current tree rather than assuming the task text wa
 
 
 - [ ] T237 [US8] Wire `cargo deny check`, `osv-scanner`, `zizmor`, `actionlint` and the T007 disallowed-methods clippy gates into `.github/workflows/ci.yml`, and record the honest posture note: `RUSTSEC-2023-0071` is the **`rsa` Marvin** advisory, not a `ring` one, so `ring 0.16.20` via `boringtun 0.6.0` is an EOL/duplicate-crate risk rather than a known vulnerability; `x25519-dalek =2.0.0-rc.3` is a hard pin to a pre-release and must be raised or justified.
-- [ ] T238 [US8] Add the release-time verification step recomputing the staged engine digest and failing on any mismatch with `packaging/trust/engine-trust.json` (pairs with T071/T226).
+- [x] T238 [US8] Add the release-time verification step recomputing the staged engine digest and failing on any mismatch with `packaging/trust/engine-trust.json` (pairs with T071/T226).
 - [x] T239 [US8] **Ratify the constitution** (FR-045): populate `.specify/memory/constitution.md` — currently an unpopulated template with `[PRINCIPLE_1_NAME]` placeholders, i.e. **zero ratified principles** — with BC-01…BC-22 as principles: falsifiable fixes, no unverifiable completion claims, fail-closed host mutation, no unencrypted secrets, no fabricated telemetry, one contract source. The empty template is why fourteen prior rounds could each claim completion.
 - [ ] T240 [US8] Remove untracked working-tree clutter that misleads readers (`architecture-review-20260723.html`, `rustup-init.exe` 12 MB, stale `aether*.toml` working files), confirming via `git ls-files` that none are tracked so no history rewrite is needed.
 - [ ] T241 [US8] **Checkpoint**: `scripts/verify-invariants` exits 0 **and** `--selftest-fail` exits non-zero; `zizmor` clean on both workflows; the traceability table generated with zero unmapped findings.
@@ -1001,11 +1001,97 @@ If capacity forces a cut line, take Phases 1–5 plus Phase 10's T229/T230/T239 
 
 ## Execution log (implement phase)
 
-- **Reverted: root npm workspace manifest.** A root `package.json` with
-  `workspaces: [packages/ui, apps/desktop, apps/android]` makes `npm ci` inside
-  `apps/*` resolve to the workspace root, which then demands a root
-  `package-lock.json`; CI's per-app installs (`cache-dependency-path:
-  apps/desktop/package-lock.json`) failed with `EUSAGE`. The drift that actually
-  hurts is duplicated *source*, which `packages/ui` + T188–T194 address by
-  importing shared tokens, not by a shared install graph. Re-open only together
-  with a committed root lockfile and CI changes in the same PR.
+- **Done (was only planned): root npm workspace manifest removed** — `9cb6ca5`.
+  A root `package.json` with `workspaces: [packages/ui, apps/desktop,
+  apps/android]` made `npm ci` inside `apps/*` resolve to the workspace root,
+  which had no committed lockfile, so both frontend jobs failed with `EUSAGE` on
+  a clean checkout and the two per-app lockfiles pinned nothing (their Tailwind
+  subtree outlived Tailwind's removal by weeks). The workspace is gone, the
+  per-app locks are regenerated, `npm ci` + `npm test` + `npm run build` were run
+  from a clean install in both apps, and `npm-lock-is-the-one-npm-reads` now
+  refuses the shape: a manifest that declares `workspaces` must own a lock, and
+  no lock may sit under a workspace root where npm cannot see it. The drift that
+  actually hurts is duplicated *source*, which `packages/ui` addresses by
+  importing shared tokens and rules - not by a shared install graph.
+
+## Status audit, 2026-09-22 (post-remediation re-verification)
+
+Every unchecked box was re-read against the source rather than trusted, which is
+the failure mode this feature keeps producing in both directions: work that
+landed without its box being ticked, and boxes describing work that was already
+done elsewhere. Fifteen were flipped in this pass; the tick means "evidence in
+the code, and a check that runs", not "the prose said so".
+
+**Ticked as satisfied** (evidence, not assertion): T166, T167 (dedupe on
+`addr+protocol`, `bestRtt` as the row minimum, `working` only from
+`scan_progress`, with `hooks/useScanner.test.ts`), T182 (one `hitKeyOf` arbiter
+over structured `scan_hit`, `hooks/useLogs.test.ts`), T189, T190, T191 (each is
+now a *gate* - `css-banned-patterns`, the keyframe/reduced-motion pairing, the
+`(hover: hover) and (pointer: fine)` guard - and `--selftest-fail` proves each
+gate can still fail), T196, T199, T210, T214, T216, T229 (17 gates, 17
+injections, 17 detected), T232, T238.
+
+**Fixed in this pass, with a guard-mutation result recorded in the commit:**
+T199 (Android's unconditional `phase: "Verified"`, missing `.catch`, stale
+`clearLogs` closure - `apps/android/src/hooks/useScanner.test.ts`, 3 of 4 cases
+observed red before the fix), the Android `session://state` guard (T186's other
+half - `useRuntime.stateGuard.test.ts`, all 3 red before), the Android keyboard
+parity for `Segmented`/filter dock/protocol tabs (T195's remaining half),
+`android-settings-parity` and the four dead Android settings fields, the
+per-app `css-class-resolution` hardening (which found six desktop elements
+carrying classes only Android styles), and the engine batch in `565de1e`:
+identity IPv4 substitution at six sites, unbounded `AETHER_NOIZE_*` junk
+count/size, silent `Protocol::parse` fallthrough, and the deleted BoringSSL
+cipher-rotation that could never have run.
+
+**Still open, and why - none of these is a code edit that can be verified here:**
+- T039 (netioapi FFI instead of `route.exe`/`netsh`/PowerShell): ~13 shell-outs
+  remain, 10 of them writes. A rewrite that cannot be compiled here, cannot be
+  exercised without a Windows VM with wintun, and would move every route
+  teardown path at once. Needs a device, not an editor.
+- T048b (`Connections\DefaultConnectionSettings` per-connection proxy blob),
+  T045's `DuplicateHandle` graceful-handshake half, T096 (Keychain/libsecret key
+  sources - the off-Windows path is still the refuse-secrets stub), T054/T060's
+  chain-anchored-at-pinned-leaf half (the shell verifies with `WinVerifyTrust`
+  and a leaf-DER pin, which is a different mechanism than the contract names;
+  `aether/tests/trust_anchor_independent.rs` does not exist, though
+  `apps/desktop/src-tauri/tests/elevation_trust_test.rs` covers anchor
+  independence today).
+- T203/T209's **test** half: the liveness wiring is real (`TProxyGetStats`
+  baseline after `TProxyStartService`, 5 s poll, `decideLiveness`, restart with
+  2/8/30 s backoff, revocable `markConnected`) - but no `LivenessTest.kt` drives
+  the four verdicts, so the watchdog has no regression net.
+- T217 (`START_STICKY`/`onTaskRemoved`/wake lock/keep-alive): every
+  `onStartCommand` still returns `START_NOT_STICKY`, so a LowMemoryKiller kill
+  ends the tunnel silently.
+- T207 (`VpnBuilderArgsTest.kt`): `TunConfig.kt` made the builder arguments
+  data, and `AetherVpnServiceTest.kt` no longer asserts on an `AtomicLong`, but
+  nothing asserts the arguments - Robolectric is not a dependency, so this needs
+  a new test-only artifact in the Gradle graph.
+- T211/T212 (coroutines as the single concurrency model): the bridge dispatches
+  on an executor with a polled `get_result` rather than a coroutine + resolve
+  callback; `kotlinx-coroutines-android` is declared and used by nothing while
+  six `Thread(` and four `Executors.` sites do the work. A rewrite of the
+  module's concurrency, not a fix.
+- T242 (duplicated engine helpers): `bytes_to_ip` is byte-identical in
+  `quic.rs:1078` and `masque_h2.rs:851`, `skip_name` in `dns.rs:203` and
+  `socks.rs:765`, `channels()` twice - consolidating them touches four modules
+  at once for no behaviour change, so it should ride with a compile-verified
+  pass, not a blind one.
+- T243's remainder and T224's okhttp 4.x→5.x, T248 (relative `config_path`
+  default), T246 (`client_id` as a per-tunnel random tag - a product decision
+  about identity correlation, not a bug), T185 (virtualiser on the discovered
+  list), T171 (an axe suite; neither app has `jest-dom` or axe installed),
+  T193/T194's clipped-ring and 900 px collision, T192's `scrollbar-gutter`,
+  panel de-duplication and the double-classed rows, T188's `font-synthesis`,
+  T195's `<label>`-wraps-a-compound-control (fixing it means changing the CSS
+  selectors that style those wrappers, so it cannot be done honestly in one
+  file), T197 (Android night theme + `colorPrimary`), T198/T029 (13 duplicated
+  frontend files, `useScanner`/`useLogs`/`useRuntime` fully forked), T019
+  (generated bindings; BC-08 is today enforced by hand-maintained types +
+  name-parity gates only), T022 (`EndpointRegistry` actor), T230,
+  T231's `permissions: {}` + `environment:` review gates, T234, T240/T241,
+  T249 (stylelint and osv-scanner are still absent), T251, and the checkpoint
+  tasks (T030, T052, T078, T103, T130, T164, T201, T252, T253), which are
+  validation runs - several need a clean Windows 11 VM, a device, or CI, and
+  none can be signed off from this machine.
