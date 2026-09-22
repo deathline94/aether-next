@@ -105,30 +105,99 @@ Version tags (`v1.0.0`, `v1.1.0`, ...) create/update a frozen release with the s
 
 ## Build from source
 
-### Windows app
+### Windows desktop (GUI)
 
-```text
+```powershell
+# 1. engine - always builds, no witness involved
 cd aether
 cargo build --release
 
+# 2. shell - needs a signed, witnessed engine or an explicit opt-out
 cd ..\apps\desktop
 npm install
 npm run stage-engine
 npm run tauri build
 ```
 
+Step 2 **fails on a fresh clone**, and that is deliberate. `apps/desktop/src-tauri/build.rs`
+embeds `packaging/trust/engine-trust.json`, and on `main` that file still carries the
+all-zero witness for `aether.exe` — a signed engine only exists inside a release run — so
+the build stops rather than producing a GUI that would refuse to launch the engine it
+ships with. Pick one:
+
+```powershell
+# development only: build an unwitnessed shell that asserts nothing about release
+# provenance. It can never be shipped; the build prints a warning saying so.
+$env:AETHER_ALLOW_UNWITNESSED = "1"
+npm run tauri build
+
+# a real release: cut the witness first, in a reviewed separate run
+gh workflow run prepare-anchor.yml -f confirm=PUBLISH -f ref=main
+# ...merge the pull request it opens, then tag
+```
+
+Full sequence, and what each guard refuses: [`Docs/GUIDE.en.md`](Docs/GUIDE.en.md) § Build notes.
+
 ### Android app
 
-```text
+```powershell
 cd apps\android
 npm install
 npm run sync-www
 # stage arm64/armv7/x86_64 engines as jniLibs/*/libaether.so
 cd android
-gradlew assembleRelease
+.\gradlew assembleRelease
 ```
 
 Engine crate alone: `cd aether && cargo build --release`.
+
+The three `libhev-socks5-tunnel.so` payloads under `jniLibs` are committed and
+digest-pinned (`scripts/verify-hev-lock.mjs`); `libaether.so` is not — it is built by CI.
+`versionName` and `versionCode` are coupled by hand, not derived; see the guide before
+bumping either.
+
+---
+
+## Naming, and what is not here
+
+**There is no imagery in this README, by observation rather than by choice.** Nothing in
+`README.md` or `Docs/GUIDE.en.md` contains a single real `![...](...)`: every screenshot
+would have to come from a running Windows or Android build with a tunnel established, and
+no such capture exists in the tree. A "screenshot" here would be a placeholder or a mock,
+which is the kind of claim this repository has been deleting. The Vite/Tauri scaffold art
+is not available to use either: of the three files the stock templates ship, only
+`apps/desktop/src/assets/react.svg` is in the index, and it is referenced by nothing and
+already absent from the working tree (the deletion is uncommitted as of this writing -
+`git status` will show it). `public/vite.svg` and `public/tauri.svg` are not in this
+repository at all. Nothing was removed to write this paragraph; if the intent is a brand
+mark rather than a screenshot, that is a design decision and belongs with the icons in
+`apps/desktop/src-tauri/icons/`, not here.
+
+**Four spellings of one product.** `Aether Next`, `AetherNext`, `app.aethernext`,
+`aether-next`. They are not interchangeable and the split is load-bearing in some places:
+
+| Spelling | Where it lives | Can it change? |
+|---|---|---|
+| `Aether Next` | README title, window/product name, `tauri.conf.json` productName | display only — renaming changes the installed-app identity and the path under `%PROGRAMFILES%` |
+| `AetherNext` | artifact file names in Releases (`AetherNext-windows-x64-setup.exe`) | no — published file names are what users and scripts already downloaded |
+| `app.aethernext` | Android `applicationId` | **never** — changing it means existing installs cannot update, and Play treats it as a different app |
+| `aether-next` | git remote / repository name | cosmetic, but breaks every external link |
+
+Recommendation, not a rename: fix `app.aethernext` and the Release file names as
+immutable, document `Aether Next` as the only user-visible spelling, and let `aether-next`
+stand as the repository slug. A future unification should change the display name and
+nothing else.
+
+**Three owner namespaces, all live.** `deathline94` is the Authenticode subject
+(`CN=deathline94`, asserted by `.github/scripts/sign-windows.ps1` and both workflows) and
+also appears in the release download URL — so it is not a stylistic choice, it is what the
+signature check compares against. `CluvexStudio/Aether` is cited in
+[Why this exists](#why-this-exists) as the upstream lineage of the original CLI, not as this
+repository's remote. `aether-next` is where this code is actually pushed. Those three are
+consistent with each other today; the failure mode to avoid is treating `CN=deathline94`
+as a string to tidy up, because the trust anchor's `issued_cn` is derived from it and the
+witness in `packaging/trust/engine-trust.json` would stop matching the binaries it
+describes.
 
 ---
 

@@ -17,7 +17,7 @@ on:
         required: true
         default: ''
       ref:
-        description: 'Ref to build the engine from'
+        description: 'Commit SHA (40 hex), tag, or main to build the engine from'
         required: true
         default: 'main'
 
@@ -33,19 +33,44 @@ jobs:
     name: Build, sign and witness the engine
     runs-on: windows-latest
     timeout-minutes: 60
+    # The witness this job writes is the thing the shipped shell refuses to run
+    # without, so the job needs the same protection the release job has. specs/015
+    # research.md R30 claims "an `environment: release` with a required reviewer"
+    # already exists for the paths that mint trust material; for this workflow it did
+    # not, and this job both checks out a caller-supplied ref and pushes a branch.
+    # A required-reviewer environment is what makes "manual trigger only, on purpose"
+    # an actual control instead of a comment.
+    environment: trust-anchor
     permissions:
       contents: write
     env:
       CONFIRM: ${{ github.event.inputs.confirm }}
+      INPUT_REF: ${{ github.event.inputs.ref }}
     steps:
       - name: Refuse to run without confirmation
         shell: pwsh
         run: |
           if ($env:CONFIRM -ne 'PUBLISH') { throw "confirm input must be exactly PUBLISH (got a value that is not)" }
 
+      # Free-form `ref` + `contents: write` is the shape this step closes: without a
+      # validation gate the job would happily check out any branch or tag anyone can
+      # name, sign the binary from it, and push the result as a witness PR. Accepted
+      # forms are a full commit SHA, `main`, or a release-looking tag - anything that
+      # can be reviewed before it is witnessed.
+      - name: Validate the requested ref
+        shell: pwsh
+        run: |
+          $ref = $env:INPUT_REF
+          if ($ref -notmatch '^(?:[0-9a-f]{40}|main|v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw "ref must be a 40-character commit SHA, 'main', or a version tag (got '$ref')"
+          }
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.inputs.ref }}
+          # The only step that needs to write does so with an explicit GH_TOKEN;
+          # checkout's persisted default credentials are dead weight until then.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -86,12 +111,14 @@ jobs:
             Where-Object HasPrivateKey | Select-Object -First 1
           if (-not $cert) { throw "no importable signing certificate" }
           $eng = "aether/target/release/aether.exe"
-          Set-AuthenticodeSignature -FilePath $eng -Certificate $cert -HashAlgorithm SHA256 `
-            -TimestampServer "http://timestamp.digicert.com" | Out-Null
-          $sig = Get-AuthenticodeSignature -FilePath $eng
-          if ($sig.Status -ne "Valid") { throw "refusing to witness an engine whose signature is not Valid: $($sig.StatusMessage)" }
-          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "publisher mismatch: $($sig.SignerCertificate.Subject)" }
-          $sha = (([Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
+          # Signed and asserted through .github/scripts/sign-windows.ps1 - the same
+          # single rule build.yml signs the shipped installer with. This step used to
+          # demand exactly `Status -eq 'Valid'` while build.yml accepted anything but
+          # NotSigned/HashMismatch, on the same ephemeral self-signed certificate; the
+          # two could not both be right, and the witness is the stricter consumer.
+          & ".github/scripts/sign-windows.ps1" -Thumbprint $cert.Thumbprint -Path $eng
+          $sig = Get-AuthenticodeSignature -LiteralPath $eng
+          $sha = (([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
           "ANCHOR_CERT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ANCHOR_CN=$($sig.SignerCertificate.Subject)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -112,7 +139,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          DEFAULT_BASE: ${{ github.event.inputs.ref }}
+          # Never the caller's `ref`: the base has to be a branch, and an input
+          # landing here verbatim is both a `gh pr create --base <sha>` that cannot
+          # work and a second path by which unreviewed text reaches a write API.
+          DEFAULT_BASE: ${{ github.event.repository.default_branch }}
         shell: pwsh
         run: |
           $branch = "anchor/$(git rev-parse --short HEAD)-$([Guid]::NewGuid().ToString('N').Substring(0,8))"

@@ -54,3 +54,30 @@ updates:
     directory: /apps/desktop/src-tauri
     schedule:
       interval: weekly
+
+  # Gradle: the Android shell's dependency graph (AGP, Kotlin, androidx, the
+  # Tauri-generated WebView glue) was invisible to Dependabot - `gradle` is a
+  # supported ecosystem and `apps/android/android` is a normal Gradle root with a
+  # settings.gradle, so the only reason it was missing is that nobody added it.
+  - package-ecosystem: gradle
+    directory: /apps/android/android
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      android-gradle:
+        patterns:
+          - "*"
+
+  # NOT COVERABLE, on purpose and not an oversight: the vendored `quiche/` tree.
+  # Dependabot's cargo ecosystem needs a committed lockfile in the directory it is
+  # pointed at, and `quiche/` is a workspace with no `quiche/Cargo.lock` - it is
+  # resolved through `aether/Cargo.lock` as a path dependency. So:
+  #   * a `package-ecosystem: cargo / directory: /quiche` entry would be rejected
+  #     ("does not contain a Cargo.lock file"), and
+  #   * Dependabot would not see the hand-applied patches either way, because it
+  #     compares crates.io versions while `quiche/` is a *source* copy whose real
+  #     base is the upstream commit recorded in quiche/PATCHES.md, not the `0.29.2`
+  #     its manifest declares.
+  # The vendor copy is instead gated by scripts/verify-quiche-vendor.mjs (ci.yml's
+  # supply-chain job), which turns any drift from that recorded provenance red.

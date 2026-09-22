@@ -51,6 +51,95 @@ jobs:
       - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets --features test-hooks -- -D warnings
       - run: cargo test --manifest-path aether/Cargo.toml --features test-hooks
 
+  fmt:
+    # `cargo fmt --check` existed nowhere, and the tree is NOT rustfmt-clean: at the
+    # time this gate was written, 40 of the 65 non-vendored .rs files carried
+    # formatting drift (492 hunks). Do not trust that number - it is moving while the
+    # engine and shell are being edited in parallel, which is exactly why the gate
+    # below is a ratchet rather than a snapshot:
+    #   - every Rust file a change touches MUST be rustfmt-clean (blocking), and
+    #   - the standing debt is re-measured and listed every run (informational),
+    #     so it can only be reported, never asserted from a comment.
+    # A whole-tree hard gate today would either be red on arrival or would bury a
+    # real diff under dozens of files of reformatting.
+    #   - every Rust file a change touches MUST be rustfmt-clean (blocking), and
+    #   - the standing debt is reported every run with a count (informational),
+    #     so it can only shrink.
+    # `quiche/` is excluded on purpose: it is a byte-pinned vendor copy and
+    # reformatting it would destroy the patch surface recorded in quiche/PATCHES.md.
+    name: Rust formatting ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt
+      - name: Rust files touched by this change must be rustfmt-clean
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || '' }}"
+          if [ -z "$base" ]; then
+            # push/dispatch: compare against the commit we were fast-forwarded from
+            if git rev-parse -q --verify HEAD^ >/dev/null; then base="$(git rev-parse HEAD^)"; else base="$(git hash-object -t tree /dev/null)"; fi
+          fi
+          files="$(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.rs' | grep -v '^quiche/' || true)"
+          if [ -z "$files" ]; then echo "no non-vendored .rs files touched"; exit 0; fi
+          echo "$files" | sed 's/^/  check /'
+          # shellcheck disable=SC2086
+          rustfmt --edition 2021 --check $files
+      - name: Whole-tree formatting debt (informational)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          node scripts/fmt-report.mjs
+
+  supply-chain:
+    # cargo deny was configured (deny.toml) but invoked by NOTHING - `grep -rn
+    # "cargo deny" .github scripts` proved that. This is the real gate: pinned tool
+    # by version + sha256, advisory/license/source/ban checks in error severity.
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+      - name: Install cargo-deny (pinned version + archive digest)
+        env:
+          CARGO_DENY_VERSION: 0.20.2
+          CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64" || { echo "digest is pinned for linux-musl/x86_64 only"; exit 1; }
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL --retry 3 -o cargo-deny.tgz "$url"
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tgz" | sha256sum -c -
+          tar -xzf cargo-deny.tgz
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" "$HOME/.local/bin/cargo-deny"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo-deny --version
+      # Both locks get checked: the engine and the desktop shell ship different
+      # binary trees and share almost none of their graph.
+      - name: cargo deny check (engine)
+        run: cargo-deny check --manifest-path aether/Cargo.toml --config deny.toml --locked advisories licenses sources bans
+      - name: cargo deny check (desktop shell)
+        run: cargo-deny check --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml --locked advisories licenses sources bans
+      # The exemptions above are generated from the locks, not hand-kept, so a
+      # silently-stale deny.toml is itself a failure.
+      - name: deny.toml skip block matches the committed locks
+        run: node scripts/measure-deny.mjs
+      # cargo-deny keys advisories on crates.io name+version, so it cannot see that
+      # `quiche 0.29.2` here is not upstream `quiche 0.29.2`. This closes that gap.
+      - name: Vendored quiche matches its recorded provenance
+        run: |
+          set -euo pipefail
+          node scripts/verify-quiche-vendor.mjs
+          node scripts/verify-quiche-vendor.mjs --selftest-fail
+
   desktop-ui:
     name: Desktop UI
     runs-on: ubuntu-latest
@@ -108,19 +197,62 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Both tools are downloaded by version AND verified against a recorded
+      # sha256, because `bash <(curl -sSfL .../download-actionlint.bash)` with no
+      # version and no digest meant the gate that exists to catch floating refs was
+      # itself fetching whatever the server felt like returning. The digests below
+      # are of the exact release archives named; re-derive with:
+      #   curl -sSL <url> | sha256sum
       - name: actionlint (must be clean)
+        env:
+          ACTIONLINT_VERSION: v1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint -color
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64" || { echo "digest is pinned for linux/amd64 only"; exit 1; }
+          url="https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o actionlint.tgz "$url"
+          echo "${ACTIONLINT_SHA256}  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz
+          ./actionlint_${ACTIONLINT_VERSION#v}_linux_amd64/actionlint --version | head -1
+          ./actionlint_${ACTIONLINT_VERSION#v}_linux_amd64/actionlint -color
+      # zizmor is expected to FIND the historical issues named in specs/015; if it
+      # exits clean because it failed to run, this gate is worthless. So: pin the
+      # version, assert the binary reports exactly that version, assert a non-empty
+      # SARIF was produced, distinguish "no findings" (0) from "findings" (1) from
+      # "the tool crashed" (anything else), and actually upload the SARIF the
+      # failure text points at.
+      # Release wheel digest for the pin below:
+      #   zizmor-1.30.1-py3-none-manylinux_2_28_x86_64.whl
+      #   sha256:eee12266b793cb87ad4a7e3af2e72404f8a63e3de5eb099b80bf7b1cfd232a8e
       - name: zizmor (must be clean after fixes)
         env:
           GH_TOKEN: ${{ github.token }}
+          ZIZMOR_VERSION: "1.30.1"
         run: |
-          pipx install zizmor
-          zizmor --format=sarif . || {
-            echo "::error::zizmor reported findings; see the SARIF artifact"
-            exit 1
-          }
+          set -uo pipefail
+          pipx install "zizmor==${ZIZMOR_VERSION}"
+          actual="$(zizmor --version | awk '{print $NF}')"
+          test "$actual" = "$ZIZMOR_VERSION" || { echo "pipx installed zizmor $actual, not $ZIZMOR_VERSION"; exit 1; }
+          zizmor --format=sarif --output zizmor.sarif . || rc=$?
+          rc="${rc:-0}"
+          test -s zizmor.sarif || { echo "zizmor exited $rc without writing a SARIF report: the gate looked at nothing"; exit 1; }
+          echo "ZIZMOR_RC=$rc" >> "$GITHUB_ENV"
+          case "$rc" in
+            0) echo "zizmor: no findings" ;;
+            1) echo "::error::zizmor reported findings; see the zizmor-sarif artifact" ;;
+            *) echo "::error::zizmor itself failed (exit $rc) - this is not a clean run"; exit 1 ;;
+          esac
+      - name: Upload zizmor SARIF
+        if: always() && hashFiles('zizmor.sarif') != ''
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: zizmor-sarif
+          path: zizmor.sarif
+          if-no-files-found: error
+      - name: Fail on zizmor findings
+        if: env.ZIZMOR_RC == '1'
+        run: exit 1
 
   installer-verifier:
     name: Installer verifier can fail
@@ -153,23 +285,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Require ABI libraries when present in tree
+      - name: Assert the vendored native payloads are real
         run: |
           set -euo pipefail
-          # If any ABI dir exists, every advertised ABI must have both libs.
+          # The old version of this step did `if [[ -e $f ]]; then test -s $f; fi`,
+          # i.e. it asserted nothing unless the file was already there. Worse,
+          # libaether.so is gitignored (it is staged by build.yml), so that half of
+          # the loop could never fail and the "Android native payload gate" was
+          # green by construction on every commit in the repository's history.
+          # What is actually tracked here is the vendored hev-socks5-tunnel payload
+          # plus a .gitkeep per ABI - so that is what this gate is allowed to claim.
           root="apps/android/android/app/src/main/jniLibs"
-          if [[ ! -d "$root" ]]; then
-            echo "jniLibs absent (CI release workflow builds them)"
-            exit 0
-          fi
+          fail=0
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            for lib in libaether.so libhev-socks5-tunnel.so; do
-              f="$root/$abi/$lib"
-              if [[ -e "$f" ]]; then
-                test -s "$f"
-              fi
-            done
+            # A missing ABI directory is now a failure, not a silent skip: these
+            # three are committed, and `build.gradle.kts` advertises exactly them.
+            if [[ ! -d "$root/$abi" ]]; then echo "::error::$root/$abi is missing"; fail=1; continue; fi
+            lib="$root/$abi/libhev-socks5-tunnel.so"
+            if [[ ! -s "$lib" ]]; then echo "::error::$lib is missing or empty"; fail=1; continue; fi
+            # Non-empty is not the same as loadable: a 1-byte placeholder passes
+            # `test -s`, so check it is really an ELF shared object for that ABI.
+            if ! file "$lib" | grep -q 'ELF .* shared object'; then echo "::error::$lib is not an ELF shared object"; fail=1; fi
+            # The engine is gitignored here but must never be committed dirty: if it
+            # ever appears in the tree it has to be a real shared library too.
+            eng="$root/$abi/libaether.so"
+            if [[ -e "$eng" ]]; then
+              [[ -s "$eng" ]] || { echo "::error::$eng exists and is empty"; fail=1; }
+              file "$eng" | grep -q 'ELF .* shared object' || { echo "::error::$eng is not an ELF shared object"; fail=1; }
+            else
+              echo "libaether.so not staged for $abi (built and checked by build.yml's android job)"
+            fi
           done
+          # And the gate must be able to fail: prove a truncated payload goes red.
+          cp "$root/arm64-v8a/libhev-socks5-tunnel.so" /tmp/hev-backup.so
+          : > "$root/arm64-v8a/libhev-socks5-tunnel.so"
+          if file "$root/arm64-v8a/libhev-socks5-tunnel.so" | grep -q 'ELF .* shared object'; then
+            echo "::error::selftest failed - an emptied payload still looked like a payload"
+            cp /tmp/hev-backup.so "$root/arm64-v8a/libhev-socks5-tunnel.so"
+            exit 1
+          fi
+          cp /tmp/hev-backup.so "$root/arm64-v8a/libhev-socks5-tunnel.so"
+          [[ -s "$root/arm64-v8a/libhev-socks5-tunnel.so" ]]
+          exit "$fail"
       - name: Vendored native payloads match their lock
         # Digest + 16 KB PT_LOAD alignment, with a selftest that a substituted
         # blob really does turn this red.

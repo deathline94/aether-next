@@ -42,18 +42,80 @@ release run.
 
 ### Who publishes it, and why that is not circular
 
-`.github/workflows/build.yml` runs the publish step between *engine staged* and
-*app compiled*, so the shell is compiled against the digest of the engine that
-run produced and signature-verified. It is still a separate witness from the
-comparison: the value is read from the staged file before the checker exists, and
-`--check` re-measures the bytes that ship at the end of the pipeline. Because the
-CI certificate is ephemeral (self-signed per run), the run's anchor is uploaded
-with the artifacts (`dist-windows/engine-trust.json`, and inside the portable
-zip) so the digests a build will accept are always readable next to it.
+`.github/workflows/prepare-anchor.yml` — a separate, manually-triggered,
+environment-protected workflow — builds and signs the engine, rewrites the matching
+`file_sha256`/`cert_sha256`, and opens a pull request. It never pushes to `main`.
+`build.yml` does **not** publish: it only runs `publish-engine-trust.mjs --check` at two
+points (after staging, after packaging), so a tag build that has no committed witness for
+the engine it staged fails instead of rewriting its own anchor. That separation is the
+whole point: the value is measured by a different run than the one that consumes it, and
+`--check` re-measures the bytes that actually ship. Because the CI certificate is
+ephemeral (self-signed per run), the run's anchor is uploaded with the artifacts
+(`dist-windows/engine-trust.json`, and inside the portable zip) so the digests a build
+will accept are always readable next to it.
 
-To build a release yourself: run the publish step locally for both artifacts
-against the engine you signed, then `npm run tauri build`. Without it, TUN mode
-refuses to launch the engine and proxy mode is unaffected.
+To build a release yourself: run `publish-engine-trust.mjs` locally for both artifacts
+against the engine you signed, then `npm run tauri build`. Without it, `build.rs` stops a
+release build outright — see `Docs/GUIDE.en.md` § Build notes for the exact sequence and
+for what `AETHER_ALLOW_UNWITNESSED` does and does not let you ship.
+
+## `wintun.dll`: a pinned third-party binary whose certificate has already expired
+
+`packaging/wintun.dll` is measured like everything else, and its entry is real:
+
+| | |
+|---|---|
+| Provenance | WireGuard LLC (Jason A. Donenker), `FileInternalVersion`/`FileVersion` **0.14.1** |
+| Authenticode | `Status = Valid` — verified on this checkout, 2026 |
+| Leaf `NotAfter` | **2021-12-14** |
+| Leaf SHA-1 (as printed by `Get-AuthenticodeSignature`) | `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
+| Anchor `cert_sha256` (SHA-256 over the leaf DER) | `c9e1b3127c2f1312056d49a93ac4bd700393fd323d2bf3b2235aff52bea8d136` |
+| Anchor `file_sha256` | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
+
+The leaf expired four years ago and the signature is still `Valid`, because it carries an
+RFC 3161 counter-signature: Authenticode judges the bytes as of the moment they were
+signed. **That is a property of this one binary, not a general licence to accept expired
+chains** — the moment the timestamp is stripped or a different copy is dropped in, the
+status flips to `TimestampMismatch`/`NotTrusted` and `.github/scripts/sign-windows.ps1`
+refuses it.
+
+The cost of pinning both digests is that **the driver cannot be updated in place.**
+Replacing `packaging/wintun.dll` — for a newer WireGuard release, a Windows compatibility
+fix, or because a CVE lands on 0.14.1 — changes `file_sha256`, which changes the bytes
+`build.rs` embeds, which invalidates the witness. There is no shortcut around re-cutting
+it. Procedure:
+
+1. Obtain the release from <https://www.wintun.net/> (in-tree builds are published by
+   WireGuard LLC; anything else is not the same artifact).
+2. Confirm the copy you are about to commit before you touch the anchor:
+   ```powershell
+   Get-AuthenticodeSignature packaging\wintun.dll | Format-List Status,StatusMessage
+   (Get-Item packaging\wintun.dll).VersionInfo.FileVersion
+   (Get-FileHash -Algorithm SHA256 packaging\wintun.dll).Hash.ToLower()
+   ```
+   `Status` must be `Valid` and the subject must still be `CN=WireGuard LLC`. A
+   `NotTrusted` result means the chain no longer validates even at its own timestamp —
+   stop.
+3. Replace the file **and** re-publish its anchor entry in one commit, via the script
+   rather than by hand (the previous `wintun.dll` digest in this repo was hand-written and
+   never measured):
+   ```powershell
+   node scripts/publish-engine-trust.mjs --name wintun.dll `
+     --file packaging/wintun.dll --cert-sha <sha256-of-leaf-der> --cn "CN=WireGuard LLC"
+   node scripts/publish-engine-trust.mjs --check --name wintun.dll --file packaging/wintun.dll
+   ```
+   Update the table above in the same commit; a stale digest table in this file is how the
+   next person re-introduces a hand-written one.
+4. Land both `packaging/wintun.dll` and `packaging/trust/engine-trust.json` together. A
+   commit containing one without the other is a build that refuses its own driver.
+5. The engine's staged copy under `apps/desktop/src-tauri/resources/wintun.dll` is a build
+   artifact (gitignored) — CI re-stages it, and `build.yml`'s "Verify all packaged Windows
+   binaries" step re-checks the copy that ships.
+
+Old and new cannot coexist in the anchor: `files[]` keys on `name`, so this is a
+replacement, not a rotation with a dual-pin window like `masque-pins.json` gets below.
+Ship the bump, and if TUN mode refuses to start on a user's machine, that is the witness
+doing its job — the fallback is proxy mode, not a relaxed check.
 
 ## Authenticode and the updater signature are unrelated
 

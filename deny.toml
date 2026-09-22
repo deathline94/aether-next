@@ -1,42 +1,195 @@
 # cargo deny configuration — specs/015-full-audit-remediation (T236/T237).
 #
-# The allow-lists below are deliberately permissive *today* and are expected to
-# shrink: a gate that cannot pass is a gate that gets deleted. Every entry names
-# why, so removal is a reviewable diff.
+# This file was wired to NOTHING until now: `grep -rn "cargo deny"  .github scripts`
+# returned only this file's own comments and the docs that promised a gate. It is
+# now invoked by the `supply-chain` job in `.github/workflows/ci.yml`, which fails
+# the build on any error-severity finding. Because a gate that cannot pass gets
+# deleted, every relaxation below is measured against the committed lockfiles and
+# says so, with the number and the command that produced it.
+#
+# Re-measure after any dependency change:
+#   node scripts/measure-deny.mjs        # rewrites the [bans] skip block from both locks
+#
+# Vendored `quiche/`: the path dependencies `../quiche/quiche` and `../quiche/octets`
+# ARE in `aether/Cargo.lock` (quiche 0.29.2, octets 0.3.5), so `cargo deny` resolves
+# them and walks their dependency requirements — the vendor copy is not invisible.
+# What cargo-deny cannot do is audit *their source*: RustSec advisories key on
+# crates.io name+version, and a hand-patched tree published under those names is
+# checked under the upstream version. That residual gap is closed by
+# `scripts/verify-quiche-vendor.mjs` (see quiche/PATCHES.md), which is run in the
+# same job.
 
 [graph]
 all-features = false
 
 [advisories]
 version = 2
-# RUSTSEC-2023-0071 is the `rsa` Marvin advisory, NOT a ring one. ring 0.16.20
-# reaches this tree via boringtun 0.6.0 and is an EOL/duplicate-crate risk, not
-# a known vulnerability; it is recorded here so the distinction survives.
+# Measured against both committed locks (595 package versions, `aether/Cargo.lock` +
+# `apps/desktop/src-tauri/Cargo.lock`) against RustSec as of this commit: 76 of the
+# locked crates have advisory files, and ZERO of them match a version this tree
+# locks. So `check advisories` is green on arrival and stays meaningful.
 ignore = [
-  { id = "RUSTSEC-2023-0071", reason = "applies to rsa; we pull ring 0.16 transitively via boringtun (duplicate-crate risk, tracked)" },
+  # Recorded, not ignored for a match: RUSTSEC-2023-0071 is the `rsa` Marvin
+  # advisory and `rsa` is not in either lock at all. The real note belongs to the
+  # crate the old comment misattributed it to: `ring` 0.16.20 is pulled in
+  # transitively by boringtun 0.6.0 alongside ring 0.17.14. That is a
+  # duplicate/EOL-crate risk, not a known vulnerability — no RustSec advisory
+  # covers ring 0.16.20's locked version — and it is tracked in [bans] below.
+  { id = "RUSTSEC-2023-0071", reason = "belongs to rsa (absent from our graph); kept so the ring-0.16-vs-rsa confusion that produced this entry does not come back" },
 ]
 
 [bans]
-multiple-versions = "warn"
-wildcards = "allow"
+# HARD ERROR. Today's graph is exempted only by the enumerated list below, so any
+# NEW duplicated crate turns this red instead of scrolling past in a warning.
+multiple-versions = "deny"
+# HARD ERROR, and provably free: `grep -rnE 'version = "\*"' --include=Cargo.toml
+# aether apps quiche` matches nothing. A wildcard requirement means the resolver,
+# not this repository, decides which bytes get compiled.
+wildcards = "deny"
 highlight-graph = false
 skip = [
-  # boring/quiche keep two copies of several low-level crates; resolving this is
-  # a vendored-dependency decision, not a defect.
-  { name = "windows-sys", version = "0.52" },
-  { name = "windows-targets", version = "0.52" },
+  # Generated from the two committed lockfiles: 46 crate names carry more
+  # than one version (117 name+version pairs). Each
+  # one is a transitive disagreement this repository does not own - boring/quiche,
+  # tauri, smoltcp/boringtun pin different major lines of the same low-level crate.
+  # Regenerate with `node scripts/measure-deny.mjs`; a *new* duplicate then shows up
+  # as a red `cargo deny check bans` rather than a warning nobody reads.
+  { name = "base64", version = "0.13.1" },
+  { name = "base64", version = "0.21.7" },
+  { name = "base64", version = "0.22.1" },
+  { name = "bitflags", version = "1.3.2" },
+  { name = "bitflags", version = "2.13.1" },
+  { name = "chacha20", version = "0.10.1" },
+  { name = "chacha20", version = "0.9.1" },
+  { name = "cpufeatures", version = "0.2.17" },
+  { name = "cpufeatures", version = "0.3.0" },
+  { name = "defmt", version = "0.3.100" },
+  { name = "defmt", version = "1.1.1" },
+  { name = "getrandom", version = "0.2.17" },
+  { name = "getrandom", version = "0.3.4" },
+  { name = "getrandom", version = "0.4.3" },
+  { name = "hashbrown", version = "0.12.3" },
+  { name = "hashbrown", version = "0.17.1" },
+  { name = "heck", version = "0.4.1" },
+  { name = "heck", version = "0.5.0" },
+  { name = "indexmap", version = "1.9.3" },
+  { name = "indexmap", version = "2.14.0" },
+  { name = "jni-sys", version = "0.3.1" },
+  { name = "jni-sys", version = "0.4.1" },
+  { name = "libloading", version = "0.7.4" },
+  { name = "libloading", version = "0.8.9" },
+  { name = "libloading", version = "0.9.0" },
+  { name = "png", version = "0.17.16" },
+  { name = "png", version = "0.18.1" },
+  { name = "proc-macro-crate", version = "1.3.1" },
+  { name = "proc-macro-crate", version = "2.0.2" },
+  { name = "proc-macro-crate", version = "3.5.0" },
+  { name = "r-efi", version = "5.3.0" },
+  { name = "r-efi", version = "6.0.0" },
+  { name = "rand", version = "0.10.2" },
+  { name = "rand", version = "0.8.7" },
+  { name = "rand", version = "0.8.8" },
+  { name = "rand_core", version = "0.10.1" },
+  { name = "rand_core", version = "0.6.4" },
+  { name = "reqwest", version = "0.12.28" },
+  { name = "reqwest", version = "0.13.4" },
+  { name = "ring", version = "0.16.20" },
+  { name = "ring", version = "0.17.14" },
+  { name = "schemars", version = "0.8.22" },
+  { name = "schemars", version = "0.9.0" },
+  { name = "schemars", version = "1.2.1" },
+  { name = "serde_spanned", version = "0.6.9" },
+  { name = "serde_spanned", version = "1.1.1" },
+  { name = "shlex", version = "1.3.0" },
+  { name = "shlex", version = "2.0.1" },
+  { name = "syn", version = "1.0.109" },
+  { name = "syn", version = "2.0.119" },
+  { name = "syn", version = "3.0.3" },
+  { name = "thiserror", version = "1.0.69" },
+  { name = "thiserror", version = "2.0.19" },
+  { name = "thiserror-impl", version = "1.0.69" },
+  { name = "thiserror-impl", version = "2.0.19" },
+  { name = "toml", version = "0.8.2" },
+  { name = "toml", version = "0.8.23" },
+  { name = "toml", version = "0.9.12+spec-1.1.0" },
+  { name = "toml", version = "1.1.3+spec-1.1.0" },
+  { name = "toml_datetime", version = "0.6.11" },
+  { name = "toml_datetime", version = "0.6.3" },
+  { name = "toml_datetime", version = "0.7.5+spec-1.1.0" },
+  { name = "toml_datetime", version = "1.1.1+spec-1.1.0" },
+  { name = "toml_edit", version = "0.19.15" },
+  { name = "toml_edit", version = "0.20.2" },
+  { name = "toml_edit", version = "0.22.27" },
+  { name = "toml_edit", version = "0.25.13+spec-1.1.0" },
+  { name = "untrusted", version = "0.7.1" },
+  { name = "untrusted", version = "0.9.0" },
+  { name = "webpki-roots", version = "0.26.11" },
+  { name = "webpki-roots", version = "1.0.9" },
+  { name = "windows-core", version = "0.61.2" },
+  { name = "windows-core", version = "0.62.2" },
+  { name = "windows-link", version = "0.1.3" },
+  { name = "windows-link", version = "0.2.1" },
+  { name = "windows-result", version = "0.3.4" },
+  { name = "windows-result", version = "0.4.1" },
+  { name = "windows-strings", version = "0.4.2" },
+  { name = "windows-strings", version = "0.5.1" },
+  { name = "windows-sys", version = "0.45.0" },
+  { name = "windows-sys", version = "0.52.0" },
+  { name = "windows-sys", version = "0.59.0" },
+  { name = "windows-sys", version = "0.60.2" },
+  { name = "windows-sys", version = "0.61.2" },
+  { name = "windows-targets", version = "0.42.2" },
+  { name = "windows-targets", version = "0.52.6" },
+  { name = "windows-targets", version = "0.53.5" },
+  { name = "windows_aarch64_gnullvm", version = "0.42.2" },
+  { name = "windows_aarch64_gnullvm", version = "0.52.6" },
+  { name = "windows_aarch64_gnullvm", version = "0.53.1" },
+  { name = "windows_aarch64_msvc", version = "0.42.2" },
+  { name = "windows_aarch64_msvc", version = "0.52.6" },
+  { name = "windows_aarch64_msvc", version = "0.53.1" },
+  { name = "windows_i686_gnu", version = "0.42.2" },
+  { name = "windows_i686_gnu", version = "0.52.6" },
+  { name = "windows_i686_gnu", version = "0.53.1" },
+  { name = "windows_i686_gnullvm", version = "0.52.6" },
+  { name = "windows_i686_gnullvm", version = "0.53.1" },
+  { name = "windows_i686_msvc", version = "0.42.2" },
+  { name = "windows_i686_msvc", version = "0.52.6" },
+  { name = "windows_i686_msvc", version = "0.53.1" },
+  { name = "windows_x86_64_gnu", version = "0.42.2" },
+  { name = "windows_x86_64_gnu", version = "0.52.6" },
+  { name = "windows_x86_64_gnu", version = "0.53.1" },
+  { name = "windows_x86_64_gnullvm", version = "0.42.2" },
+  { name = "windows_x86_64_gnullvm", version = "0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "0.53.1" },
+  { name = "windows_x86_64_msvc", version = "0.42.2" },
+  { name = "windows_x86_64_msvc", version = "0.52.6" },
+  { name = "windows_x86_64_msvc", version = "0.53.1" },
+  { name = "winnow", version = "0.5.40" },
+  { name = "winnow", version = "0.7.15" },
+  { name = "winnow", version = "1.0.4" },
+  { name = "zerocopy", version = "0.8.55" },
+  { name = "zerocopy", version = "0.8.57" },
+  { name = "zerocopy-derive", version = "0.8.55" },
+  { name = "zerocopy-derive", version = "0.8.57" },
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The vendored quiche fork is a path dependency, so it needs no git allowance.
+# The vendored quiche fork is a path dependency, so it needs no git allowance —
+# and it must not get one: an `allow-git` entry is how a vendor copy quietly
+# turns into a live git dependency that nobody reviews.
 allow-git = []
 
 [licenses]
 version = 2
-copyleft = "warn"
+# NOTE, verified against the cargo-deny docs: `copyleft` is a REMOVED key — "all
+# licenses are denied unless explicitly allowed". Leaving a `copyleft = "warn"`
+# line here would claim a knob that cannot move anything; the control that
+# actually exists is this allow-list, so tightening means *removing an entry
+# below*, and that is what "allowlist shrinkage requires human review" in
+# spec.md §User Story 8 refers to.
 allow = [
   "MIT",
   "Apache-2.0",

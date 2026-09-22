@@ -213,7 +213,7 @@ A maintainer adds a guard, and CI proves the guard can be reached — or the mer
 - **Diagnostics are exportable.** A single action produces engine version, resolved binary paths and digests, trust decision outcomes, effective runtime-config snapshot, route/proxy journal state, counters above.
 - **Failure policy for state transitions**: any failure while leaving the host in a mutated state (routes installed, proxy enabled, adapter configured) MUST block or reverse, never proceed.
 - **Assumptions**: The Cloudflare MASQUE edges remain the only production peers, so per-host pin sets are small and their rotation cadence is handled by expiry-plus-secondary-pin rather than online fetch. A single user account per device on desktop; multi-account elevation is handled by SID-derived ACLs rather than separate profiles.
-- **Scope guard**: `quiche/` is patched in place at a pinned tag with a patch manifest; upstreaming is explicitly out of scope for this feature.
+- **Scope guard**: `quiche/` is patched in place at a pinned commit with a patch manifest; upstreaming is explicitly out of scope for this feature. Recorded in `quiche/PATCHES.md` (base `cloudflare/quiche@c4c0b978461aa153399a90217d85bebd1800f84d`, 6 deviating files in 3 classes) and enforced by `packaging/trust/quiche-vendor.json` + `scripts/verify-quiche-vendor.mjs`, both run by the `supply-chain` job in `ci.yml`. "Pinned commit", not "pinned tag": the tree's declared `version = "0.29.2"` is three commits stale relative to its actual content, so a tag-based pin would have been a false record — see the manifest.
 
 ### Edge Cases
 

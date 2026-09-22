@@ -160,4 +160,49 @@ no check that would fail without it is not a fix.
 
 Windows desktop: Rust + Node, then `npm run tauri build` under `apps/desktop` after a release engine build.
 
+**A release build of the shell is not a plain `cargo build --release`.** `apps/desktop/src-tauri/build.rs`
+embeds `packaging/trust/engine-trust.json` and hard-fails when it still carries the
+all-zero `aether.exe` witness, because a shell that would refuse to spawn the engine it
+ships is worse than a build that stops here. On a fresh clone that file *does* carry the
+placeholder — a signed engine only exists inside a release run — so the documented
+sequence is:
+
+```sh
+# 1. the engine alone (no anchor involved, this always works)
+cd aether && cargo build --release
+
+# 2a. a real release shell: cut the witness first, from the engine you just built
+#     (needs a signed aether.exe; see "Rotating the engine trust anchor" above)
+node ../scripts/publish-engine-trust.mjs --name aether.exe --file ../apps/desktop/src-tauri/resources/aether.exe --cert-sha <leaf-sha256> --cn "CN=deathline94"
+
+# 2b. a dev shell, which asserts nothing about release provenance
+$env:AETHER_ALLOW_UNWITNESSED = "1"   # Windows PowerShell; `export` elsewhere
+npm run tauri build
+```
+
+`AETHER_ALLOW_UNWITNESSED` builds a binary that can never be released: it has no trusted
+engine to start, and the build says so in a `cargo:warning`. CI does not set it on a tag
+build; if the witness is missing there, the release fails and you are pointed at
+`prepare-anchor.yml`.
+
 Android: Node UI (`npm run sync-www`), Gradle APK under `apps/android/android`, with engine binaries staged into `jniLibs` as `libaether.so`.
+
+### Android `versionCode` ↔ `versionName`
+
+`apps/android/android/app/build.gradle.kts` pairs `versionCode = 52` with
+`versionName = "1.3.0"`, and nothing recorded why 52. It is not derived and must not be
+guessed at: **Android installs strictly greater `versionCode` only**, so a release that
+bumps `versionName` and forgets `versionCode` publishes an APK that existing users cannot
+update to — silently, with no build error.
+
+The coupling, stated:
+
+| Field | Lives in | Rule |
+|---|---|---|
+| `versionName` | `aether/Cargo.toml`, `apps/desktop/src-tauri/Cargo.toml` + `tauri.conf.json`, `apps/desktop/package.json`, `apps/android/android/app/build.gradle.kts` | user-facing semver, **must match across all five** |
+| `versionCode` | `apps/android/android/app/build.gradle.kts` only | monotonic integer, `+1` per published APK, never reused, never derived from `versionName` |
+
+52 is simply the count of published Android builds to date. When you bump `versionName`
+to `1.3.1`, set `versionCode = 53` in the same commit; a `versionCode` that is not the
+previous release's plus one is a release-blocking review comment.
+

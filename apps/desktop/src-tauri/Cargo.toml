@@ -46,3 +46,22 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+
+# The engine (aether/Cargo.toml) has shipped with `strip = true, lto = "fat",
+# codegen-units = 1` for a long time; this crate had no `[profile.release]` at all,
+# so the binary that actually sits on the customer's desktop - the one with the
+# tray, the IPC surface and the paths into `%APPDATA%` - kept its full symbol
+# table while the thing it spawns did not. The GUI is the more interesting
+# reverse-engineering target of the two, which makes the mismatch backwards.
+#
+# `panic = "unwind"` is stated rather than inherited: the engine's unwind is
+# load-bearing (its `catch_unwind` netstack containment), and here it is what the
+# shell's own `tests/` and the Tauri runtime expect. Writing it down means a future
+# `panic = "abort"` size-optimisation cannot be applied to one half of the product
+# and silently change how a crash looks to a user.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true

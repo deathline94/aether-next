@@ -185,14 +185,11 @@ jobs:
       - name: Sign and verify engine
         shell: pwsh
         run: |
-          $cert = Get-Item "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT"
-          if (-not $cert) { throw "Code signing cert not found in store" }
-          $enginePath = "aether/target/release/aether.exe"
-          Set-AuthenticodeSignature -FilePath $enginePath -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
-          $sig = Get-AuthenticodeSignature -FilePath $enginePath
-          if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Engine signature invalid: $($sig.StatusMessage)" }
-          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Engine publisher CN mismatch: $($sig.SignerCertificate.Subject)" }
-          Write-Host "Engine signed and verified successfully: $($sig.SignerCertificate.Subject)"
+          if (-not (Get-Item "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -ErrorAction SilentlyContinue)) { throw "Code signing cert not found in store" }
+          # Single rule for "this binary is properly signed", shared with the
+          # installer/GUI signing step and the packaged-artifact re-verification
+          # below. It used to be re-typed at each site with different strictness.
+          & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path "aether/target/release/aether.exe"
 
       - name: Stage engine
         shell: pwsh
@@ -257,11 +254,11 @@ jobs:
           if (-not $gui) { throw "gui missing" }
 
           foreach ($bin in @($nsis.FullName, $gui)) {
+            # sign-windows.ps1 now re-reads the signature through the same
+            # Status -eq 'Valid' + CN assertion the release job demands, so the
+            # weaker inline `@("NotSigned","HashMismatch")` re-check that used to
+            # follow this call - and pass a NotTrusted signature - is gone.
             & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path $bin
-            $sig = Get-AuthenticodeSignature -FilePath $bin
-            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Signature invalid for ${bin}: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Publisher CN mismatch for ${bin}: $($sig.SignerCertificate.Subject)" }
-            Write-Host "Verified signature for ${bin}: $($sig.SignerCertificate.Subject)"
           }
 
       - name: Package
@@ -300,10 +297,7 @@ jobs:
             "dist-windows/portable/engine/aether.exe"
           )
           foreach ($b in $bins) {
-            $sig = Get-AuthenticodeSignature -FilePath $b
-            if (-not $sig.SignerCertificate -or $sig.Status -in @("NotSigned", "HashMismatch")) { throw "Packaged artifact signature invalid for ${b}: $($sig.StatusMessage)" }
-            if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "Packaged artifact publisher mismatch for ${b}: $($sig.SignerCertificate.Subject)" }
-            Write-Host "Verified packaged artifact $b : $($sig.SignerCertificate.Subject)"
+            & ".github/scripts/sign-windows.ps1" -VerifyOnly -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path $b
           }
           # The outer signature only says the container was signed when it was
           # built; NSIS payloads are not hash-sealed, so extract and check what a
@@ -381,7 +375,17 @@ jobs:
           ndk-version: r27d
           link-to-sdk: true
       - name: Accept Android licenses
-        run: yes | sdkmanager --licenses || true
+        # `|| true` was there because `sdkmanager --licenses` exits non-zero even
+        # when it succeeded. Tolerating the exit code is fine; tolerating the
+        # absence of its *effect* is not - a failed acceptance would fall through
+        # to the Gradle build, which then either prompts forever or fails with an
+        # error that points at the NDK, not at the licence. Assert the outcome.
+        run: |
+          set -uo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          test -d "$ANDROID_HOME/licenses" || { echo "::error::sdkmanager created no licenses directory under $ANDROID_HOME"; exit 1; }
+          find "$ANDROID_HOME/licenses" -type f -size +0c | grep -q . || { echo "::error::$ANDROID_HOME/licenses holds no accepted term - the SDK licences were not agreed"; exit 1; }
+          echo "Android SDK licences accepted ($(find "$ANDROID_HOME/licenses" -type f -size +0c | wc -l) file(s))"
       - run: cargo install cargo-ndk --version 4.1.2 --locked
       - name: Engine + stage
         working-directory: aether
@@ -513,7 +517,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) -exec cp -v {} out/ \;
+          # Flattening `dist/**` into `out/` used to be `cp -v {} out/`, which
+          # silently overwrites when two payloads share a basename - the release
+          # then ships whichever find() visited last. Refuse instead.
+          find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) | LC_ALL=C sort > /tmp/pack-list
+          while IFS= read -r f; do
+            b="$(basename "$f")"
+            if [[ -e "out/$b" ]]; then
+              echo "::error::two artifacts flatten to out/$b - existing source vs '$f'"
+              exit 1
+            fi
+            cp -v "$f" "out/$b"
+          done < /tmp/pack-list
           cd out
           ls -la
           for f in ./*; do
@@ -522,7 +537,24 @@ jobs:
           done
           # `./*` rather than `*`: a name beginning with a dash would otherwise be
           # parsed as an option by sha256sum.
-          sha256sum ./* > SHA256SUMS.txt 2>/dev/null || true
+          # No `|| true`: this used to swallow every failure and still publish. An
+          # empty or partial SHA256SUMS.txt is precisely the artifact nobody notices
+          # until a download cannot be checked, so assert the manifest covers every
+          # payload and that it verifies.
+          sha256sum ./* > SHA256SUMS.txt
+          test -s SHA256SUMS.txt
+          expected=$(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name '*.sha256' | wc -l)
+          actual=$(grep -c . SHA256SUMS.txt)
+          if [[ "$expected" != "$actual" ]]; then
+            echo "::error::SHA256SUMS.txt lists $actual digest(es) for $expected artifact(s)"
+            exit 1
+          fi
+          sha256sum -c --quiet SHA256SUMS.txt
+          count=$(find . -maxdepth 1 -name '*.sha256' | wc -l)
+          if [[ "$count" != "$expected" ]]; then
+            echo "::error::$count per-file .sha256 sidecars for $expected artifacts"
+            exit 1
+          fi
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             {
               echo "tag=${GITHUB_REF_NAME}"

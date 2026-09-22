@@ -85,17 +85,50 @@ rustup-init.exe
 *.jks
 google-services.json
 local.properties
+# Private key material and certificate containers. specs/015 research.md R30
+# claimed these were added; they were not, which is why the only thing standing
+# between a committed signing key and `git add -A` used to be the `.env` lines
+# above. Verified against `git ls-files` first: the only key/cert files tracked
+# today are quiche's upstream example fixtures, listed as explicit negations
+# below so a re-vendor cannot accidentally drop them and so nobody reads these
+# patterns as an oversight.
+*.key
+*.pem
+*.pfx
+*.p12
+*.crt
+# !  Upstream vendored example certificates/keys (test fixtures, not secrets):
+!quiche/apps/src/bin/cert.key
+!quiche/apps/src/bin/cert.crt
+!quiche/fuzz/cert.key
+!quiche/fuzz/cert.crt
+!quiche/quiche/examples/cert.key
+!quiche/quiche/examples/cert.crt
+!quiche/quiche/examples/cert-big.crt
+!quiche/quiche/examples/rootca.crt
+!quiche/tokio-quiche/examples/cert.key
+!quiche/tokio-quiche/examples/cert.crt
 
 # ── Archives (do not commit build products) ───────────────────
 *.zip
 *.tar.gz
 *.tgz
 *.7z
-!packaging/**
+# There used to be a `!packaging/**` here. A blanket un-ignore of an entire
+# subtree sitting directly beside the code that mints installers means a committed
+# `packaging/windows-x64.zip` would have bypassed this rule with no review signal.
+# Nothing under packaging/ is an archive today (`git ls-files packaging` = 3 text
+# files + wintun.dll), so the exception is gone. Re-add it BY FILE NAME, in the
+# commit that adds the asset, never by subtree.
 
 # ⚙ Runtime Configs & State
-aether*.toml
-aether*.json
+# Anchored to the repository root and no longer a bare `aether*` prefix: the
+# unanchored form matched ANY directory in the tree, so a legitimate future asset
+# - apps/desktop/src-tauri/aether.config.json, Docs/aether-notes.toml - would be
+# silently un-addable, which is the same class of bug as the archive exception
+# above. Local scratch files produced by the tooling live at the root.
+/aether*.toml
+/aether*.json
 
 # ── Qoder / AI tooling artifacts ─────────────────────────────
 .qoder/
