@@ -1359,6 +1359,8 @@ impl MasqueProbe {
                     noize: self.noize.clone(),
                     timeout,
                     local_ipv4: self.local_ipv4,
+                    header_mode: crate::masque::H3HeaderMode::Standard,
+                    protocol: None,
                 };
 
                 match crate::quic::verify_masque(&vp).await {

@@ -24,14 +24,6 @@ use crate::quic::{self, VerifyParams};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
-fn header_label(mode: H3HeaderMode) -> &'static str {
-    match mode {
-        H3HeaderMode::Cf => "cf",
-        H3HeaderMode::Standard => "standard",
-        H3HeaderMode::Both => "both",
-    }
-}
-
 struct Combo {
     sni: &'static str,
     headers: H3HeaderMode,
@@ -40,7 +32,7 @@ struct Combo {
     dgram: H3DgramMode,
     authority: String,
     path: String,
-    /// Overrides `AETHER_MASQUE_H3_PROTOCOL` for this combo when set.
+    /// Overrides the CONNECT-IP protocol token for this combo when set.
     proto: Option<&'static str>,
 }
 
@@ -79,13 +71,9 @@ pub async fn run_probe(edge: SocketAddr, identity: &Identity, ech: Option<Vec<u8
 
     let mut rows: Vec<String> = Vec::new();
     for c in &combos {
-        // connect_ip_request / H3DgramMode read these at request-build time; each
+        // The datagram axis is read from the process env at data-plane time; each
         // probe is awaited fully before the next, so there is no cross-combo race.
-        crate::runtime_env::set("AETHER_MASQUE_H3_HEADERS", header_label(c.headers));
         crate::runtime_env::set("AETHER_MASQUE_H3_DGRAM", c.dgram.label());
-        if let Some(p) = c.proto {
-            crate::runtime_env::set("AETHER_MASQUE_H3_PROTOCOL", p);
-        }
 
         let vp = VerifyParams {
             peer: edge,
@@ -98,6 +86,8 @@ pub async fn run_probe(edge: SocketAddr, identity: &Identity, ech: Option<Vec<u8
             noize: noize.clone(),
             timeout: PROBE_TIMEOUT,
             local_ipv4,
+            header_mode: c.headers,
+            protocol: c.proto,
         };
         let started = Instant::now();
         let outcome = match quic::verify_masque(&vp).await {
@@ -106,11 +96,11 @@ pub async fn run_probe(edge: SocketAddr, identity: &Identity, ech: Option<Vec<u8
         };
         let row = format!(
             "proto={} authority={} path={} sni={} headers={} ech={} dgram={} elapsed={:?} -> {outcome}",
-            c.proto.unwrap_or("(env)"),
+            c.proto.unwrap_or("(default)"),
             c.authority,
             c.path,
             c.sni,
-            header_label(c.headers),
+            c.headers.label(),
             c.ech_label,
             c.dgram.label(),
             started.elapsed(),

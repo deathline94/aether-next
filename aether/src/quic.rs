@@ -1206,6 +1206,12 @@ pub struct VerifyParams {
     pub timeout: Duration,
     /// Local IPv4 for data-plane probe source address.
     pub local_ipv4: std::net::Ipv4Addr,
+    /// Which CONNECT-IP header recipe to put on the wire. The production tunnel
+    /// always sends [`crate::masque::H3HeaderMode::Standard`]; the H3 probe sweeps
+    /// this so a 400 can be attributed to a shape rather than guessed at.
+    pub header_mode: crate::masque::H3HeaderMode,
+    /// Overrides the CONNECT-IP protocol token for the same reason.
+    pub protocol: Option<&'static str>,
 }
 
 pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
@@ -1338,7 +1344,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     &format!("alpn={}", String::from_utf8_lossy(conn.application_proto())),
                 );
             }
-            let headers = masque::connect_ip_request(&p.authority, &p.path);
+            let headers =
+                masque::connect_ip_request_mode(&p.authority, &p.path, p.header_mode, p.protocol);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
             req_stream = Some(sid);
             h3_conn = Some(h3c);

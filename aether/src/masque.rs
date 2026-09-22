@@ -49,23 +49,11 @@ pub enum H3HeaderMode {
 }
 
 impl H3HeaderMode {
-    /// Resolve from `AETHER_MASQUE_H3_HEADERS` (default: `standard`).
-    #[allow(dead_code)]
-    pub fn from_env() -> Self {
-        match crate::runtime_env::var("AETHER_MASQUE_H3_HEADERS")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "cf" => H3HeaderMode::Cf,
-            "both" => H3HeaderMode::Both,
-            // Default: Standard = clean RFC 9484 extended CONNECT (:protocol
-            // cf-connect-ip + :scheme/:authority/:path). Proven live to reach 200 +
-            // data-plane on the MASQUE VIP. The previous `Both` default piled the
-            // legacy cf-connect-proto/pq-enabled headers on top, which some edges
-            // reject with 400 (observed on 162.159.198.2) -> H3 could not connect.
-            _ => H3HeaderMode::Standard,
+    pub fn label(self) -> &'static str {
+        match self {
+            H3HeaderMode::Cf => "cf",
+            H3HeaderMode::Standard => "standard",
+            H3HeaderMode::Both => "both",
         }
     }
 }
@@ -115,43 +103,52 @@ impl H3DgramMode {
     }
 }
 
+/// The production CONNECT-IP request.
+///
+/// RFC 9484 extended CONNECT (`:protocol` + `:scheme`/`:authority`/`:path` +
+/// `capsule-protocol`), the only shape observed to reach 200 + data-plane on the
+/// MASQUE VIP. Piling the legacy `cf-connect-proto`/`pq-enabled` headers on top
+/// made some edges answer 400 (observed on 162.159.198.2).
 pub fn connect_ip_request(authority: &str, path: &str) -> Vec<h3::Header> {
-    vec![
-        h3::Header::new(b":method", b"CONNECT"),
-        h3::Header::new(b":protocol", consts::CF_CONNECT_PROTOCOL.as_bytes()),
-        h3::Header::new(b":scheme", b"https"),
-        h3::Header::new(b":authority", authority.as_bytes()),
-        h3::Header::new(b":path", path.as_bytes()),
-        h3::Header::new(b"user-agent", b""),
-        h3::Header::new(b"capsule-protocol", b"?1"),
-    ]
+    connect_ip_request_mode(authority, path, H3HeaderMode::Standard, None)
 }
 
-/// Build the CONNECT-IP request headers for a given recipe (used by test harnesses).
-#[allow(dead_code)]
-pub fn connect_ip_request_mode(authority: &str, path: &str, mode: H3HeaderMode) -> Vec<h3::Header> {
+/// Build the CONNECT-IP request headers for a given recipe.
+///
+/// `protocol` overrides the negotiated token (`:protocol` for the extended-CONNECT
+/// shapes, `cf-connect-proto` for the legacy one) so a probe can sweep it.
+pub fn connect_ip_request_mode(
+    authority: &str,
+    path: &str,
+    mode: H3HeaderMode,
+    protocol: Option<&str>,
+) -> Vec<h3::Header> {
+    let token = protocol.unwrap_or(consts::CF_CONNECT_PROTOCOL).as_bytes();
     match mode {
-        H3HeaderMode::Standard => connect_ip_request(authority, path),
-        H3HeaderMode::Cf => {
-            vec![
-                h3::Header::new(b":method", b"CONNECT"),
-                h3::Header::new(b":authority", authority.as_bytes()),
-                h3::Header::new(b"user-agent", b""),
-                h3::Header::new(
-                    consts::CF_CONNECT_PROTO_HEADER.as_bytes(),
-                    consts::CF_CONNECT_PROTOCOL.as_bytes(),
-                ),
-                h3::Header::new(
-                    consts::CF_PQ_ENABLED_HEADER.as_bytes(),
-                    consts::CF_PQ_ENABLED_VALUE.as_bytes(),
-                ),
-            ]
-        }
+        H3HeaderMode::Standard => vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", token),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", authority.as_bytes()),
+            h3::Header::new(b":path", path.as_bytes()),
+            h3::Header::new(b"user-agent", b""),
+            h3::Header::new(b"capsule-protocol", b"?1"),
+        ],
+        H3HeaderMode::Cf => vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":authority", authority.as_bytes()),
+            h3::Header::new(b"user-agent", b""),
+            h3::Header::new(consts::CF_CONNECT_PROTO_HEADER.as_bytes(), token),
+            h3::Header::new(
+                consts::CF_PQ_ENABLED_HEADER.as_bytes(),
+                consts::CF_PQ_ENABLED_VALUE.as_bytes(),
+            ),
+        ],
         H3HeaderMode::Both => {
-            let mut h = connect_ip_request(authority, path);
+            let mut h = connect_ip_request_mode(authority, path, H3HeaderMode::Standard, protocol);
             h.push(h3::Header::new(
                 consts::CF_CONNECT_PROTO_HEADER.as_bytes(),
-                consts::CF_CONNECT_PROTOCOL.as_bytes(),
+                token,
             ));
             h.push(h3::Header::new(
                 consts::CF_PQ_ENABLED_HEADER.as_bytes(),
@@ -395,7 +392,7 @@ mod tests {
 
     #[test]
     fn h3_headers_cf_mirrors_h2_recipe() {
-        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Cf);
+        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Cf, None);
         assert_eq!(header_value(&hs, b":method").as_deref(), Some(&b"CONNECT"[..]));
         assert_eq!(header_value(&hs, b":authority").as_deref(), Some(&b"cloudflareaccess.com"[..]));
         assert_eq!(header_value(&hs, b"cf-connect-proto").as_deref(), Some(&b"cf-connect-ip"[..]));
@@ -408,7 +405,7 @@ mod tests {
 
     #[test]
     fn h3_headers_standard_is_extended_connect() {
-        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Standard);
+        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Standard, None);
         assert_eq!(header_value(&hs, b":protocol").as_deref(), Some(&b"cf-connect-ip"[..]));
         assert_eq!(header_value(&hs, b":scheme").as_deref(), Some(&b"https"[..]));
         assert_eq!(header_value(&hs, b":path").as_deref(), Some(&b"/"[..]));
@@ -418,10 +415,35 @@ mod tests {
 
     #[test]
     fn h3_headers_both_is_superset() {
-        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Both);
+        let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Both, None);
         assert!(header_value(&hs, b":protocol").is_some());
         assert!(header_value(&hs, b"cf-connect-proto").is_some());
         assert!(header_value(&hs, b"capsule-protocol").is_some());
+    }
+
+    /// The probe's `:protocol` axis has to change the bytes on the wire, in
+    /// whichever header carries the token for that recipe.
+    #[test]
+    fn h3_headers_protocol_override_reaches_the_wire() {
+        for mode in [H3HeaderMode::Cf, H3HeaderMode::Standard, H3HeaderMode::Both] {
+            let hs =
+                connect_ip_request_mode("example.com", "/", mode, Some("connect-ip"));
+            let token = match mode {
+                H3HeaderMode::Cf => b"cf-connect-proto".as_slice(),
+                _ => b":protocol".as_slice(),
+            };
+            assert_eq!(
+                header_value(&hs, token).as_deref(),
+                Some(&b"connect-ip"[..]),
+                "{mode:?} swallowed the protocol override"
+            );
+        }
+        // The production shape is unaffected by the new parameter.
+        let prod = connect_ip_request("example.com", "/");
+        assert_eq!(
+            header_value(&prod, b":protocol").as_deref(),
+            Some(consts::CF_CONNECT_PROTOCOL.as_bytes())
+        );
     }
 
     #[test]

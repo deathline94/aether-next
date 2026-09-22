@@ -685,6 +685,8 @@ async fn quick_verify_masque(
         noize: noize_config(),
         timeout: std::time::Duration::from_secs(6),
         local_ipv4,
+        header_mode: crate::masque::H3HeaderMode::Standard,
+        protocol: None,
     };
     quic::verify_masque(&vp).await
 }
