@@ -89,7 +89,16 @@ export type LogEntry = {
 };
 
 export function formatLogTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  // `hour12: false`, matching the desktop console: the rows sit on a 64 px time
+  // track, and an en-US "02:15:33 PM" is ~69 px of an 11-char monospace string —
+  // so every afternoon the column wrapped or clipped and the log stopped lining
+  // up. A 24-hour HH:MM:SS is always the same width.
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 // Android default: full-device VPN (VpnService + hev tun2socks).
