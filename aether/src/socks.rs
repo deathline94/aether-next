@@ -331,7 +331,11 @@ pub(crate) fn configured_dns_servers() -> Vec<SocketAddr> {
 ///
 /// IPv4 only: the adapter's IPv6 binding is disabled just above, and a
 /// mixed-family `-ServerAddresses` call fails outright.
-pub(crate) fn dns_servers_for_adapter(list: &[SocketAddr]) -> Vec<Ipv4Addr> {
+/// `pub` rather than `pub(crate)` on purpose: its only caller is the Windows TUN
+/// path, and a crate-private helper used by exactly one `#[cfg(windows)]` module is
+/// dead code — and therefore a hard `-D warnings` failure — on every other target,
+/// including the Linux CI that runs this module's tests.
+pub fn dns_servers_for_adapter(list: &[SocketAddr]) -> Vec<Ipv4Addr> {
     let mut out: Vec<Ipv4Addr> = Vec::new();
     for sa in list {
         if let IpAddr::V4(v4) = sa.ip() {
