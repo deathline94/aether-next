@@ -409,6 +409,33 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'engine-verified-before-every-spawn',
+    invariant: 'BC-02',
+    summary: 'every engine spawn site verifies the binary first, in every routing mode',
+    scan(api) {
+      const v = [];
+      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
+        const t = api.read(f);
+        const spawns = [...t.matchAll(/Command::new\(&executable\)/g)].length;
+        const verified = [...t.matchAll(/verify_engine_or_refuse\(&executable\)/g)].length;
+        if (verified < spawns) {
+          v.push(`${rel(f)}: ${spawns - verified} spawn site(s) reach Command::new without the signature/digest check — verification used to be gated on routing_mode == "tun", so proxy mode spawned an unchecked binary`);
+        }
+        const modeGatedTrust = /routing_mode\s*==\s*"tun"[\s\S]{0,400}?verify_elevated_binary\(&executable/.test(t);
+        if (modeGatedTrust) {
+          v.push(`${rel(f)}: an engine trust check sits inside a routing-mode branch again`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/lib.rs',
+        content: 'fn a() {\n  if settings.routing_mode == "tun" {\n    verify_elevated_binary(&executable, "aether.exe", &policy).unwrap();\n  }\n  let mut command = Command::new(&executable);\n  command.spawn();\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

@@ -1311,6 +1311,19 @@ pub fn verify_elevated_binary(
     Ok(())
 }
 
+/// Verify the engine binary this process is about to spawn, in **every** mode.
+///
+/// The call used to live inside `if settings.routing_mode == "tun"`, so the
+/// unelevated proxy/socks paths started a binary whose signature and digest
+/// nobody had looked at: `engine_path` only proves "a PE under an allowed root",
+/// which a dropped-in file satisfies. Wrapping it in one named function keeps a
+/// mode from being able to opt out again by accident, and gives the invariant
+/// gate a single token to count against the spawn sites.
+fn verify_engine_or_refuse(path: &Path) -> Result<(), CommandError> {
+    verify_elevated_binary(path, "aether.exe", &TrustedBinaryPolicy::for_engine())
+        .map_err(CommandError::from)
+}
+
 /// Drop every `AETHER_*` variable this process inherited before spawning the
 /// engine.
 ///
@@ -1724,9 +1737,6 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         // renamed, or shadowed by one the user dropped next to the exe.
         let mut wintun_for_handoff: Option<PathBuf> = None;
         if settings.routing_mode == "tun" {
-            let engine_policy = TrustedBinaryPolicy::for_engine();
-            verify_elevated_binary(&executable, "aether.exe", &engine_policy)
-                .map_err(CommandError::from)?;
             let wintun = wintun_path(&app).ok_or_else(|| {
                 CommandError::new(
                     "not_found",
@@ -1759,6 +1769,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         }
 
         let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
+        verify_engine_or_refuse(&executable)?;
         let mut command = Command::new(&executable);
         scrub_ambient_engine_env(&mut command);
         command
@@ -2034,6 +2045,7 @@ fn scan(
     };
 
     let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
+    verify_engine_or_refuse(&executable)?;
     let mut command = Command::new(&executable);
     scrub_ambient_engine_env(&mut command);
     command
