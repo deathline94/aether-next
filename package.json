@@ -1,14 +1,9 @@
 {
-  "name": "aether-workspace",
+  "name": "aether-tools",
   "private": true,
   "version": "1.3.0",
   "type": "module",
-  "description": "npm workspace tying the shared @aether/ui package to the desktop and Android frontends so both consume one token source.",
-  "workspaces": [
-    "packages/*",
-    "apps/desktop",
-    "apps/android"
-  ],
+  "description": "Repository-level scripts (token sync, invariant gates). Deliberately NOT an npm workspace: every import of packages/ui is a relative path, so workspaces bought nothing here, and a workspace root without its own lockfile makes `npm ci` fail for both apps — npm walks to the root, ignores the committed apps/*/package-lock.json, and reports EUSAGE. The frontends install and pin independently.",
   "scripts": {
     "sync-tokens": "node scripts/sync-tokens.mjs",
     "verify-invariants": "node scripts/sync-tokens.mjs --check && node scripts/verify-invariants.mjs"

@@ -624,7 +624,7 @@ const GATES = [
   },
   {
     name: 'actions-pinned-to-full-commit',
-    invariant: 'BC-22',
+    invariant: 'BC-18',
     summary: 'workflow actions are pinned to a full commit SHA, one SHA per action',
     scan(api) {
       const v = [];
@@ -655,6 +655,67 @@ const GATES = [
       return {
         file: '.github/workflows/__selftest__.yml',
         content: 'jobs:\n  a:\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68\n      - uses: actions/setup-node@v4\n',
+      };
+    },
+  },
+  {
+    name: 'npm-lock-is-the-one-npm-reads',
+    invariant: 'BC-18',
+    summary: 'a workspaces root owns the lockfile; no committed lock sits where npm cannot see it',
+    scan(api) {
+      // `workspaces` in an ancestor manifest makes every descendant
+      // `package-lock.json` invisible: npm resolves the workspace root and reads
+      // only *its* lock — and if the root has none, `npm ci` in `apps/desktop`
+      // fails with EUSAGE on a clean checkout while the committed 100 KB lock
+      // beside it looks perfectly pinned. This repo shipped both halves of that:
+      // a root declaring three workspaces, no root lock, and two member locks
+      // that pinned nothing (their Tailwind entries survived the removal of
+      // Tailwind itself).
+      const FIRST_PARTY = /^(|apps\/[^/]+|packages\/[^/]+)$/;
+      const dirOf = (abs) => {
+        const parts = rel(abs).split('/');
+        return parts.slice(0, -1).join('/');
+      };
+      // The workspace root of the repository itself is the empty relative dir, and
+      // everything below it is inside that root.
+      const isUnder = (dir, root) => (root === '' ? true : dir === root || dir.startsWith(`${root}/`));
+
+      const manifests = [];
+      for (const f of api.files('.', /^package\.json$/)) {
+        const dir = dirOf(f);
+        if (!FIRST_PARTY.test(dir)) continue;
+        let json;
+        try {
+          json = JSON.parse(api.read(f));
+        } catch {
+          continue;
+        }
+        manifests.push([dir, f, json]);
+      }
+      if (!manifests.length) return ['no first-party package.json found — the check is unverifiable'];
+
+      const locked = new Set(api.files('.', /^package-lock\.json$/).map(dirOf));
+      const roots = manifests.filter(([, , j]) => Array.isArray(j.workspaces) || typeof j.workspaces === 'object');
+      const v = [];
+      for (const [dir, f] of roots) {
+        if (!locked.has(dir)) {
+          v.push(`${rel(f)} declares workspaces but has no package-lock.json beside it: every lockfile below it is unreadable and \`npm ci\` fails there`);
+        }
+      }
+      for (const lock of api.files('.', /^package-lock\.json$/)) {
+        const dir = dirOf(lock);
+        if (!dir) continue;
+        const owner = roots.map(([rdir]) => rdir).find((rdir) => isUnder(dir, rdir) && dir !== rdir);
+        if (owner !== undefined) {
+          v.push(`${rel(lock)} is inside the workspace root "${owner || '.'}/package.json" — npm resolves the root manifest and never reads this lock`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'packages/__selftest__/package.json',
+        content: '{ "name": "phantom-workspace", "workspaces": ["apps/*"] }\n',
       };
     },
   },
