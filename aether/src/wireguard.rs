@@ -42,7 +42,6 @@ pub struct WgConfig {
     pub peer_public_key: [u8; 32],
     pub peer_endpoint: SocketAddr,
     pub client_id: [u8; 3],
-    pub preshared_key: Option<[u8; 32]>,
     pub persistent_keepalive: Option<u16>,
     pub aethernoize: Arc<AetherNoizeConfig>,
 }
@@ -64,6 +63,19 @@ pub struct EstablishedSession {
     client_id: [u8; 3],
 }
 
+/// How long the tunnel should hold the NAT mapping open with.
+///
+/// Read here rather than at each call site because the probe and the session
+/// have to agree: a session established during a scan carries the keepalive the
+/// probe asked for, so a setting the probe ignored was silently discarded on
+/// exactly the path that reuses it (`WgTunnel::from_established`).
+pub fn persistent_keepalive_secs() -> u16 {
+    crate::runtime_env::var("AETHER_WG_KEEPALIVE")
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&v: &u16| v > 0)
+        .unwrap_or(5)
+}
+
 impl WgTunnel {
     pub async fn new(cfg: WgConfig, inbound_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
         let bind_addr = if cfg.peer_endpoint.is_ipv4() {
@@ -77,7 +89,11 @@ impl WgTunnel {
 
         let local_secret = StaticSecret::from(cfg.local_private_key);
         let peer_public = PublicKey::from(cfg.peer_public_key);
-        let preshared = cfg.preshared_key;
+        // No preshared key, deliberately: WARP enrolment never returns one, and
+        // boringtun folds a nonzero PSK into k2/mac2, so a peer configured without
+        // it could not answer the handshake at all. The probe below builds its
+        // tunnel the same way, which is what makes a cached handshake reusable.
+        let preshared: Option<[u8; 32]> = None;
 
         let tunn = Tunn::new(local_secret, peer_public, preshared, cfg.persistent_keepalive, 0, None)
             .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
@@ -443,7 +459,14 @@ pub async fn verify_endpoint_keep_session(
     let local_secret = StaticSecret::from(private_key);
     let peer_pk = PublicKey::from(peer_public);
 
-    let mut tunn = Tunn::new(local_secret, peer_pk, None, Some(25), 0, None)
+    let mut tunn = Tunn::new(
+        local_secret,
+        peer_pk,
+        None,
+        Some(persistent_keepalive_secs()),
+        0,
+        None,
+    )
         .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
 
     let mut out_buf = vec![0u8; MAX_PACKET];

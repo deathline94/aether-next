@@ -952,11 +952,10 @@ async fn await_opt<T>(handle: &mut Option<tokio::task::JoinHandle<T>>) {
 
 // ─── WireGuard tunnel runner ────────────────────────────────────────────────
 
+/// The single definition lives in `wireguard.rs`, beside the probe that has to
+/// use the same value — see `wireguard::persistent_keepalive_secs`.
 fn wg_keepalive_secs() -> u16 {
-    crate::runtime_env::var("AETHER_WG_KEEPALIVE")
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v: &u16| v > 0)
-        .unwrap_or(5)
+    crate::wireguard::persistent_keepalive_secs()
 }
 
 async fn run_wireguard(
@@ -1061,7 +1060,6 @@ async fn run_wireguard_tunnel(
         peer_public_key: peer_public,
         peer_endpoint: peer,
         client_id: identity.client_id,
-        preshared_key: None,
         persistent_keepalive: Some(wg_keepalive_secs()),
         aethernoize: std::sync::Arc::new(aethernoize.clone()),
     };
@@ -1168,7 +1166,6 @@ async fn establish_wg(
         peer_public_key: peer_public,
         peer_endpoint: peer,
         client_id: identity.client_id,
-        preshared_key: None,
         persistent_keepalive: Some(keepalive),
         aethernoize: std::sync::Arc::new(profile),
     };
