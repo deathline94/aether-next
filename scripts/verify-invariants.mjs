@@ -732,6 +732,54 @@ const GATES = [
     },
   },
   {
+    name: 'css-breakpoint-reachable',
+    invariant: 'BC-11',
+    summary: 'no desktop media query narrower or shorter than the window minimum',
+    scan(api) {
+      // A window that cannot be resized below 900x620 can never show a 680 px
+      // layout, so every rule under such a breakpoint is dead CSS that reads as
+      // responsive work. Two desktop blocks were like that in this repo's history
+      // (measured across all 29 commits that touched the sheet, which is the same
+      // shape of check this gate runs on every push); they are gone now, and the
+      // rule keeps them from coming back. Desktop only: on the phone the viewport
+      // *is* the device, so a 680 px query there is the layout, not a fiction.
+      const CONF = 'apps/desktop/src-tauri/tauri.conf.json';
+      if (!existsRel(CONF)) return ['tauri.conf.json missing'];
+      let conf;
+      try {
+        conf = JSON.parse(readFileSync(join(ROOT, CONF), 'utf8'));
+      } catch (e) {
+        return [`tauri.conf.json does not parse: ${e.message}`];
+      }
+      const win = conf?.app?.windows?.[0] ?? {};
+      if (typeof win.width !== 'number' || typeof win.height !== 'number') {
+        return ['no primary window size in tauri.conf.json — reachability is unverifiable'];
+      }
+      const minWidth = typeof win.minWidth === 'number' ? win.minWidth : 0;
+      const minHeight = typeof win.minHeight === 'number' ? win.minHeight : 0;
+      const v = [];
+      for (const f of api.files('apps/desktop/src', /\.css$/)) {
+        const src = api.read(f);
+        for (const m of src.matchAll(/@media[^{]*?\((max-width|max-height):\s*(\d+)px\)/g)) {
+          const limit = m[1] === 'max-width' ? minWidth : minHeight;
+          const px = Number(m[2]);
+          if (px < limit) {
+            v.push(
+              `${locate(f, src, m.index)} (${m[1]}: ${px}px) can never match: the window cannot be smaller than ${limit}px, so every rule in this block is dead`,
+            );
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: '@media (max-width: 400px) {\n  .impossible { color: red; }\n}\n',
+      };
+    },
+  },
+  {
     name: 'npm-lock-is-the-one-npm-reads',
     invariant: 'BC-18',
     summary: 'a workspaces root owns the lockfile; no committed lock sits where npm cannot see it',
