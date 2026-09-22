@@ -481,43 +481,53 @@ class SessionController(
         fun validateSettings(s: Settings) {
             val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg", "gool")
             if (s.protocol.lowercase() !in validProtocols) {
-                throw IllegalArgumentException("Invalid protocol '${s.protocol}'. Allowed: $validProtocols")
+                throw SettingRejected("protocol", "Invalid protocol '${s.protocol}'. Allowed: $validProtocols")
             }
             val validTransports = setOf("h2", "h3")
             if (s.transport.lowercase() !in validTransports) {
-                throw IllegalArgumentException("Invalid transport '${s.transport}'. Allowed: $validTransports")
+                throw SettingRejected("transport", "Invalid transport '${s.transport}'. Allowed: $validTransports")
             }
             val validPresets = setOf("warp", "gool")
             if (s.endpointPreset.lowercase() !in validPresets) {
-                throw IllegalArgumentException("Invalid endpointPreset '${s.endpointPreset}'. Allowed: $validPresets")
+                throw SettingRejected("endpointPreset", "Invalid endpointPreset '${s.endpointPreset}'. Allowed: $validPresets")
             }
             val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "thorough", "ironclad")
             if (s.scanMode.lowercase() !in validScanModes) {
-                throw IllegalArgumentException("Invalid scanMode '${s.scanMode}'. Allowed: $validScanModes")
+                throw SettingRejected("scanMode", "Invalid scanMode '${s.scanMode}'. Allowed: $validScanModes")
             }
             val validIpVersions = setOf("v4", "v6", "dual", "both")
             if (s.ipVersion.lowercase() !in validIpVersions) {
-                throw IllegalArgumentException("Invalid ipVersion '${s.ipVersion}'. Allowed: $validIpVersions")
+                throw SettingRejected("ipVersion", "Invalid ipVersion '${s.ipVersion}'. Allowed: $validIpVersions")
             }
             val validRoutingModes = setOf("tun", "proxy-only", "system-proxy")
             if (s.routingMode.lowercase() !in validRoutingModes) {
-                throw IllegalArgumentException("Invalid routingMode '${s.routingMode}'. Allowed: $validRoutingModes")
+                throw SettingRejected("routingMode", "Invalid routingMode '${s.routingMode}'. Allowed: $validRoutingModes")
             }
             val validNoize = setOf("off", "on", "random", "m1", "m2", "light", "medium", "high", "max", "custom")
             if (s.noize.lowercase() !in validNoize) {
-                throw IllegalArgumentException("Invalid noize mode '${s.noize}'. Allowed: $validNoize")
+                throw SettingRejected("noize", "Invalid noize mode '${s.noize}'. Allowed: $validNoize")
             }
-            if (s.socksPort !in 1024..65535 || s.httpPort !in 1024..65535) {
-                throw IllegalArgumentException("Ports must be 1024-65535")
+            if (s.httpPort !in 1024..65535) {
+                throw SettingRejected("httpPort", "HTTP port must be 1024-65535 (got ${s.httpPort})")
+            }
+            if (s.socksPort !in 1024..65535) {
+                throw SettingRejected("socksPort", "SOCKS5 port must be 1024-65535 (got ${s.socksPort})")
             }
             if (s.socksPort == s.httpPort) {
-                throw IllegalArgumentException("HTTP and SOCKS5 ports must differ")
+                throw SettingRejected("httpPort", "HTTP and SOCKS5 ports must differ")
             }
             if (s.quicInitialFragSize !in 16..512) {
-                throw IllegalArgumentException("quicInitialFragSize must be between 16 and 512")
+                throw SettingRejected("quicInitialFragSize", "quicInitialFragSize must be between 16 and 512")
             }
-            if (s.noizeJc < 0 || s.noizeJmin < 0 || s.noizeJmax < s.noizeJmin) {
-                throw IllegalArgumentException("Invalid noize jitter bounds")
+            // One message for three inputs told the user nothing about which one.
+            if (s.noizeJc < 0) {
+                throw SettingRejected("noizeJc", "noizeJc must be >= 0")
+            }
+            if (s.noizeJmin < 0) {
+                throw SettingRejected("noizeJmin", "noizeJmin must be >= 0")
+            }
+            if (s.noizeJmax < s.noizeJmin) {
+                throw SettingRejected("noizeJmax", "noizeJmax (${s.noizeJmax}) must be >= noizeJmin (${s.noizeJmin})")
             }
         }
 

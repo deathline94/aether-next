@@ -1,6 +1,7 @@
 package app.aethernext
 
 import android.webkit.JavascriptInterface
+import org.json.JSONException
 import org.json.JSONObject
 
 /**
@@ -25,11 +26,19 @@ class AetherBridge(
                 "stop_scan" -> handleStopScan()
                 "test_connection" -> handleTestConnection(args)
                 "app_info" -> handleAppInfo()
-                else -> throw IllegalArgumentException("unknown command $cmd")
+                else -> throw BridgeError("unknown_command", "unknown command $cmd")
             }
-            ok(data)
+            bridgeOk(data)
+        } catch (e: SettingRejected) {
+            bridgeErr("validation", e.message ?: "invalid setting", e.field)
+        } catch (e: BridgeError) {
+            bridgeErr(e.code, e.detail, e.field)
+        } catch (e: JSONException) {
+            // A malformed `settings` payload is a different conversation from a
+            // failed connect: the caller sent something this side cannot parse.
+            bridgeErr("encode", e.message ?: e.toString(), null)
         } catch (e: Exception) {
-            err(e.message ?: e.toString())
+            bridgeErr("internal", e.message ?: e.toString(), null)
         }
     }
 
@@ -55,7 +64,7 @@ class AetherBridge(
                 // Permission pending - not a hard failure
                 JSONObject.NULL
             }
-            err != null -> throw IllegalStateException(err)
+            err != null -> throw BridgeError("connect_failed", err)
             else -> JSONObject.NULL
         }
     }
@@ -77,7 +86,7 @@ class AetherBridge(
         }
         val noize = args.optString("noize", "off")
         val err = session.scan(protocol, ipVersion, concurrency, timeoutMs, noize)
-        if (err != null) throw IllegalStateException(err)
+        if (err != null) throw BridgeError("scan_failed", err)
         return JSONObject.NULL
     }
 
@@ -102,20 +111,4 @@ class AetherBridge(
             .put("author", "deathline94")
             .put("engine", "deathline94/aether-next")
             .put("platform", "android")
-
-    private fun ok(data: Any?): String {
-        val o = JSONObject().put("ok", true)
-        when (data) {
-            null, JSONObject.NULL -> o.put("data", JSONObject.NULL)
-            is JSONObject -> o.put("data", data)
-            is Boolean -> o.put("data", data)
-            is Number -> o.put("data", data)
-            is String -> o.put("data", data)
-            else -> o.put("data", data.toString())
-        }
-        return o.toString()
-    }
-
-    private fun err(message: String): String =
-        JSONObject().put("ok", false).put("error", message).toString()
 }

@@ -150,10 +150,27 @@
   message-typed commands, and it caught this work on the first run by reading a doc comment as a
   `Result<_, String>` claim). Still open, filed as T051c: the Android envelope's `error` is a plain
   string, so the structure `bridge.ts` now preserves has no producer on that side yet.
-- [ ] T051c [US2] Emit `{code, message, field}` from the Android native envelope in
+- [x] T051c [US2] Emit `{code, message, field}` from the Android native envelope in
   `apps/android/android/app/src/main/java/app/aethernext/AetherBridge.kt` (`error` is a bare message
   string at `:120` today) so the code the TypeScript side preserves has a producer. Map the codes the
   shell already uses; `ipcError.ts`'s prose fallback can stay.
+  Done. `BridgeEnvelope.kt` now owns the envelope and the two error kinds: `BridgeError(code, detail,
+  field?)` for failures the bridge names itself (`unknown_command`, `scan_failed`, `connect_failed`),
+  `SettingRejected(field, detail)` for a refused setting, and `invoke`'s catch chain reports
+  `validation` / `encode` / `internal` accordingly instead of one flat string for all of them.
+  `SettingRejected` deliberately subclasses `IllegalArgumentException` — that is what
+  `SessionController.validateSettings` has always thrown and what the existing 13 `SettingsStoreTest`
+  cases catch, so narrowing the type here would have broken callers that did nothing wrong.
+  `validateSettings` now names the setting it rejected at all 14 of its guards (it previously named
+  none: "Ports must be 1024-65535" and "Invalid noize jitter bounds" each covered three inputs under
+  one sentence), in the camelCase key the React state uses, so the same `field` consumer the desktop
+  form has can work on Android.
+  Tests: `BridgeEnvelopeTest.kt` (6) — envelope shape, `field` omitted when there is none, the
+  per-port and per-jitter field names, and that a rejected setting is still an
+  `IllegalArgumentException`. Whole Android JVM suite green: 40 tests, 0 failures.
+  The Android form does not yet read `field` (`endpointPreset` and `quicInitialFragSize` have no
+  input-level consumer, and only the two ports are marked `aria-invalid`); that is the Android UI
+  lifecycle work, not this wire change.
 
 - [ ] T052b [P] Add an invariant gate that every `uses:` pin in `.github/workflows/` is a full
   40-character commit SHA (and that one action does not carry two different pins). The
