@@ -847,8 +847,16 @@ Checked each part against the current tree rather than assuming the task text wa
 - [ ] T237 [US8] Wire `cargo deny check`, `osv-scanner`, `zizmor`, `actionlint` and the T007 disallowed-methods clippy gates into `.github/workflows/ci.yml`, and record the honest posture note: `RUSTSEC-2023-0071` is the **`rsa` Marvin** advisory, not a `ring` one, so `ring 0.16.20` via `boringtun 0.6.0` is an EOL/duplicate-crate risk rather than a known vulnerability; `x25519-dalek =2.0.0-rc.3` is a hard pin to a pre-release and must be raised or justified.
 - [x] T238 [US8] Add the release-time verification step recomputing the staged engine digest and failing on any mismatch with `packaging/trust/engine-trust.json` (pairs with T071/T226).
 - [x] T239 [US8] **Ratify the constitution** (FR-045): populate `.specify/memory/constitution.md` — currently an unpopulated template with `[PRINCIPLE_1_NAME]` placeholders, i.e. **zero ratified principles** — with BC-01…BC-22 as principles: falsifiable fixes, no unverifiable completion claims, fail-closed host mutation, no unencrypted secrets, no fabricated telemetry, one contract source. The empty template is why fourteen prior rounds could each claim completion.
-- [ ] T240 [US8] Remove untracked working-tree clutter that misleads readers (`architecture-review-20260723.html`, `rustup-init.exe` 12 MB, stale `aether*.toml` working files), confirming via `git ls-files` that none are tracked so no history rewrite is needed.
+- [x] T240 [US8] Remove untracked working-tree clutter that misleads readers (`architecture-review-20260723.html`, `rustup-init.exe` 12 MB, stale `aether*.toml` working files), confirming via `git ls-files` that none are tracked so no history rewrite is needed. Checked: none of the three names exists in the tree or in `git ls-files`, the only root `.toml` files are `deny.toml` and `aether/clippy.toml` (both configs), and `git status` is empty - so no rewrite was ever needed.
 - [ ] T241 [US8] **Checkpoint**: `scripts/verify-invariants` exits 0 **and** `--selftest-fail` exits non-zero; `zizmor` clean on both workflows; the traceability table generated with zero unmapped findings.
+
+  **Cannot be signed off as written.** Its second clause asks `--selftest-fail` to
+  exit non-zero, which was the correct expectation only while gates were
+  placeholders (T013/T027 were red by design); demanding it of a healthy tree
+  demands a blind gate. What is true today: 19 gates exit 0, and `--selftest-fail`
+  exits 0 with all 19 detecting their own injected defect. What this machine
+  cannot show: `zizmor` (runs in CI) and the T230 traceability generator (never
+  built). Split rather than ticked.
 
 **Checkpoint**: The remediation is now self-defending: a future regression of any fixed class fails CI rather than waiting for another audit.
 
