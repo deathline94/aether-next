@@ -3199,3 +3199,19 @@ code, kbd, pre {
 .stepper-input-wrapper:focus-within {
   outline-offset: -2px;
 }
+
+/* Compact text action inside a banner. The hydration-failure banner used to carry
+   twelve inline declarations restating .error-banner with raw rgba() and a
+   #f87171 that is not in the palette, and its Retry button wore .banner-dismiss
+   — the icon-only X geometry — so a word button was sized for a glyph. */
+.banner-action {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-micro);
+  color: var(--coral);
+  background: var(--coral-dim);
+  border: 1px solid var(--coral-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
