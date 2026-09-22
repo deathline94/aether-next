@@ -188,20 +188,20 @@ pub(crate) fn handle_engine_line(
     // handle and restored the system proxy under a live tunnel. Teardown belongs
     // to the structured `Error` event above and to `watch_child`'s exit path, both
     // of which know whether the session actually ended.
-    if line.contains("[-] session failed:") {
-        let msg = line
-            .split("[-] session failed:")
-            .nth(1)
-            .map(|s| s.trim())
-            .unwrap_or("Connection failed");
-        let state = app.state::<AppState>();
-        let status = state.runtime.lock().status.clone();
-        if status.eq_ignore_ascii_case("connected") {
-            // Keep the tunnel; say what was seen.
-            emit_log(app, format!("engine reported a failed session ({msg})"));
-        } else if !status.eq_ignore_ascii_case("error") {
-            emit_state(app, &state, "error", msg, None, None);
-        }
+    //
+    // The guard below used to keep one exception: while not connected it wrote the
+    // prose straight into runtime state as `error`. That is the same claim the
+    // structured path already makes - so a failed probe during a scan, whose
+    // session state is "connecting" or "disconnected", put an error on the UI for
+    // something that was never a tunnel attempt. Now it is always a log line, and
+    // the state answer comes only from events that know the outcome.
+    if let Some(msg) = line
+        .split("[-] session failed:")
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        emit_log(app, format!("engine reported a failed session ({msg})"));
     }
     // Readiness has exactly one source: the structured `ProxyReady`,
     // `TunnelReady` and `TunReady` events handled above, which the engine emits
