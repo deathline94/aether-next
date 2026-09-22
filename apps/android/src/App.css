@@ -505,8 +505,14 @@ code, kbd, pre {
 .topbar {
   position: sticky;
   top: 0;
-  height: 76px;
-  padding: 0 clamp(24px, 4vw, 48px);
+  /* A notch or a display cut-out is not decoration: the bar keeps its 76 px of
+     content height and adds the inset above it, and every layout that measures
+     itself against this bar (see .tactical-activity-view) has to subtract the
+     same inset or its last rows land under the notch. */
+  height: calc(76px + env(safe-area-inset-top, 0px));
+  padding: env(safe-area-inset-top, 0px) clamp(24px, 4vw, 48px) 0;
+  padding-inline: max(clamp(24px, 4vw, 48px), env(safe-area-inset-right, 0px))
+    max(clamp(24px, 4vw, 48px), env(safe-area-inset-left, 0px));
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
@@ -1221,6 +1227,7 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   cursor: pointer;
+  padding: 0;
   transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
 }@media (hover: hover) and (pointer: fine){
 .tactile-copy-btn:hover {
@@ -2391,24 +2398,9 @@ code, kbd, pre {
   flex-shrink: 0;
 }
 
-.tactile-copy-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  border: 1px solid var(--border-card);
-  background: #070a0e;
-  color: var(--muted);
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-  transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s, opacity 0.15s;
-  padding: 0;
-}@media (hover: hover) and (pointer: fine){
-.tactile-copy-btn:hover {
-  border-color: var(--edge-strong);
-  color: #ffffff;
-  background: var(--panel-hover);
-}}
+/* `.tactile-copy-btn` is declared once, above with the profile cards: a second
+   equal-specificity copy used to sit here and win by order, replacing the
+   emerald hover with a grey one and the token background with a raw #070a0e. */
 
 .rtt-badge {
   display: inline-flex;
@@ -2469,7 +2461,7 @@ code, kbd, pre {
 
 /* ─── Activity Tab (Terminal Console) ─────────────────────────────────────── */
 .tactical-activity-view {
-  height: calc(100dvh - 76px);
+  height: calc(100dvh - 76px - env(safe-area-inset-top, 0px));
   display: flex;
   flex-direction: column;
   gap: 12px;

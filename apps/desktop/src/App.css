@@ -1221,6 +1221,7 @@ code, kbd, pre {
   display: grid;
   place-items: center;
   cursor: pointer;
+  padding: 0;
   transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
 }@media (hover: hover) and (pointer: fine){
 .tactile-copy-btn:hover {
@@ -2391,24 +2392,9 @@ code, kbd, pre {
   flex-shrink: 0;
 }
 
-.tactile-copy-btn {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  border: 1px solid var(--border-card);
-  background: #070a0e;
-  color: var(--muted);
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-  transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s, opacity 0.15s;
-  padding: 0;
-}@media (hover: hover) and (pointer: fine){
-.tactile-copy-btn:hover {
-  border-color: var(--edge-strong);
-  color: #ffffff;
-  background: var(--panel-hover);
-}}
+/* `.tactile-copy-btn` is declared once, above with the profile cards: a second
+   equal-specificity copy used to sit here and win by order, replacing the
+   emerald hover with a grey one and the token background with a raw #070a0e. */
 
 .rtt-badge {
   display: inline-flex;
@@ -3121,7 +3107,12 @@ code, kbd, pre {
   .app-shell { grid-template-columns: 78px minmax(0, 1fr); }
   .sidebar { padding-inline: 10px; }
   .brand { padding-inline: 4px; justify-content: center; }
-  .brand-text, .nav-pill-label, .nav-pill-trailing, .sidebar-bottom, .version-bar { display: none; }
+  .brand-text, .nav-pill-label, .nav-pill-trailing { display: none; }
+  /* `.sidebar-bottom` holds the connection beacon and `.version-bar` the running
+     version: this rule used to switch both off at the smallest *legal* window
+     (minWidth is 900, so this query is the only one a desktop user can reach),
+     which left a narrow window with no status indication at all. The rail is
+     already 78 px wide here — the beacon and the version line still fit. */
   .nav-pill { justify-content: center; padding: 0; }
   .bento-col-7, .bento-col-5, .bento-col-6 { grid-column: span 12; }
 }
