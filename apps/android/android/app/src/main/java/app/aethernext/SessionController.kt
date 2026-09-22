@@ -63,6 +63,25 @@ class SessionController(
     /** Attach [owner]'s sink. Idempotent per owner, so `onResume` may re-attach. */
     fun attachUi(owner: Any, fn: (event: String, payload: JSONObject) -> Unit) {
         synchronized(emitterLock) { uiEmitters[owner] = fn }
+        reportUnfinishedSession()
+    }
+
+    /**
+     * Tell the console once per process that the previous session did not end
+     * because it was asked to.
+     *
+     * The ledger in [SessionLedger] is only cleared by a teardown that ran, so an
+     * entry left behind means the system killed the app mid-tunnel. Without this
+     * the user sees STANDBY and has no way to know the difference between "I
+     * stopped it" and "it stopped, and my traffic is bare".
+     */
+    private fun reportUnfinishedSession() {
+        if (!ledgerReported.compareAndSet(false, true)) return
+        val since = ledger.takeUnfinished() ?: return
+        val message = SessionLedger.messageFor(since, System.currentTimeMillis())
+        Log.w(TAG, message)
+        emit("session://log", JSONObject().put("level", "error").put("message", message))
+        setRuntime("error", message, null, null)
     }
 
     /**
@@ -111,6 +130,9 @@ class SessionController(
     }
 
     private val store = SettingsStore(context)
+    /** Survives the process so an outside kill can be reported on next launch. */
+    private val ledger = SessionLedger(context)
+    private val ledgerReported = java.util.concurrent.atomic.AtomicBoolean(false)
     private val connectedOnce = AtomicBoolean(false)
     private val socksSeen = AtomicBoolean(false)
     private val tunnelSeen = AtomicBoolean(false)
@@ -423,6 +445,10 @@ class SessionController(
         }
         val vpnErr = stopVpnService()
         resetSessionFlags()
+        // Whatever the teardown found, this session was asked to stop, so the next
+        // process has nothing to report. Leaving the ledger set would turn a
+        // routine disconnect into an "unexpectedly ended" alarm on next launch.
+        ledger.clearActive()
 
         val problems = mutableListOf<String>()
         if (vpnErr != null) problems += vpnErr
@@ -755,6 +781,7 @@ class SessionController(
             "system-proxy" -> "App proxy active"
             else -> "Proxy only active"
         }
+        ledger.markActive()
         setRuntime("connected", detail, runner.pid(), runtime.endpoint)
     }
 
