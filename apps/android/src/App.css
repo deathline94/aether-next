@@ -1,122 +1,122 @@
 /*==AETHER-TOKENS-START==*/
 /* GENERATED from packages/ui/tokens.css by scripts/sync-tokens.mjs — do not edit this block. */
-:root {
-  /* UA dark palette: form controls, scrollbars and <select> popups resolve to
-     dark instead of the light UA defaults (contract U-D5). */
-  color-scheme: dark;
-
-  /* Type families — the real Geist faces are bundled by @fontsource-variable and
-     imported in App.tsx; the system fallbacks only back them up. */
-  --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
-
-  /* Smallest size any text may use. Both sheets carried five sub-11px values
-     (8.5/9/9.5/10/10.5) across 44 declarations, and they were the *status*
-     layer — stat labels, timestamps, version, field hints, the empty state. At
-     8.5px, uppercase, letter-spaced and monospaced on a 100%-zoom Windows
-     desktop they are below any legible floor, and on Android the webview does
-     not scale px text with the OS font size at all. One token so the floor is
-     a decision in one place rather than 44 accidents. */
-  --text-micro: 11px;
-
-  /* Stacking, by what the layer is for. The numbers only carry meaning relative
-     to each other, and the low cluster is deliberate rather than accidental: the
-     ping rings sit under the copy, the copy under the switch chassis and label,
-     and the whole assembly above them — which is why they are 1/2/3/4 and not
-     four uses of one value. Named by role so a new overlay is placed by asking
-     what it is, not by picking a number larger than the last one seen. */
-  --z-decor: 1;
-  --z-copy: 2;
-  --z-chassis: 3;
-  --z-switch: 4;
-  --z-dock: 10;
-  --z-topbar: 20;
-  --z-sidebar: 30;
-  /* Android's mobile nav detaches the sidebar from the page and floats it over
-     everything else, so it has to outrank the desktop sidebar it replaces. */
-  --z-overlay: 40;
-
-  /* Surfaces */
-  --bg-app: #07090b;
-  --bg-sidebar: #090c0f;
-  --panel: #0d1116;
-  --panel-2: #11161d;
-  --panel-hover: #141b24;
-  --panel-active: #17202b;
-  --panel-nested: #0d131a;
-
-  /*
-   * Opaque edge tokens (WCAG 1.4.11, contract U-E1). Raw alpha hairlines
-   * antialias away at Windows 125%/150% scaling and vanish on any surface but
-   * the exact one they were blended against, so boundaries are pre-resolved
-   * opaque composites. Ratios measured (WCAG relative luminance) against every
-   * surface each token sits on; the binding worst case is --panel-active #17202b.
-   */
-  --edge: #3b4652;             /* decorative separation: 1.97:1 vs --panel, 1.71 vs --panel-active — >=1.6 */
-  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.14 vs --panel-active — >=3 (WCAG 1.4.11) */
-  --edge-strong: #6b7b8a;      /* hover/emphasis step only: 4.35:1 vs --panel; never resting, cannot outrank --emerald .active (12.47:1) */
-
-  /* Micro-borders & architectural highlights (derived from the edge tiers) */
-  --border-subtle: var(--edge);
-  --border-card: var(--edge);
-  --border-strong: var(--edge-interactive);
-  --line: var(--edge);
-  --inner-highlight: inset 0 1px 0 0 var(--edge);
-  --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
-
-  /* Primary phosphor emerald accent */
-  --emerald: #00f08a;
-  --emerald-dim: rgba(0, 240, 138, 0.12);
-  --emerald-border: rgba(0, 240, 138, 0.55); /* sheets carried .32 vs this file's .55 — reconciled to .55 */
-  --emerald-glow: 0 0 28px rgba(0, 240, 138, 0.24);
-  --green: #00f08a;
-  --green-dark: #092618;
-
-  /* Tactical signal accents */
-  /*
-   * State-bearing borders composite, they do not sit flat on a swatch: coral at
-   * the old 0.32 measured 1.59:1 on --bg-app, and 1.4.11 asks 3:1 of an edge
-   * that tells you which state a control is in. The alphas below are the solved
-   * minima (coral .66, yellow .43, blue .48) rounded up one step, and
-   * `wcag-state-edges` re-derives them on every run.
-   */
-  --coral: #ff5c5c;
-  --coral-dim: rgba(255, 92, 92, 0.12);
-  --coral-border: rgba(255, 92, 92, 0.68);
-  --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
-  --yellow: #facc15;
-  --yellow-dim: rgba(250, 204, 21, 0.12);
-  --yellow-border: rgba(250, 204, 21, 0.45);
-  --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
-  --blue-dim: rgba(92, 200, 255, 0.12);
-  --blue-border: rgba(92, 200, 255, 0.5);
-  --amber: #facc15;
-  --violet: #a78bfa;
-
-  /*
-   * Text greys. --muted is reconciled to this file's #8b98a3 (sheets had
-   * #7d8b96): 6.42:1 on --panel, 6.16 on --panel-2. --muted-strong is the
-   * accessible AA floor value; --muted-dark aliases it.
-   */
-  --muted: #8b98a3;
-  --muted-light: #a4b3be;
-  --muted-strong: #7d8b96;
-  /*
-   * --muted-dark was #47535e — 2.40:1 on --panel and 2.53:1 on --bg-app, below
-   * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
-   * non-text floor for the .heartbeat-dot state LED. It now aliases
-   * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
-   * --panel-hover and 4.70 vs --panel-active. Those are bare-surface ratios; a
-   * translucent chip on top of the surface lifts it further, which is how
-   * .nav-shortcut measured 4.33:1 and moved to --muted. Verify a pair against
-   * its composite, not the token, before quoting a number here.
-   */
-  --muted-dark: var(--muted-strong);
-
-  /* Motion curves — sheets carried two different --ease-spring values; reconciled */
-  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
-  --duration-fast: 150ms;
+:root {
+  /* UA dark palette: form controls, scrollbars and <select> popups resolve to
+     dark instead of the light UA defaults (contract U-D5). */
+  color-scheme: dark;
+
+  /* Type families — the real Geist faces are bundled by @fontsource-variable and
+     imported in App.tsx; the system fallbacks only back them up. */
+  --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+
+  /* Smallest size any text may use. Both sheets carried five sub-11px values
+     (8.5/9/9.5/10/10.5) across 44 declarations, and they were the *status*
+     layer — stat labels, timestamps, version, field hints, the empty state. At
+     8.5px, uppercase, letter-spaced and monospaced on a 100%-zoom Windows
+     desktop they are below any legible floor, and on Android the webview does
+     not scale px text with the OS font size at all. One token so the floor is
+     a decision in one place rather than 44 accidents. */
+  --text-micro: 11px;
+
+  /* Stacking, by what the layer is for. The numbers only carry meaning relative
+     to each other, and the low cluster is deliberate rather than accidental: the
+     ping rings sit under the copy, the copy under the switch chassis and label,
+     and the whole assembly above them — which is why they are 1/2/3/4 and not
+     four uses of one value. Named by role so a new overlay is placed by asking
+     what it is, not by picking a number larger than the last one seen. */
+  --z-decor: 1;
+  --z-copy: 2;
+  --z-chassis: 3;
+  --z-switch: 4;
+  --z-dock: 10;
+  --z-topbar: 20;
+  --z-sidebar: 30;
+  /* Android's mobile nav detaches the sidebar from the page and floats it over
+     everything else, so it has to outrank the desktop sidebar it replaces. */
+  --z-overlay: 40;
+
+  /* Surfaces */
+  --bg-app: #07090b;
+  --bg-sidebar: #090c0f;
+  --panel: #0d1116;
+  --panel-2: #11161d;
+  --panel-hover: #141b24;
+  --panel-active: #17202b;
+  --panel-nested: #0d131a;
+
+  /*
+   * Opaque edge tokens (WCAG 1.4.11, contract U-E1). Raw alpha hairlines
+   * antialias away at Windows 125%/150% scaling and vanish on any surface but
+   * the exact one they were blended against, so boundaries are pre-resolved
+   * opaque composites. Ratios measured (WCAG relative luminance) against every
+   * surface each token sits on; the binding worst case is --panel-active #17202b.
+   */
+  --edge: #3b4652;             /* decorative separation: 1.97:1 vs --panel, 1.71 vs --panel-active — >=1.6 */
+  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.14 vs --panel-active — >=3 (WCAG 1.4.11) */
+  --edge-strong: #6b7b8a;      /* hover/emphasis step only: 4.35:1 vs --panel; never resting, cannot outrank --emerald .active (12.47:1) */
+
+  /* Micro-borders & architectural highlights (derived from the edge tiers) */
+  --border-subtle: var(--edge);
+  --border-card: var(--edge);
+  --border-strong: var(--edge-interactive);
+  --line: var(--edge);
+  --inner-highlight: inset 0 1px 0 0 var(--edge);
+  --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
+
+  /* Primary phosphor emerald accent */
+  --emerald: #00f08a;
+  --emerald-dim: rgba(0, 240, 138, 0.12);
+  --emerald-border: rgba(0, 240, 138, 0.55); /* sheets carried .32 vs this file's .55 — reconciled to .55 */
+  --emerald-glow: 0 0 28px rgba(0, 240, 138, 0.24);
+  --green: #00f08a;
+  --green-dark: #092618;
+
+  /* Tactical signal accents */
+  /*
+   * State-bearing borders composite, they do not sit flat on a swatch: coral at
+   * the old 0.32 measured 1.59:1 on --bg-app, and 1.4.11 asks 3:1 of an edge
+   * that tells you which state a control is in. The alphas below are the solved
+   * minima (coral .66, yellow .43, blue .48) rounded up one step, and
+   * `wcag-state-edges` re-derives them on every run.
+   */
+  --coral: #ff5c5c;
+  --coral-dim: rgba(255, 92, 92, 0.12);
+  --coral-border: rgba(255, 92, 92, 0.68);
+  --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
+  --yellow: #facc15;
+  --yellow-dim: rgba(250, 204, 21, 0.12);
+  --yellow-border: rgba(250, 204, 21, 0.45);
+  --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
+  --blue-dim: rgba(92, 200, 255, 0.12);
+  --blue-border: rgba(92, 200, 255, 0.5);
+  --amber: #facc15;
+  --violet: #a78bfa;
+
+  /*
+   * Text greys. --muted is reconciled to this file's #8b98a3 (sheets had
+   * #7d8b96): 6.42:1 on --panel, 6.16 on --panel-2. --muted-strong is the
+   * accessible AA floor value; --muted-dark aliases it.
+   */
+  --muted: #8b98a3;
+  --muted-light: #a4b3be;
+  --muted-strong: #7d8b96;
+  /*
+   * --muted-dark was #47535e — 2.40:1 on --panel and 2.53:1 on --bg-app, below
+   * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
+   * non-text floor for the .heartbeat-dot state LED. It now aliases
+   * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
+   * --panel-hover and 4.70 vs --panel-active. Those are bare-surface ratios; a
+   * translucent chip on top of the surface lifts it further, which is how
+   * .nav-shortcut measured 4.33:1 and moved to --muted. Verify a pair against
+   * its composite, not the token, before quoting a number here.
+   */
+  --muted-dark: var(--muted-strong);
+
+  /* Motion curves — sheets carried two different --ease-spring values; reconciled */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-fast: 150ms;
 
   /* Inks. --fg is body text, --fg-bright the emphasis step; the rest are the
    per-context greys the log stream and the mono layers use. */
@@ -235,24 +235,24 @@
   --yellow-a35: rgba(250, 204, 21, 0.35);
   --yellow-a40: rgba(250, 204, 21, 0.4);
   --yellow-a50: rgba(250, 204, 21, 0.5);
-}
-
-/*
- * UA defaults the audit found with zero occurrences in the codebase
- * (contract U-D5): `option` inherited the light UA popup palette — #edf2f5 on
- * #ffffff measures 1.13:1, i.e. invisible — and the UA selection highlight
- * measured 1.24:1 (#d8e2ec on #accef7), so selected text disappeared.
- */
-option {
-  padding: 8px 10px;
-  background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
-  color: #edf2f5;
-}
-option:disabled { color: var(--muted); }
-
-::selection {
-  background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
-  color: var(--bg-app);
+}
+
+/*
+ * UA defaults the audit found with zero occurrences in the codebase
+ * (contract U-D5): `option` inherited the light UA popup palette — #edf2f5 on
+ * #ffffff measures 1.13:1, i.e. invisible — and the UA selection highlight
+ * measured 1.24:1 (#d8e2ec on #accef7), so selected text disappeared.
+ */
+option {
+  padding: 8px 10px;
+  background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
+  color: #edf2f5;
+}
+option:disabled { color: var(--muted); }
+
+::selection {
+  background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
+  color: var(--bg-app);
 }
 /*==AETHER-TOKENS-END==*/
 
@@ -2411,6 +2411,14 @@ code, kbd, pre {
   border-bottom: 1px solid var(--border-subtle);
   overflow-x: auto;
   scrollbar-width: none;
+  /* Hiding the scrollbar was deliberate (a 26px bar inside a 40px dock is
+     worse than none), but it left nothing saying "this row continues": on a
+     narrow window the fourth protocol chip is simply unreachable and looks
+     absent. The trailing fade is that missing signal, and it needs no ink of
+     its own because it reveals the panel behind. */
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 28px), transparent 100%);
+  scroll-padding-inline: 20px;
 }
 .discovered-proto-dock::-webkit-scrollbar {
   display: none;
