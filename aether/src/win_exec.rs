@@ -28,15 +28,16 @@ fn system_dir() -> Result<PathBuf> {
     let mut buf = vec![0u16; 32_767];
     let needed = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
     if needed == 0 {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "GetSystemDirectoryW failed: {}",
             std::io::Error::last_os_error()
         )));
     }
-    let n = usize::try_from(needed)
-        .map_err(|_| AetherError::Other("GetSystemDirectoryW returned an absurd length".into()))?;
+    let n = usize::try_from(needed).map_err(|_| {
+        AetherError::HostState("GetSystemDirectoryW returned an absurd length".into())
+    })?;
     if n >= buf.len() {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "system directory path needs {n} characters, more than the buffer"
         )));
     }
@@ -53,9 +54,11 @@ pub fn system_exe(name: &str) -> Result<PathBuf> {
     if lowered.is_empty()
         || lowered.len() > 64
         || lowered.contains(['/', '\\', ':'])
-        || !lowered.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || !lowered
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "{name:?} is not a bare tool name; refusing to resolve it through the search path"
         )));
     }
@@ -67,7 +70,7 @@ pub fn system_exe(name: &str) -> Result<PathBuf> {
     let mut path = system_dir()?;
     path.push(file);
     if !path.is_file() {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "{} does not exist; refusing to run {name} from anywhere else",
             path.display()
         )));
@@ -82,7 +85,7 @@ pub fn system_exe(name: &str) -> Result<PathBuf> {
 /// the default order would mean the control silently does nothing.
 pub fn pin_dll_search_path() -> Result<()> {
     if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) failed: {}",
             std::io::Error::last_os_error()
         )));
@@ -99,7 +102,9 @@ mod tests {
         let p = system_exe("icacls").expect("icacls exists on every supported Windows");
         assert!(p.to_string_lossy().ends_with("icacls.exe"));
         assert!(
-            p.parent().map(|d| d == system_dir().unwrap()).unwrap_or(false),
+            p.parent()
+                .map(|d| d == system_dir().unwrap())
+                .unwrap_or(false),
             "resolved outside the system directory: {}",
             p.display()
         );
@@ -107,7 +112,14 @@ mod tests {
 
     #[test]
     fn anything_resembling_a_path_is_refused() {
-        for bad in ["", "..\\evil", "C:\\tmp\\route", "a/b", "x".repeat(80).as_str(), "net;sh"] {
+        for bad in [
+            "",
+            "..\\evil",
+            "C:\\tmp\\route",
+            "a/b",
+            "x".repeat(80).as_str(),
+            "net;sh",
+        ] {
             assert!(system_exe(bad).is_err(), "accepted {bad:?}");
         }
     }

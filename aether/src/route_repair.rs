@@ -1054,17 +1054,18 @@ fn sibling_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
 pub fn write_journal(path: &std::path::Path, j: &RouteJournal) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| AetherError::Other(format!("create journal dir: {e}")))?;
+            .map_err(|e| AetherError::HostState(format!("create journal dir: {e}")))?;
     }
     let body = serde_json::to_vec_pretty(j)
-        .map_err(|e| AetherError::Other(format!("encode journal: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("encode journal: {e}")))?;
     let tmp = sibling_with_suffix(
         path,
         &format!(".{}.{}.tmp", std::process::id(), rand::random::<u32>()),
     );
-    std::fs::write(&tmp, body).map_err(|e| AetherError::Other(format!("write journal: {e}")))?;
+    std::fs::write(&tmp, body)
+        .map_err(|e| AetherError::HostState(format!("write journal: {e}")))?;
     std::fs::rename(&tmp, path)
-        .map_err(|e| AetherError::Other(format!("rename journal into place: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("rename journal into place: {e}")))?;
     Ok(())
 }
 

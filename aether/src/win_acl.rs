@@ -20,7 +20,7 @@ pub fn current_user_sid() -> Result<String> {
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::HostState(format!(
                 "OpenProcessToken failed: {}",
                 std::io::Error::last_os_error()
             )));
@@ -33,7 +33,7 @@ pub fn current_user_sid() -> Result<String> {
         if needed == 0 {
             let err = std::io::Error::last_os_error();
             CloseHandle(token);
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::HostState(format!(
                 "GetTokenInformation size: {err}"
             )));
         }
@@ -48,7 +48,7 @@ pub fn current_user_sid() -> Result<String> {
         );
         CloseHandle(token);
         if ok == 0 {
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::HostState(format!(
                 "GetTokenInformation(TokenUser) failed: {}",
                 std::io::Error::last_os_error()
             )));
@@ -57,12 +57,12 @@ pub fn current_user_sid() -> Result<String> {
         let tu = &*(buf.as_ptr() as *const TOKEN_USER);
         let sid = tu.User.Sid;
         if sid.is_null() {
-            return Err(AetherError::Other("token has no user SID".into()));
+            return Err(AetherError::HostState("token has no user SID".into()));
         }
 
         let mut str_sid: *mut u16 = std::ptr::null_mut();
         if ConvertSidToStringSidW(sid, &mut str_sid) == 0 {
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::HostState(format!(
                 "ConvertSidToStringSidW failed: {}",
                 std::io::Error::last_os_error()
             )));
@@ -78,7 +78,7 @@ pub fn current_user_sid() -> Result<String> {
         let out = String::from_utf16_lossy(wide);
         LocalFree(str_sid as *mut core::ffi::c_void);
         if !out.starts_with("S-1-") {
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::HostState(format!(
                 "unexpected SID form {out:?} for the current token"
             )));
         }

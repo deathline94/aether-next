@@ -59,20 +59,20 @@ pub fn wintun_dll_path() -> Option<std::path::PathBuf> {
 pub fn parse_key_line(line: &str) -> Result<String> {
     let line = line.trim_end_matches(['\r', '\n']);
     let Some(value) = line.strip_prefix(LINE_PREFIX) else {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "expected a `{LINE_PREFIX}<base64>` handoff line on stdin"
         )));
     };
     let value = value.trim();
     let mut decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
-        .map_err(|e| AetherError::Other(format!("config key handoff is not valid base64: {e}")))?;
+        .map_err(|e| AetherError::Config(format!("config key handoff is not valid base64: {e}")))?;
     let len = decoded.len();
     // The decoded buffer *is* the key; the returned `String` is only its base64
     // spelling, and `value` borrows the caller's line, which the caller wipes.
     decoded.zeroize();
     if len != 32 {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "config key handoff must be 32 bytes (got {len})"
         )));
     }
@@ -85,13 +85,13 @@ pub fn parse_key_line(line: &str) -> Result<String> {
 pub fn parse_dll_line(line: &str) -> Result<String> {
     let line = line.trim_end_matches(['\r', '\n']);
     let Some(value) = line.strip_prefix(DLL_PREFIX) else {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "expected a `{DLL_PREFIX}<path>` handoff line on stdin"
         )));
     };
     let value = value.trim();
     if value.is_empty() || value.len() > 4096 || value.contains('\0') {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "wintun handoff path is empty, over-long ({} bytes) or contains a NUL",
             value.len()
         )));
@@ -124,17 +124,17 @@ fn read_preamble_line(what: &str) -> Result<String> {
                 }
             }
         })
-        .map_err(|e| AetherError::Other(format!("cannot start handoff reader: {e}")))?;
+        .map_err(|e| AetherError::Config(format!("cannot start handoff reader: {e}")))?;
 
     match rx.recv_timeout(HANDOFF_TIMEOUT) {
         Ok(Ok(line)) => Ok(line),
-        Ok(Err(e)) => Err(AetherError::Other(format!("{what} read failed: {e}"))),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AetherError::Other(format!(
+        Ok(Err(e)) => Err(AetherError::Config(format!("{what} read failed: {e}"))),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AetherError::Config(format!(
             "{REQUEST_ENV}=1 but no {what} line arrived within {:?}",
             HANDOFF_TIMEOUT
         ))),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(AetherError::Other(format!("{what} reader died")))
+            Err(AetherError::Config(format!("{what} reader died")))
         }
     }
 }
@@ -171,7 +171,7 @@ pub fn receive_if_requested() -> Result<()> {
     if crate::tun_win::enabled() {
         let raw = parse_dll_line(&read_preamble_line("wintun")?)?;
         if WINTUN_TOKEN.set(std::path::PathBuf::from(raw)).is_err() {
-            return Err(AetherError::Other("wintun handoff delivered twice".into()));
+            return Err(AetherError::Config("wintun handoff delivered twice".into()));
         }
         log::debug!("[keyhandoff] wintun path received over stdin");
     }

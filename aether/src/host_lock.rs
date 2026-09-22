@@ -67,13 +67,13 @@ impl HostMutationGuard {
                 TryAcquired::Held(guard) => return Ok(guard),
                 TryAcquired::Busy => {
                     if Instant::now() >= deadline {
-                        return Err(AetherError::Other(format!(
+                        return Err(AetherError::HostState(format!(
                             "another Aether session is mutating host network state; refusing to                              install routes concurrently (waited {timeout:?})"
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                TryAcquired::Failed(why) => return Err(AetherError::Other(why)),
+                TryAcquired::Failed(why) => return Err(AetherError::HostState(why)),
             }
         }
     }

@@ -158,9 +158,9 @@ pub struct PinFile {
 /// Load and validate the per-host pin file.
 pub fn load_pins(json: &str, now_unix: u64) -> Result<Vec<PinSet>> {
     let file: PinFile =
-        serde_json::from_str(json).map_err(|e| AetherError::Other(format!("pin file: {e}")))?;
+        serde_json::from_str(json).map_err(|e| AetherError::Config(format!("pin file: {e}")))?;
     if file.version != 1 {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "unsupported pin file schema {} (expected 1)",
             file.version
         )));
@@ -177,21 +177,21 @@ pub fn load_pins(json: &str, now_unix: u64) -> Result<Vec<PinSet>> {
 /// an empty allow-list.
 pub fn load_anchors(json: &str) -> Result<AnchorSet> {
     let set: AnchorSet = serde_json::from_str(json)
-        .map_err(|e| AetherError::Other(format!("trust anchors: {e}")))?;
+        .map_err(|e| AetherError::Config(format!("trust anchors: {e}")))?;
     if set.version != ANCHOR_SCHEMA {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "unsupported trust anchor schema {} (expected {ANCHOR_SCHEMA})",
             set.version
         )));
     }
     if set.files.is_empty() {
-        return Err(AetherError::Other(
+        return Err(AetherError::Config(
             "trust anchor file lists no binaries; refusing to run an empty allow-list".into(),
         ));
     }
     for f in &set.files {
         if !is_hex_sha256(&f.file_sha256) || !is_hex_sha256(&f.cert_sha256) {
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::Config(format!(
                 "trust anchor for {:?} has a non-SHA-256 digest",
                 f.name
             )));
@@ -295,13 +295,13 @@ pub enum VerifyPolicy<'a> {
 pub fn file_sha256_hex(path: &std::path::Path) -> Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)
-        .map_err(|e| AetherError::Other(format!("open {} for digest: {e}", path.display())))?;
+        .map_err(|e| AetherError::Config(format!("open {} for digest: {e}", path.display())))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f
             .read(&mut buf)
-            .map_err(|e| AetherError::Other(format!("read {} for digest: {e}", path.display())))?;
+            .map_err(|e| AetherError::Config(format!("read {} for digest: {e}", path.display())))?;
         if n == 0 {
             break;
         }

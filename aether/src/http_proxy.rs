@@ -125,7 +125,7 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
                 Err(_) => {
                     let msg = socks::session_cap_message("http proxy", socks::MAX_SESSION);
                     log::warn!("{msg} (peer {peer})");
-                    return Err(AetherError::Other(msg));
+                    return Err(AetherError::Proxy(msg));
                 }
             };
             if let Err(error) = session {
@@ -145,10 +145,10 @@ async fn refuse_over_capacity(mut client: TcpStream) -> Result<()> {
     .await;
     match wrote {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AetherError::Other(format!(
+        Ok(Err(e)) => Err(AetherError::Proxy(format!(
             "http refusal write failed: {e}"
         ))),
-        Err(_) => Err(AetherError::Other("http refusal write timed out".into())),
+        Err(_) => Err(AetherError::Proxy("http refusal write timed out".into())),
     }
 }
 
@@ -166,12 +166,12 @@ fn assert_strict_crlf(block: &[u8]) -> Result<()> {
         match block[i] {
             b'\r' => {
                 if block.get(i + 1) != Some(&b'\n') {
-                    return Err(AetherError::Other("HTTP header: bare CR".into()));
+                    return Err(AetherError::Proxy("HTTP header: bare CR".into()));
                 }
                 i += 2;
             }
-            b'\n' => return Err(AetherError::Other("HTTP header: bare LF".into())),
-            b'\0' => return Err(AetherError::Other("HTTP header: NUL byte".into())),
+            b'\n' => return Err(AetherError::Proxy("HTTP header: bare LF".into())),
+            b'\0' => return Err(AetherError::Proxy("HTTP header: NUL byte".into())),
             _ => i += 1,
         }
     }
@@ -181,17 +181,17 @@ fn assert_strict_crlf(block: &[u8]) -> Result<()> {
 async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     let header = read_header(&mut client).await?;
     let header_end =
-        find_header_end(&header).ok_or_else(|| AetherError::Other("invalid HTTP header".into()))?;
+        find_header_end(&header).ok_or_else(|| AetherError::Proxy("invalid HTTP header".into()))?;
     assert_strict_crlf(&header[..header_end])?;
     let text = std::str::from_utf8(&header[..header_end])
-        .map_err(|_| AetherError::Other("invalid HTTP header".into()))?;
+        .map_err(|_| AetherError::Proxy("invalid HTTP header".into()))?;
     // Credentials, if configured, are checked before a single byte is relayed:
     // the listener may be reachable by others, and nothing here should be
     // resolved or connected on their behalf (T157).
     if let Some(want) = socks::proxy_credentials() {
         if !proxy_auth_ok(text, &want) {
             let _ = client.write_all(&auth_required_reply()).await;
-            return Err(AetherError::Other(
+            return Err(AetherError::Proxy(
                 "http proxy authentication required".into(),
             ));
         }
@@ -199,9 +199,9 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     let first = text
         .lines()
         .next()
-        .ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
+        .ok_or_else(|| AetherError::Proxy("empty HTTP request".into()))?;
     if first.len() > MAX_REQUEST_LINE {
-        return Err(AetherError::Other("HTTP request line too long".into()));
+        return Err(AetherError::Proxy("HTTP request line too long".into()));
     }
     // `split_whitespace` would also fold a tab or vertical space into a
     // separator, so a request line is only ever three SP-delimited tokens.
@@ -214,7 +214,7 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
         || target.is_empty()
         || !(version.eq_ignore_ascii_case("HTTP/1.1") || version.eq_ignore_ascii_case("HTTP/1.0"))
     {
-        return Err(AetherError::Other("malformed HTTP request line".into()));
+        return Err(AetherError::Proxy("malformed HTTP request line".into()));
     }
 
     let (host, port) = if method.eq_ignore_ascii_case("CONNECT") {
@@ -234,7 +234,7 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
                     None
                 }
             })
-            .ok_or_else(|| AetherError::Other("HTTP Host header missing".into()))?;
+            .ok_or_else(|| AetherError::Proxy("HTTP Host header missing".into()))?;
         parse_authority(&host, 80)?
     };
 
@@ -264,7 +264,7 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
                 let _ = client
                     .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n")
                     .await;
-                return Err(AetherError::Other("upstream connect timed out".into()));
+                return Err(AetherError::Proxy("upstream connect timed out".into()));
             }
         };
 
@@ -312,7 +312,7 @@ pub async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
     loop {
         let remaining = MAX_HEADER.saturating_sub(header.len());
         if remaining == 0 {
-            return Err(AetherError::Other("HTTP header too large".into()));
+            return Err(AetherError::Proxy("HTTP header too large".into()));
         }
         let to_read = buf.len().min(remaining);
         let count = tokio::time::timeout(
@@ -320,22 +320,22 @@ pub async fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>> {
             stream.read(&mut buf[..to_read]),
         )
         .await
-        .map_err(|_| AetherError::Other("HTTP header read timeout".into()))??;
+        .map_err(|_| AetherError::Proxy("HTTP header read timeout".into()))??;
 
         if count == 0 {
-            return Err(AetherError::Other(
+            return Err(AetherError::Proxy(
                 "client closed before HTTP header".into(),
             ));
         }
         header.extend_from_slice(&buf[..count]);
         if let Some(pos) = header.windows(4).position(|window| window == b"\r\n\r\n") {
             if pos + 4 > MAX_HEADER {
-                return Err(AetherError::Other("HTTP header too large".into()));
+                return Err(AetherError::Proxy("HTTP header too large".into()));
             }
             return Ok(header);
         }
         if header.len() >= MAX_HEADER {
-            return Err(AetherError::Other("HTTP header too large".into()));
+            return Err(AetherError::Proxy("HTTP header too large".into()));
         }
     }
 }
@@ -359,7 +359,7 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
             .trim()
             .parse()
             .map(Some)
-            .map_err(|_| AetherError::Other("invalid proxy port".into()))
+            .map_err(|_| AetherError::Proxy("invalid proxy port".into()))
     }
     if value.starts_with('[') {
         if let Some(end) = value.find(']') {
@@ -379,13 +379,13 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
                 port_str
                     .trim()
                     .parse()
-                    .map_err(|_| AetherError::Other("invalid proxy port".into()))?
+                    .map_err(|_| AetherError::Proxy("invalid proxy port".into()))?
             };
             return Ok((host.to_string(), port));
         }
     }
     if value.is_empty() {
-        return Err(AetherError::Other("proxy target missing".into()));
+        return Err(AetherError::Proxy("proxy target missing".into()));
     }
     Ok((value.to_string(), default_port))
 }
@@ -394,9 +394,9 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
     let end = header
         .windows(2)
         .position(|window| window == b"\r\n")
-        .ok_or_else(|| AetherError::Other("invalid HTTP request line".into()))?;
+        .ok_or_else(|| AetherError::Proxy("invalid HTTP request line".into()))?;
     let first = std::str::from_utf8(&header[..end])
-        .map_err(|_| AetherError::Other("invalid HTTP request line".into()))?;
+        .map_err(|_| AetherError::Proxy("invalid HTTP request line".into()))?;
     let mut parts = first.split(' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -409,7 +409,7 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
         || target.is_empty()
         || parts.next().is_some()
     {
-        return Err(AetherError::Other("invalid HTTP request line".into()));
+        return Err(AetherError::Proxy("invalid HTTP request line".into()));
     }
     if target.len() >= 7 && target[..7].eq_ignore_ascii_case("http://") {
         let rest = &target[7..];

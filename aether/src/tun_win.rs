@@ -72,7 +72,7 @@ fn find_wintun_dll() -> Result<PathBuf> {
     if let Some(p) = crate::keyhandoff::wintun_dll_path() {
         let s = p.to_string_lossy();
         return inside_allowed_root(&s).ok_or_else(|| {
-            AetherError::Other(format!(
+            AetherError::HostState(format!(
                 "wintun path from the parent ({s}) is not a plain wintun.dll inside the install \
                  directory; refusing to load a driver from anywhere else"
             ))
@@ -92,7 +92,7 @@ fn find_wintun_dll() -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    Err(AetherError::Other(
+    Err(AetherError::HostState(
         "wintun.dll not found beside aether.exe, and the parent handed over no path".into(),
     ))
 }
@@ -104,11 +104,11 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     let out = Command::new(&exe)
         .args(args)
         .output()
-        .map_err(|e| AetherError::Other(format!("{} failed: {e}", exe.display())))?;
+        .map_err(|e| AetherError::HostState(format!("{} failed: {e}", exe.display())))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     if !out.status.success() {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::HostState(format!(
             "{program} {:?}: {} {}",
             args, stdout, stderr
         )));
@@ -123,7 +123,7 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
 fn parse_v4(s: &str) -> Result<Ipv4Addr> {
     let ip = s.split('/').next().unwrap_or(s);
     ip.parse()
-        .map_err(|_| AetherError::Other(format!("bad ipv4 {s}")))
+        .map_err(|_| AetherError::HostState(format!("bad ipv4 {s}")))
 }
 
 fn default_gateway() -> Result<(u32, Ipv4Addr)> {
@@ -143,18 +143,18 @@ Write-Output ($best.InterfaceIndex.ToString() + '|' + $best.NextHop)
         .lines()
         .map(str::trim)
         .find(|line| line.contains('|'))
-        .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
+        .ok_or_else(|| AetherError::HostState("bad default gateway output".into()))?;
     let (idx, gateway) = line
         .split_once('|')
-        .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
+        .ok_or_else(|| AetherError::HostState("bad default gateway output".into()))?;
     let idx = idx
         .trim()
         .parse::<u32>()
-        .map_err(|_| AetherError::Other("bad default interface index".into()))?;
+        .map_err(|_| AetherError::HostState("bad default interface index".into()))?;
     let gateway = gateway
         .trim()
         .parse::<Ipv4Addr>()
-        .map_err(|_| AetherError::Other("bad default gateway".into()))?;
+        .map_err(|_| AetherError::HostState("bad default gateway".into()))?;
     Ok((idx, gateway))
 }
 
@@ -167,7 +167,9 @@ fn ps(cmd: &str) -> Result<String> {
 
 fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr, mtu: usize) -> Result<()> {
     if !ps_literal_is_safe(name) {
-        return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
+        return Err(AetherError::HostState(format!(
+            "unsafe adapter name: {name:?}"
+        )));
     }
     // WireGuard-style: /32 on tunnel NIC, no gateway, low metric, DNS via tunnel.
     //
@@ -274,7 +276,7 @@ Write-Output ('ok mtu-requested={mtu} mtu-applied=' + $applied)
                 // packets that the data plane then throws away. A tunnel that
                 // works for small requests and blackholes everything else is
                 // worse than one that says it did not start.
-                return Err(AetherError::Other(format!(
+                return Err(AetherError::HostState(format!(
                     "cannot set the {name} adapter MTU to {mtu}: {e}"
                 )));
             }
@@ -296,7 +298,9 @@ Write-Output ('ok mtu-requested={mtu} mtu-applied=' + $applied)
 
 fn interface_index(name: &str) -> Result<u32> {
     if !ps_literal_is_safe(name) {
-        return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
+        return Err(AetherError::HostState(format!(
+            "unsafe adapter name: {name:?}"
+        )));
     }
     let out = ps(&format!(
         "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ifIndex)"
@@ -306,7 +310,7 @@ fn interface_index(name: &str) -> Result<u32> {
         .map(str::trim)
         .find(|l| !l.is_empty())
         .and_then(|l| l.parse::<u32>().ok())
-        .ok_or_else(|| AetherError::Other(format!("could not resolve ifIndex for {name}")))?;
+        .ok_or_else(|| AetherError::HostState(format!("could not resolve ifIndex for {name}")))?;
     Ok(idx)
 }
 
@@ -363,7 +367,7 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
     let peer_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
         IpAddr::V6(_) => {
-            return Err(AetherError::Other(
+            return Err(AetherError::HostState(
                 "TUN mode currently requires IPv4 peer".into(),
             ))
         }
@@ -392,10 +396,10 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
     refuse_if_another_instance_holds_a_journal(if_index, &me)?;
     let mut journal = plan_journal(peer_ip, ipv4, gw, if_index, physical_if_index);
     let journal_path = route_repair::journal_path_for(&me).ok_or_else(|| {
-        AetherError::Other("refusing to mutate routes: no per-owner journal path".into())
+        AetherError::HostState("refusing to mutate routes: no per-owner journal path".into())
     })?;
     route_repair::write_journal(&journal_path, &journal)
-        .map_err(|e| AetherError::Other(format!("refusing to mutate routes: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("refusing to mutate routes: {e}")))?;
 
     // T044 — the backstop block, see `route_repair::ROUTE_BACKSTOP_LIFETIME`. It
     // is applied inside its own `try`, so a host whose NetTCPIP cmdlets do not
@@ -512,7 +516,7 @@ try {{
                 ],
             ) {
                 clear_journal_at(&journal_path);
-                return Err(AetherError::Other(format!(
+                return Err(AetherError::HostState(format!(
                     "failed to install physical peer escape route: {err}"
                 )));
             }
@@ -594,7 +598,7 @@ fn refuse_if_another_instance_holds_a_journal(if_index: u32, me: &JournalOwner) 
             .collect();
     match route_repair::decide_owner_exclusivity(&records, me, if_index) {
         MutationVerdict::Proceed => Ok(()),
-        MutationVerdict::Refuse { why, owner } => Err(AetherError::Other(format!(
+        MutationVerdict::Refuse { why, owner } => Err(AetherError::HostState(format!(
             "{why} (pid {} from boot {:#x}); refusing to install routes a second instance would later delete",
             owner.creator_pid, owner.boot_id
         ))),
@@ -1006,7 +1010,7 @@ pub async fn spawn(
     let dll = find_wintun_dll()?;
     log::info!("[tun] loading {}", dll.display());
     let wintun = unsafe { wintun_bindings::load_from_path(&dll) }
-        .map_err(|e| AetherError::Other(format!("load wintun: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("load wintun: {e}")))?;
 
     // Prefer existing adapter; create if missing. Orphaned "Aether 1" names are cleaned by WinTun.
     let adapter = match Adapter::open(&wintun, ADAPTER_NAME) {
@@ -1017,7 +1021,7 @@ pub async fn spawn(
         Err(e) => {
             log::info!("[tun] open {ADAPTER_NAME}: {e}; creating");
             Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
-                .map_err(|e| AetherError::Other(format!("create adapter: {e}")))?
+                .map_err(|e| AetherError::HostState(format!("create adapter: {e}")))?
         }
     };
 
@@ -1035,7 +1039,7 @@ pub async fn spawn(
 
     let session = adapter
         .start_session(MAX_RING_CAPACITY)
-        .map_err(|e| AetherError::Other(format!("start session: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("start session: {e}")))?;
     let journal = match install_routes(peer, ipv4) {
         Ok(journal) => journal,
         Err(error) => {
@@ -1058,7 +1062,7 @@ pub async fn spawn(
                      session stayed open: {e}"
                 );
             }
-            AetherError::Other("no per-owner journal path for the routes just installed".into())
+            AetherError::HostState("no per-owner journal path for the routes just installed".into())
         })?;
     let handle = TunHandle {
         _adapter: adapter,
@@ -1100,7 +1104,7 @@ pub async fn spawn(
             }
             log::info!("[tun] rx thread exit after {n} packets");
         })
-        .map_err(|e| AetherError::Other(format!("tun rx thread: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("tun rx thread: {e}")))?;
 
     // Kernel TX path: write decrypted tunnel packets into WinTUN for the OS stack.
     let session_w = session;
@@ -1186,7 +1190,7 @@ pub async fn spawn(
                 log::info!("[tun] tx thread exit after {n} packets");
             });
         })
-        .map_err(|e| AetherError::Other(format!("tun tx thread: {e}")))?;
+        .map_err(|e| AetherError::HostState(format!("tun tx thread: {e}")))?;
 
     log::info!(
         "[tun] adapter {ADAPTER_NAME} up {ipv4}/32 peer exclude {}",

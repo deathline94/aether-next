@@ -40,6 +40,22 @@ pub enum AetherError {
     #[error("api: {0}")]
     Api(String),
 
+    /// The identity/config file could not be read, parsed, sealed or opened. The
+    /// user can fix this in Settings; no retry can.
+    #[error("config: {0}")]
+    Config(String),
+
+    /// A local proxy listener failed — bind, accept, handshake or session. The
+    /// next attempt may succeed on the same configuration.
+    #[error("proxy: {0}")]
+    Proxy(String),
+
+    /// The host's own state could not be arranged: adapter, routes, ACLs, the
+    /// mutation lock, a system tool that refused. Retrying without changing the
+    /// host reproduces the failure.
+    #[error("host state: {0}")]
+    HostState(String),
+
     #[error("other: {0}")]
     Other(String),
 }
@@ -67,6 +83,9 @@ impl AetherError {
             Self::NoIpv6Route => "no_ipv6_route",
             Self::Capsule(_) => "capsule",
             Self::Api(_) => "api",
+            Self::Config(_) => "config",
+            Self::Proxy(_) => "proxy",
+            Self::HostState(_) => "host_state",
             Self::Other(_) => "other",
         }
     }
@@ -90,6 +109,8 @@ impl AetherError {
             ),
             Self::Quic(_) | Self::H3(_) | Self::Capsule(_) => true,
             Self::Api(_) => true,
+            Self::Proxy(_) => true,
+            Self::Config(_) | Self::HostState(_) => false,
             Self::NoCleanEndpoint => true,
             // Pressing Stop succeeded; nothing about the network is implicated, so
             // a retry is always available.

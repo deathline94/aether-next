@@ -72,12 +72,12 @@ impl EngineConfig {
         if !env_truthy("AETHER_ALLOW_REMOTE_PROXY")
             && (!cfg.socks.ip().is_loopback() || !cfg.http.ip().is_loopback())
         {
-            return Err(AetherError::Other(
+            return Err(AetherError::Config(
                 "proxy listeners must use loopback unless AETHER_ALLOW_REMOTE_PROXY=1".into(),
             ));
         }
         if cfg.socks.port() == cfg.http.port() {
-            return Err(AetherError::Other(
+            return Err(AetherError::Config(
                 "AETHER_SOCKS and AETHER_HTTP ports must differ".into(),
             ));
         }
@@ -116,7 +116,7 @@ fn env_addr(name: &str) -> Result<Option<SocketAddr>> {
             let addr: SocketAddr = v
                 .trim()
                 .parse()
-                .map_err(|_| AetherError::Other(format!("bad {name} address {v}")))?;
+                .map_err(|_| AetherError::Config(format!("bad {name} address {v}")))?;
             Ok(Some(addr))
         }
         _ => Ok(None),
@@ -127,9 +127,9 @@ fn parse_listen(var: &str, default: &str) -> Result<SocketAddr> {
     let raw = crate::runtime_env::var(var).unwrap_or_else(|| default.to_string());
     let addr: SocketAddr = raw
         .parse()
-        .map_err(|_| AetherError::Other(format!("bad {var} address {raw}")))?;
+        .map_err(|_| AetherError::Config(format!("bad {var} address {raw}")))?;
     if addr.port() < 1024 {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Config(format!(
             "{var} port must be >= 1024 (got {})",
             addr.port()
         )));

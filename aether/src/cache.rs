@@ -416,7 +416,7 @@ impl ProvisionGuard {
         if let Some(parent) = lock_file_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    AetherError::Other(format!(
+                    AetherError::Config(format!(
                         "create dir for provision lock {}: {e}",
                         parent.display()
                     ))
@@ -431,7 +431,7 @@ impl ProvisionGuard {
             .truncate(false)
             .open(lock_file_path)
             .map_err(|e| {
-                AetherError::Other(format!(
+                AetherError::Config(format!(
                     "open provision lock {}: {e}",
                     lock_file_path.display()
                 ))
@@ -444,28 +444,28 @@ impl ProvisionGuard {
                     let mut f = &file;
                     f.seek(SeekFrom::Start(0)).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!(
+                        AetherError::Config(format!(
                             "seek provision lock {}: {e}",
                             lock_file_path.display()
                         ))
                     })?;
                     f.set_len(0).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!(
+                        AetherError::Config(format!(
                             "truncate provision lock {}: {e}",
                             lock_file_path.display()
                         ))
                     })?;
                     writeln!(f, "pid={}", std::process::id()).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!(
+                        AetherError::Config(format!(
                             "write pid to provision lock {}: {e}",
                             lock_file_path.display()
                         ))
                     })?;
                     f.flush().map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!(
+                        AetherError::Config(format!(
                             "flush provision lock {}: {e}",
                             lock_file_path.display()
                         ))
@@ -500,7 +500,7 @@ impl ProvisionGuard {
                             }
                             Err(e) => format!("could not inspect lock owner: {e}"),
                         };
-                        return Err(AetherError::Other(format!(
+                        return Err(AetherError::Config(format!(
                             "provisioning lock acquisition timed out after {:?} on {} [{}]",
                             wait,
                             lock_file_path.display(),
@@ -696,9 +696,9 @@ pub fn load_endpoints(base_config: &str) -> EndpointsCache {
 pub fn save_endpoints(base_config: &str, cache: &EndpointsCache) -> Result<()> {
     let path = cache_path(base_config);
     let data = serde_json::to_string_pretty(cache)
-        .map_err(|e| AetherError::Other(format!("encode {}: {e}", path.display())))?;
+        .map_err(|e| AetherError::Config(format!("encode {}: {e}", path.display())))?;
     write_atomic(&path, data.as_bytes())
-        .map_err(|e| AetherError::Other(format!("persist {}: {e}", path.display())))
+        .map_err(|e| AetherError::Config(format!("persist {}: {e}", path.display())))
 }
 
 /// Which act produced an RTT number.

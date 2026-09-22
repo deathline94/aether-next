@@ -181,7 +181,7 @@ pub fn proxy_credentials() -> Option<(String, String)> {
 /// Refuse to bind a proxy listener that would be reachable and unauthenticated.
 pub fn check_listener_bind(listen: SocketAddr) -> Result<()> {
     if !listen.ip().is_loopback() && proxy_credentials().is_none() {
-        return Err(AetherError::Other(format!(
+        return Err(AetherError::Proxy(format!(
             "{listen} is not a loopback address: a remote-facing proxy must set \
              AETHER_PROXY_USER and AETHER_PROXY_PASS"
         )));
@@ -256,7 +256,7 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
                 Err(_) => {
                     let msg = session_cap_message("socks", MAX_SESSION);
                     log::warn!("{msg} (peer {peer})");
-                    return Err(AetherError::Other(msg));
+                    return Err(AetherError::Proxy(msg));
                 }
             };
             if let Err(e) = session {
@@ -282,10 +282,10 @@ async fn refuse_over_capacity(mut sock: TcpStream) -> Result<()> {
     .await;
     match wrote {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AetherError::Other(format!(
+        Ok(Err(e)) => Err(AetherError::Proxy(format!(
             "socks refusal write failed: {e}"
         ))),
-        Err(_) => Err(AetherError::Other("socks refusal write timed out".into())),
+        Err(_) => Err(AetherError::Proxy("socks refusal write timed out".into())),
     }
 }
 
@@ -295,13 +295,13 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
         let mut head = [0u8; 4];
         sock.read_exact(&mut head).await?;
         if head[0] != VER {
-            return Err(AetherError::Other("bad socks version".into()));
+            return Err(AetherError::Proxy("bad socks version".into()));
         }
         let (target, port) = read_target(&mut sock, head[3]).await?;
         Ok::<_, AetherError>((head[1], target, port))
     })
     .await
-    .map_err(|_| AetherError::Other("SOCKS handshake timeout".into()))??;
+    .map_err(|_| AetherError::Proxy("SOCKS handshake timeout".into()))??;
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
@@ -310,11 +310,11 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
             // BIND is not implemented; refuse it with the command code and close
             // instead of falling through to a protocol-mislabelled reply.
             reply(&mut sock, REP_CMD_NOT_SUPPORTED).await?;
-            Err(AetherError::Other("SOCKS BIND is not supported".into()))
+            Err(AetherError::Proxy("SOCKS BIND is not supported".into()))
         }
         _ => {
             reply(&mut sock, REP_CMD_NOT_SUPPORTED).await?;
-            Err(AetherError::Other("unsupported socks command".into()))
+            Err(AetherError::Proxy("unsupported socks command".into()))
         }
     }
 }
@@ -324,7 +324,7 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let mut prefix = [0u8; 2];
     sock.read_exact(&mut prefix).await?;
     if prefix[0] != VER {
-        return Err(AetherError::Other("bad greeting version".into()));
+        return Err(AetherError::Proxy("bad greeting version".into()));
     }
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
@@ -335,9 +335,9 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
         AUTH_NONE => Ok(()),
         AUTH_USERPASS => match creds {
             Some(want) => authenticate_userpass(sock, &want).await,
-            None => Err(AetherError::Other("proxy credentials unavailable".into())),
+            None => Err(AetherError::Proxy("proxy credentials unavailable".into())),
         },
-        _ => Err(AetherError::Other(
+        _ => Err(AetherError::Proxy(
             "no supported socks authentication method".into(),
         )),
     }
@@ -368,7 +368,7 @@ async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) ->
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != USERPASS_VER {
-        return Err(AetherError::Other("bad username/password version".into()));
+        return Err(AetherError::Proxy("bad username/password version".into()));
     }
     let ulen = head[1] as usize;
     let mut user = vec![0u8; ulen];
@@ -383,7 +383,7 @@ async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) ->
     if ok {
         Ok(())
     } else {
-        Err(AetherError::Other("socks authentication failed".into()))
+        Err(AetherError::Proxy("socks authentication failed".into()))
     }
 }
 
@@ -394,15 +394,15 @@ async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) ->
 /// up a *different* host than the client asked for and reported success.
 fn parse_domain_name(raw: &[u8]) -> Result<String> {
     if raw.is_empty() || raw.len() > 253 {
-        return Err(AetherError::Other("invalid SOCKS domain length".into()));
+        return Err(AetherError::Proxy("invalid SOCKS domain length".into()));
     }
     if !raw.is_ascii() {
-        return Err(AetherError::Other("non-ASCII SOCKS domain".into()));
+        return Err(AetherError::Proxy("non-ASCII SOCKS domain".into()));
     }
     let name = String::from_utf8(raw.to_vec())
-        .map_err(|_| AetherError::Other("invalid SOCKS domain encoding".into()))?;
+        .map_err(|_| AetherError::Proxy("invalid SOCKS domain encoding".into()))?;
     if !name.split('.').all(|l| !l.is_empty() && l.len() <= 63) {
-        return Err(AetherError::Other("invalid SOCKS domain label".into()));
+        return Err(AetherError::Proxy("invalid SOCKS domain label".into()));
     }
     Ok(name)
 }
@@ -426,7 +426,7 @@ async fn read_target(sock: &mut TcpStream, atyp: u8) -> Result<(Target, u16)> {
             sock.read_exact(&mut name).await?;
             Target::Domain(parse_domain_name(&name)?)
         }
-        _ => return Err(AetherError::Other("bad atyp".into())),
+        _ => return Err(AetherError::Proxy("bad atyp".into())),
     };
 
     let mut port = [0u8; 2];
@@ -600,7 +600,7 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
         }
     }
     if !valid_dns_name(&key) {
-        return Err(AetherError::Other(format!("invalid domain name {name:?}")));
+        return Err(AetherError::Proxy(format!("invalid domain name {name:?}")));
     }
 
     // The UdpSender's Drop now closes the netstack socket (H1 fix), so every
@@ -613,7 +613,7 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let udp = stack.open_udp_resolver().await?;
     let (sender, mut from_stack) = udp.into_split();
 
-    let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
+    let mut last_err = AetherError::Proxy(format!("no DNS record for {name}"));
     for server in configured_dns_servers() {
         for qtype in dns_prefer_order() {
             // Drop anything the association is already holding before asking a
@@ -635,18 +635,18 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
                 match tokio::time::timeout(Duration::from_secs(3), from_stack.recv()).await {
                     Ok(Some(r)) => r,
                     Ok(None) => {
-                        last_err = AetherError::Other("dns channel closed".into());
+                        last_err = AetherError::Proxy("dns channel closed".into());
                         continue;
                     }
                     Err(_) => {
-                        last_err = AetherError::Other("dns timeout".into());
+                        last_err = AetherError::Proxy("dns timeout".into());
                         continue;
                     }
                 };
             // M11 fix: only accept replies from the resolver we actually asked.
             if src != server {
                 log::debug!("[socks-dns] dropping reply from {src} (asked {server})");
-                last_err = AetherError::Other("dns reply from unexpected source".into());
+                last_err = AetherError::Proxy("dns reply from unexpected source".into());
                 continue;
             }
             if let Some(ip) = parse_dns_answer_id(&resp, qtype, Some(qid), Some(&key)) {
@@ -658,7 +658,7 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
                 }
                 return Ok(ip);
             }
-            last_err = AetherError::Other(format!("no type-{qtype} record for {name}"));
+            last_err = AetherError::Proxy(format!("no type-{qtype} record for {name}"));
         }
     }
     Err(last_err)
@@ -682,7 +682,7 @@ fn build_dns_query(name: &str, qtype: u16) -> Result<(u16, Vec<u8>)> {
         if label.is_empty() || label.len() > 63 {
             // Dropping the label would ask for `example.com` when the client
             // asked for `<64+-byte-label>.example.com`.
-            return Err(AetherError::Other(format!(
+            return Err(AetherError::Proxy(format!(
                 "cannot encode DNS label {:?} (empty or longer than 63 bytes)",
                 label
             )));
@@ -838,7 +838,7 @@ async fn handle_connect(
 
     if ip.is_ipv6() && is_ipv4_only() {
         let _ = reply(&mut sock, REP_ATYP_NOT_SUPPORTED).await;
-        return Err(AetherError::Other(
+        return Err(AetherError::Proxy(
             "IPv6 target rejected in IPv4-only mode".into(),
         ));
     }
@@ -861,7 +861,7 @@ async fn handle_connect(
         }
         Err(_) => {
             let _ = reply(&mut sock, REP_GENERAL).await;
-            return Err(AetherError::Other("upstream connect timed out".into()));
+            return Err(AetherError::Proxy("upstream connect timed out".into()));
         }
     };
 
