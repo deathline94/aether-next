@@ -106,6 +106,13 @@ fn is_admin(app: AppHandle) -> bool {
     {
         elevation::is_elevated()
     }
+    // Off Windows the answer is permissive on purpose, and it is not a claim about
+    // privileges: the only thing the UI gates on it is the Windows TUN path, which
+    // `connect` refuses outright on every other platform (`engine_path` never even
+    // resolves a driver), so a truthful `false` here would only mislabel the
+    // Settings row. The key story is the same shape — `dpapi::service()` reports
+    // `KeyService::None` and every path that needs a wrapped key fails with
+    // `key_service_unavailable` rather than writing one unwrapped.
     #[cfg(not(windows))]
     {
         true

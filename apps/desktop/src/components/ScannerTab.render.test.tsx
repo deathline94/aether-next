@@ -82,8 +82,10 @@ describe("ScannerTab probe parameters", () => {
         tab.getAttribute("aria-selected") === "true" ? "0" : "-1",
       );
     }
-    fireEvent.keyDown(tabs[0], { key: "ArrowRight" });
-    expect(screen.getAllByRole("tab")[1].getAttribute("aria-selected")).toBe("true");
+    const firstTab = tabs[0];
+    if (!firstTab) throw new Error("the protocol filter rendered no tabs");
+    fireEvent.keyDown(firstTab, { key: "ArrowRight" });
+    expect(screen.getAllByRole("tab")[1]?.getAttribute("aria-selected")).toBe("true");
   });
 
   it("prints an unmeasured round-trip as such, not as a blank HIGH LATENCY row", () => {

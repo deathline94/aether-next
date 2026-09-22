@@ -26,35 +26,43 @@ const LINE_LIMIT: usize = 500;
 
 /// Where the startup log lives: the app's config directory when it can be derived,
 /// the system temp directory otherwise.
+///
+/// The *directory* is resolved once (a `create_dir_all` per line would be a syscall
+/// pile in the middle of the failure path); the file itself is opened per write, so
+/// a quarantine or a rotation between lines is met by a fresh open rather than a
+/// stale handle.
 fn log_file() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        candidates.push(PathBuf::from(appdata).join(APP_IDENTIFIER));
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join(APP_IDENTIFIER),
-        );
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-        if let Some(base) = base {
-            candidates.push(base.join(APP_IDENTIFIER));
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        #[cfg(windows)]
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            candidates.push(PathBuf::from(appdata).join(APP_IDENTIFIER));
         }
-    }
-    candidates.push(std::env::temp_dir().join(APP_IDENTIFIER));
-    candidates
-        .into_iter()
-        .find(|dir| std::fs::create_dir_all(dir).is_ok() && PathBuf::from(dir).is_dir())
-        .map(|dir| dir.join(FILE_NAME))
+        #[cfg(target_os = "macos")]
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join(APP_IDENTIFIER),
+            );
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let base = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+            if let Some(base) = base {
+                candidates.push(base.join(APP_IDENTIFIER));
+            }
+        }
+        candidates.push(std::env::temp_dir().join(APP_IDENTIFIER));
+        candidates
+            .into_iter()
+            .find(|dir| std::fs::create_dir_all(dir).is_ok() && dir.is_dir())
+    });
+    dir.as_ref().map(|dir| dir.join(FILE_NAME))
 }
 
 /// Append one timestamped line. Best-effort by design: this is the last resort, so

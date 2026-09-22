@@ -18,7 +18,11 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    /* Indexing an array or record yields `| undefined`, so `heroCopy[status]`
+       cannot silently become `undefined` at render — the class of crash that
+       white-screened the window when an unknown engine status arrived. */
+    "noUncheckedIndexedAccess": true
   },
   "include": ["src"],
   /*

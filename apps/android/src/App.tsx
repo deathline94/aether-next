@@ -132,8 +132,8 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div className="topbar-titles">
-            <p className="topbar-eyebrow">{activeNav.eyebrow}</p>
-            <h1 className="topbar-heading">{activeNav.label}</h1>
+            <p className="topbar-eyebrow">{activeNav?.eyebrow}</p>
+            <h1 className="topbar-heading">{activeNav?.label}</h1>
           </div>
           <div className="topbar-actions">
             <div className={`header-status ${runtime.status}`} title={runtime.detail}>

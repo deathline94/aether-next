@@ -124,9 +124,10 @@ describe("useLogs hit counting", () => {
       result.current.appendLog(hit("candidate ok 104.16.0.1:443 in 12ms"));
     });
     const [entry] = result.current.logs;
+    if (!entry) throw new Error("no log entry was appended");
     expect(entry.time).toMatch(/^\d{2}:\d{2}:\d{2}$/);
     const before = entry.time;
     act(() => result.current.setLogFilter("raw"));
-    expect(result.current.logs[0].time).toBe(before);
+    expect(result.current.logs[0]?.time).toBe(before);
   });
 });

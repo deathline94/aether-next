@@ -204,13 +204,14 @@ pub(crate) fn emit_log(app: &AppHandle, line: String) {
 /// flag is set every later line goes straight out.
 pub(crate) fn note_webview_ready(app: &AppHandle) {
     let state = app.state::<AppState>();
+    // The guard is held across the flush, not just across the swap: `emit_log`
+    // re-checks readiness under this same lock, so a line emitted while the page is
+    // being caught up cannot overtake the older ones behind it. No listener in this
+    // process subscribes to `session://log`, so nothing reachable from `emit` can
+    // re-enter this lock. Calling it twice is a no-op — the buffer is empty.
     let mut pending = state.pending_logs.lock();
-    if state.log_ready.swap(true, Ordering::SeqCst) {
-        pending.clear();
-        return;
-    }
+    state.log_ready.store(true, Ordering::SeqCst);
     let buffered = std::mem::take(&mut *pending);
-    drop(pending);
     for event in buffered {
         let _ = app.emit("session://log", event);
     }

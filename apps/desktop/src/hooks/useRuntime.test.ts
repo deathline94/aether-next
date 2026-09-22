@@ -390,13 +390,15 @@ describe("desktop useRuntime update check", () => {
     emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
-    const url = String(fetchMock.mock.calls[0][0]);
+    const call = fetchMock.mock.calls[0];
+    if (!call) throw new Error("the release host was never contacted");
+    const url = String(call[0]);
     expect(url).toContain("api.github.com");
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const init = call[1] as RequestInit | undefined;
     expect(init?.signal).toBeInstanceOf(AbortSignal);
-    expect(init.signal?.aborted).toBe(false);
+    expect(init?.signal?.aborted).toBe(false);
 
     cleanup();
-    expect(init.signal?.aborted).toBe(true);
+    expect(init?.signal?.aborted).toBe(true);
   });
 });

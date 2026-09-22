@@ -48,6 +48,14 @@ pub fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
     allowed.then(|| host.to_string())
 }
 
+/// The registry journal and its mirror.
+///
+/// `#[cfg(windows)]` because everything below is `HKCU\Software\...\Internet
+/// Settings` traffic and the `winreg`/`windows-sys` dependencies behind it are
+/// declared under `[target.'cfg(windows)'.dependencies]`: an ungated module here
+/// would make the shell unbuildable for every other target, which is exactly how
+/// the cross-platform `--repair-proxy` reading came to be pointless.
+#[cfg(windows)]
 pub mod windows_proxy {
     use crate::CommandError;
 

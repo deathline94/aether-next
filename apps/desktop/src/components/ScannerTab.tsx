@@ -125,7 +125,9 @@ export function ScannerTab({
     const next = nextOptionIndex(selected, event.key, protoTabs.length);
     if (next === null) return;
     event.preventDefault();
-    setProtoFilter(protoTabs[next].id);
+    const tab = protoTabs[next];
+    if (!tab) return;
+    setProtoFilter(tab.id);
     tabRefs.current[next]?.focus();
   };
 

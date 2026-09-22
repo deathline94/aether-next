@@ -52,7 +52,9 @@ export function Segmented<T extends string>({
     const next = nextOptionIndex(selected, event.key, options.length);
     if (next === null) return;
     event.preventDefault();
-    onChange(options[next].value);
+    const option = options[next];
+    if (!option) return;
+    onChange(option.value);
     refs.current[next]?.focus();
   };
 

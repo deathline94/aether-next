@@ -393,12 +393,12 @@ export function useRuntime(
 /** Semver-aware greater-than comparison; tolerates pre-release suffixes. */
 function semverGt(a: string, b: string): boolean {
   const parse = (v: string) =>
-    v.split("-")[0].split(".").map((p) => Number.parseInt(p, 10) || 0);
+    (v.split("-")[0] ?? "").split(".").map((p) => Number.parseInt(p, 10) || 0);
   const pa = parse(a);
   const pb = parse(b);
   for (let i = 0; i < 3; i++) {
-    const na = pa[i] || 0;
-    const nb = pb[i] || 0;
+    const na = pa[i] ?? 0;
+    const nb = pb[i] ?? 0;
     if (na > nb) return true;
     if (na < nb) return false;
   }

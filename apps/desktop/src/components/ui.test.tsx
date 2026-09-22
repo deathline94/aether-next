@@ -57,12 +57,17 @@ describe("Segmented", () => {
     const onChange = vi.fn();
     render(<Segmented label="pick" value="a" options={options} onChange={onChange} />);
     const radios = screen.getAllByRole("radio");
-    fireEvent.keyDown(radios[0], { key: "ArrowRight" });
+    const firstRadio = radios[0];
+    const secondRadio = radios[1];
+    if (!firstRadio || !secondRadio) throw new Error("the group rendered too few radios");
+    fireEvent.keyDown(firstRadio, { key: "ArrowRight" });
     expect(onChange).toHaveBeenCalledWith("b");
     // The button that just took the selection has to be the one under the caret,
     // or the next keystroke moves the wrong thing.
-    expect(radios[1].getAttribute("aria-checked")).toBe("false");
-    fireEvent.keyDown(screen.getAllByRole("radio")[0], { key: "End" });
+    expect(secondRadio.getAttribute("aria-checked")).toBe("false");
+    const focusedAgain = screen.getAllByRole("radio")[0];
+    if (!focusedAgain) throw new Error("the group lost its radios");
+    fireEvent.keyDown(focusedAgain, { key: "End" });
     expect(onChange).toHaveBeenCalledWith("c");
   });
 });

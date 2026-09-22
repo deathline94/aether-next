@@ -257,7 +257,9 @@ export function ActivityTab({
             const next = nextOptionIndex(selected, event.key, FILTERS.length);
             if (next === null) return;
             event.preventDefault();
-            setLogFilter(FILTERS[next].id);
+            const filter = FILTERS[next];
+            if (!filter) return;
+            setLogFilter(filter.id);
           }}
         >
           <div className="filter-pill-group">
