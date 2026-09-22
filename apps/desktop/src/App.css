@@ -3052,8 +3052,8 @@ code, kbd, pre {
   place-items: center;
 }
 .gutter-dot {
-  width: 5px;
-  height: 5px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--edge);
   display: inline-block;
@@ -3078,10 +3078,6 @@ code, kbd, pre {
    so warn vs error was invisible to colour-blind users and to anyone reading a
    grey-scaled or high-contrast display. Each level now has a distinct shape as
    well, and the dot is large enough for the shape to be legible. */
-.gutter-dot {
-  width: 7px;
-  height: 7px;
-}
 .terminal-log-row.info .gutter-dot {
   clip-path: circle(50%);
 }

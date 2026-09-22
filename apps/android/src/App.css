@@ -3015,8 +3015,8 @@ code, kbd, pre {
   place-items: center;
 }
 .gutter-dot {
-  width: 5px;
-  height: 5px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--edge);
   display: inline-block;
@@ -3041,10 +3041,6 @@ code, kbd, pre {
    so warn vs error was invisible to colour-blind users and to anyone reading a
    grey-scaled or high-contrast display. Each level now has a distinct shape as
    well, and the dot is large enough for the shape to be legible. */
-.gutter-dot {
-  width: 7px;
-  height: 7px;
-}
 .terminal-log-row.info .gutter-dot {
   clip-path: circle(50%);
 }
@@ -3255,14 +3251,13 @@ code, kbd, pre {
 }
 
 @media (max-width: 680px) {
-  .app-shell { grid-template-columns: 1fr; padding-bottom: 60px; }
+  .app-shell { grid-template-columns: 1fr; }
   .sidebar {
     position: fixed;
     z-index: var(--z-overlay);
     top: auto;
     bottom: 0;
     width: 100%;
-    height: 60px;
     padding: 6px 12px;
     border: 0;
     border-top: 1px solid var(--border-card);
@@ -3292,7 +3287,6 @@ code, kbd, pre {
     height: auto;
     min-height: 56px;
     padding: 10px 16px;
-    background: var(--bg-app) !important;
     border-bottom: 1px solid var(--border-card);
   }
   .home-view, .settings-view, .logs-view, .scanner-view {

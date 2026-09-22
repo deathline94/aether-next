@@ -1300,6 +1300,97 @@ const GATES = [
     },
   },
   {
+    name: 'css-no-conflicting-duplicate-selectors',
+    invariant: 'BC-11',
+    summary: 'no selector is defined twice at the same nesting level with different values',
+    scan(api) {
+      /*
+       * Two rules for the same selector at the same level is not a fallback and
+       * not responsive design - it is a coin toss decided by file order, and the
+       * losing copy keeps getting edited because that is where the reader finds
+       * the selector first. This repo shipped exactly that: a second
+       * `.tactile-copy-btn` block, later in the sheet, silently switching off
+       * the emerald hover on all five copy buttons.
+       *
+       * Only same-level duplicates count. A selector repeated inside an @media
+       * block, or a `0%` step repeated across two @keyframes, is the cascade
+       * doing its job, so the scanner tracks the enclosing chain and compares
+       * each block against its siblings only.
+       */
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const code = blankComments(api.read(f));
+        const stack = [];
+        const groups = new Map();
+        let buf = '';
+        let line = 1;
+        for (let i = 0; i < code.length; i += 1) {
+          const ch = code[i];
+          if (ch === '\n') line += 1;
+          if (ch === '{') {
+            const prelude = buf.trim().split('\n').pop().trim();
+            buf = '';
+            const isAt = /^@/.test(prelude);
+            const frame = { prelude, isAt, body: '', startLine: line };
+            if (!isAt && stack.filter((s) => !s.isAt).length === 0) {
+              const key = `${stack.map((s) => s.prelude).join(' > ')}::${prelude}`;
+              if (!groups.has(key)) groups.set(key, []);
+              groups.get(key).push(frame);
+            }
+            stack.push(frame);
+            continue;
+          }
+          if (ch === '}') {
+            stack.pop();
+            buf = '';
+            continue;
+          }
+          buf += ch;
+          if (stack.length) stack[stack.length - 1].body += ch;
+        }
+        for (const [key, blocks] of groups) {
+          if (blocks.length < 2) continue;
+          const seen = new Map();
+          const clashes = [];
+          const repeats = [];
+          for (const b of blocks) {
+            for (const d of b.body.split(';')) {
+              const m = d.match(/^\s*([a-z-]+)\s*:\s*(.+)$/i);
+              if (!m) continue;
+              const prop = m[1].toLowerCase();
+              const value = m[2].trim().replace(/\s+/g, ' ');
+              const first = seen.get(prop);
+              if (first && first.value !== value) {
+                clashes.push(`${prop}: ${first.value} (line ${first.line}) vs ${value} (line ${b.startLine})`);
+              } else if (first) {
+                repeats.push(`${prop}: ${value} (line ${b.startLine})`);
+              } else {
+                seen.set(prop, { value, line: b.startLine });
+              }
+            }
+          }
+          const sel = key.split('::').pop();
+          // Two blocks adding *different* declarations is normal CSS (a second
+          // `:root` that extends the token set); only the two shapes below are
+          // defects: a value that another block quietly overrides, and a
+          // declaration repeated with the same value, which cannot ever apply.
+          if (clashes.length) {
+            v.push(`${rel(f)}:${blocks[0].startLine} '${sel}' is defined ${blocks.length} times at the same level; the later one wins for: ${clashes.slice(0, 3).join('; ')}`);
+          } else if (repeats.length) {
+            v.push(`${rel(f)}:${blocks[0].startLine} '${sel}' repeats declarations identically across ${blocks.length} blocks - those lines do nothing: ${repeats.slice(0, 4).join('; ')}`);
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: '.a{color:red}\n.a{color:blue}\n',
+      };
+    },
+  },
+  {
     name: 'colour-single-source',
     invariant: 'BC-11',
     summary: 'no colour literal in an app sheet outside the fenced token block',
