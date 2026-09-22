@@ -1736,7 +1736,7 @@ code, kbd, pre {
   border-radius: 8px;
   background: var(--coral-dim);
   border: 1px solid var(--coral-border);
-  color: #ff8b82;
+  color: var(--coral);
   font-size: 11.5px;
 }
 .port-collision-alert strong {
@@ -2228,7 +2228,8 @@ code, kbd, pre {
   border-radius: 3px;
   background: linear-gradient(90deg, #00ab60 0%, #00f08a 100%);
   box-shadow: 0 0 10px rgba(0, 240, 138, 0.5);
-  transition: width 0.3s ease;
+  /* Deliberately not transitioned: scan_progress drives this width at up to frame rate, and a
+     transition on a layout property reflows the whole stat row on every frame. */
 }
 .scan-progress-bar-fill.active-glow {
   box-shadow: 0 0 14px rgba(0, 240, 138, 0.7);
@@ -2446,7 +2447,7 @@ code, kbd, pre {
   border-radius: 9px;
   background: rgba(255, 92, 92, 0.08);
   border: 1px solid var(--coral-border);
-  color: #ff8585;
+  color: var(--coral);
   font-size: 12.5px;
   margin-top: 4px;
   margin-bottom: 8px;
@@ -2470,7 +2471,7 @@ code, kbd, pre {
 .error-banner-dismiss {
   background: transparent;
   border: 0;
-  color: #ff8585;
+  color: var(--coral);
   cursor: pointer;
   padding: 4px;
   display: grid;
@@ -2776,7 +2777,7 @@ code, kbd, pre {
 }@media (hover: hover) and (pointer: fine){
 .tactile-terminal-btn.danger:hover:not(:disabled) {
   border-color: var(--coral-border);
-  color: #ffa191;
+  color: var(--coral);
   background: rgba(255, 92, 92, 0.12);
 }}
 .tactile-terminal-btn:disabled { opacity: 0.35; cursor: not-allowed; }
@@ -2970,7 +2971,7 @@ code, kbd, pre {
   border: 1px solid rgba(255, 92, 92, 0.3);
 }
 .terminal-log-row.error .log-message-body {
-  color: #fca5a5;
+  color: var(--coral);
 }
 
 .terminal-log-row.debug .gutter-dot {
@@ -3092,7 +3093,7 @@ code, kbd, pre {
   border: 1px solid var(--coral-border);
   border-radius: 8px;
   background: var(--coral-dim);
-  color: #ff9e9e;
+  color: var(--coral);
   font-size: 11.5px;
   overflow-wrap: anywhere;
 }
@@ -3123,175 +3124,7 @@ code, kbd, pre {
   .bento-col-7, .bento-col-5, .bento-col-6 { grid-column: span 12; }
 }
 
-@media (max-width: 680px) {
-  .app-shell { grid-template-columns: 1fr; padding-bottom: 60px; }
-  .sidebar {
-    position: fixed;
-    z-index: 40;
-    top: auto;
-    bottom: 0;
-    width: 100%;
-    height: 60px;
-    padding: 6px 12px;
-    border: 0;
-    border-top: 1px solid var(--border-card);
-    flex-direction: row;
-    background: rgba(9, 12, 15, 0.94);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-  }
-  .brand, .sidebar-bottom { display: none; }
-  .nav-group {
-    width: 100%;
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 4px;
-  }
-  .nav-pill {
-    height: 48px;
-    flex-direction: column;
-    justify-content: center;
-    gap: 3px;
-    padding: 0;
-  }
-  .nav-pill-label { display: block; font-size: var(--text-micro); }
-  .nav-active-pill { display: none; }
-  .workspace { height: auto; min-height: calc(100dvh - 60px); }
-  .topbar {
-    height: auto;
-    min-height: 56px;
-    padding: 10px 16px;
-    background: #07090b !important;
-    border-bottom: 1px solid var(--border-card);
-  }
-  .home-view, .settings-view, .logs-view, .scanner-view {
-    padding: 14px 14px 24px;
-    gap: 12px;
-  }
-  .section-heading {
-    min-height: 48px;
-    padding: 12px 16px;
-  }
-  .section-heading h3 {
-    font-size: 15px;
-  }
-  
-  .connection-stage {
-    min-height: 380px;
-    grid-template-columns: 1fr;
-    justify-items: center;
-    align-content: center;
-    gap: 24px;
-    text-align: center;
-    padding-bottom: 34px;
-  }
-  .connection-copy p { margin-inline: auto; }
-  .eyebrow { justify-content: center; }
-  .master-switch-assembly { margin-top: 4px; }
-  
-  .telemetry-bento { grid-template-columns: 1fr; gap: 12px; }
-  .bento-col-7, .bento-col-5, .bento-col-6 { grid-column: span 1; }
-  .telemetry-figures { grid-template-columns: 1fr; }
-  .cipher-specs-grid, .daemon-metrics-row { grid-template-columns: 1fr; }
-  
-  .profile-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
-    padding: 14px 16px;
-  }
-  .port-field-block,
-  .param-field-block {
-    flex: 1 1 auto;
-    width: 100%;
-    min-width: 0;
-  }
-  .setting-row.input-row {
-    flex-direction: column;
-    gap: 12px;
-  }
-  .radar-telemetry-banner {
-    grid-template-columns: 72px 1fr;
-    gap: 14px;
-    padding: 14px 16px;
-  }
-  .radar-radar-scope {
-    width: 72px;
-    height: 72px;
-  }
-  .endpoint-row { grid-template-columns: 1fr 36px; gap: 10px; }
-  .endpoint-row code { grid-column: 1; grid-row: 2; max-width: 100%; min-width: 0; }
-  .endpoint-row button { grid-column: 2; grid-row: 2; }
-  .setting-row {
-    align-items: stretch;
-    flex-direction: column;
-    justify-content: flex-start;
-    gap: 10px;
-    min-height: auto;
-    padding: 14px 16px;
-  }
-  .setting-row > div:first-child {
-    flex: 0 0 auto;
-    width: 100%;
-    min-width: 0;
-  }
-  .tactical-select {
-    width: 100%;
-    min-width: 0;
-  }
-  .segmented {
-    width: 100%;
-  }
-  .segmented button {
-    flex: 1 1 0;
-    min-width: 0;
-    text-align: center;
-    justify-content: center;
-    padding: 0 8px;
-  }
-  .tactical-input-wrapper {
-    width: 100%;
-    max-width: 100%;
-  }
-  .custom-noise-matrix {
-    margin: 10px 14px 14px;
-    padding: 12px 14px;
-  }
-  .scanner-action-bar {
-    width: 100%;
-  }
-  .scanner-action-bar .primary-cta {
-    width: 100%;
-    justify-content: center;
-  }
-  .path-row input, .input-row input { width: 100%; }
-  .test-row { flex-direction: column; align-items: stretch; }
-  .activity-view { height: auto; min-height: calc(100dvh - 134px); padding: 16px 14px 26px; }
-  .activity-console { min-height: 260px; }
-  .activity-head { flex-direction: column; align-items: stretch; gap: 10px; }
-  .activity-actions { justify-content: flex-end; }
-  .filter-chip { flex: 1 1 auto; justify-content: center; }
-  .save-bar { flex-direction: column; gap: 8px; align-items: stretch; }
-  .tactical-save-dock {
-    position: sticky;
-    bottom: 8px;
-    margin-top: 12px;
-    padding: 10px 14px;
-    border-radius: 10px;
-    background: rgba(9, 12, 15, 0.96);
-    border: 1px solid var(--border-card);
-  }
-}
 
-@media (max-width: 380px) {
-  .profile-grid {
-    grid-template-columns: 1fr;
-  }
-  .radar-telemetry-banner {
-    grid-template-columns: 1fr;
-    text-align: center;
-    justify-items: center;
-  }
-}
 
 /* ─── Declared-in-markup class layer (spec 015 / BC-10) ───────────────────
    These rules used to exist only in the JSX: every consumer rendered as
