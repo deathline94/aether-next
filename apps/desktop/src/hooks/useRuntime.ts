@@ -9,6 +9,17 @@ import type { IpcError } from "../ipcError";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
+/**
+ * How long the UI will sit in `connecting` before it calls the attempt failed.
+ *
+ * Android had this and desktop did not, so on the machine where most people
+ * start a tunnel, a connect that never reaches readiness - an endpoint that
+ * accepts UDP and answers nothing, a hung handshake - left the beacon on
+ * "connecting", the settings panel locked, and no error ever surfaced. 90 s is
+ * the same budget both shells use, and it is above the engine's own per-probe
+ * ceiling so a slow but live route is not aborted.
+ */
+const CONNECT_WATCHDOG_MS = 90_000;
 const UPDATE_CHECK_URL = "https://api.github.com/repos/deathline94/aether-next/releases/latest";
 
 /** A state the UI asserts for itself, with nothing measured. */
@@ -59,6 +70,7 @@ export function useRuntime(
 
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Settings | null>(null);
   /// Monotonic save token: only the newest dispatch may report success, so a
   /// slow write of an older payload cannot flip "Synchronized" for a newer one.
@@ -158,7 +170,37 @@ export function useRuntime(
   useEffect(() => () => {
     if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    if (watchdogRef.current) clearTimeout(watchdogRef.current);
   }, []);
+
+  // Connection watchdog: never let the UI sit on "connecting" forever.
+  useEffect(() => {
+    if (watchdogRef.current) {
+      clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+    if (runtime.status !== "connecting") return;
+    watchdogRef.current = setTimeout(() => {
+      setRuntime((prev) =>
+        prev.status === "connecting"
+          ? uiState("error", "Connection timed out - no reachable route found. Try another protocol or network.")
+          : prev,
+      );
+      // The engine may still be handshaking; leaving it running would mean the
+      // next Connect has to fight its own predecessor for the host lock.
+      void invoke("disconnect").catch(() => {});
+      appendLog({
+        level: "error",
+        message: `Connection timed out after ${CONNECT_WATCHDOG_MS / 1000}s; engine stopped.`,
+      });
+    }, CONNECT_WATCHDOG_MS);
+    return () => {
+      if (watchdogRef.current) {
+        clearTimeout(watchdogRef.current);
+        watchdogRef.current = null;
+      }
+    };
+  }, [runtime.status, appendLog]);
 
   // "A new version exists", nothing more.
   //

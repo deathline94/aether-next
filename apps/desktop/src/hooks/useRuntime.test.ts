@@ -215,6 +215,61 @@ describe("desktop useRuntime hydration", () => {
   });
 });
 
+describe("desktop connect watchdog", () => {
+  // Android refused to let the UI sit on "connecting" forever; the desktop hook
+  // had no such bound, so a handshake that neither fails nor completes left the
+  // beacon spinning and the settings panel locked with nothing to read back.
+  it("fails a connect that never reaches readiness, and stops the engine", async () => {
+    const emit = captureState();
+    stubInvoke(shellSettings());
+    const log = vi.fn();
+    const { result } = renderHook(() => useRuntime(log));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    vi.useFakeTimers();
+    try {
+      emit({ status: "connecting", detail: "Starting engine", pid: 7, endpoint: null, handshakeRttMs: null });
+      vi.mocked(invoke).mockClear();
+
+      act(() => {
+        vi.advanceTimersByTime(90_000);
+      });
+
+      expect(result.current.runtime.status).toBe("error");
+      expect(result.current.runtime.detail).toMatch(/timed out/i);
+      expect(vi.mocked(invoke).mock.calls.map((c) => c[0])).toContain("disconnect");
+      expect(log.mock.calls.map((c) => c[0].message).join("\n")).toMatch(/timed out after 90s/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fire once the session is up", async () => {
+    const emit = captureState();
+    stubInvoke(shellSettings());
+    const log = vi.fn();
+    const { result } = renderHook(() => useRuntime(log));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    vi.useFakeTimers();
+    try {
+      emit({ status: "connecting", detail: "Starting engine", pid: 7, endpoint: null, handshakeRttMs: null });
+      act(() => {
+        vi.advanceTimersByTime(89_000);
+      });
+      emit({ status: "connected", detail: "Session active", pid: 7, endpoint: "104.16.0.1:443", handshakeRttMs: 21 });
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+
+      expect(result.current.runtime.status).toBe("connected");
+      expect(log.mock.calls.map((c) => c[0].message).join("\n")).not.toMatch(/timed out/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("desktop useRuntime session state", () => {
   it("applies a well-formed session state including the measured round-trip", async () => {
     const emit = captureState();
