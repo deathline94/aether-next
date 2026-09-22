@@ -462,7 +462,28 @@ Checked each part against the current tree rather than assuming the task text wa
   budget, so a stats delta measures the same fact less directly; if the intent was to notice a
   tunnel that is acknowledged but not carrying IP traffic, that is T124's measurement work, not
   this teardown rule.
-- [ ] T126 [US4] Fix the WireGuard reuse/PSK decisions in `aether/src/{wireguard.rs,session.rs}`: thread `persistent_keepalive` into the probe (hardcoded `Some(25)` at `wireguard.rs:446`, and `from_established` silently discards `AETHER_WG_KEEPALIVE`); **delete** `preshared_key` (WARP enrolment returns none, and a nonzero PSK folds into `k2`/`mac2` in boringtun making the handshake unpairable); replace `WgSessionCache`'s `map.clear()` at 4 with a TTL of `REJECT_AFTER_TIME − REKEY_TIMEOUT = 175 s` plus LRU eviction; swap `.lock().unwrap()` for `parking_lot` so a poison cannot panic every later probe.
+- [x] T126 [US4] Fix the WireGuard reuse/PSK decisions
+  * **Probe keepalive threaded.** `WgTunnel::new` honoured `persistent_keepalive`
+    (5 s default, `AETHER_WG_KEEPALIVE`) but the scanner's probe built its tunnel with a
+    hardcoded `Some(25)`; because the session handed to `from_established` *is* the probe's
+    tunnel, the configured value was discarded on precisely the reuse path. One
+    `wireguard::persistent_keepalive_secs()` now decides it, beside the probe that has to
+    agree with the session.
+  * **`preshared_key` deleted, not defaulted.** Nothing ever populated it (both `WgConfig`
+    construction sites passed `None`), WARP enrolment returns none, and a nonzero PSK folds
+    into `k2`/`mac2` in boringtun so a peer configured without one cannot answer the
+    handshake. Leaving the field was a way for one path to disagree with the other; the
+    reason now sits at the site that passes `None`.
+  * **`WgSessionCache` TTL + LRU.** `insert_capped` used to `clear()` at four peers — a
+    hunt that found a fifth endpoint discarded every established handshake. Entries carry
+    their insertion instant, expired ones are reaped on insert *and* on `take`, and the cap
+    evicts the oldest live session only. The TTL is `REJECT_AFTER_TIME − REKEY_TIMEOUT`
+    = 175 s, asserted rather than assumed by `an_expired_session_is_never_handed_out`, and
+    the eviction rule has four more tests (`prober::wg_cache_tests`).
+  * **`.lock().unwrap()`** was already `parking_lot` at every site in this file — verified,
+    not assumed, so no change was needed.
+  Engine code: compiled and tested on CI (`Rust engine`, `Rust engine (Windows)` green at
+  f85e053); the local box cannot build the engine at all.
 - [x] T127 [US4] Remove the misleading status claims in `apps/desktop/src/components/ConnectionTab.tsx`: `:21-26` shows `ENGAGING // 0-RTT PROBING` and `ACTIVE // 0-RTT TUNNEL` regardless of transport; `:189` claims an update "is ready" when none was downloaded; `:287` prints `V4 DUAL-READY`. Wire to measured state or delete.
   Done in both UIs. The desktop hero now derives its badge and body from
   `settings.routingMode`: TUN says it routes Windows traffic, system-proxy says only
