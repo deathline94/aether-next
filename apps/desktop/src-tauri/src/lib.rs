@@ -2305,6 +2305,29 @@ pub mod windows_proxy {
         pub enabled: u32,
         pub server: Option<String>,
         pub bypass: Option<String>,
+        /// The PAC URL, which WinINet honours *ahead* of `ProxyServer`. It was not
+        /// part of the snapshot at all, so enabling Aether on a machine with a
+        /// corporate PAC left the PAC in charge — traffic went direct while the UI
+        /// reported the proxy as active — and disconnecting deleted a `ProxyServer`
+        /// that had been ours for the whole session.
+        ///
+        /// `#[serde(default)]`: a recovery file written by an older build has no
+        /// such field, and a missing optional field must not fatal the read that is
+        /// trying to undo the proxy.
+        #[serde(default)]
+        pub auto_config_url: Option<String>,
+    }
+
+    /// `ProxyEnable` absent is a real state ("this profile never enabled a proxy"),
+    /// so it maps to 0. Any *other* read failure must propagate: `unwrap_or(0)`
+    /// turned a transient registry error into "the user's proxy was off", which the
+    /// restore path then honoured by switching a live proxy off permanently.
+    fn read_enable(key: &RegKey) -> Result<u32, CommandError> {
+        match key.get_value::<u32, _>("ProxyEnable") {
+            Ok(v) => Ok(v),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(format!("read ProxyEnable: {e}").into()),
+        }
     }
 
     fn key() -> io::Result<RegKey> {
@@ -2337,10 +2360,19 @@ pub mod windows_proxy {
         recovery_path: Option<&Path>,
     ) -> Result<ProxySnapshot, (String, Option<ProxySnapshot>)> {
         let key = key().map_err(|e| (e.to_string(), None))?;
+        // Every read is hard-fail: a snapshot that silently lost a value is a
+        // snapshot that will delete that value on restore.
         let snapshot = ProxySnapshot {
-            enabled: key.get_value("ProxyEnable").unwrap_or(0),
-            server: key.get_value("ProxyServer").ok(),
-            bypass: key.get_value("ProxyOverride").ok(),
+            enabled: read_enable(&key).map_err(|e| (e.message, None))?,
+            server: read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")
+                .map_err(|e| (e.message, None))?,
+            bypass: read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")
+                .map_err(|e| (e.message, None))?,
+            auto_config_url: read_optional_reg_value(
+                key.get_value("AutoConfigURL"),
+                "AutoConfigURL",
+            )
+            .map_err(|e| (e.message, None))?,
         };
         if let Some(path) = recovery_path {
             if let Some(parent) = path.parent() {
@@ -2370,6 +2402,13 @@ pub mod windows_proxy {
             }
             key.set_value("ProxyOverride", &bypass)
                 .map_err(CommandError::from)?;
+            // Take the PAC out of the way while our proxy is active, but only
+            // because it has been snapshotted: `restore` puts it back.
+            match key.delete_value("AutoConfigURL") {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("delete AutoConfigURL: {e}").into()),
+            }
             key.set_value("ProxyEnable", &1u32)
                 .map_err(CommandError::from)?;
             Ok(())
@@ -2392,44 +2431,35 @@ pub mod windows_proxy {
         Ok(snapshot)
     }
 
+    /// Compare what the registry says now against what was intended, in full.
+    ///
+    /// Takes two snapshots rather than three loose parameters so that adding a
+    /// field to `ProxySnapshot` cannot leave the comparison checking one value
+    /// fewer than the writer wrote — which is how `AutoConfigURL` came to be
+    /// restored, cleared and verified by nobody at the same time.
     pub fn verify_readback_values(
-        snapshot: &ProxySnapshot,
-        actual_enabled: u32,
-        actual_server: Option<&str>,
-        actual_bypass: Option<&str>,
+        expected: &ProxySnapshot,
+        actual: &ProxySnapshot,
     ) -> Result<(), CommandError> {
-        if actual_enabled != snapshot.enabled {
+        if actual.enabled != expected.enabled {
             return Err(format!(
                 "ProxyEnable read-back mismatch: expected {}, got {}",
-                snapshot.enabled, actual_enabled
-            ).into());
+                expected.enabled, actual.enabled
+            )
+            .into());
         }
-        match (snapshot.server.as_deref(), actual_server) {
-            (Some(expected), Some(actual)) if expected == actual => {}
-            (None, None) => {}
-            (Some(expected), actual) => {
+        for (name, want, got) in [
+            ("ProxyServer", &expected.server, &actual.server),
+            ("ProxyOverride", &expected.bypass, &actual.bypass),
+            ("AutoConfigURL", &expected.auto_config_url, &actual.auto_config_url),
+        ] {
+            if want != got {
                 return Err(format!(
-                    "ProxyServer read-back mismatch: expected Some({expected:?}), got {actual:?}"
-                ).into());
-            }
-            (None, Some(actual)) => {
-                return Err(format!(
-                    "ProxyServer read-back mismatch: expected None, got Some({actual:?})"
-                ).into());
-            }
-        }
-        match (snapshot.bypass.as_deref(), actual_bypass) {
-            (Some(expected), Some(actual)) if expected == actual => {}
-            (None, None) => {}
-            (Some(expected), actual) => {
-                return Err(format!(
-                    "ProxyOverride read-back mismatch: expected Some({expected:?}), got {actual:?}"
-                ).into());
-            }
-            (None, Some(actual)) => {
-                return Err(format!(
-                    "ProxyOverride read-back mismatch: expected None, got Some({actual:?})"
-                ).into());
+                    "{name} read-back mismatch: expected {:?}, got {:?}",
+                    want.as_deref(),
+                    got.as_deref()
+                )
+                .into());
             }
         }
         Ok(())
@@ -2457,22 +2487,31 @@ pub mod windows_proxy {
                 Err(e) => return Err(format!("delete ProxyOverride: {e}").into()),
             },
         }
+        match snapshot.auto_config_url.as_ref() {
+            Some(value) => key
+                .set_value("AutoConfigURL", value)
+                .map_err(CommandError::from)?,
+            None => match key.delete_value("AutoConfigURL") {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("delete AutoConfigURL: {e}").into()),
+            },
+        }
         key.set_value("ProxyEnable", &snapshot.enabled)
             .map_err(CommandError::from)?;
 
-        // 3-tuple read-back verification: ProxyEnable, ProxyServer, ProxyOverride
-        let current_enabled: u32 = key
-            .get_value("ProxyEnable")
-            .map_err(|e| format!("verify ProxyEnable: {e}"))?;
-        let current_server = read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")?;
-        let current_bypass = read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")?;
+        // Read every value back before deciding the restore worked.
+        let actual = ProxySnapshot {
+            enabled: read_enable(&key)?,
+            server: read_optional_reg_value(key.get_value("ProxyServer"), "ProxyServer")?,
+            bypass: read_optional_reg_value(key.get_value("ProxyOverride"), "ProxyOverride")?,
+            auto_config_url: read_optional_reg_value(
+                key.get_value("AutoConfigURL"),
+                "AutoConfigURL",
+            )?,
+        };
 
-        verify_readback_values(
-            &snapshot,
-            current_enabled,
-            current_server.as_deref(),
-            current_bypass.as_deref(),
-        )?;
+        verify_readback_values(&snapshot, &actual)?;
 
         refresh();
         Ok(())
