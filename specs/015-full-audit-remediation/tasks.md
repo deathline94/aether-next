@@ -662,6 +662,17 @@
   pass, both typecheck.
 - [ ] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
 - [ ] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.
+  **Attempted and reverted, like T178.** `ErrorBoundary` gained `resetKeys`/`onRetry`/`label` and the
+  per-tab wiring was ready to go, but three tests for it could not be made to observe the boundary at
+  all: under React 19 + @testing-library with jsdom, a child that throws during render is rethrown
+  out of `act()` and the tree is unmounted, so neither the fallback nor the recovery is queryable —
+  the assertions failed on "unable to find an accessible element with role alert", not on the
+  behaviour under test. That is the boundary working and the harness giving up, which is exactly the
+  kind of check that looks green and measures nothing, so the component change was reverted with it.
+  What T186 needs to be landing-able: a render-error test that goes through a real browser context
+  (Playwright/WebDriver, or the manual VM pass in quickstart §1), or the boundary's key-comparison
+  logic extracted as a pure function that can be tested without React's error plumbing. Neither the
+  boundary improvement nor the per-tab scoping is in the tree as a result.
 - [ ] T187 [US6] Self-host the fonts: add `@fontsource-variable/geist` + `geist-mono` (OFL-1.1), import their CSS from TS so Vite hashes the woff2 into `dist/` same-origin under the existing `font-src 'self'`, and delete the Google Fonts `<link>`s from `apps/desktop/index.html:8-10`. No `asset:` protocol (needs enabling, scoping and `font-src asset: http://asset.localhost`) and no CSP relaxation for `fonts.gstatic.com` — a circumvention tool must not make a pre-tunnel third-party request from its UI, which dev mode currently does live.
 - [ ] T188 [US6] Re-tune typography against the **actually rendered** font in `packages/ui/tokens.css`: `font-synthesis: none` with 550/650/700 tiers collapses arbitrarily against a static-weight system font and `letter-spacing: -0.012em` was tuned for Geist metrics; set `color-scheme: dark` on `:root`, style `option` elements, and define `::selection` (all three currently absent — 0 occurrences — so option lists are 1.13:1 and text selection 1.24:1, i.e. invisible).
 - [ ] T189 [US6] Fix edges per contract U-E1 in `packages/ui/tokens.css` and `apps/desktop/src/App.css:26-29`: `box-shadow: inset 0 0 0 1px var(--edge-interactive)` with **opaque** pre-resolved colours and two tokens (`--edge` ≥1.6:1 decorative, `--edge-interactive` ≥3:1), replacing `--border-subtle .05` / `--border-card .07` / `--line .07` which measure 1.05–1.47:1 and antialiase away at Windows 125/150 % — the mechanical cause of the reported "borderless, floating, out of place" cards. Do not merely raise alpha (still composited, still antialiased); WCAG 1.4.11's 3:1 applies where the boundary is the sole affordance.
