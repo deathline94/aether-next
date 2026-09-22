@@ -287,3 +287,42 @@ fn test_elevation_trust_allows_missing_hash_when_not_enforced() {
     let res = verify_elevated_binary(&current_exe, filename, &policy);
     assert!(res.is_ok(), "Missing hash must be allowed when enforce_hash_match=false in debug: {res:?}");
 }
+
+/// The old root set was "the exe's directory **and its parent**". For an
+/// installed app that parent is `C:\Program Files`; for the portable package it is
+/// whatever folder the user unpacked the zip into. A child launched from there is
+/// handed the DPAPI master key, so the set has to be named layout directories, not
+/// a directory that happens to contain one.
+#[test]
+fn trusted_binary_roots_are_the_named_layout_directories_only() {
+    let base = std::env::temp_dir().join(format!("aether_roots_{}", std::process::id()));
+    let app = base.join("Aether Next");
+    for dir in [&app, &app.join("resources"), &app.join("engine"), &base.join("OtherVendor")] {
+        fs::create_dir_all(dir).expect("create dir");
+    }
+
+    let roots = aether_desktop_lib::allowed_binary_roots(Some(&app));
+    assert!(
+        roots.iter().any(|r| r == &app.canonicalize().unwrap()),
+        "the exe's own directory must be a root"
+    );
+    assert!(roots.iter().any(|r| r == &app.join("resources").canonicalize().unwrap()));
+    assert!(roots.iter().any(|r| r == &app.join("engine").canonicalize().unwrap()));
+    assert!(
+        !roots.iter().any(|r| r == &base.canonicalize().unwrap()),
+        "the parent directory must not be a root: it is Program Files, or the user's extraction \
+         folder, or Temp"
+    );
+
+    // The property that matters: a sibling install is outside every root, and the
+    // containing directory itself would have admitted it.
+    let sibling = app.join("..").join("OtherVendor").join("aether.exe");
+    let resolved = sibling.canonicalize().unwrap_or_else(|_| {
+        base.join("OtherVendor").join("aether.exe")
+    });
+    assert!(
+        !roots.iter().any(|r| resolved.starts_with(r)),
+        "a binary in a sibling directory was accepted by the root list"
+    );
+    let _ = fs::remove_dir_all(&base);
+}

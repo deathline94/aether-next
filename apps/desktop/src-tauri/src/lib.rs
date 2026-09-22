@@ -960,18 +960,7 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), Comman
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-    // M9 fix: the allowed roots are the exe's own directory and its PARENT
-    // (packaged resource layouts put binaries under install-dir/resources).
-    // The previous fallback accepted ANY path whose parent directory happened
-    // to be named "resources" or "engine", letting arbitrary user-chosen
-    // locations through the elevation-path trust check.
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(root) = &app_root {
-        roots.push(root.canonicalize().unwrap_or_else(|_| root.clone()));
-        if let Some(parent) = root.parent() {
-            roots.push(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()));
-        }
-    }
+    let roots = allowed_binary_roots(app_root.as_deref());
     for root in &roots {
         if canon.starts_with(root) {
             return Ok(());
@@ -1002,6 +991,37 @@ fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
     ok.then(|| host.to_string())
 }
 
+/// The only directories an engine binary may live in.
+///
+/// This used to be "the exe's directory and its parent", which for an installed
+/// app is `C:\Program Files` — a root that includes every other vendor's folder —
+/// and for the portable package is whatever directory the user extracted the zip
+/// into, i.e. usually somewhere writable. The child launched from there is handed
+/// the DPAPI master key, so "under the install directory, broadly" was not a
+/// boundary worth the name. Named layout directories only, plus the repository
+/// build path the dev fallback resolves, which is a fixed constant rather than a
+/// place an attacker gets to write by being lucky.
+pub fn allowed_binary_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir {
+        for candidate in [
+            dir.to_path_buf(),
+            dir.join("resources"),
+            dir.join("engine"),
+        ] {
+            roots.push(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+    // `cargo run` / `cargo test` from the repository: the engine sits in the
+    // workspace's release target directory, which is no relation to where the
+    // shell binary happens to be.
+    let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../aether/target/release")
+        .join(if cfg!(windows) { "aether.exe" } else { "aether" });
+    roots.push(repo_build.canonicalize().unwrap_or(repo_build));
+    roots
+}
+
 pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -1019,7 +1039,7 @@ pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
     let mut s = String::with_capacity(64);
     for b in res {
         use std::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
+        let _ = write!(s, "{b:02x}");
     }
     Ok(s)
 }

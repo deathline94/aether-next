@@ -176,7 +176,14 @@
 
 - [ ] T060 [US2] Implement the ordered binary-trust pipeline in `aether/src/trust.rs` (contract T-A3): resolve canonical path → file SHA-256 → leaf cert hash + SPKI hash → chain anchored **at the pinned leaf** → `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_AUTHENTICODE)` → spawn.
 - [x] T061 [US2] Make verification unconditional across every branch in `apps/desktop/src-tauri/src/lib.rs::engine_path` (`:1046-1094`) and `connect` (`:1368`), including custom `enginePath` and `AETHER_ENGINE`.
-- [ ] T062 [US2] Narrow the trusted root: remove `exe.parent().parent()` from the allowed roots in `apps/desktop/src-tauri/src/lib.rs:762-787` — for perMachine that is `C:\Program Files`, for portable a user-writable extraction directory, while the child is handed the DPAPI master key.
+- [x] T062 [US2] Narrow the trusted root: remove `exe.parent().parent()` from the allowed roots in `apps/desktop/src-tauri/src/lib.rs:762-787` — for perMachine that is `C:\Program Files`, for portable a user-writable extraction directory, while the child is handed the DPAPI master key.
+  Done. `allowed_binary_roots` replaces "the exe's directory and its parent": the roots are
+  now the exe directory, `resources`, `engine`, and the fixed repository-build release path the
+  dev fallback resolves. The parent was `C:\Program Files` for an installed app and the user's
+  own extraction folder (or `Temp`) for the portable package, and the child launched from it is
+  handed the DPAPI master key. `trusted_binary_roots_are_the_named_layout_directories_only`
+  asserts a sibling install is outside every root, and was checked to fail with the parent put
+  back into the list.
 - [x] T063 [US2] Replace `AETHER_MASQUE_DISABLE_SPKI_PINS` / `AETHER_DANGEROUS_DISABLE_TLS_VERIFY` with an explicit `VerifyPolicy` parameter in `aether/src/{tls.rs,masque_h2.rs,h3_probe.rs}`; make `Insecure` `#[cfg(debug_assertions)]`-only; make an empty or fully-expired pin set `Err` (today `aether/src/tls.rs:31-33` maps empty pins to `SslVerifyMode::NONE`).
 - [x] T064 [US2] Give `aether/src/h3_probe.rs` the `VerifyPolicy::ReadOnlyProbe` variant (chain-verified, unpinned, never used for tunnel traffic) passed into `quic::fingerprint_h3`, replacing the sticky `runtime_env::set` of a process-wide verification kill switch.
 - [x] T065 [US2] Restore real chain verification inside the pin callback in `aether/src/tls.rs`: `ctx.verify_cert()? && pin_matches(host, leaf)` (boring 4.22's `X509StoreContextRef::verify_cert()` is documented as valid only inside `init`, and BoringSSL pre-initialises the store context with chain + `"ssl_server"` + SNI before invoking the callback).
