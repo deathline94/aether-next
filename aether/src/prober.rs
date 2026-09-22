@@ -697,7 +697,7 @@ pub async fn hunt_best(
         Tier0Outcome::Winner(pr) => return Ok(pr),
         Tier0Outcome::Cancelled => {
             log::info!("[*] scan cancelled during Tier-0 race");
-            return Err(AetherError::NoCleanEndpoint);
+            return Err(AetherError::Cancelled);
         }
         Tier0Outcome::Miss => {}
     }
@@ -709,7 +709,7 @@ pub async fn hunt_best(
             effective_ip = IpScan::V4;
         } else {
             log::warn!("[-] host has no IPv6 route; IPv6 scan needs native IPv6 connectivity");
-            return Err(AetherError::NoCleanEndpoint);
+            return Err(AetherError::NoIpv6Route);
         }
     }
     let candidates = build_candidates(config, &st, ports, effective_ip);

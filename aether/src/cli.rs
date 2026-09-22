@@ -89,6 +89,15 @@ pub async fn run() -> Result<()> {
                 "No working gateway found. Try HTTP/2, another scan mode, or a different network."
                     .to_string()
             }
+            crate::error::AetherError::Cancelled => {
+                "Scan stopped as requested. Nothing was found because nothing finished probing."
+                    .to_string()
+            }
+            crate::error::AetherError::NoIpv6Route => {
+                "This machine has no IPv6 connectivity, so an IPv6-only scan cannot run. \
+                 Switch the address family to IPv4 or Dual."
+                    .to_string()
+            }
             other => other.to_string(),
         };
         // The code travels with the text so a failure can be identified without

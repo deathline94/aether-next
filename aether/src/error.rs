@@ -23,6 +23,17 @@ pub enum AetherError {
     #[error("prober: no clean endpoint found")]
     NoCleanEndpoint,
 
+    /// A Stop ended the scan. This is not a search that failed: the user pressed
+    /// the button, and reporting "no working gateway found" made a cancelled scan
+    /// read as a broken network — and the follow-up Connect inherited the blame.
+    #[error("prober: scan cancelled")]
+    Cancelled,
+
+    /// The requested address family is not available on this host at all, which
+    /// is a different answer from "we probed everything and nothing answered".
+    #[error("prober: no IPv6 connectivity on this host")]
+    NoIpv6Route,
+
     #[error("capsule: {0}")]
     Capsule(String),
 
@@ -52,6 +63,8 @@ impl AetherError {
             Self::Ech(_) => "ech",
             Self::Masque(_) => "masque",
             Self::NoCleanEndpoint => "no_clean_endpoint",
+            Self::Cancelled => "cancelled",
+            Self::NoIpv6Route => "no_ipv6_route",
             Self::Capsule(_) => "capsule",
             Self::Api(_) => "api",
             Self::Other(_) => "other",
@@ -78,6 +91,11 @@ impl AetherError {
             Self::Quic(_) | Self::H3(_) | Self::Capsule(_) => true,
             Self::Api(_) => true,
             Self::NoCleanEndpoint => true,
+            // Pressing Stop succeeded; nothing about the network is implicated, so
+            // a retry is always available.
+            Self::Cancelled => true,
+            // Nothing changes between attempts until the user does.
+            Self::NoIpv6Route => false,
             Self::Tls(_) | Self::Masque(_) | Self::Ech(_) | Self::Other(_) => false,
         }
     }
