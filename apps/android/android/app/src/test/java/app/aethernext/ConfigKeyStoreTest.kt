@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -146,6 +147,56 @@ class ConfigKeyStoreTest {
             ConfigKeyStore.keyStoreSupplier = { mockKeyStore }
         }
         assertTrue("a transient failure must not quarantine the identity", tomlFile.exists())
+        dir.deleteRecursively()
+    }
+
+    /**
+     * The keystore generated a key, the wrapped copy never reached the
+     * authoritative slot, and the app is restarted. Without a second committed
+     * copy the only thing left to do is generate again — which produces a key that
+     * cannot decrypt the identity file that was written with the first one, so the
+     * unreadable file is classified as corruption and quarantined. A crash during a
+     * write must not cost the device its identity.
+     */
+    @Test
+    fun anInterruptedPromotionRecoversTheKeyFromTheStagingSlot() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "aether_ks_stage_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(dir)
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val tomlFile = File(configDir, "aether.toml")
+        tomlFile.writeText("device_id = \"keep_me\"")
+
+        val first = ConfigKeyStore.loadOrCreate(context)
+        val committed = context.fakePrefs.map["wrapped"] as String
+
+        // Simulate the process dying after the staging write, before the promote.
+        context.fakePrefs.map.remove("wrapped")
+        context.fakePrefs.map["wrapped_staging"] = committed
+
+        val recovered = ConfigKeyStore.loadOrCreate(context)
+        assertEquals("the same master key must come back", first, recovered)
+        assertEquals(
+            "the recovered copy must be promoted",
+            committed,
+            context.fakePrefs.map["wrapped"],
+        )
+        assertFalse(
+            "the staging slot must not outlive the promotion",
+            context.fakePrefs.map.containsKey("wrapped_staging"),
+        )
+        assertTrue("the identity must not have been quarantined", tomlFile.exists())
+        dir.deleteRecursively()
+    }
+
+    /** A successful fresh generation leaves exactly one committed, readable slot. */
+    @Test
+    fun aFreshWrappingEndsUpInOneTrustedSlotAndReadsBack() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "aether_ks_fresh_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(dir)
+        val first = ConfigKeyStore.loadOrCreate(context)
+        assertTrue(context.fakePrefs.map.containsKey("wrapped"))
+        assertFalse(context.fakePrefs.map.containsKey("wrapped_staging"))
+        assertEquals(first, ConfigKeyStore.loadOrCreate(context))
         dir.deleteRecursively()
     }
 

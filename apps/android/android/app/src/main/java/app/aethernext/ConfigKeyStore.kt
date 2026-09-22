@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Log
 import java.io.File
+import java.security.Key
 import java.security.KeyStore
 import java.security.SecureRandom
 import java.util.Base64
@@ -17,6 +18,18 @@ object ConfigKeyStore {
     private const val ALIAS = "aether-config-wrap-v1"
     private const val PREFS_NAME = "aether_secure_config"
     private const val KEY_WRAPPED = "wrapped"
+
+    /**
+     * Second copy, written first and cleared last.
+     *
+     * With a single slot, an interrupt between "the keystore generated a new
+     * master key" and "its wrapped form reached disk" leaves the config
+     * encrypted under a key that no longer exists anywhere — the next read is an
+     * authentication failure, which is classified as corruption, which rotates,
+     * which quarantines the identity. Staging means every interrupted write still
+     * has a committed, decryptable copy of the thing it was writing.
+     */
+    private const val KEY_WRAPPED_STAGING = "wrapped_staging"
 
     // Three retries with escalating backoff: a keystore service that is
     // restarting comes back within a second, a slow one within a few.
@@ -129,7 +142,9 @@ object ConfigKeyStore {
             Log.w(TAG, "Failed to delete corrupted KeyStore entry: ${e.message}")
         }
         val p = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val commitOk = p.edit().remove(KEY_WRAPPED).commit()
+        // Both slots: leaving the staging copy behind would let the next start
+        // "recover" the wrapping of the key we have just destroyed.
+        val commitOk = p.edit().remove(KEY_WRAPPED).remove(KEY_WRAPPED_STAGING).commit()
         if (!commitOk) {
             throw IllegalStateException("Failed to remove wrapped key from SharedPreferences during recovery")
         }
@@ -163,8 +178,59 @@ object ConfigKeyStore {
         return getOrGenerate(context)
     }
 
+    private fun unwrap(key: Key, saved: String): ByteArray {
+        val b = Base64.getDecoder().decode(saved)
+        if (b.size < 12 + 16) {
+            // 12-byte IV + 16-byte GCM tag at minimum. Throwing the classified
+            // exception is what lets `loadOrCreate` tell a truncated blob apart
+            // from a service that is merely busy.
+            throw CorruptWrappingException("wrapped config key is truncated (${b.size} bytes)")
+        }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, b.copyOfRange(0, 12)))
+        return cipher.doFinal(b.copyOfRange(12, b.size))
+    }
+
+    private fun wrap(key: Key, raw: ByteArray): String {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        return Base64.getEncoder().encodeToString(cipher.iv + cipher.doFinal(raw))
+    }
+
+    /** Commit a value to a prefs slot, refusing to pretend a failed commit worked. */
+    private fun commit(p: android.content.SharedPreferences, key: String, value: String) {
+        if (!p.edit().putString(key, value).commit()) {
+            throw IllegalStateException("Failed to commit $key to SharedPreferences")
+        }
+    }
+
     private fun getOrGenerate(context: Context): String {
         val ks = getKeyStore()
+        val p = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // A committed wrapping is read *before* any key is generated: the old
+        // order could mint a fresh master key, then discover the stored blob, and
+        // leave the two permanently unable to agree.
+        val keyFor: () -> Key = {
+            ks.getKey(ALIAS, null) ?: throw IllegalStateException("KeyStore key missing for alias $ALIAS")
+        }
+        val saved = p.getString(KEY_WRAPPED, null)
+        if (saved != null) {
+            return Base64.getEncoder().encodeToString(unwrap(keyFor(), saved))
+        }
+
+        // The authoritative slot is gone but the staging copy survived: that is an
+        // interrupted promotion, not a new install. Recover it rather than
+        // generating a second key that orphans the config encrypted under the first.
+        val staged = p.getString(KEY_WRAPPED_STAGING, null)
+        if (staged != null) {
+            val raw = unwrap(keyFor(), staged)
+            commit(p, KEY_WRAPPED, staged)
+            p.edit().remove(KEY_WRAPPED_STAGING).apply()
+            Log.i(TAG, "recovered the config key from the staging slot after an interrupted promotion")
+            return Base64.getEncoder().encodeToString(raw)
+        }
+
         if (!ks.containsAlias(ALIAS)) {
             if (masterKeyGenerator != null) {
                 masterKeyGenerator!!.invoke()
@@ -172,49 +238,42 @@ object ConfigKeyStore {
                 generateMasterKey()
             }
         }
-        val key = ks.getKey(ALIAS, null)
-            ?: throw IllegalStateException("KeyStore key missing for alias $ALIAS")
-
-        val p = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val saved = p.getString(KEY_WRAPPED, null)
-
-        val raw = if (saved == null) {
-            val freshKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, key)
-            val iv = cipher.iv
-            val ciphertext = cipher.doFinal(freshKey)
-            val committed = p.edit().putString(KEY_WRAPPED, Base64.getEncoder().encodeToString(iv + ciphertext)).commit()
-            if (!committed) {
-                throw IllegalStateException("Failed to commit wrapped config key to SharedPreferences")
-            }
-            freshKey
-        } else {
-            val b = Base64.getDecoder().decode(saved)
-            if (b.size < 12 + 16) {
-                // 12-byte IV + 16-byte GCM tag at minimum. Throwing the classified
-                // exception is what lets `loadOrCreate` tell a truncated blob
-                // apart from a service that is merely busy.
-                throw CorruptWrappingException("wrapped config key is truncated (${b.size} bytes)")
-            }
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, b.copyOfRange(0, 12)))
-            cipher.doFinal(b.copyOfRange(12, b.size))
+        val key = keyFor()
+        val freshKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val wrapped = wrap(key, freshKey)
+        // Read the wrapping back through the keystore key before either slot is
+        // trusted: a copy that cannot be decrypted here is not a copy at all.
+        if (!unwrap(key, wrapped).contentEquals(freshKey)) {
+            throw CorruptWrappingException("freshly wrapped config key failed its read-back check")
         }
-        return Base64.getEncoder().encodeToString(raw)
+        commit(p, KEY_WRAPPED_STAGING, wrapped)
+        commit(p, KEY_WRAPPED, wrapped)
+        p.edit().remove(KEY_WRAPPED_STAGING).apply()
+        return Base64.getEncoder().encodeToString(freshKey)
     }
 
     private fun generateMasterKey() {
         val g = KeyGenerator.getInstance("AES", keyStoreProvider)
-        val spec = KeyGenParameterSpec.Builder(
+        val builder = KeyGenParameterSpec.Builder(
             ALIAS,
             KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
         )
             .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
             .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
             .setKeySize(256)
-            .build()
-        g.init(spec)
+            // Both are today's defaults, and both are load-bearing for an
+            // unattended tunnel: a key that a biometric enrollment can invalidate
+            // is a key that can silently stop decrypting the identity.
+            .setUserAuthenticationRequired(false)
+            .setInvalidatedByBiometricEnrollment(false)
+        // `setRollbackResistant(true)` was the other half of this task. It is not
+        // reachable here: the symbol does not exist anywhere under
+        // `android.security`/`android.hardware` in the android-34 platform jar this
+        // project compiles against (verified with javap and a jar-wide search),
+        // because rollback resistance is a KeyMint tag rather than a published
+        // AndroidKeyStore builder option. The durable copy below is what actually
+        // protects this key today; see KEY_WRAPPED_STAGING.
+        g.init(builder.build())
         g.generateKey()
     }
 }
