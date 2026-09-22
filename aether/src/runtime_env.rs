@@ -25,13 +25,16 @@
 //! * [`var`] never falls through to the live environment.
 //! * [`set`] / [`remove`] are the only mutation paths, both poison-safe: a write
 //!   is never silently dropped (the previous `if let Ok(..)` discarded it, after
-//!   which readers saw a *different* setting).
+//!   which readers saw a *different* setting). Both zeroize the value they
+//!   displace, so a secret does not survive its own overwrite.
 //! * [`flag`] is truthiness, not presence. `AETHER_X=0` means **false**
 //!   (see `wireguard.rs`, where presence-only inverted a data-plane check).
 //! * A numeric value that fails to parse is reported, not silently defaulted.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+
+use zeroize::Zeroize;
 
 const PREFIX: &str = "AETHER_";
 
@@ -47,7 +50,10 @@ fn store() -> &'static Store {
         // Snapshot once, before any worker thread exists. Everything after this
         // point flows through set()/remove().
         for (k, v) in std::env::vars_os() {
-            let (k, v) = (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned());
+            let (k, v) = (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            );
             if k.starts_with(PREFIX) {
                 seeded.insert(k, v);
             }
@@ -73,15 +79,24 @@ fn with_map<R>(f: impl FnOnce(&HashMap<String, String>) -> R) -> R {
 }
 
 /// Set (or overwrite) a runtime config value. Safe to call from any thread.
+///
+/// The displaced value is zeroized rather than merely dropped. This store is the
+/// only long-lived home for secrets — `AETHER_CONFIG_KEY` arrives on the stdin
+/// handoff and is installed here — and `String::drop` returns the buffer to the
+/// allocator with the bytes intact, where they stay reachable to a later
+/// allocation, a core dump or a heap scan. Overwriting must not leave the old
+/// copy behind for the rest of the process.
 pub fn set(key: &str, val: &str) {
     let mut guard = match store().map.write() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.insert(key.to_string(), val.to_string());
+    if let Some(mut previous) = guard.insert(key.to_string(), val.to_string()) {
+        previous.zeroize();
+    }
 }
 
-/// Clear a runtime config value.
+/// Clear a runtime config value, zeroizing the bytes it held.
 ///
 /// The store previously had no removal path at all, which meant a diagnostic
 /// that turned verification off could only ever be *shadowed*, never undone —
@@ -91,7 +106,9 @@ pub fn remove(key: &str) {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.remove(key);
+    if let Some(mut previous) = guard.remove(key) {
+        previous.zeroize();
+    }
 }
 
 /// Read a config value. Never consults the live process environment.
@@ -101,7 +118,11 @@ pub fn var(key: &str) -> Option<String> {
 
 /// Immutable copy of the current configuration, for diagnostics export.
 pub fn snapshot() -> Vec<(String, String)> {
-    let mut v = with_map(|m| m.iter().map(|(k, val)| (k.clone(), val.clone())).collect::<Vec<_>>());
+    let mut v = with_map(|m| {
+        m.iter()
+            .map(|(k, val)| (k.clone(), val.clone()))
+            .collect::<Vec<_>>()
+    });
     v.sort();
     v
 }
@@ -111,7 +132,10 @@ pub fn snapshot() -> Vec<(String, String)> {
 /// Presence alone is deliberately **not** truthy: `AETHER_X=0`, `=false`,
 /// `=off` and `=` all mean false.
 pub fn truthy(raw: &str) -> bool {
-    matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Read a boolean flag (default false).
@@ -154,6 +178,31 @@ pub fn usize(key: &str) -> Option<usize> {
     }
 }
 
+/// Read a number that has to fit in 16 bits — a port, a keepalive interval.
+///
+/// The smaller-int callers used to spell this `var(key).and_then(parse).ok()
+/// .unwrap_or(default)`, which cannot tell "not set" from "set to something
+/// unparseable" and drops the difference: `AETHER_WG_KEEPALIVE=25s` silently
+/// restored the 5 s default, on the one knob whose job is surviving a NAT
+/// mapping. Zero is refused for the same reason — neither a port nor a
+/// keepalive has a meaningful 0.
+pub fn u16_or(key: &str, default: u16) -> u16 {
+    match usize(key) {
+        Some(n) => match u16::try_from(n) {
+            Ok(0) => {
+                log::warn!("[config] {key}=0 is not a usable value; using {default}");
+                default
+            }
+            Ok(v) => v,
+            Err(_) => {
+                log::warn!("[config] {key}={n} does not fit in 16 bits; using {default}");
+                default
+            }
+        },
+        None => default,
+    }
+}
+
 /// Read a bounded number, clamping with a visible warning.
 pub fn usize_bounded(key: &str, default: usize, min: usize, max: usize) -> usize {
     let v = usize_or(key, default);
@@ -192,7 +241,9 @@ pub fn keylog_target() -> Option<std::path::PathBuf> {
     if !flag(TLS_KEYLOG_FLAG) {
         return None;
     }
-    let Some(dir) = var(DIAGNOSTICS_DIR).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    let Some(dir) = var(DIAGNOSTICS_DIR)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
     else {
         log::warn!(
             "[config] {TLS_KEYLOG_FLAG} is set but {DIAGNOSTICS_DIR} is not: no key log \
@@ -291,9 +342,17 @@ mod tests {
         // Opt-in without a directory must not invent one.
         remove(DIAGNOSTICS_DIR);
         set(TLS_KEYLOG_FLAG, "1");
-        assert_eq!(keylog_target(), None, "keys must stay inside the diagnostics dir");
+        assert_eq!(
+            keylog_target(),
+            None,
+            "keys must stay inside the diagnostics dir"
+        );
         set(TLS_KEYLOG_FLAG, "0");
-        assert_eq!(keylog_target(), None, "a zero-valued opt-in is not an opt-in");
+        assert_eq!(
+            keylog_target(),
+            None,
+            "a zero-valued opt-in is not an opt-in"
+        );
 
         // Both present: one file, under the directory the operator named.
         set(TLS_KEYLOG_FLAG, "1");
@@ -309,9 +368,20 @@ mod tests {
         );
 
         // None of these may escape the directory, however they are spelled.
-        for hostile in ["../../windows/startup.sql", r"..\..\..\evil.log", "/etc/passwd", "..", "C:boot.ini", ""] {
+        for hostile in [
+            "../../windows/startup.sql",
+            r"..\..\..\evil.log",
+            "/etc/passwd",
+            "..",
+            "C:boot.ini",
+            "",
+        ] {
             set(TLS_KEYLOG_NAME, hostile);
-            assert_eq!(keylog_target(), None, "{hostile:?} must be refused outright");
+            assert_eq!(
+                keylog_target(),
+                None,
+                "{hostile:?} must be refused outright"
+            );
         }
 
         remove(TLS_KEYLOG_FLAG);

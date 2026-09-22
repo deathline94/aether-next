@@ -70,10 +70,7 @@ pub struct EstablishedSession {
 /// probe asked for, so a setting the probe ignored was silently discarded on
 /// exactly the path that reuses it (`WgTunnel::from_established`).
 pub fn persistent_keepalive_secs() -> u16 {
-    crate::runtime_env::var("AETHER_WG_KEEPALIVE")
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|&v: &u16| v > 0)
-        .unwrap_or(5)
+    crate::runtime_env::u16_or("AETHER_WG_KEEPALIVE", 5)
 }
 
 impl WgTunnel {
@@ -95,8 +92,15 @@ impl WgTunnel {
         // tunnel the same way, which is what makes a cached handshake reusable.
         let preshared: Option<[u8; 32]> = None;
 
-        let tunn = Tunn::new(local_secret, peer_public, preshared, cfg.persistent_keepalive, 0, None)
-            .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
+        let tunn = Tunn::new(
+            local_secret,
+            peer_public,
+            preshared,
+            cfg.persistent_keepalive,
+            0,
+            None,
+        )
+        .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
 
         Ok(Self {
             tunn: Arc::new(Mutex::new(Box::new(tunn))),
@@ -157,7 +161,8 @@ impl WgTunnel {
                             TunnResult::WriteToNetwork(pkt) => {
                                 let mut pkt_vec = pkt.to_vec();
                                 inject_client_id(&mut pkt_vec, &client_id);
-                                let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp, &client_id);
+                                let (extra, extra_tun) =
+                                    drain_tunn(&mut tunn, &mut tmp, &client_id);
                                 drop(tunn);
                                 let _ = sock_r.send(&pkt_vec).await;
                                 for p in extra {
@@ -167,9 +172,11 @@ impl WgTunnel {
                                     let _ = inbound_tx_r.send(p).await;
                                 }
                             }
-                            TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+                            TunnResult::WriteToTunnelV4(pkt, _)
+                            | TunnResult::WriteToTunnelV6(pkt, _) => {
                                 let pkt_vec = pkt.to_vec();
-                                let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp, &client_id);
+                                let (extra, extra_tun) =
+                                    drain_tunn(&mut tunn, &mut tmp, &client_id);
                                 drop(tunn);
                                 let _ = inbound_tx_r.send(pkt_vec).await;
                                 for p in extra {
@@ -226,7 +233,12 @@ impl WgTunnel {
                             let sock_clone = sock_w.clone();
                             let cfg_clone = aethernoize.clone();
                             tokio::spawn(async move {
-                                aethernoize::send_post_handshake_junk(&sock_clone, peer, &cfg_clone).await;
+                                aethernoize::send_post_handshake_junk(
+                                    &sock_clone,
+                                    peer,
+                                    &cfg_clone,
+                                )
+                                .await;
                             });
                         }
                     }
@@ -290,7 +302,10 @@ impl WgTunnel {
                             let mut pkt_vec = pkt.to_vec();
                             inject_client_id(&mut pkt_vec, &client_id);
                             let _ = sock_t.send(&pkt_vec).await;
-                            log::debug!("[wg] adaptive keepalive: idle {}s, sent empty keepalive", last_activity.elapsed().as_secs());
+                            log::debug!(
+                                "[wg] adaptive keepalive: idle {}s, sent empty keepalive",
+                                last_activity.elapsed().as_secs()
+                            );
                         }
                     }
                 }
@@ -317,7 +332,11 @@ impl WgTunnel {
 
 /// Bound tunnel draining to avoid infinite allocation loops while ensuring
 /// handshake packets and queued data are flushed.
-fn drain_tunn(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+fn drain_tunn(
+    tunn: &mut Tunn,
+    out_buf: &mut [u8],
+    client_id: &[u8; 3],
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut wire = Vec::new();
     let mut tun_pkts = Vec::new();
     for _ in 0..32 {
@@ -331,13 +350,10 @@ fn drain_tunn(tunn: &mut Tunn, out_buf: &mut [u8], client_id: &[u8; 3]) -> (Vec<
                 tun_pkts.push(pkt.to_vec());
             }
             TunnResult::Done | TunnResult::Err(_) => break,
-
         }
     }
     (wire, tun_pkts)
 }
-
-
 
 async fn send_dataplane_probe(
     sock: &UdpSocket,
@@ -386,12 +402,19 @@ async fn verify_dataplane(
         if now >= deadline {
             log::debug!(
                 "[wg] dataplane verify timed out ({}/{} confirmations)",
-                successes, DATAPLANE_REQUIRED_SUCCESSES
+                successes,
+                DATAPLANE_REQUIRED_SUCCESSES
             );
             return Err(AetherError::Other("dataplane timeout".into()));
         }
         if now >= resend_at {
-            let _ = send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await;
+            if let Err(e) = send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await
+            {
+                // A failed resend is the reason the "dataplane timeout" below is
+                // about to fire; swallowing it left the reader with a timeout and
+                // no indication that the socket itself was the problem.
+                log::warn!("[wg] dataplane probe resend failed: {e}");
+            }
             last_probe_at = now;
             resend_at = now + Duration::from_millis(700);
         }
@@ -416,14 +439,23 @@ async fn verify_dataplane(
                             return Ok(elapsed);
                         }
                         let next_at = Instant::now().max(last_probe_at + DATAPLANE_PROBE_GAP);
-                        let _ = send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await;
+                        if let Err(e) =
+                            send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await
+                        {
+                            log::warn!("[wg] next dataplane probe could not be sent: {e}");
+                        }
                         last_probe_at = next_at;
                         resend_at = next_at + Duration::from_millis(700);
                     }
                     TunnResult::WriteToNetwork(pkt) => {
                         let mut v = pkt.to_vec();
                         inject_client_id(&mut v, client_id);
-                        let _ = sock.send(&v).await;
+                        // Handshake bytes on the verification path: if they do
+                        // not leave, the handshake cannot complete, and "silent"
+                        // is what made this loop look like a peer problem.
+                        if let Err(e) = sock.send(&v).await {
+                            log::warn!("[wg] handshake packet send failed during verification: {e}");
+                        }
                     }
                     _ => {}
                 }
@@ -443,9 +475,18 @@ pub async fn verify_endpoint_keep_session(
     timeout: Duration,
 ) -> Result<(Duration, EstablishedSession)> {
     let data_check = !crate::runtime_env::flag("AETHER_WG_NO_DATA_CHECK");
-    log::debug!("[wg] verify {} obf={} data_check={}", peer, aethernoize.is_enabled(), data_check);
+    log::debug!(
+        "[wg] verify {} obf={} data_check={}",
+        peer,
+        aethernoize.is_enabled(),
+        data_check
+    );
 
-    let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(peer).await?;
 
@@ -467,7 +508,7 @@ pub async fn verify_endpoint_keep_session(
         0,
         None,
     )
-        .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
+    .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
 
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
@@ -502,7 +543,12 @@ pub async fn verify_endpoint_keep_session(
                 let mut pkt_vec = pkt.to_vec();
                 inject_client_id(&mut pkt_vec, &client_id);
                 log::debug!("[wg] retransmit init {} bytes to {}", pkt_vec.len(), peer);
-                let _ = sock.send(&pkt_vec).await;
+                if let Err(e) = sock.send(&pkt_vec).await {
+                    // The retransmit is insurance against a lost original, so a
+                    // failure here is not fatal — but it is the last chance this
+                    // handshake gets before the deadline.
+                    log::warn!("[wg] Init retransmit to {peer} failed: {e}");
+                }
             }
         }
 
@@ -520,7 +566,11 @@ pub async fn verify_endpoint_keep_session(
                     TunnResult::Done => {
                         let (extra, _) = drain_tunn(&mut tunn, &mut out_buf, &client_id);
                         for pkt in extra {
-                            let _ = sock.send(&pkt).await;
+                            // Handshake packets the state machine still owed the
+                            // peer. If one of these cannot leave, the session is
+                            // not established, and returning Ok() here used to
+                            // report a handshake the peer never received.
+                            sock.send(&pkt).await?;
                         }
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake done in {:?}", elapsed);
@@ -547,7 +597,10 @@ pub async fn verify_endpoint_keep_session(
                         sock.send(&pkt_vec).await?;
                         let (extra, _) = drain_tunn(&mut tunn, &mut out_buf, &client_id);
                         for pkt in extra {
-                            let _ = sock.send(&pkt).await;
+                            // Same rule as above: these are handshake packets, and
+                            // a dropped one is a session that will never be
+                            // confirmed, not a packet worth losing quietly.
+                            sock.send(&pkt).await?;
                         }
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake success in {:?}", elapsed);
@@ -609,7 +662,10 @@ pub const WG_PORTS: &[u16] = &[
 /// documented default is 2408, then the 500/1701/4500 fallbacks — try them in that
 /// order rather than leading with 500.
 pub const WG_PORTS_T1: &[u16] = &[2408, 500, 1701, 4500];
-pub const WG_PORTS_T2: &[u16] = &[854, 880, 928, 942, 943, 946, 955, 987, 1002, 1010, 1014, 1070, 1074, 1180, 1387, 1843, 2371, 2506, 3138];
+pub const WG_PORTS_T2: &[u16] = &[
+    854, 880, 928, 942, 943, 946, 955, 987, 1002, 1010, 1014, 1070, 1074, 1180, 1387, 1843, 2371,
+    2506, 3138,
+];
 // Tier 3 = everything else (remaining ports in WG_PORTS not in T1 or T2).
 
 pub const WG_SEEDS_V4: &[&str] = &[
@@ -620,4 +676,9 @@ pub const WG_SEEDS_V4: &[&str] = &[
     "162.159.193.1",
 ];
 
-pub const WG_SEEDS_V6: &[&str] = &["2606:4700:d0::a29f:c001", "2606:4700:d1::a29f:c001", "2606:4700:d0::a29f:c301", "2606:4700:d0::bc72:6001"];
+pub const WG_SEEDS_V6: &[&str] = &[
+    "2606:4700:d0::a29f:c001",
+    "2606:4700:d1::a29f:c001",
+    "2606:4700:d0::a29f:c301",
+    "2606:4700:d0::bc72:6001",
+];

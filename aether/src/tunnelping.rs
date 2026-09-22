@@ -25,9 +25,7 @@ impl<T> Drop for AbortGuard<T> {
 }
 
 fn http_probe_port() -> u16 {
-    crate::runtime_env::var("AETHER_IRONCLAD_PORT")
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(80)
+    crate::runtime_env::u16_or("AETHER_IRONCLAD_PORT", 80)
 }
 
 async fn http_probe(stack: &netstack::StackHandle) -> Result<()> {
@@ -71,7 +69,9 @@ async fn http_probe(stack: &netstack::StackHandle) -> Result<()> {
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
-        .ok_or_else(|| AetherError::Other(format!("http probe: bad status line {status_line:?}")))?;
+        .ok_or_else(|| {
+            AetherError::Other(format!("http probe: bad status line {status_line:?}"))
+        })?;
     if code == 204 {
         Ok(())
     } else {
@@ -121,7 +121,9 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 key_pem: p.key_pem.clone(),
                 probe_src: Some(p.local_ipv4),
             };
-            AbortGuard(tokio::spawn(masque_h2::run(h2cfg, internals, None, ready_tx)))
+            AbortGuard(tokio::spawn(masque_h2::run(
+                h2cfg, internals, None, ready_tx,
+            )))
         } else {
             let cfg = quic::TunnelConfig {
                 peer: p.peer,

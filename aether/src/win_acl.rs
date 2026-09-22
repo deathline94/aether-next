@@ -8,9 +8,9 @@
 //! re-provisioned a second WARP device. A SID cannot be ambiguous about which
 //! account it names, and it is derived from the token that will open the file.
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
-use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::error::{AetherError, Result};
@@ -33,7 +33,9 @@ pub fn current_user_sid() -> Result<String> {
         if needed == 0 {
             let err = std::io::Error::last_os_error();
             CloseHandle(token);
-            return Err(AetherError::Other(format!("GetTokenInformation size: {err}")));
+            return Err(AetherError::Other(format!(
+                "GetTokenInformation size: {err}"
+            )));
         }
 
         let mut buf: Vec<u8> = vec![0u8; needed as usize];
@@ -93,7 +95,17 @@ pub fn current_user_sid() -> Result<String> {
 pub fn protective_descriptor() -> String {
     match current_user_sid() {
         Ok(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWX;{sid})"),
-        Err(_) => "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string(),
+        Err(e) => {
+            // The descriptor still protects the file, but it grants it to SYSTEM
+            // and Administrators only: the ordinary account that owns the config
+            // cannot read it back, which is the failure that made a second WARP
+            // device get provisioned over the first. Never silent.
+            log::error!(
+                "[acl] no SID for the current token ({e}): the descriptor omits the user grant, \
+                 so this account cannot open the file it is written for"
+            );
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
+        }
     }
 }
 

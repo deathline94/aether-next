@@ -6,7 +6,18 @@
 //! the right privileges, `/proc/<pid>/environ` on Android with root or an
 //! `adb`-attached debuggable build), and they survive for the whole lifetime of
 //! the process. One line on the already-piped control stdin is the same bytes
-//! with a much shorter exposure and no path for a bystander to read.
+//! with no path for a bystander to read: the environment block stays readable
+//! by anything with the privilege to open the process, for the whole life of
+//! the child, and every grandchild inherits it. A pipe buffer is none of those.
+//!
+//! What this does **not** do is shorten the lifetime inside *this* process. The
+//! key is installed into [`runtime_env`] and stays there, because the config
+//! envelope is re-sealed whenever an identity refreshes — long after the
+//! handoff. What is narrowed instead is the number of copies: the line read off
+//! stdin, the decoded bytes and the store's own entry are each zeroized on the
+//! paths below ([`runtime_env::set`] / [`runtime_env::remove`] wipe the value
+//! they displace), and [`forget_key`] drops the last one for a shutdown that
+//! wants to leave nothing behind.
 
 use std::io::BufRead;
 use std::time::Duration;
@@ -19,6 +30,8 @@ use crate::runtime_env;
 
 /// Set by the parent to say "the key follows on stdin, not in the environment".
 pub const REQUEST_ENV: &str = "AETHER_CONFIG_KEY_STDIN";
+/// Where the received key lives while the process can still need it.
+pub const KEY_ENV: &str = "AETHER_CONFIG_KEY";
 /// Prefix of the first control-channel line that carries the key.
 pub const LINE_PREFIX: &str = "key ";
 /// Prefix of the second control-channel line: where the driver DLL lives.
@@ -51,13 +64,16 @@ pub fn parse_key_line(line: &str) -> Result<String> {
         )));
     };
     let value = value.trim();
-    let decoded = base64::engine::general_purpose::STANDARD
+    let mut decoded = base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|e| AetherError::Other(format!("config key handoff is not valid base64: {e}")))?;
-    if decoded.len() != 32 {
+    let len = decoded.len();
+    // The decoded buffer *is* the key; the returned `String` is only its base64
+    // spelling, and `value` borrows the caller's line, which the caller wipes.
+    decoded.zeroize();
+    if len != 32 {
         return Err(AetherError::Other(format!(
-            "config key handoff must be 32 bytes (got {})",
-            decoded.len()
+            "config key handoff must be 32 bytes (got {len})"
         )));
     }
     Ok(value.to_string())
@@ -133,13 +149,18 @@ pub fn receive_if_requested() -> Result<()> {
     if !runtime_env::flag(REQUEST_ENV) {
         return Ok(());
     }
-    if runtime_env::var("AETHER_CONFIG_KEY").is_some() {
+    if runtime_env::var(KEY_ENV).is_some() {
         log::debug!("[keyhandoff] key already present in the environment; ignoring stdin request");
         return Ok(());
     }
 
-    let mut key = parse_key_line(&read_preamble_line("key")?)?;
-    runtime_env::set("AETHER_CONFIG_KEY", &key);
+    // `raw` owns the line read off stdin and `key` the base64 text inside it;
+    // both are wiped once the store has its own copy, so the handoff leaves at
+    // most one live copy of the bytes rather than three.
+    let mut raw = read_preamble_line("key")?;
+    let mut key = parse_key_line(&raw)?;
+    raw.zeroize();
+    runtime_env::set(KEY_ENV, &key);
     key.zeroize();
     log::debug!("[keyhandoff] configuration key received over stdin");
 
@@ -155,6 +176,21 @@ pub fn receive_if_requested() -> Result<()> {
         log::debug!("[keyhandoff] wintun path received over stdin");
     }
     Ok(())
+}
+
+/// Drop the process's last long-lived copy of the configuration key.
+///
+/// The runtime store holds the value the config envelope is sealed with, so this
+/// belongs to a shutdown path and nowhere else: a later identity write fails
+/// closed ("no configuration key available") rather than silently re-sealing
+/// with a key the operator thought was gone. `runtime_env::remove` zeroizes what
+/// it unlinks, so this is not a `drop` that leaves the bytes in freed heap.
+pub fn forget_key() {
+    if runtime_env::var(KEY_ENV).is_none() {
+        return;
+    }
+    runtime_env::remove(KEY_ENV);
+    log::debug!("[keyhandoff] configuration key removed and zeroized from the runtime store");
 }
 
 #[cfg(test)]
@@ -192,11 +228,17 @@ mod tests {
     fn a_dll_line_that_is_not_a_path_is_rejected() {
         assert!(parse_dll_line("key abc\n").is_err(), "wrong token");
         assert!(parse_dll_line("dll wintun \n").is_err(), "empty path");
-        assert!(parse_dll_line("dll wintun a\0b").is_err(), "NUL inside the path");
+        assert!(
+            parse_dll_line("dll wintun a\0b").is_err(),
+            "NUL inside the path"
+        );
         assert!(
             parse_dll_line(&format!("dll wintun {}", "x".repeat(5000))).is_err(),
             "absurd length"
         );
-        assert!(parse_dll_line("shutdown\n").is_err(), "a control command is not a path");
+        assert!(
+            parse_dll_line("shutdown\n").is_err(),
+            "a control command is not a path"
+        );
     }
 }

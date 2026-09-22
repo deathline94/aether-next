@@ -36,16 +36,22 @@ use crate::wireguard;
 /// measured over.
 const SUPERVISE_TICK: Duration = Duration::from_secs(2);
 
+/// What warp-in-warp costs the inner packet: ~60 B of WireGuard encapsulation
+/// on the outer leg plus ~60 B on the inner one.
+const INNER_ENCAP_OVERHEAD: usize = 120;
+
 /// The inner MTU for a given outer tunnel MTU.
 ///
-/// The M12 floor was `v.max(1152.min(tm - 80))` — with a tunnel MTU of 1240 that
-/// returns 1152 where the encapsulation budget is `1240 - 120 = 1120`, i.e. the
-/// floor *was* the overflow the comment called impossible. A floor may never
-/// exceed the budget, so 1152 is a preference here and not an override: below an
-/// outer MTU of 1272 the answer is simply the budget.
+/// The M12 floor was `v.max(1152.min(tm - 80))`: with an outer MTU of 1240 that
+/// returned 1152 against a 1120-byte budget, so the floor *was* the overflow its
+/// own comment called impossible. The re-clamp that followed (`budget.max(1152
+/// .min(budget))`) could not change the answer in either direction — a floor can
+/// never raise an MTU above the budget it is supposed to respect — so the 1152
+/// preference is gone rather than re-clamped, and the budget is the whole rule.
+/// No lower guard is put back: `mtu::env_override` already floors the outer
+/// value at 576, so the smallest budget here is 456.
 fn inner_mtu_for(tunnel_mtu: usize) -> usize {
-    let budget = tunnel_mtu.saturating_sub(120);
-    budget.max(1152.min(budget))
+    tunnel_mtu.saturating_sub(INNER_ENCAP_OVERHEAD)
 }
 
 /// MTU for a WireGuard-leg stack (plain WARP and the gool outer leg).
@@ -124,7 +130,9 @@ async fn wait_stack_alive(stack: &netstack::StackHandle, label: &str) -> Result<
                 return Ok(());
             }
             Err(_) => {
-                log::warn!("[-] {label} data plane not ready (attempt {attempt}/{ATTEMPTS}); retrying");
+                log::warn!(
+                    "[-] {label} data plane not ready (attempt {attempt}/{ATTEMPTS}); retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
         }
@@ -150,7 +158,6 @@ fn local_stack_broken(err: &str) -> bool {
 mod readiness_tests {
     use super::local_stack_broken;
 
-
     #[test]
     fn local_refusals_are_not_proof_of_life() {
         assert!(local_stack_broken("netstack dropped"));
@@ -163,6 +170,22 @@ mod readiness_tests {
         assert!(!local_stack_broken("connection refused"));
         assert!(!local_stack_broken("timed out"));
         assert!(!local_stack_broken(""));
+    }
+
+    /// M12, as a number: the old floor turned a 1240-byte outer MTU into a
+    /// 1152-byte inner one against a 1120-byte budget, so every full-size inner
+    /// packet overflowed the encapsulation the comment claimed was safe.
+    #[test]
+    fn the_inner_mtu_never_exceeds_the_encapsulation_budget() {
+        assert_eq!(super::inner_mtu_for(1240), 1120);
+        assert_eq!(super::inner_mtu_for(1280), 1160);
+        assert_eq!(super::inner_mtu_for(576), 456);
+        for outer in [576, 1240, 1280, 1400, 1500, 65535] {
+            assert!(
+                super::inner_mtu_for(outer) + super::INNER_ENCAP_OVERHEAD <= outer,
+                "outer {outer} produced an inner MTU the encapsulation cannot carry"
+            );
+        }
     }
 }
 
@@ -537,7 +560,8 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
             return Ok(identity);
         }
         log::info!("[+] masque identity missing credentials; enrolling masque key");
-        let (cert_pem, key_pem, masque_endpoint) = account::ensure_masque_enrolled(&identity).await?;
+        let (cert_pem, key_pem, masque_endpoint) =
+            account::ensure_masque_enrolled(&identity).await?;
         // Assigned in place rather than rebuilt with `..identity`: an `Identity`
         // zeroizes on drop, so it cannot be partially moved out of.
         let mut identity = identity;
@@ -594,8 +618,9 @@ async fn select_peer(
 ) -> Result<Selection> {
     let force_peer = match protocol {
         Protocol::Masque => runtime_env::var("AETHER_PEER"),
-        Protocol::WireGuard | Protocol::WarpInWarp => runtime_env::var("AETHER_WG_PEER")
-            .or_else(|| runtime_env::var("AETHER_PEER")),
+        Protocol::WireGuard | Protocol::WarpInWarp => {
+            runtime_env::var("AETHER_WG_PEER").or_else(|| runtime_env::var("AETHER_PEER"))
+        }
     };
 
     if let Some(p) = force_peer {
@@ -680,7 +705,9 @@ async fn select_peer(
                         };
                         if let Ok(rtt) = verified {
                             log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
-                            if crate::cache::record_success(base_config, peer_addr, true).was_skipped() {
+                            if crate::cache::record_success(base_config, peer_addr, true)
+                                .was_skipped()
+                            {
                                 log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
                             }
                             session_event::emit(SessionEvent::EndpointSelected {
@@ -693,10 +720,14 @@ async fn select_peer(
                                 rtt: Some(rtt),
                             });
                         } else {
-                            log::warn!("[-] cached gateway {peer_addr} no longer works; scanning fresh");
+                            log::warn!(
+                                "[-] cached gateway {peer_addr} no longer works; scanning fresh"
+                            );
                             // Evict the dead peer from the trust cache so we stop
                             // trying it first on every reconnect after a network change.
-                            if crate::cache::record_failure(base_config, peer_addr, true).was_skipped() {
+                            if crate::cache::record_failure(base_config, peer_addr, true)
+                                .was_skipped()
+                            {
                                 log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
                             }
                         }
@@ -713,17 +744,16 @@ async fn select_peer(
             );
             let peer = SocketAddr::new(best.ip, best.port);
             // Cache the working gateway so the next session can quick-reconnect.
-            lastconn::save(
-                &lastconn::cache_path(base_config),
-                &peer.to_string(),
-                "",
-            );
+            lastconn::save(&lastconn::cache_path(base_config), &peer.to_string(), "");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: "masque".into(),
                 rtt_ms: Some(best.rtt.as_secs_f64() * 1000.0),
             });
-            Ok(Selection { peer, rtt: Some(best.rtt) })
+            Ok(Selection {
+                peer,
+                rtt: Some(best.rtt),
+            })
         }
         Protocol::WireGuard | Protocol::WarpInWarp => {
             log::info!(
@@ -833,7 +863,9 @@ fn ech_related(err: &AetherError) -> bool {
 
 async fn resolve_ech() -> Option<Vec<u8>> {
     match crate::runtime_env::var("AETHER_ECH") {
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
+        Some(v)
+            if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") =>
+        {
             log::info!("[+] ECH explicitly disabled via AETHER_ECH={v}");
             None
         }
@@ -894,7 +926,9 @@ async fn run_masque_tunnel(
     } else {
         let capped = mtu_val.min(1280);
         if capped != mtu_val {
-            log::info!("[+] H3 data-plane MTU capped to {capped} (was {mtu_val}) to fit QUIC DATAGRAM");
+            log::info!(
+                "[+] H3 data-plane MTU capped to {capped} (was {mtu_val}) to fit QUIC DATAGRAM"
+            );
         }
         capped
     };
@@ -1127,8 +1161,7 @@ async fn run_wireguard(
     http_listen: SocketAddr,
     base_config: &str,
 ) -> Result<()> {
-    let forced = runtime_env::var("AETHER_WG_PEER")
-        .or_else(|| runtime_env::var("AETHER_PEER"));
+    let forced = runtime_env::var("AETHER_WG_PEER").or_else(|| runtime_env::var("AETHER_PEER"));
 
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
@@ -1192,15 +1225,7 @@ async fn run_wireguard(
     // instead of performing a second one (Cloudflare edges punish double
     // handshakes — see the comment in run_wireguard_tunnel).
     let established = wg_sessions.take(&peer);
-    run_wireguard_tunnel(
-        identity,
-        peer,
-        profile,
-        listen,
-        http_listen,
-        established,
-    )
-    .await
+    run_wireguard_tunnel(identity, peer, profile, listen, http_listen, established).await
 }
 
 async fn run_wireguard_tunnel(
@@ -1326,7 +1351,10 @@ async fn spawn_stack_and_optional_tun(
     mtu: usize,
     inbound_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-) -> Result<(Option<netstack::StackHandle>, Option<routing_plane::TunGuard>)> {
+) -> Result<(
+    Option<netstack::StackHandle>,
+    Option<routing_plane::TunGuard>,
+)> {
     routing_plane::spawn(ipv4, ipv6, peer, mtu, inbound_rx, outbound_tx).await
 }
 

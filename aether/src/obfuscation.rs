@@ -19,8 +19,20 @@ pub enum Transport {
 /// The names the shell's vocabulary accepts, kept next to `is_recognized` so the
 /// refusal can quote them back.
 pub const RECOGNIZED_PROFILES: &[&str] = &[
-    "off", "none", "light", "low", "medium", "balanced", "firewall", "default", "high", "gfw",
-    "max", "aggressive", "heavy", "custom",
+    "off",
+    "none",
+    "light",
+    "low",
+    "medium",
+    "balanced",
+    "firewall",
+    "default",
+    "high",
+    "gfw",
+    "max",
+    "aggressive",
+    "heavy",
+    "custom",
 ];
 
 /// Refuse a profile name the transports have no definition for.
@@ -69,8 +81,20 @@ pub fn normalize(name: &str) -> &str {
 pub fn is_recognized(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
-        "" | "off" | "none" | "light" | "low" | "medium" | "balanced" | "firewall"
-            | "default" | "high" | "gfw" | "max" | "aggressive" | "heavy" | "custom"
+        "" | "off"
+            | "none"
+            | "light"
+            | "low"
+            | "medium"
+            | "balanced"
+            | "firewall"
+            | "default"
+            | "high"
+            | "gfw"
+            | "max"
+            | "aggressive"
+            | "heavy"
+            | "custom"
     )
 }
 
@@ -83,7 +107,12 @@ pub fn default_profile(transport: Transport) -> &'static str {
 }
 
 fn env_usize(key: &str) -> Option<usize> {
-    crate::runtime_env::var(key)?.trim().parse().ok()
+    // `runtime_env::usize` is the reporting reader: an unparseable
+    // `AETHER_NOIZE_JC=abc` is logged rather than silently treated as unset,
+    // which is the difference between "the custom profile is not being applied"
+    // being visible and being a mystery. It also owns the trim and the
+    // empty-means-absent rule.
+    crate::runtime_env::usize(key)
 }
 
 /// Optional custom knobs from env (used when profile is `custom`).
@@ -131,7 +160,9 @@ pub fn masque_from_env() -> NoizeConfig {
         log::warn!("[!] unknown obfuscation profile {raw:?}; falling back to '{name}'");
     }
     if name == "max" {
-        log::info!("[i] MASQUE obfuscation 'max' is equivalent to 'high' (only two profiles exist)");
+        log::info!(
+            "[i] MASQUE obfuscation 'max' is equivalent to 'high' (only two profiles exist)"
+        );
     }
     log::info!("[+] obfuscation profile (masque): {name}");
     let mut cfg = noize_from_name(name);
@@ -183,16 +214,36 @@ pub fn aethernoize_from_name(name: &str) -> AetherNoizeConfig {
 // ─── Canonical CPS parser ───────────────────────────────────────────────────
 
 /// Parse a range spec: either a fixed `N` or a randomized `MIN-MAX`.
+///
+/// An unparseable bound is reported, not quietly read as zero: `<r 16-abc>` used
+/// to yield a length of 0, so the signature lost the random run it was built
+/// around and the connection failed (or, worse, succeeded with a different
+/// fingerprint than the profile says) with nothing in the log naming the typo.
 fn parse_range(data: &str) -> usize {
     let mut parts = data.split('-');
     if let (Some(min_str), Some(max_str)) = (parts.next(), parts.next()) {
-        let min: usize = min_str.trim().parse().unwrap_or(0);
-        let max: usize = max_str.trim().parse().unwrap_or(0);
+        let min: usize = min_str.trim().parse().unwrap_or_else(|_| {
+            log::warn!("[obfs] range bound {min_str:?} in {data:?} is not a number; using 0");
+            0
+        });
+        let max: usize = max_str.trim().parse().unwrap_or_else(|_| {
+            log::warn!("[obfs] range bound {max_str:?} in {data:?} is not a number; using 0");
+            0
+        });
         if max > min && min > 0 {
             return rand::thread_rng().gen_range(min..=max).min(2048);
         }
+        // A `MIN-MAX` pair that does not describe a range (`0-16`, `16-8`) keeps
+        // the answer it always had — zero bytes — but says why, because "this
+        // tag contributed nothing" is otherwise invisible.
+        log::warn!("[obfs] range {data:?} is not usable (min {min}, max {max}); emitting 0 bytes");
+        return 0;
     }
-    data.trim().parse().unwrap_or(0).min(2048)
+    let fixed = data.trim().parse().unwrap_or_else(|_| {
+        log::warn!("[obfs] length {data:?} is not a number; emitting 0 bytes");
+        0
+    });
+    fixed.min(2048)
 }
 
 /// Canonical CPS (Custom Packet Signature) parser.
@@ -223,6 +274,14 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                     .unwrap_or(&hex_str);
                 if let Ok(decoded) = hex::decode(clean) {
                     out.extend_from_slice(&decoded);
+                } else {
+                    // The literal bytes of a signature are the part a middlebox
+                    // fingerprint is built on: an odd-length or non-hex spec used
+                    // to drop the whole tag silently, so the hello went out
+                    // shaped like something else while the profile claimed this.
+                    log::warn!(
+                        "[obfs] <b {tag_data:?}> is not valid hex; the tag emitted no bytes"
+                    );
                 }
             }
             "t" => {
@@ -313,8 +372,8 @@ mod tests {
         assert!(validate_profile_name("").is_ok(), "empty means the default");
 
         for bad in ["turbo", "max1", "off-x", "medium-ish", "é", "11"] {
-            let err = validate_profile_name(bad)
-                .expect_err("{bad} must not silently become balanced()");
+            let err =
+                validate_profile_name(bad).expect_err("{bad} must not silently become balanced()");
             assert!(
                 err.to_string().contains(bad),
                 "the refusal must name what it rejected: {err}"
@@ -342,8 +401,17 @@ mod tests {
     #[test]
     fn cross_map_never_panics() {
         for n in [
-            "off", "light", "medium", "high", "max", "custom", "gfw", "firewall", "balanced",
-            "aggressive", "weird",
+            "off",
+            "light",
+            "medium",
+            "high",
+            "max",
+            "custom",
+            "gfw",
+            "firewall",
+            "balanced",
+            "aggressive",
+            "weird",
         ] {
             let _ = noize_from_name(n);
             let _ = aethernoize_from_name(n);

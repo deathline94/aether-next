@@ -39,6 +39,9 @@ counters! {
     INBOUND_DROPPED => "inbound_dropped",
     /// Outbound packets dropped on a full datagram queue or a closed stream.
     DATAGRAM_SEND_DROPPED => "datagram_send_dropped",
+    /// UDP datagrams the stack refused to send. Nothing above retransmits UDP, so
+    /// a refusal here is a loss the application will never hear about otherwise.
+    UDP_EGRESS_DROPPED => "udp_egress_dropped",
     /// Engine events that arrived as `AETHER_EVENT` but did not parse.
     MALFORMED_EVENTS => "malformed_events",
     /// Cache entries rejected by `sanitise` (bogus RTT, malformed address, …).

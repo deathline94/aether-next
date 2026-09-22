@@ -70,6 +70,11 @@ pub async fn run() -> Result<()> {
             result = session => result,
             _ = shutdown_request() => {
                 log::info!("[+] graceful shutdown requested");
+                // The envelope key is held in the process environment store so the
+                // session can re-seal the identity file; on an explicit shutdown
+                // there is no later session to serve, so drop the copy rather than
+                // let it sit until the process ends.
+                crate::keyhandoff::forget_key();
                 Ok(())
             }
         }

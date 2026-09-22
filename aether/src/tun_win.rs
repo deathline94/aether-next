@@ -31,7 +31,10 @@ pub fn enabled() -> bool {
 /// Same pair the shell uses for its own allow-list, so the two ends cannot drift.
 fn wintun_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         let canon = dir.canonicalize().unwrap_or(dir.clone());
         roots.push(canon.clone());
         if let Some(parent) = canon.parent() {
@@ -57,7 +60,10 @@ fn inside_allowed_root(raw: &str) -> Option<PathBuf> {
     if !canon.is_file() {
         return None;
     }
-    wintun_roots().into_iter().find(|r| canon.starts_with(r)).map(|_| canon)
+    wintun_roots()
+        .into_iter()
+        .find(|r| canon.starts_with(r))
+        .map(|_| canon)
 }
 
 fn find_wintun_dll() -> Result<PathBuf> {
@@ -133,13 +139,21 @@ if (-not $best) { throw 'physical default gateway not found' }
 Write-Output ($best.InterfaceIndex.ToString() + '|' + $best.NextHop)
 "#;
     let out = ps(script)?;
-    let line = out.lines().map(str::trim).find(|line| line.contains('|'))
+    let line = out
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains('|'))
         .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
-    let (idx, gateway) = line.split_once('|')
+    let (idx, gateway) = line
+        .split_once('|')
         .ok_or_else(|| AetherError::Other("bad default gateway output".into()))?;
-    let idx = idx.trim().parse::<u32>()
+    let idx = idx
+        .trim()
+        .parse::<u32>()
         .map_err(|_| AetherError::Other("bad default interface index".into()))?;
-    let gateway = gateway.trim().parse::<Ipv4Addr>()
+    let gateway = gateway
+        .trim()
+        .parse::<Ipv4Addr>()
         .map_err(|_| AetherError::Other("bad default gateway".into()))?;
     Ok((idx, gateway))
 }
@@ -156,10 +170,19 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr, mtu: usize) -> Result<()> {
         return Err(AetherError::Other(format!("unsafe adapter name: {name:?}")));
     }
     // WireGuard-style: /32 on tunnel NIC, no gateway, low metric, DNS via tunnel.
-    // MTU is threaded in from the tunnel runner (the H3 data plane caps it to 1280
-    // to fit QUIC DATAGRAMs) instead of read from a global, so a concurrent
-    // scan/tunnel in the same process cannot clobber it.
-    let mtu = mtu.clamp(1280, 1400);
+    //
+    // `mtu` is the value the **data plane** was told to use: the session caps it
+    // (H3 DATAGRAMs get 1280, `mtu::resolve_mtu` the per-protocol answer) and
+    // threads it here so the adapter cannot disagree with the stack feeding it.
+    // The old `clamp(1280, 1400)` broke that on the way *up*: a legal
+    // `AETHER_MTU=1200` (see `mtu::env_override`) arrived as 1200 and left as
+    // 1280, i.e. the host was configured to emit frames the tunnel then dropped.
+    // Nothing is raised above what was threaded; 576 is the IPv4 floor (IPv6 is
+    // disabled on this adapter two lines below, so the 1280 v6 floor does not
+    // apply) and 1400 is the largest value this path ever asks the adapter for.
+    const ADAPTER_MIN_MTU: usize = 576;
+    const ADAPTER_MAX_MTU: usize = 1400;
+    let mtu = mtu.clamp(ADAPTER_MIN_MTU, ADAPTER_MAX_MTU);
     let ip = ipv4.to_string();
     // Each entry is an `Ipv4Addr` rendered by `to_string`, so the literals below
     // cannot be steered by configuration.
@@ -184,8 +207,12 @@ Get-NetRoute -InterfaceAlias $n -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 New-NetIPAddress -InterfaceAlias $n -IPAddress '{ip}' -PrefixLength 32 -PolicyStore ActiveStore | Out-Null
 Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @({dns_literal})
-Set-NetIPInterface -InterfaceAlias $n -InterfaceMetric 1 -NlMtuBytes {mtu} -ErrorAction SilentlyContinue
-Write-Output 'ok'
+Set-NetIPInterface -InterfaceAlias $n -InterfaceMetric 1 -NlMtuBytes {mtu}
+# Read the value back instead of assuming it: a mtu the host refused to take is
+# the one failure mode that turns the tunnel into a silent blackhole, and the log
+# line below has to describe the adapter, not the request.
+$applied = (Get-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4).NlMtuBytes
+Write-Output ('ok mtu-requested={mtu} mtu-applied=' + $applied)
 "#
     );
     match ps(&script) {
@@ -217,14 +244,20 @@ Write-Output 'ok'
                 resolvers[0].to_string(),
                 "primary".into(),
             ];
-            run_cmd("netsh", &dns_args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            run_cmd(
+                "netsh",
+                &dns_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
             if let Some(second) = resolvers.get(1) {
                 // `add dns` appends the secondary; `set dns` above replaced the list.
                 dns_args[3] = "add".into();
                 dns_args[7] = second.to_string();
-                run_cmd("netsh", &dns_args.iter().map(String::as_str).collect::<Vec<_>>())?;
+                run_cmd(
+                    "netsh",
+                    &dns_args.iter().map(String::as_str).collect::<Vec<_>>(),
+                )?;
             }
-            let _ = run_cmd(
+            if let Err(e) = run_cmd(
                 "netsh",
                 &[
                     "interface",
@@ -235,11 +268,26 @@ Write-Output 'ok'
                     &format!("mtu={mtu}"),
                     "store=active",
                 ],
-            );
-            let _ = run_cmd(
+            ) {
+                // Fail the bring-up rather than come up wrong: the adapter keeps
+                // its own MTU here, which on the H3 path means full-size inner
+                // packets that the data plane then throws away. A tunnel that
+                // works for small requests and blackholes everything else is
+                // worse than one that says it did not start.
+                return Err(AetherError::Other(format!(
+                    "cannot set the {name} adapter MTU to {mtu}: {e}"
+                )));
+            }
+            if let Err(e) = run_cmd(
                 "netsh",
                 &["interface", "ip", "set", "interface", name, "metric=1"],
-            );
+            ) {
+                // Not fatal — the explicit split-default routes carry the
+                // traffic — but a higher interface metric means Windows may
+                // prefer the physical adapter for anything the journal does not
+                // name, and that has to be visible.
+                log::error!("[tun] could not set interface metric=1 on {name}: {e}");
+            }
         }
     }
     log::info!("[tun] adapter {name} mtu={mtu} metric=1 ip={ip}/32");
@@ -279,9 +327,7 @@ fn plan_journal(
         let (destination, mask) = dest.split_once('/').unwrap_or((dest, "0"));
         entries.push(RouteIntent {
             destination: destination.into(),
-            mask: crate::route_repair::prefix_len_to_mask(
-                mask.parse::<u32>().unwrap_or(0)
-            ),
+            mask: crate::route_repair::prefix_len_to_mask(mask.parse::<u32>().unwrap_or(0)),
             // On-link on the tunnel interface, WireGuard-style.
             next_hop: "0.0.0.0".into(),
             if_index: tun_if,
@@ -327,7 +373,8 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
     // describe those prefixes as its own: the lock serialises the act of
     // installing, and `refuse_if_another_instance_holds_a_journal` (T036) makes a
     // live journal by another owner a refusal rather than a takeover.
-    let _mutation = crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)?;
+    let _mutation =
+        crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)?;
     let (physical_if_index, gw) = default_gateway()?;
     let if_index = interface_index(ADAPTER_NAME)?;
     let peer_s = peer_ip.to_string();
@@ -363,10 +410,28 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
             block.push_str(command);
             block.push('\n');
         }
-        block.push_str("  Write-Output 'backstop=armed'\n} catch { Write-Output 'backstop=unsupported' }");
+        block.push_str(
+            "  Write-Output 'backstop=armed'\n} catch { Write-Output 'backstop=unsupported' }",
+        );
         block
     };
 
+    // Never a bare `route` inside the script: PowerShell resolves a tool name
+    // through PATH *and the process current directory*, which is the search
+    // order `win_exec` exists to take out of the picture for an elevated
+    // process. The absolute System32 path is the same one `run_cmd` uses.
+    let route_exe = match crate::win_exec::system_exe("route") {
+        Ok(p) => format!("& '{}'", p.to_string_lossy().replace('\'', "''")),
+        Err(e) => {
+            // The NetTCPIP cmdlets are still the primary path; only the
+            // in-script fallback needs route.exe. Naming the refusal keeps the
+            // script from silently going looking for the tool somewhere else.
+            log::warn!(
+                "[tun] route.exe could not be resolved ({e}); the in-script fallback is disabled"
+            );
+            "throw 'route.exe unresolvable'".to_string()
+        }
+    };
     // WireGuard-Windows style: on-link split default on tunnel IF (NextHop 0.0.0.0),
     // plus host route for edge peer via physical gateway. Prefer New-NetRoute.
     let script = format!(
@@ -398,7 +463,7 @@ try {{
       # Fallback: next-hop = tunnel IP + IF
       $dest = $p.Split('/')[0]
       $mask = if ($p -like '0.0.0.0/*') {{ '128.0.0.0' }} else {{ '128.0.0.0' }}
-      route add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
+      {route_exe} add $dest mask $mask $via metric 1 IF $tunIf | Out-Null
     }}
   }}
   # IPv6 stays disabled until this TUN path supports it.
@@ -434,7 +499,17 @@ try {{
             // 1. Mandatory peer escape route pinned to physical interface
             if let Err(err) = run_cmd(
                 "route",
-                &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1", "IF", &phys_s],
+                &[
+                    "add",
+                    &peer_s,
+                    "mask",
+                    "255.255.255.255",
+                    &gw_s,
+                    "metric",
+                    "1",
+                    "IF",
+                    &phys_s,
+                ],
             ) {
                 clear_journal_at(&journal_path);
                 return Err(AetherError::Other(format!(
@@ -448,13 +523,31 @@ try {{
                 let _ = run_cmd("route", &["delete", dest, "mask", "128.0.0.0", "IF", &ifs]);
                 if let Err(add_err) = run_cmd(
                     "route",
-                    &["add", dest, "mask", "128.0.0.0", &via, "metric", "1", "IF", &ifs],
+                    &[
+                        "add",
+                        dest,
+                        "mask",
+                        "128.0.0.0",
+                        &via,
+                        "metric",
+                        "1",
+                        "IF",
+                        &ifs,
+                    ],
                 ) {
-                    log::error!("[tun] failed to add split route {dest} ({add_err}); rolling back routes");
+                    log::error!(
+                        "[tun] failed to add split route {dest} ({add_err}); rolling back routes"
+                    );
                     for installed in installed_splits {
-                        let _ = run_cmd("route", &["delete", installed, "mask", "128.0.0.0", "IF", &ifs]);
+                        let _ = run_cmd(
+                            "route",
+                            &["delete", installed, "mask", "128.0.0.0", "IF", &ifs],
+                        );
                     }
-                    let _ = run_cmd("route", &["delete", &peer_s, "mask", "255.255.255.255", "IF", &phys_s]);
+                    let _ = run_cmd(
+                        "route",
+                        &["delete", &peer_s, "mask", "255.255.255.255", "IF", &phys_s],
+                    );
                     clear_journal_at(&journal_path);
                     return Err(add_err);
                 }
@@ -490,14 +583,15 @@ try {{
 
 /// T036 — another instance's journal blocks us, and that is the whole answer.
 fn refuse_if_another_instance_holds_a_journal(if_index: u32, me: &JournalOwner) -> Result<()> {
-    let records: Vec<OwnershipRecord> = route_repair::scan_journals(route_repair::boot_id(), process_liveness)
-        .into_iter()
-        .map(|stale| OwnershipRecord {
-            owner: route_repair::owner_of(&stale.journal),
-            tun_if_index: stale.journal.tun_if_index,
-            holder: stale.holder,
-        })
-        .collect();
+    let records: Vec<OwnershipRecord> =
+        route_repair::scan_journals(route_repair::boot_id(), process_liveness)
+            .into_iter()
+            .map(|stale| OwnershipRecord {
+                owner: route_repair::owner_of(&stale.journal),
+                tun_if_index: stale.journal.tun_if_index,
+                holder: stale.holder,
+            })
+            .collect();
     match route_repair::decide_owner_exclusivity(&records, me, if_index) {
         MutationVerdict::Proceed => Ok(()),
         MutationVerdict::Refuse { why, owner } => Err(AetherError::Other(format!(
@@ -524,8 +618,9 @@ fn refuse_if_another_instance_holds_a_journal(if_index: u32, me: &JournalOwner) 
 /// unguarded delete would take down routes that are no longer only ours, and the
 /// machine would lose its tunnel with one still reporting connected.
 fn remove_routes(journal: &RouteJournal) {
-    let _mutation = match crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)
-    {
+    let _mutation = match crate::host_lock::HostMutationGuard::acquire(
+        crate::host_lock::ACQUIRE_TIMEOUT,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             log::error!(
@@ -595,8 +690,20 @@ fn legacy_state_path() -> Option<PathBuf> {
 /// next-hop scoped even when its interface indexes are zero — which is exactly
 /// the case that used to trigger global prefix deletion.
 fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
-    let g = |k: &str| state.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let u = |k: &str| state.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(0);
+    let g = |k: &str| {
+        state
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let u = |k: &str| {
+        state
+            .get(k)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(0)
+    };
     let tunnel_ipv4 = g("ipv4");
     let peer_ipv4 = g("peer");
     if tunnel_ipv4.is_empty() && peer_ipv4.is_empty() {
@@ -610,7 +717,11 @@ fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
         entries.push(RouteIntent {
             destination: destination.into(),
             mask: crate::route_repair::prefix_len_to_mask(mask.parse::<u32>().unwrap_or(0)),
-            next_hop: if tun_if != 0 { "0.0.0.0".into() } else { tunnel_ipv4.clone() },
+            next_hop: if tun_if != 0 {
+                "0.0.0.0".into()
+            } else {
+                tunnel_ipv4.clone()
+            },
             if_index: tun_if,
             family: 2,
         });
@@ -654,7 +765,8 @@ fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
 pub fn recover_stale_routes() {
     // The replay is a host mutation like any other. Holding the lock here also
     // means `remove_routes_locked` below is called with it already taken.
-    let Ok(_mutation) = crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)
+    let Ok(_mutation) =
+        crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)
     else {
         log::info!("[tun] another session owns host mutation; skipping the stale-route replay");
         return;
@@ -662,9 +774,10 @@ pub fn recover_stale_routes() {
     // Every journal on disk — this one, every other owner's, and the legacy single
     // file. `remove_routes_locked` already folds the adapter reset into the same
     // script, so recovery needs no separate reset call.
-    let handled = route_repair::replay_abandoned_journals(process_liveness, &|journal: &RouteJournal| {
-        remove_routes_locked(journal);
-    });
+    let handled =
+        route_repair::replay_abandoned_journals(process_liveness, &|journal: &RouteJournal| {
+            remove_routes_locked(journal);
+        });
     if recover_legacy_state_file() {
         log::info!("[tun] recovered routes recorded by a pre-journal build");
     }
@@ -810,7 +923,6 @@ fn tasklist_liveness(pid: u32) -> Liveness {
     route_repair::liveness_from_tasklist(&String::from_utf8_lossy(&o.stdout), pid)
 }
 
-
 /// T044 — re-arm the route lifetime every [`route_repair::ROUTE_BACKSTOP_REFRESH_INTERVAL`]
 /// while this tunnel is up.
 ///
@@ -842,8 +954,7 @@ fn rearm_route_lifetime(journal: &RouteJournal) {
     }
     // A refresh is a host mutation like any other: if another session is
     // mid-install, decline this round rather than race it.
-    let Ok(_mutation) =
-        crate::host_lock::HostMutationGuard::acquire(Duration::from_millis(500))
+    let Ok(_mutation) = crate::host_lock::HostMutationGuard::acquire(Duration::from_millis(500))
     else {
         log::debug!("[tun] host mutation is busy; skipping this lifetime refresh");
         return;
@@ -871,8 +982,17 @@ impl Drop for TunHandle {
         }
         remove_routes(&self.journal);
         clear_journal_at(&self.journal_path);
-        let _ = self.session.shutdown();
-        log::info!("[tun] cleaned routes, adapter config, and session");
+        // Closing the session is the step that releases the adapter. When it
+        // fails the adapter stays claimed by a process that is already gone, and
+        // the next start inherits a device nobody can open — so the failure is
+        // named, and the "all cleaned" line is not printed over it.
+        match self.session.shutdown() {
+            Ok(()) => log::info!("[tun] cleaned routes, adapter config, and session"),
+            Err(e) => log::error!(
+                "[tun] routes and journal cleaned, but the wintun session could not be shut \
+                 down: {e}; the adapter may stay claimed until the next start"
+            ),
+        }
     }
 }
 
@@ -919,7 +1039,12 @@ pub async fn spawn(
     let journal = match install_routes(peer, ipv4) {
         Ok(journal) => journal,
         Err(error) => {
-            let _ = session.shutdown();
+            // The routes did not go in, so the adapter is ours to give back; a
+            // failed shutdown here leaks the device, which the next start then
+            // cannot raise. Say so rather than returning only the route error.
+            if let Err(e) = session.shutdown() {
+                log::error!("[tun] route install failed and the wintun session stayed open: {e}");
+            }
             return Err(error);
         }
     };
@@ -927,7 +1052,12 @@ pub async fn spawn(
     // Build handle first so Drop cleans routes/session if thread spawn fails.
     let journal_path = route_repair::journal_path_for(&route_repair::owner_of(&journal))
         .ok_or_else(|| {
-            let _ = session.shutdown();
+            if let Err(e) = session.shutdown() {
+                log::error!(
+                    "[tun] no journal path for the routes just installed and the wintun \
+                     session stayed open: {e}"
+                );
+            }
             AetherError::Other("no per-owner journal path for the routes just installed".into())
         })?;
     let handle = TunHandle {
@@ -1013,7 +1143,9 @@ pub async fn spawn(
                             }
                             // WinTUN expects raw IP packets. Ensure version is 4 (no ethernet header).
                             if pkt[0] >> 4 == 4 {
-                                if let Ok(mut packet) = session.allocate_send_packet(pkt.len() as u16) {
+                                if let Ok(mut packet) =
+                                    session.allocate_send_packet(pkt.len() as u16)
+                                {
                                     packet.bytes_mut()[..pkt.len()].copy_from_slice(&pkt);
                                     session.send_packet(packet);
                                     ok += 1;
@@ -1032,7 +1164,9 @@ pub async fn spawn(
                                     && pkt[14] >> 4 == 4
                                 {
                                     let ip_len = pkt.len() - 14;
-                                    if let Ok(mut packet) = session.allocate_send_packet(ip_len as u16) {
+                                    if let Ok(mut packet) =
+                                        session.allocate_send_packet(ip_len as u16)
+                                    {
                                         packet.bytes_mut()[..ip_len].copy_from_slice(&pkt[14..]);
                                         session.send_packet(packet);
                                         ok += 1;
@@ -1135,7 +1269,11 @@ mod wintun_resolution_tests {
         // With no handoff and no environment variable, resolution can only be the
         // copy next to the executable (or an error): the CWD-relative probe is gone,
         // because a working directory is not a trust boundary.
-        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let candidate = exe_dir.join("wintun.dll");
         match find_wintun_dll() {
             Ok(path) => assert!(

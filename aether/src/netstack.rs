@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -20,14 +20,17 @@ use crate::error::{AetherError, Result};
 const UDP_BUF: usize = 128 * 1024;
 const UDP_META: usize = 128;
 const APP_QUEUE: usize = 256;
-/// Inbound frames copied out of the tunnel channel per wakeup.
+/// Inbound frames *copied from the tunnel channel into the RX ring* per wakeup.
 ///
-/// This bounds the *handoff* from `inbound_rx` into `device.rx`; the ring itself
-/// is separately capped at [`RX_RING`] frames / 8 MB by `push_ingress`, so the
-/// channel can never be drained into an unbounded queue. It is deliberately
-/// larger than [`MAX_INGRESS_PER_TICK`]: the two are different knobs, and the
-/// one that matters for latency is the smaller.
-const MAX_INGEST_PER_TICK: usize = 256;
+/// This is the handoff cap, not the service cap: it bounds the cheap `Vec<u8>`
+/// move out of `inbound_rx`, while [`MAX_INGRESS_PER_TICK`] bounds how many of
+/// those frames smoltcp runs through the TCP state machine in the same tick. The
+/// two differ by design (8x) and by name — they used to be `MAX_INGEST_PER_TICK`
+/// and `MAX_INGRESS_PER_TICK`, one letter apart, which read as a typo rather
+/// than as two knobs. The handoff is separately bounded by [`RX_RING`] frames /
+/// [`RX_BYTE_BUDGET`] bytes in `push_ingress`, so draining the channel can never
+/// pour into an unbounded queue; the latency-relevant number is the smaller one.
+const MAX_HANDOFF_PER_TICK: usize = 256;
 const MAX_CMDS_PER_TICK: usize = 64;
 /// App-side writes per pass. Higher than the command budget because one flow
 /// bursts many writes per command it was opened with, but still bounded so a
@@ -199,7 +202,7 @@ impl SocketClass {
 /// This is the bound behind the "bounded ingress" claim in `c151591`: it caps
 /// how many frames smoltcp will *process* per tick, and therefore how long one
 /// tick can hold `poll_egress`, the socket services and `flush_tx` off. The
-/// channel-to-ring handoff above (`MAX_INGEST_PER_TICK`) is a different, looser
+/// channel-to-ring handoff above (`MAX_HANDOFF_PER_TICK`) is a different, looser
 /// limit — moving a `Vec<u8>` between two queues costs far less than running it
 /// through the TCP state machine, which is why one is 256 and this is 32.
 const MAX_INGRESS_PER_TICK: usize = 32;
@@ -433,10 +436,7 @@ pub struct UdpConn {
 
 impl UdpConn {
     pub fn into_split(self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
-        (
-            UdpSender::new(self.id, self.data_in),
-            self.from_stack,
-        )
+        (UdpSender::new(self.id, self.data_in), self.from_stack)
     }
 }
 
@@ -494,7 +494,9 @@ impl Drop for UdpSender {
         // Taking the `Arc` out first makes this fire on the *last* handle only:
         // the SOCKS UDP resolver clones the sender, and closing per-clone tore
         // down an association that was still carrying traffic.
-        let Some(shared) = self.inner.take() else { return };
+        let Some(shared) = self.inner.take() else {
+            return;
+        };
         if std::sync::Arc::strong_count(&shared) != 1 {
             return;
         }
@@ -685,12 +687,18 @@ impl NetStack {
     /// single pool leaked slots, and `count()` over at most 512 entries is noise
     /// next to the 1 MB of buffers each admission allocates.
     fn tcp_in_class(&self, class: SocketClass) -> usize {
-        self.tcp_conns.values().filter(|st| st.class == class).count()
+        self.tcp_conns
+            .values()
+            .filter(|st| st.class == class)
+            .count()
     }
 
     /// Live UDP associations in one budget class; see [`Self::tcp_in_class`].
     fn udp_in_class(&self, class: SocketClass) -> usize {
-        self.udp_conns.values().filter(|st| st.class == class).count()
+        self.udp_conns
+            .values()
+            .filter(|st| st.class == class)
+            .count()
     }
 }
 
@@ -752,11 +760,7 @@ fn routable_prefix_v6(p: u8) -> u8 {
     }
 }
 
-fn apply_addrs(
-    iface: &mut Interface,
-    v4: Option<(Ipv4Addr, u8)>,
-    v6: Option<(Ipv6Addr, u8)>,
-) {
+fn apply_addrs(iface: &mut Interface, v4: Option<(Ipv4Addr, u8)>, v6: Option<(Ipv6Addr, u8)>) {
     // Merge: when only one family is provided, keep the other family's current addrs.
     let mut keep_v4: Option<(Ipv4Addr, u8)> = None;
     let mut keep_v6: Option<(Ipv6Addr, u8)> = None;
@@ -937,7 +941,6 @@ fn alloc_unique_port(s: &NetStack) -> Option<u16> {
     pick_free_port(&live_local_ports(&s.sockets), s.next_port, s.port_stride)
 }
 
-
 /// Destinations the tunnel must never reach, whatever a web page asks for.
 ///
 /// A local HTTP/SOCKS proxy is an amplification point: a browser can make it
@@ -1025,7 +1028,12 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     }
     let f = v6.segments();
     let from_words = |a: u16, b: u16| {
-        Ipv4Addr::new((a >> 8) as u8, (a & 0xff) as u8, (b >> 8) as u8, (b & 0xff) as u8)
+        Ipv4Addr::new(
+            (a >> 8) as u8,
+            (a & 0xff) as u8,
+            (b >> 8) as u8,
+            (b & 0xff) as u8,
+        )
     };
     if f[..4].iter().all(|&w| w == 0) && (f[4] | f[5]) == 0 && (f[6] | f[7]) != 0 {
         // `::a.b.c.d` (deprecated v4-compatible) and `::ffff:a.b.c.d` (mapped).
@@ -1101,11 +1109,7 @@ async fn run(
             // make the panic path a no-op instead of a state corruption.
             log::error!("[netstack] smoltcp poll panicked; continuing with buffers retained");
         }
-        for (name, svc) in [
-            ("service_tcp", 0u8),
-            ("service_udp", 1),
-            ("flush_tx", 2),
-        ] {
+        for (name, svc) in [("service_tcp", 0u8), ("service_udp", 1), ("flush_tx", 2)] {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match svc {
                 0 => {
                     service_tcp(&mut s);
@@ -1184,7 +1188,7 @@ enum DrainSrc {
 /// This is the command-starvation fix (T134). With `biased;` on the select, and
 /// with the ingest branch draining a whole batch before any command was looked
 /// at, a peer that kept frames arriving meant `Cmd::OpenTcp` waited behind
-/// `MAX_INGEST_PER_TICK` frames *per wakeup* — a new tab's connect queued behind
+/// `MAX_HANDOFF_PER_TICK` frames *per wakeup* — a new tab's connect queued behind
 /// the current download. Serving at most one item per source and then advancing
 /// the cursor means a concurrently-submitted command is reached on the *second*
 /// step of the first pass no matter how much ingress is pending, while the
@@ -1197,7 +1201,7 @@ struct DrainState {
 
 impl DrainState {
     const CAPS: [usize; 3] = [
-        MAX_INGEST_PER_TICK,
+        MAX_HANDOFF_PER_TICK,
         MAX_CMDS_PER_TICK,
         MAX_APPDATA_PER_TICK,
     ];
@@ -1297,12 +1301,18 @@ async fn sleep_opt(delay: Option<std::time::Duration>) {
 
 fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     match cmd {
-        Cmd::OpenTcp { dst, resp, resolver } => {
+        Cmd::OpenTcp {
+            dst,
+            resp,
+            resolver,
+        } => {
             let class = SocketClass::for_resolver(resolver);
             // Post-resolution choke point (T157): `dst` is an address here, not a
             // name, so this is the one check a DNS rebinding cannot walk around.
             if let Some(reason) = forbidden_destination(dst.ip()) {
-                let _ = resp.send(Err(format!("destination {dst} is not reachable through the tunnel: {reason}")));
+                let _ = resp.send(Err(format!(
+                    "destination {dst} is not reachable through the tunnel: {reason}"
+                )));
                 return;
             }
             if s.tcp_in_class(class) >= class.tcp_cap() {
@@ -1483,9 +1493,32 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
             };
             // Checked access: a sender racing its own `UdpClose`, or an
             // association retired by the pool, used to panic here.
-            with_udp(&mut s.sockets, handle, |sock| {
-                let _ = sock.send_slice(&data, to_ip_endpoint(dst));
-            });
+            //
+            // The result used to be discarded, which read as "sent". A refused
+            // datagram is a *loss*, not a delay — nothing above us retransmits
+            // UDP, so the resolver or the QUIC peer simply stops hearing from
+            // this flow. The counter is what makes "did this ever happen?" a
+            // question with an answer after the fact; the log line names the
+            // reason while the flow is still in front of us.
+            match with_udp(&mut s.sockets, handle, |sock| {
+                sock.send_slice(&data, to_ip_endpoint(dst))
+            }) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    let n = crate::counters::bump(&crate::counters::UDP_EGRESS_DROPPED);
+                    log::debug!(
+                        "netstack UDP {id}: dropped {} byte(s) to {dst}: {e:?} (count {n})",
+                        data.len()
+                    );
+                }
+                None => {
+                    let n = crate::counters::bump(&crate::counters::UDP_EGRESS_DROPPED);
+                    log::debug!(
+                        "netstack UDP {id}: socket gone, dropped {} byte(s) to {dst} (count {n})",
+                        data.len()
+                    );
+                }
+            }
         }
         DataIn::UdpClose(id) => {
             if let Some(st) = s.udp_conns.remove(&id) {
@@ -1555,7 +1588,8 @@ fn service_tcp(s: &mut NetStack) {
     let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
 
     for id in ids {
-        let Some((handle, was_established)) = s.tcp_conns.get(&id).map(|st| (st.handle, st.established))
+        let Some((handle, was_established)) =
+            s.tcp_conns.get(&id).map(|st| (st.handle, st.established))
         else {
             continue;
         };
@@ -1692,7 +1726,8 @@ fn service_tcp(s: &mut NetStack) {
             continue;
         }
 
-        let st_state = with_tcp(&mut s.sockets, handle, |sock| sock.state()).unwrap_or(tcp::State::Closed);
+        let st_state =
+            with_tcp(&mut s.sockets, handle, |sock| sock.state()).unwrap_or(tcp::State::Closed);
         if matches!(st_state, tcp::State::CloseWait) {
             with_tcp(&mut s.sockets, handle, |sock| sock.close());
         }
@@ -1776,13 +1811,27 @@ mod tests {
             (v4(100, 64, 0, 1), "carrier-grade NAT (100.64.0.0/10)"),
             (v4(224, 0, 0, 1), "multicast"),
             (IpAddr::V6(Ipv6Addr::LOCALHOST), "loopback (::1)"),
-            (IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)), "unique local (fc00::/7)"),
-            (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), "link-local (fe80::/10)"),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+                "unique local (fc00::/7)",
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+                "link-local (fe80::/10)",
+            ),
         ] {
             assert_eq!(forbidden_destination(addr), Some(why), "{addr}");
         }
-        for addr in [v4(93, 184, 216, 34), v4(10, 0, 0, 5), IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1))] {
-            assert_eq!(forbidden_destination(addr), None, "{addr} must be reachable");
+        for addr in [
+            v4(93, 184, 216, 34),
+            v4(10, 0, 0, 5),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert_eq!(
+                forbidden_destination(addr),
+                None,
+                "{addr} must be reachable"
+            );
         }
     }
 
@@ -1794,7 +1843,16 @@ mod tests {
     #[test]
     fn ipv4_targets_in_ipv6_form_are_refused_too() {
         let mapped = |a, b, c, d| {
-            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, (a << 8 | b) as u16, (c << 8 | d) as u16))
+            IpAddr::V6(Ipv6Addr::new(
+                0,
+                0,
+                0,
+                0,
+                0,
+                0xffff,
+                (a << 8 | b) as u16,
+                (c << 8 | d) as u16,
+            ))
         };
         let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
         for (a, b, c, d, why) in [
@@ -1818,9 +1876,7 @@ mod tests {
 
         // Deprecated v4-compatible form, and a routable host in both spellings.
         assert_eq!(
-            forbidden_destination(IpAddr::V6(Ipv6Addr::new(
-                0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe
-            ))),
+            forbidden_destination(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe))),
             Some("link-local (instance metadata)"),
             "::169.254.169.254"
         );
@@ -2058,11 +2114,19 @@ mod tests {
                 (EPHEMERAL_BASE..=65535).contains(&port),
                 "port {port} escaped the ephemeral band"
             );
-            assert!(seen.insert(port), "cycle repeated after only {} ports", seen.len());
+            assert!(
+                seen.insert(port),
+                "cycle repeated after only {} ports",
+                seen.len()
+            );
             min_delta = min_delta.min(port.wrapping_sub(prev));
             prev = port;
         }
-        assert_eq!(seen.len(), EPHEMERAL_SPAN as usize, "did not cover the band");
+        assert_eq!(
+            seen.len(),
+            EPHEMERAL_SPAN as usize,
+            "did not cover the band"
+        );
         assert!(
             min_delta >= 17,
             "consecutive allocations differed by only {min_delta} — predictable"
@@ -2248,7 +2312,7 @@ mod tests {
     #[test]
     fn cmd_not_starved_by_inbound() {
         // Five full ingest batches queued behind one `Cmd::OpenTcp`.
-        let mut queued_ingest = MAX_INGEST_PER_TICK * 5;
+        let mut queued_ingest = MAX_HANDOFF_PER_TICK * 5;
         let mut queued_cmd = 1usize;
         let mut state = DrainState::default();
         let mut steps = 0usize;
@@ -2261,7 +2325,10 @@ mod tests {
                 Some(DrainSrc::Data) => {}
             }
             steps += 1;
-            assert!(steps <= 10, "a concurrently submitted command took {steps} drain steps");
+            assert!(
+                steps <= 10,
+                "a concurrently submitted command took {steps} drain steps"
+            );
         }
         assert_eq!(queued_cmd, 0, "OpenTcp was starved by the ingest backlog");
         assert!(
@@ -2280,7 +2347,10 @@ mod tests {
                 None => break,
             }
         }
-        assert_eq!(ingested, MAX_INGEST_PER_TICK, "one pass ignored the ingest cap");
+        assert_eq!(
+            ingested, MAX_HANDOFF_PER_TICK,
+            "one pass ignored the ingest cap"
+        );
     }
 
     /// Deliver every frame one device queued into the other's ingress ring.
@@ -2324,7 +2394,14 @@ mod tests {
     fn admitted_tcp(stack: &mut NetStack, dst: SocketAddr, resolver: bool) -> bool {
         let before = stack.tcp_conns.len();
         let (tx, _rx) = oneshot::channel();
-        handle_cmd(stack, Cmd::OpenTcp { dst, resp: tx, resolver });
+        handle_cmd(
+            stack,
+            Cmd::OpenTcp {
+                dst,
+                resp: tx,
+                resolver,
+            },
+        );
         stack.tcp_conns.len() > before
     }
 
@@ -2382,7 +2459,10 @@ mod tests {
         // retiring them on its own timers, or a close racing the service loop.
         assert!(remove_socket(&mut stack.sockets, handle));
         assert!(remove_socket(&mut stack.sockets, uhandle));
-        assert!(!remove_socket(&mut stack.sockets, uhandle), "double remove reported success");
+        assert!(
+            !remove_socket(&mut stack.sockets, uhandle),
+            "double remove reported success"
+        );
 
         // Buffered traffic that must survive.
         stack.device.push_ingress(vec![0u8; 64]);
