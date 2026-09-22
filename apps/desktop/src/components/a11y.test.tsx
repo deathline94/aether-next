@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import axe from "axe-core";
+import { stubViewport } from "../testing/viewport";
 import { ActivityTab } from "./ActivityTab";
 import { ScannerTab } from "./ScannerTab";
 import { SettingsTab } from "./SettingsTab";
@@ -27,9 +28,15 @@ afterEach(() => cleanup());
 
 // jsdom has no scrolling model, so the console's `scrollIntoView` on mount — real
 // in every browser, including the WebView this ships in — is simply absent here.
+let restoreViewport: () => void;
+
 beforeAll(() => {
   Element.prototype.scrollIntoView = () => {};
+  // The endpoint panel is windowed, and axe over a list that jsdom's zero-sized
+  // viewport leaves unmounted would say nothing about the rows.
+  restoreViewport = stubViewport(420);
 });
+afterAll(() => restoreViewport());
 
 const HOURS = new Date(2026, 8, 22, 14, 15, 33).getTime();
 

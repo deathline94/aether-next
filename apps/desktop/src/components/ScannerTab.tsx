@@ -1,5 +1,6 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
 import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
@@ -86,6 +87,11 @@ function CopyIpButton({ addr }: { addr: string }) {
   );
 }
 
+/** Row height before it is measured: 12+12 padding, one line of content, 2 px of
+ *  border, plus the gap the list used to express with `gap`. */
+const ESTIMATED_ENDPOINT_PX = 56;
+const ENDPOINT_GAP_PX = 10;
+
 export function ScannerTab({
   protocol, setProtocol,
   ipScan, setIpScan,
@@ -99,29 +105,58 @@ export function ScannerTab({
   const [protoFilter, setProtoFilter] = useState<ScanProtocolFilter>("all");
   const resultsId = useId();
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   const progressPct = scanState.total > 0
     ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
     : 0;
 
-  const h3Count = endpoints.filter((e) => e.protocol.toLowerCase().includes("h3")).length;
-  const h2Count = endpoints.filter((e) => e.protocol.toLowerCase().includes("h2")).length;
-  const wgCount = endpoints.filter((e) => e.protocol.toLowerCase().includes("wireguard")).length;
+  // One pass over the run's rows per change instead of four: the counts, the
+  // filter and the list rendering each walked the array separately, so a 2 000
+  // endpoint result re-derived the same buckets on every keystroke in the panel.
+  const { h3Count, h2Count, wgCount } = useMemo(() => {
+    let h3 = 0;
+    let h2 = 0;
+    let wg = 0;
+    for (const e of endpoints) {
+      const p = e.protocol.toLowerCase();
+      if (p.includes("h3")) h3 += 1;
+      if (p.includes("h2")) h2 += 1;
+      if (p.includes("wireguard") || p.includes("wg")) wg += 1;
+    }
+    return { h3Count: h3, h2Count: h2, wgCount: wg };
+  }, [endpoints]);
 
-  const filteredEndpoints = endpoints.filter((e) => {
-    if (protoFilter === "all") return true;
-    if (protoFilter === "masque-h3") return e.protocol.toLowerCase().includes("h3");
-    if (protoFilter === "masque-h2") return e.protocol.toLowerCase().includes("h2");
-    if (protoFilter === "wireguard") return e.protocol.toLowerCase().includes("wireguard");
-    return true;
+  const filteredEndpoints = useMemo(() => {
+    if (protoFilter === "all") return endpoints;
+    // The same predicates as the counts above: a row counted under "WireGuard"
+    // has to appear when that tab is selected, or the tab lies in one direction
+    // or the other. The engine labels the same transport `wg` and `wireguard`.
+    const matches = (p: string) =>
+      protoFilter === "masque-h3"
+        ? p.includes("h3")
+        : protoFilter === "masque-h2"
+          ? p.includes("h2")
+          : p.includes("wireguard") || p.includes("wg");
+    return endpoints.filter((e) => matches(e.protocol.toLowerCase()));
+  }, [endpoints, protoFilter]);
+
+  const endpointRows = useVirtualizer({
+    count: filteredEndpoints.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => ESTIMATED_ENDPOINT_PX,
+    overscan: 8,
   });
 
-  const protoTabs: { id: ScanProtocolFilter; label: string; count: number }[] = [
-    { id: "all", label: "All Protocols", count: endpoints.length },
-    { id: "masque-h3", label: "MASQUE H3", count: h3Count },
-    { id: "masque-h2", label: "MASQUE H2", count: h2Count },
-    { id: "wireguard", label: "WireGuard", count: wgCount },
-  ];
+  const protoTabs: { id: ScanProtocolFilter; label: string; count: number }[] = useMemo(
+    () => [
+      { id: "all", label: "All Protocols", count: endpoints.length },
+      { id: "masque-h3", label: "MASQUE H3", count: h3Count },
+      { id: "masque-h2", label: "MASQUE H2", count: h2Count },
+      { id: "wireguard", label: "WireGuard", count: wgCount },
+    ],
+    [endpoints.length, h3Count, h2Count, wgCount],
+  );
 
   // `role="tablist"` is a promise about the keyboard: one stop in the tab order,
   // arrows between the tabs, and a panel each tab names. None of that was wired,
@@ -389,39 +424,68 @@ export function ScannerTab({
             id={resultsId}
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
+            ref={listRef}
             // A hundred rows in a fixed-height panel cannot be reached without this:
             // the list was mouse-only, so PageUp and the arrows scrolled the page
             // behind it instead of the endpoints the tab just promised.
             tabIndex={0}
           >
-            {filteredEndpoints.map((item) => {
-              const { tierClass, badgeText, text } = rttBadge(item);
-              return (
-                <div className="discovered-row" key={`${item.addr}|${item.protocol}`}>
-                  <div className="discovered-info">
-                    <CopyIpButton addr={item.addr} />
-                    <code className="tabular-nums">{item.addr}</code>
-                    <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
-                  </div>
+            {/* The whole result of a deep scan used to be in the DOM at once: a
+                thorough run streams hundreds of rows, and each one is a button, a
+                copy control and a badge. Only the visible window is mounted now,
+                positioned inside a spacer of the full height so the scrollbar still
+                describes the whole list. */}
+            <div
+              style={{ height: endpointRows.getTotalSize(), position: "relative", width: "100%" }}
+            >
+              {endpointRows.getVirtualItems().map((row) => {
+                const item = filteredEndpoints[row.index];
+                if (!item) return null;
+                const { tierClass, badgeText, text } = rttBadge(item);
+                return (
+                  <div
+                    key={`${item.addr}|${item.protocol}`}
+                    data-index={row.index}
+                    ref={endpointRows.measureElement}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${row.start}px)`,
+                      // The 10 px gap between rows lives inside the measured box, so
+                      // the stride the list is laid out on is the stride the rows
+                      // actually occupy.
+                      paddingBottom: ENDPOINT_GAP_PX,
+                    }}
+                  >
+                    <div className="discovered-row">
+                      <div className="discovered-info">
+                        <CopyIpButton addr={item.addr} />
+                        <code className="tabular-nums">{item.addr}</code>
+                        <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
+                      </div>
 
-                  <div className="discovered-actions">
-                    <span className={`rtt-badge ${tierClass}`} title={badgeText}>
-                      <span className="rtt-dot" />
-                      <span className="tabular-nums">{text}</span>
-                    </span>
-                    <button
-                      type="button"
-                      className="connect-direct-btn"
-                      disabled={connectBusy || active}
-                      title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
-                      onClick={() => connectDirect(item)}
-                    >
-                      Connect Direct
-                    </button>
+                      <div className="discovered-actions">
+                        <span className={`rtt-badge ${tierClass}`} title={badgeText}>
+                          <span className="rtt-dot" />
+                          <span className="tabular-nums">{text}</span>
+                        </span>
+                        <button
+                          type="button"
+                          className="connect-direct-btn"
+                          disabled={connectBusy || active}
+                          title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
+                          onClick={() => connectDirect(item)}
+                        >
+                          Connect Direct
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
         )}
       </section>

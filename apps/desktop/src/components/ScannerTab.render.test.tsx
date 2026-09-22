@@ -1,12 +1,22 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ScannerTab } from "./ScannerTab";
 import { SCAN_MAX_CONCURRENCY } from "../../../../packages/ui/src";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint } from "../types";
+import { stubViewport } from "../testing/viewport";
 
 afterEach(() => cleanup());
+
+// The endpoint panel is windowed, and a windowed list with a 0x0 viewport mounts
+// nothing at all - so without a measured height every row assertion below would
+// pass against an empty DOM.
+let restoreViewport: () => void;
+beforeAll(() => {
+  restoreViewport = stubViewport(420);
+});
+afterAll(() => restoreViewport());
 
 function renderTab(over: Partial<Parameters<typeof ScannerTab>[0]> = {}) {
   const props = {
@@ -96,5 +106,34 @@ describe("ScannerTab probe parameters", () => {
     });
     expect(screen.getByText("not measured")).toBeTruthy();
     expect(screen.queryByText("HIGH LATENCY")).toBeNull();
+  });
+
+  it("mounts a viewport-sized window of a 2 000-endpoint result, not 2 000 rows", () => {
+    // T171/T185's measured half: the heading has to keep telling the truth about
+    // the whole result while the DOM carries only what can be seen. A deep scan
+    // used to put every row - each with a copy button and a Connect button - in
+    // the tree at once.
+    const many: DiscoveredEndpoint[] = Array.from({ length: 2000 }, (_, i) => ({
+      addr: `162.159.${Math.floor(i / 250)}.${i % 250}:443`,
+      rtt: `${10 + (i % 90)} ms`,
+      rttMs: 10 + (i % 90),
+      protocol: "masque-h3",
+    }));
+    renderTab({ endpoints: many });
+
+    const mounted = document.querySelectorAll(".discovered-row");
+    expect(mounted.length).toBeGreaterThan(0);
+    expect(mounted.length).toBeLessThan(60);
+    expect(mounted.length).toBeLessThan(many.length / 20);
+    // The spacer carries the full height, so the scrollbar still describes 2 000.
+    // (row -> absolutely positioned wrapper -> spacer of the total height)
+    const spacer = mounted[0]?.parentElement?.parentElement as HTMLElement | undefined;
+    const totalPx = Number.parseInt(spacer?.style.height ?? "0", 10);
+    expect(totalPx).toBeGreaterThan(2000 * 50);
+    // Measured rows can differ from the estimate, so this only rules out the
+    // collapse that would make the panel unscrollable: a spacer no taller than a
+    // handful of rows.
+    expect(totalPx).toBeLessThan(2000 * 80);
+    expect(screen.getByText(/Discovered Gateways \(2000\)/)).toBeTruthy();
   });
 });
