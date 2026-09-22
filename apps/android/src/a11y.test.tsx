@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 import axe from "axe-core";
+import { stubViewport } from "./testing/viewport";
 import { ActivityTab } from "./components/ActivityTab";
 import { ScannerTab } from "./components/ScannerTab";
 import { SettingsTab } from "./components/SettingsTab";
@@ -22,10 +23,15 @@ import type { DiscoveredEndpoint, LogEntry, LogFilter, ScanState } from "./types
 afterEach(() => cleanup());
 
 // jsdom has no scrolling model; `scrollIntoView` exists in every browser this
-// ships in, including the WebView.
+// ships in, including the WebView. The viewport stub matters for the same
+// reason as on desktop: the endpoint panel is windowed, and axe over a list that
+// an unmeasured viewport leaves empty proves nothing about the rows.
+let restoreViewport: () => void;
 beforeAll(() => {
   Element.prototype.scrollIntoView = () => {};
+  restoreViewport = stubViewport(420);
 });
+afterAll(() => restoreViewport());
 
 const TS = new Date(2026, 8, 22, 14, 15, 33).getTime();
 

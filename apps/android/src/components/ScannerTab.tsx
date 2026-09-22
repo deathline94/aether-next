@@ -1,5 +1,6 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
 // The ceiling the engine will actually run, not the number the slider was set to:
@@ -14,6 +15,10 @@ import {
 } from "../../../../packages/ui/src";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
+
+/** One row plus its gap: 12+12 padding, one line of content, 2 px of border, 10 px stride. */
+const ESTIMATED_ENDPOINT_PX = 56;
+const ENDPOINT_GAP_PX = 10;
 
 interface ScannerTabProps {
   protocol: "masque-h3" | "masque-h2" | "wireguard";
@@ -81,6 +86,7 @@ export function ScannerTab({
   connectDirect, connectBusy,
 }: ScannerTabProps) {
   const [protoFilter, setProtoFilter] = useState<ProtoFilter>("all");
+  const listRef = useRef<HTMLDivElement | null>(null);
 
   const filteredEndpoints = useMemo(() => {
     if (protoFilter === "all") return endpoints;
@@ -118,6 +124,13 @@ export function ScannerTab({
   ];
 
   const resultsId = useId();
+
+  const endpointRows = useVirtualizer({
+    count: filteredEndpoints.length,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => ESTIMATED_ENDPOINT_PX,
+    overscan: 8,
+  });
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   // `role="tablist"` is a promise about the keyboard: one stop in the tab order,
@@ -386,37 +399,60 @@ export function ScannerTab({
             id={resultsId}
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
+            ref={listRef}
             // A hundred rows in a fixed-height panel cannot be reached without this.
             tabIndex={0}
           >
-            {filteredEndpoints.map((item) => {
-              const { tierClass, badgeText } = getRttTier(item.rttMs);
-              return (
-                <div className="discovered-row" key={`${item.addr}|${item.protocol}`}>
-                  <div className="discovered-info">
-                    <CopyIpButton addr={item.addr} />
-                    <code className="tabular-nums">{item.addr}</code>
-                    <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
-                  </div>
+            {/* Same window as the desktop panel: a thorough scan streams hundreds
+                of endpoints and each row is a copy control, a badge and a Connect
+                button. Only the visible window is mounted, inside a spacer of the
+                full height so the scrollbar still describes the whole result. */}
+            <div style={{ height: endpointRows.getTotalSize(), position: "relative", width: "100%" }}>
+              {endpointRows.getVirtualItems().map((row) => {
+                const item = filteredEndpoints[row.index];
+                if (!item) return null;
+                const { tierClass, badgeText } = getRttTier(item.rttMs);
+                return (
+                  <div
+                    key={`${item.addr}|${item.protocol}`}
+                    data-index={row.index}
+                    ref={endpointRows.measureElement}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${row.start}px)`,
+                      paddingBottom: ENDPOINT_GAP_PX,
+                    }}
+                  >
+                    <div className="discovered-row">
+                      <div className="discovered-info">
+                        <CopyIpButton addr={item.addr} />
+                        <code className="tabular-nums">{item.addr}</code>
+                        <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
+                      </div>
 
-                  <div className="discovered-actions">
-                    <span className={`rtt-badge ${tierClass}`} title={badgeText}>
-                      <span className="rtt-dot" />
-                      <span className="tabular-nums">{item.rtt}</span>
-                    </span>
-                    <button
-                      type="button"
-                      className="connect-direct-btn"
-                      disabled={connectBusy || active}
-                      title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
-                      onClick={() => connectDirect(item)}
-                    >
-                      Connect Direct
-                    </button>
+                      <div className="discovered-actions">
+                        <span className={`rtt-badge ${tierClass}`} title={badgeText}>
+                          <span className="rtt-dot" />
+                          <span className="tabular-nums">{item.rtt}</span>
+                        </span>
+                        <button
+                          type="button"
+                          className="connect-direct-btn"
+                          disabled={connectBusy || active}
+                          title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
+                          onClick={() => connectDirect(item)}
+                        >
+                          Connect Direct
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
         )}
       </section>

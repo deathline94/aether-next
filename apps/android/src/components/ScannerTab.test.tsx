@@ -1,11 +1,20 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ScannerTab } from "./ScannerTab";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint } from "../types";
+import { stubViewport } from "../testing/viewport";
 
 afterEach(() => cleanup());
+
+// The panel is windowed, so an unmeasured viewport mounts no rows at all and a
+// row assertion would pass against an empty DOM.
+let restoreViewport: () => void;
+beforeAll(() => {
+  restoreViewport = stubViewport(420);
+});
+afterAll(() => restoreViewport());
 
 const ENDPOINTS: DiscoveredEndpoint[] = [
   { addr: "162.159.193.1:443", rtt: "18 ms", rttMs: 18, protocol: "masque-h3" },
@@ -73,5 +82,24 @@ describe("android protocol filter tabs", () => {
     fireEvent.keyDown(screen.getAllByRole("tab")[1]!, { key: "End" });
     expect(screen.getAllByRole("tab")[3]?.getAttribute("aria-selected")).toBe("true");
     expect(screen.getByText("192.168.0.9:500")).toBeTruthy();
+  });
+
+  it("mounts a viewport-sized window of a 2 000-endpoint result", () => {
+    // The phone runs the same scan the desktop does, on a slower CPU and with no
+    // render cap on this list: every row was mounted, each with two buttons.
+    const many: DiscoveredEndpoint[] = Array.from({ length: 2000 }, (_, i) => ({
+      addr: `162.159.${Math.floor(i / 250)}.${i % 250}:443`,
+      rtt: `${10 + (i % 90)} ms`,
+      rttMs: 10 + (i % 90),
+      protocol: "masque-h3",
+    }));
+    renderTab({ endpoints: many });
+
+    const mounted = document.querySelectorAll(".discovered-row");
+    expect(mounted.length).toBeGreaterThan(0);
+    expect(mounted.length).toBeLessThan(60);
+    const spacer = mounted[0]?.parentElement?.parentElement as HTMLElement | undefined;
+    const totalPx = Number.parseInt(spacer?.style.height ?? "0", 10);
+    expect(totalPx).toBeGreaterThan(2000 * 50);
   });
 });
