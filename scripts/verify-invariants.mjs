@@ -1171,6 +1171,119 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'declarations-live-in-a-block',
+    invariant: 'BC-11',
+    summary: 'every CSS declaration sits inside a rule block',
+    scan(api) {
+      /*
+       * A custom property written between two rules is not a token: it is
+       * invalid CSS that every text scanner in this file still reads as
+       * defined, so `var(--fg)` resolves to nothing on screen while all
+       * nineteen of the colour gates go green. This gate exists because a
+       * script added ~100 tokens that way, and nothing else noticed.
+       */
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const code = blankComments(api.read(f));
+        let depth = 0;
+        const at = (idx) => code.slice(0, idx).split('\n').length;
+        // Only custom properties are checked, and only at depth 0: `--x:` can be
+        // nothing but a declaration, whereas a bare `color:` at depth 0 could be
+        // part of a selector or an @media condition and would read as a false
+        // positive. That is enough to catch the defect this gate exists for.
+        for (const m of code.matchAll(/[{}]|(--[\w-]+)\s*:/g)) {
+          if (m[0] === '{') { depth += 1; continue; }
+          if (m[0] === '}') { depth -= 1; continue; }
+          if (depth === 0) {
+            v.push(`${rel(f)}:${at(m.index)} ${m[1]}: is declared outside any rule block, so it does nothing`);
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return { file: 'packages/ui/__selftest__.css', content: '.a{color:red}\n--loose: #123456;\n' };
+    },
+  },
+  {
+    name: 'colour-single-source',
+    invariant: 'BC-11',
+    summary: 'no colour literal in an app sheet outside the fenced token block',
+    scan(api) {
+      /*
+       * Contract U-B5 says the tokens file is the sole colour source, and the
+       * tree disagreed: 408 chromatic literals sat in the two app sheets, of
+       * which the interesting part is what they had already become -- `#38bdf8`
+       * and `rgba(56,189,248,.x)` painted a blue the palette had retired to
+       * `#5cc8ff` in 20 places, and one sheet's primary text was `#edf2f5`
+       * while the emphasis step was `#ffffff` in 62. A hue spelled 23 different
+       * ways never gets changed, so the palette comment claiming it had been
+       * "reconciled" was describing an intention rather than the CSS.
+       *
+       * Achromatic alphas (r == g == b) stay allowed: a black shadow or a white
+       * overlay carries no hue, so there is nothing for it to drift from.
+       */
+      const v = [];
+      for (const f of api.files('apps', /\.css$/)) {
+        const raw = api.read(f);
+        const outside = raw
+          .split('/*==AETHER-TOKENS-START==*/')
+          .map((part) => part.split('/*==AETHER-TOKENS-END==*/').pop())
+          .join('');
+        const code = blankComments(outside);
+        for (const m of code.matchAll(/#[0-9a-fA-F]{3,8}\b|\brgba?\([^)]*\)|\bhsla?\([^)]*\)/g)) {
+          const p = parseColour(m[0]);
+          if (!p) {
+            v.push(`${locate(f, code, m.index)} ${m[0]} is a colour notation this gate cannot read; write it as a token`);
+            continue;
+          }
+          if (p[0] === p[1] && p[1] === p[2]) continue;
+          v.push(`${locate(f, code, m.index)} ${m[0]} spells a hue in the sheet instead of the palette`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return { file: 'apps/desktop/src/__selftest__.css', content: '.drift{color:#38bdf8}\n' };
+    },
+  },
+  {
+    name: 'token-alpha-triples',
+    invariant: 'BC-11',
+    summary: 'every --<family>-aNN token is still its family hue at that alpha',
+    scan(api) {
+      // The alpha ladder is spelled out as `rgba(0, 240, 138, 0.25)` rather than
+      // derived, because the alternative is a CSS function newer than anything
+      // else in these sheets and an Android WebView nobody can force to update.
+      // That trade only holds while a gate keeps every rung tied to its hue:
+      // change --emerald without the ladder and this fails, instead of quietly
+      // shipping emerald text under sky-blue glows.
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const tokens = sheetColourTokens(blankComments(api.read(f)));
+        for (const [name, value] of Object.entries(tokens.resolved)) {
+          const m = name.match(/^--(.+)-a(\d{2,3})$/);
+          if (!m) continue;
+          const family = tokens.resolved[`--${m[1]}`];
+          if (!family) continue;
+          const hue = parseColour(expandVars(family, tokens));
+          const rung = parseColour(value);
+          if (!hue || !rung) continue;
+          if (rung[0] !== hue[0] || rung[1] !== hue[1] || rung[2] !== hue[2]) {
+            v.push(`${rel(f)}:0 ${name} = ${value} is no longer --${m[1]} (${family})`);
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'packages/ui/__selftest__.tokens.css',
+        content: ':root{--emerald:#00f08a;--emerald-a25:rgba(56, 189, 248, 0.25);}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

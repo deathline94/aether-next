@@ -139,6 +139,124 @@
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
   --duration-fast: 150ms;
+
+  /* Inks. --fg is body text, --fg-bright the emphasis step; the rest are the
+   per-context greys the log stream and the mono layers use. */
+  --fg: #edf2f5;
+  --fg-bright: #ffffff;
+  --fg-cyan: #e0f2fe;
+  --fg-debug: #94a3b8;
+  --fg-hover: #dce4e8;
+  --fg-info: #d8e2ec;
+  --fg-lock: #ebd887;
+  --fg-mono: #d1dde5;
+  --fg-mono-dim: #cbd8e1;
+  --fg-on-emerald-bright: #05140d;
+  --fg-on-emerald-face: #e2faee;
+  --fg-violet: #c4b5fd;
+  --fg-warn: #fef08a;
+
+  /* Substrates: the faces a control or a stage is drawn on. Named after
+   the thing they are the face *of*, because that is the only reason each
+   value exists and the only thing a reader can check it against. */
+  --brand-mark-bottom: #0c1b14;
+  --brand-mark-top: #153324;
+  --btn-emerald-face: #143525;
+  --btn-emerald-face-hover: #1c4933;
+  --card-active-hover: #101a22;
+  --card-hover: #131c26;
+  --chassis-mid: #0d1217;
+  --chassis-top: #1a222c;
+  --chrome-bg: #0a0e13;
+  --cta-connect-bottom: #0d2319;
+  --cta-connect-hover-bottom: #102d20;
+  --cta-connect-hover-top: #1a4730;
+  --cta-connect-top: #143825;
+  --cta-disconnect-bottom: #25110f;
+  --cta-disconnect-hover-bottom: #2f1513;
+  --cta-disconnect-hover-top: #4d221e;
+  --cta-disconnect-top: #3d1b18;
+  --dock-bg: #070a0e;
+  --emerald-mid: #00ab60;
+  --face-connected-bottom: #0d2116;
+  --face-connected-top: #163625;
+  --face-stop-bottom: #240e0c;
+  --face-stop-top: #3c1916;
+  --knob-idle: #64748b;
+  --scope-bg: #06090c;
+  --screen-bg: #040608;
+  --stage-bottom: #050709;
+  --stage-mid: #090c10;
+  --stage-mid-connected: #090e0c;
+  --stage-mid-connecting: #0d0c08;
+  --stage-mid-error: #0f0a09;
+  --stage-top: #0e1319;
+  --stage-top-connected: #0f1814;
+  --stage-top-connecting: #16150e;
+  --stage-top-error: #1b0f0e;
+  --toggle-off-face: #090d12;
+  --toggle-on-face: #113622;
+
+  /* Surfaces with transparency, for floating chrome (topbar, save dock). */
+  --bg-app-a82: rgba(7, 9, 11, 0.82);
+  --bg-sidebar-a92: rgba(9, 12, 15, 0.92);
+  --bg-sidebar-a94: rgba(9, 12, 15, 0.94);
+  --bg-sidebar-a96: rgba(9, 12, 15, 0.96);
+  --panel-a85: rgba(13, 17, 22, 0.85);
+
+  /* Alpha ladder per palette hue: every translucent accent the UI
+   * paints, spelled once so a hue change touches one line. The
+   * `token-alpha-triples` gate keeps each one on its hue. */
+  --blue-a08: rgba(92, 200, 255, 0.08);
+  --blue-a12: rgba(92, 200, 255, 0.12);
+  --blue-a25: rgba(92, 200, 255, 0.25);
+  --blue-a28: rgba(92, 200, 255, 0.28);
+  --blue-a30: rgba(92, 200, 255, 0.3);
+  --blue-a35: rgba(92, 200, 255, 0.35);
+  --coral-a02: rgba(255, 92, 92, 0.02);
+  --coral-a05: rgba(255, 92, 92, 0.05);
+  --coral-a06: rgba(255, 92, 92, 0.06);
+  --coral-a08: rgba(255, 92, 92, 0.08);
+  --coral-a140: rgba(255, 92, 92, 0.14);
+  --coral-a18: rgba(255, 92, 92, 0.18);
+  --coral-a20: rgba(255, 92, 92, 0.2);
+  --coral-a25: rgba(255, 92, 92, 0.25);
+  --coral-a30: rgba(255, 92, 92, 0.3);
+  --emerald-a04: rgba(0, 240, 138, 0.04);
+  --emerald-a05: rgba(0, 240, 138, 0.05);
+  --emerald-a06: rgba(0, 240, 138, 0.06);
+  --emerald-a070: rgba(0, 240, 138, 0.07);
+  --emerald-a08: rgba(0, 240, 138, 0.08);
+  --emerald-a09: rgba(0, 240, 138, 0.09);
+  --emerald-a10: rgba(0, 240, 138, 0.1);
+  --emerald-a15: rgba(0, 240, 138, 0.15);
+  --emerald-a16: rgba(0, 240, 138, 0.16);
+  --emerald-a18: rgba(0, 240, 138, 0.18);
+  --emerald-a20: rgba(0, 240, 138, 0.2);
+  --emerald-a22: rgba(0, 240, 138, 0.22);
+  --emerald-a25: rgba(0, 240, 138, 0.25);
+  --emerald-a280: rgba(0, 240, 138, 0.28);
+  --emerald-a30: rgba(0, 240, 138, 0.3);
+  --emerald-a35: rgba(0, 240, 138, 0.35);
+  --emerald-a40: rgba(0, 240, 138, 0.4);
+  --emerald-a50: rgba(0, 240, 138, 0.5);
+  --emerald-a60: rgba(0, 240, 138, 0.6);
+  --emerald-a70: rgba(0, 240, 138, 0.7);
+  --violet-a140: rgba(167, 139, 250, 0.14);
+  --violet-a30: rgba(167, 139, 250, 0.3);
+  --yellow-a02: rgba(250, 204, 21, 0.02);
+  --yellow-a06: rgba(250, 204, 21, 0.06);
+  --yellow-a070: rgba(250, 204, 21, 0.07);
+  --yellow-a08: rgba(250, 204, 21, 0.08);
+  --yellow-a10: rgba(250, 204, 21, 0.1);
+  --yellow-a140: rgba(250, 204, 21, 0.14);
+  --yellow-a15: rgba(250, 204, 21, 0.15);
+  --yellow-a20: rgba(250, 204, 21, 0.2);
+  --yellow-a25: rgba(250, 204, 21, 0.25);
+  --yellow-a30: rgba(250, 204, 21, 0.3);
+  --yellow-a35: rgba(250, 204, 21, 0.35);
+  --yellow-a40: rgba(250, 204, 21, 0.4);
+  --yellow-a50: rgba(250, 204, 21, 0.5);
 }
 
 /*
@@ -158,4 +276,5 @@ option:disabled { color: var(--muted); }
   background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
   color: var(--bg-app);
 }
+
 /*==SHARED-END==*/
