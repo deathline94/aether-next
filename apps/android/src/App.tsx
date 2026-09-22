@@ -8,13 +8,34 @@ import "@fontsource-variable/geist-mono";
 import "./App.css";
 import { ActivityTab } from "./components/ActivityTab";
 import { ConnectionTab } from "./components/ConnectionTab";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ScannerTab } from "./components/ScannerTab";
 import { SettingsTab } from "./components/SettingsTab";
 import { useLogs } from "./hooks/useLogs";
 import { useOnline } from "./hooks/useOnline";
 import { useRuntime } from "./hooks/useRuntime";
 import { useScanner } from "./hooks/useScanner";
-import type { DiscoveredEndpoint, View } from "./types";
+import type { DiscoveredEndpoint, LogFilter, RuntimeState, Settings, View } from "./types";
+
+/**
+ * The state a tab's crash can plausibly be blamed on - see the desktop `App.tsx`,
+ * which this mirrors deliberately. The phone used to mount one boundary in
+ * `main.tsx` with no reset keys, so a view that threw on a bad session frame
+ * offered a "Try again" that re-rendered the same input and threw again, and the
+ * only way back was reloading the WebView.
+ */
+function tabResetKeys(view: View, runtime: RuntimeState, settings: Settings, logFilter: LogFilter) {
+  switch (view) {
+    case "home":
+      return [runtime, settings.protocol, settings.transport, settings.routingMode];
+    case "scanner":
+      return [settings.protocol, runtime.status];
+    case "settings":
+      return [settings, runtime.status];
+    case "logs":
+      return [logFilter, runtime.status];
+  }
+}
 
 // One definition per view — label + eyebrow copy live together so they can't drift.
 const navigation: { id: View; label: string; eyebrow: string; icon: typeof Radio }[] = [
@@ -118,7 +139,7 @@ function App() {
             <div className="beacon-info">
               <div className="beacon-header">
                 <strong className="beacon-status-text">{statusText}</strong>
-                <span className="beacon-tag">{connected ? "ACTIVE" : running ? "HANDSHAKE" : runtime.status === "error" ? "ALERT" : "STANDBY"}</span>
+                <span className="beacon-tag">{RUNTIME_STATUS_TAGS[runtime.status]}</span>
               </div>
               <span className="beacon-detail" title={runtime.detail}>{runtime.detail || "System Ready"}</span>
             </div>
@@ -145,49 +166,61 @@ function App() {
         </header>
 
         {view === "home" && (
-          <ConnectionTab
-            settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
-            connected={connected} running={running} settingsLocked={settingsLocked}
-            settingsLoaded={settingsLoaded} admin={admin} online={online}
-            testResult={testResult} appVersion={appVersion}
-            toggleConnection={toggleConnection} patchSettings={patchSettings}
-            runTest={runTest} dismissError={dismissError} appendLog={appendLog}
-          />
+          <ErrorBoundary label="Connection tab" resetKeys={tabResetKeys("home", runtime, settings, logFilter)}>
+            <ConnectionTab
+              settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
+              connected={connected} running={running} settingsLocked={settingsLocked}
+              settingsLoaded={settingsLoaded} admin={admin} online={online}
+              testResult={testResult} appVersion={appVersion}
+              toggleConnection={toggleConnection} patchSettings={patchSettings}
+              runTest={runTest} dismissError={dismissError} appendLog={appendLog}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "scanner" && (
-          <ScannerTab
-            protocol={scanner.protocol} setProtocol={scanner.setProtocol}
-            ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
-            concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
-            timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
-            noize={scanner.noize} setNoize={scanner.setNoize}
-            endpoints={scanner.endpoints} active={scanner.active}
-            scanState={scanner.scanState} busy={scanner.busy}
-            startScan={scanner.startScan} stopScan={scanner.stopScan}
-            connectDirect={connectDirect} connectBusy={busy}
-          />
+          <ErrorBoundary label="Scanner tab" resetKeys={tabResetKeys("scanner", runtime, settings, logFilter)}>
+            <ScannerTab
+              protocol={scanner.protocol} setProtocol={scanner.setProtocol}
+              ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
+              concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
+              timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
+              noize={scanner.noize} setNoize={scanner.setNoize}
+              endpoints={scanner.endpoints} active={scanner.active}
+              scanState={scanner.scanState} busy={scanner.busy}
+              startScan={scanner.startScan} stopScan={scanner.stopScan}
+              connectDirect={connectDirect} connectBusy={busy}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "settings" && (
-          <SettingsTab
-            settings={settings} settingsLocked={settingsLocked}
-            settingsLoaded={settingsLoaded}
-            settingsLoadError={settingsLoadError}
-            retrySettings={retrySettings}
-            saved={saved} saveError={saveError} admin={admin}
-            patchSettings={patchSettings}
-          />
+          <ErrorBoundary
+            label="Settings tab"
+            resetKeys={tabResetKeys("settings", runtime, settings, logFilter)}
+            onRetry={() => void retrySettings()}
+          >
+            <SettingsTab
+              settings={settings} settingsLocked={settingsLocked}
+              settingsLoaded={settingsLoaded}
+              settingsLoadError={settingsLoadError}
+              retrySettings={retrySettings}
+              saved={saved} saveError={saveError} admin={admin}
+              patchSettings={patchSettings}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "logs" && (
-          <ActivityTab
-            visibleLogs={visibleLogs} hasMore={hasMore}
-            filterCounts={filterCounts} logFilter={logFilter} setLogFilter={setLogFilter}
-            logEndRef={logEndRef} autoScroll={autoScroll} setAutoScroll={setAutoScroll}
-            exportLogs={exportLogs} clearLogs={clearLogs}
-            scanState={scanner.scanState} status={runtime.status}
-          />
+          <ErrorBoundary label="Activity tab" resetKeys={tabResetKeys("logs", runtime, settings, logFilter)}>
+            <ActivityTab
+              visibleLogs={visibleLogs} hasMore={hasMore}
+              filterCounts={filterCounts} logFilter={logFilter} setLogFilter={setLogFilter}
+              logEndRef={logEndRef} autoScroll={autoScroll} setAutoScroll={setAutoScroll}
+              exportLogs={exportLogs} clearLogs={clearLogs}
+              scanState={scanner.scanState} status={runtime.status}
+            />
+          </ErrorBoundary>
         )}
       </section>
     </main>

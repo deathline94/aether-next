@@ -1,27 +1,11 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { resetKeysChanged } from "../../../../packages/ui/src";
 
-/**
- * Has anything the boundary is keyed on actually changed?
- *
- * Extracted and exported because this comparison — not React's error plumbing —
- * is the part that decides whether a crashed tab comes back when the user switches
- * away and returns, or when a settings reload lands. The boundary itself is
- * deliberately untested: under React 19 + jsdom a child that throws during render
- * is rethrown out of `act()` and the tree is unmounted, so the fallback is not
- * observable in a unit test (see specs/015 T186). Proving the recovery path needs a
- * real browser context.
- */
-export function resetKeysChanged(
-  previous: readonly unknown[] | undefined,
-  next: readonly unknown[] | undefined,
-): boolean {
-  if (previous === undefined || next === undefined) {
-    return previous !== next;
-  }
-  if (previous === next) return false;
-  if (previous.length !== next.length) return true;
-  return previous.some((value, index) => !Object.is(value, next[index]));
-}
+// `resetKeysChanged` lives in the shared package with the other rule both UIs
+// need: the boundary's fallback cannot be rendered in jsdom (React 19 rethrows a
+// rendering child out of `act()` and unmounts the tree, so T186's recovery path
+// needs a real browser), while the comparison that decides recovery is a pure
+// function and is tested as one.
 
 interface ErrorBoundaryState {
   error: Error | null;

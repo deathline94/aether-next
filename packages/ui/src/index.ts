@@ -166,3 +166,26 @@ export function nextOptionIndex(current: number, key: string, length: number): n
       return null;
   }
 }
+
+/**
+ * Has anything the error boundary is keyed on actually changed?
+ *
+ * Both apps mount one boundary per tab, and this comparison - not React's error
+ * plumbing - decides whether a crashed view comes back when the user switches
+ * tabs and returns, or when a settings reload lands. It lives here because the
+ * boundary's *render* cannot be unit-tested at all: under React 19 + jsdom a
+ * child that throws during render is rethrown out of `act()` and the tree
+ * unmounts, so the fallback is not observable (spec 015, T186). The logic that
+ * can be observed is this function, so that is the part with one owner.
+ */
+export function resetKeysChanged(
+  previous: readonly unknown[] | undefined,
+  next: readonly unknown[] | undefined,
+): boolean {
+  if (previous === undefined || next === undefined) {
+    return previous !== next;
+  }
+  if (previous === next) return false;
+  if (previous.length !== next.length) return true;
+  return previous.some((value, index) => !Object.is(value, next[index]));
+}

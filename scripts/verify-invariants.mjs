@@ -1391,6 +1391,84 @@ const GATES = [
     },
   },
   {
+    name: 'frontend-fork-parity',
+    invariant: 'BC-13',
+    summary: 'files that exist in both frontends may not drift further apart than recorded',
+    scan(api) {
+      /*
+       * FR-037 wants one shared source; the tree has thirteen files copied into
+       * both apps, and the reason every UI fix in this project has had to be
+       * applied twice (and, historically, was applied once) is that pair. The
+       * copies cannot all be merged yet: `react` resolves only inside each app's
+       * node_modules, so a JSX component placed in packages/ui does not typecheck
+       * or bundle - which is why `components/ui.tsx` and the error boundary are
+       * still per-app twins rather than imports.
+       *
+       * So this is a ratchet, not a promise: each file's code-line identity is
+       * recorded as it stands, and a change may only raise it. Drift below the
+       * line means someone edited one app's copy of a rule and not the other -
+       * the exact move that produced the missing keyboard parity (T195), the
+       * forked scanner verdict, and the phone's unguarded error boundary.
+       */
+      const BASELINE = new Map([
+        ['App.tsx', 66],
+        ['components/ActivityTab.tsx', 87],
+        ['components/ConnectionTab.tsx', 71],
+        ['components/ErrorBoundary.tsx', 100],
+        ['components/ScannerTab.tsx', 80],
+        ['components/SettingsTab.tsx', 72],
+        ['components/ui.tsx', 100],
+        ['hooks/useLogs.ts', 29],
+        ['hooks/useRuntime.ts', 60],
+        ['hooks/useScanner.ts', 53],
+        ['ipcError.ts', 63],
+        ['main.tsx', 67],
+        ['types.ts', 50],
+        // Test plumbing, not shipped surface: `packages/ui` deliberately carries
+        // no stubs (see the header of either copy), so this pair stays copied -
+        // and 100 here means the two copies' code may never diverge.
+        ['testing/viewport.ts', 100],
+      ]);
+      const codeLines = (text) => new Set(text.split('\n').map((l) => l.trim()).filter((l) => l && !/^(\/\/|\/\*|\*)/.test(l)));
+      const listApp = (dir) => api.files(dir, /\.(ts|tsx)$/).filter((f) => !/\.test\.|\.d\.ts$/.test(f));
+      const v = [];
+      let compared = 0;
+      for (const f of listApp('apps/desktop/src')) {
+        const relPath = rel(f).replace('apps/desktop/src/', '');
+        const twin = `apps/android/src/${relPath}`;
+        let twinAbs;
+        try {
+          twinAbs = join(ROOT, twin);
+          if (!statSync(twinAbs).isFile()) continue;
+        } catch {
+          continue;
+        }
+        compared += 1;
+        const a = codeLines(api.read(f));
+        const b = codeLines(api.read(twinAbs));
+        let shared = 0;
+        for (const line of b) if (a.has(line)) shared += 1;
+        const identity = Math.round((100 * shared) / Math.max(a.size, b.size));
+        const floor = BASELINE.get(relPath);
+        if (floor === undefined) {
+          v.push(`${twin}: newly forked from apps/desktop/src/${relPath} with ${identity}% shared code - share it through packages/ui, or record the pair deliberately in this gate's baseline`);
+        } else if (identity < floor) {
+          v.push(`${relPath}: the two frontends now share ${identity}% of their code lines, down from the ${floor}% baseline - sync the change into both apps, or move the rule into packages/ui`);
+        }
+      }
+      if (compared < BASELINE.size) {
+        v.push(`frontend-fork-parity: only ${compared} of the ${BASELINE.size} recorded forked pairs were read, so the ratchet is not watching them all`);
+      }
+      return v;
+    },
+    inject() {
+      return [
+        { file: 'apps/desktop/src/App.tsx', content: 'export const x = 1;\nexport const y = 2;\nexport const z = 3;\n' },
+        { file: 'apps/android/src/App.tsx', content: 'export const a = 10;\nexport const b = 20;\nexport const c = 30;\n' },
+      ];
+    },
+  },
+  {
     name: 'colour-single-source',
     invariant: 'BC-11',
     summary: 'no colour literal in an app sheet outside the fenced token block',
