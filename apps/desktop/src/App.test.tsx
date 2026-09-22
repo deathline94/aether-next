@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import App from "./App";
+import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
 import type { Settings } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -138,5 +139,69 @@ describe("App navigation shortcuts", () => {
     input.blur();
     fireEvent.keyDown(window, { key: "2" });
     await screen.findByText(/Cloudflare Edge Scanner/);
+  });
+});
+
+describe("App status signalling (FR-033 / WCAG 1.4.1)", () => {
+  /*
+   * The sheet paints a different accent on `.header-status` for each session
+   * state, and colour is exactly what a colour-blind user, a greyscale remote
+   * session or a high-contrast override loses, so every state also has to reach
+   * the interface as a word. Those words used to live in each app's own hero
+   * copy, where the two front-ends could and did name the same state
+   * differently; they are one shared map now, so this asserts the map is what
+   * the real header renders -- through the listener the shell actually calls,
+   * not by reading the constant back.
+   */
+  it("names each of the four session states in text, not only in colour", async () => {
+    const handlers = new Map<string, (e: { payload: unknown }) => void>();
+    vi.mocked(listen).mockImplementation(((event: string, handler: (e: { payload: unknown }) => void) => {
+      handlers.set(event, handler);
+      return Promise.resolve(() => {});
+    }) as typeof listen);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Connection" });
+
+    const emit = handlers.get("session://state");
+    if (!emit) throw new Error("useRuntime never registered a session://state listener");
+
+    // Every element whose *colour* the sheet changes with the state. A coloured
+    // dot is the signal 1.4.1 is about, so each of these has to say the state
+    // in words as well - and say it differently per state, which is what an
+    // always-present-but-constant label would otherwise pass as.
+    const seen = new Map<Element, string[]>();
+    const statuses = Object.keys(RUNTIME_STATUS_TAGS);
+    for (const status of statuses) {
+      act(() => emit({ payload: { status, detail: `state is ${status}`, pid: null, endpoint: null } }));
+      const carriers = document.querySelectorAll(".header-status, .switch-status-pill, .beacon-tag");
+      expect(carriers.length, "no state-bearing indicator is rendered at all").toBeGreaterThan(2);
+      for (const c of carriers) {
+        const text = c.textContent?.replace(/\s+/g, " ").trim() ?? "";
+        expect(text, `${c.className} signals its state with colour only`).not.toBe("");
+        const list = seen.get(c) ?? [];
+        list.push(text);
+        seen.set(c, list);
+      }
+    }
+
+    for (const [element, labels] of seen) {
+      expect(labels, `${element.className} never reached every state`).toHaveLength(statuses.length);
+      expect(new Set(labels).size, `${element.className} says "${labels[0]}" for every state`).toBe(labels.length);
+    }
+
+    // And the wording of the tag itself is the shared one, so the phone and the
+    // desktop cannot describe the same state in two different words again.
+    for (const [status, tag] of statuses.map((s) => [s, RUNTIME_STATUS_TAGS[s as keyof typeof RUNTIME_STATUS_TAGS]] as const)) {
+      act(() => emit({ payload: { status, detail: "", pid: null, endpoint: null } }));
+      const tags = await screen.findAllByText(tag);
+      expect(tags.length, `${status} must appear as the shared word ${tag}`).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps the four tags distinct, so the word carries information the colour alone did not", () => {
+    const tags = Object.values(RUNTIME_STATUS_TAGS);
+    expect(new Set(tags).size).toBe(tags.length);
+    expect(tags.every((t) => /^[A-Z ]{2,12}$/.test(t))).toBe(true);
   });
 });
