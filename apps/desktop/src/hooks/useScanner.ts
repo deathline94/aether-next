@@ -12,7 +12,7 @@ import type {
 } from "../types";
 import { errorMessage } from "../ipcError";
 import { hitAddressKey } from "./useLogs";
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, effectiveScanTimeout } from "../../../../packages/ui/src";
 import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { ScanProtocol } from "../../../../packages/ui/src/enums";
 
@@ -240,7 +240,7 @@ export function useScanner(
     // The two values are clamped before they are both announced and sent, so the
     // log line describes the run the engine will actually perform.
     const workers = clampConcurrency(concurrency);
-    const timeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
+    const timeout = effectiveScanTimeout(protocol, timeoutMs);
     const noiseProfile = scanNoizeFor(protocol, noize);
     appendLog({
       level: "info",

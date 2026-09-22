@@ -5,7 +5,7 @@ import { NumberField, Segmented } from "./ui";
 // The ceiling the engine will actually run, not the number the slider was set to:
 // this field used to offer 1-2000 while the shell clamped to 500, so the "Workers
 // Active" chip contradicted the input the user had just filled in.
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, SCAN_MAX_TIMEOUT_MS, SCAN_MIN_TIMEOUT_MS } from "../../../../packages/ui/src";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
 
@@ -267,12 +267,12 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Timeout (ms)</strong>
-                <span className="field-hint">100–30000 ms</span>
+                <span className="field-hint">{SCAN_MIN_TIMEOUT_MS}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
               <NumberField
                 label="Per-probe timeout in milliseconds"
-                min={100}
-                max={30000}
+                min={SCAN_MIN_TIMEOUT_MS}
+                max={SCAN_MAX_TIMEOUT_MS}
                 step={100}
                 value={timeoutMs}
                 disabled={active}
