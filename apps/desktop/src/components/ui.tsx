@@ -65,6 +65,16 @@ export function Toggle({
  * eliminates ugly browser spinner arrows, supports free typing and
  * tactile +/- click adjustments. Clamped on blur/Enter.
  */
+/**
+ * A draft of "0" is a value, not a missing value. `Number.parseInt(draft, 10) || value`
+ * threw every legitimate zero away, so stepping up from 0 jumped back to the previous
+ * number and the min/max guards below compared a number the user had already deleted.
+ */
+export function draftNumber(draft: string, fallback: number): number {
+  const parsed = Number.parseInt(draft, 10);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
 export function NumberField({
   value,
   min,
@@ -104,7 +114,7 @@ export function NumberField({
 
   const handleStep = (delta: number) => {
     if (disabled) return;
-    const current = Number.parseInt(draft, 10) || value;
+    const current = draftNumber(draft, value);
     commit(current + delta);
   };
 
@@ -114,7 +124,7 @@ export function NumberField({
         type="button"
         className="stepper-btn"
         onClick={() => handleStep(-step)}
-        disabled={disabled || (Number.parseInt(draft, 10) || value) <= min}
+        disabled={disabled || (draftNumber(draft, value)) <= min}
         aria-label={`Decrease ${label}`}
         tabIndex={-1}
       >
@@ -141,7 +151,7 @@ export function NumberField({
         type="button"
         className="stepper-btn"
         onClick={() => handleStep(step)}
-        disabled={disabled || (Number.parseInt(draft, 10) || value) >= max}
+        disabled={disabled || (draftNumber(draft, value)) >= max}
         aria-label={`Increase ${label}`}
         tabIndex={-1}
       >
