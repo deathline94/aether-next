@@ -607,8 +607,10 @@ Checked each part against the current tree rather than assuming the task text wa
   **Partly.** The axe suite exists in both apps (`apps/desktop/src/components/a11y.test.tsx`,
   `apps/android/src/a11y.test.tsx`: three tabs each, in every state that changes
   the tree, `color-contrast` off with the reason inline, and proven to bite by
-  taking a `Toggle`'s accessible name away). The 2 000-row and frame-time
-  assertion is T185's, which the desktop discovered-endpoint list still owes.
+  taking a `Toggle`'s accessible name away). The 2 000-mocked-row and
+  DOM-nodes bound are asserted in `ScannerTab.render.test.tsx` /
+  `ScannerTab.test.tsx` since T185 landed; the *frame-time* half of the original
+  ask needs a real browser and still belongs to the quickstart run.
 
 ### Implementation for User Story 6
 
@@ -733,7 +735,19 @@ Checked each part against the current tree rather than assuming the task text wa
   programmatic scroll is still marked as ours) and is clear on return. Reinstating the deferred reset
   reddens both; the file was restored from a backup afterwards. 20 desktop and 14 Android UI tests
   pass, both typecheck.
-- [ ] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
+- [x] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
+  **Done in `8f9dc7b` (desktop) and `08407d4` (Android, same list on slower
+  hardware).** `count`/`estimateSize`/`measureElement`/`overscan: 8` as specified;
+  the counts, filter and tab list are memoised over one pass. No separate sort
+  memo is needed - rows are kept sorted where they are inserted, in `useScanner`.
+  `content-visibility` is deliberately **not** added: the task's own parenthetical
+  says it never reduces node count, and node count is what is now bounded, so it
+  would be a second mechanism claiming the same effect.
+  Measured by `ScannerTab.render.test.tsx` / `ScannerTab.test.tsx`: 2 000 endpoints
+  render 1-60 rows over a spacer taller than the panel - which needed a jsdom
+  viewport + ResizeObserver stub (`src/testing/viewport.ts`) because a windowed
+  list mounts nothing when layout is absent, and until then the axe "with results"
+  case had been silently checking an empty panel.
 - [ ] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.
   **Attempted and reverted, like T178.** `ErrorBoundary` gained `resetKeys`/`onRetry`/`label` and the
   per-tab wiring was ready to go, but three tests for it could not be made to observe the boundary at
@@ -1072,7 +1086,12 @@ both apps (T171's structural half), the Android 24-hour log timestamp that a
 doubled `overflow-wrap` declaration in both sheets plus `css-no-dead-duplicates`
 to keep it from coming back, and the note in `AetherVpnService.restartTunnel`
 recording that reusing the session's captured SOCKS port is correct where the
-audit read it as stale.
+audit read it as stale. T197 closed in `3d307ac` (one dark theme, one
+`@color/app_canvas` for all four chrome slots, verified by
+`:app:processDebugResources`; its `colorPrimary` "drift" was checked and is not
+one - #66E3A4 is the brand mint the identity master names), and T185 with it
+(`8f9dc7b`, `08407d4`: the endpoint list windowed on both surfaces and the bound
+asserted, which also made the axe "with results" case mean something).
 
 **Still open, and why - none of these is a code edit that can be verified here:**
 - T039 (netioapi FFI instead of `route.exe`/`netsh`/PowerShell): ~13 shell-outs
@@ -1110,17 +1129,14 @@ audit read it as stale.
   pass, not a blind one.
 - T243's remainder and T224's okhttp 4.x→5.x, T248 (relative `config_path`
   default), T246 (`client_id` as a per-tunnel random tag - a product decision
-  about identity correlation, not a bug), T185 (virtualiser on the discovered
-  list), T193/T194's clipped ping ring and 900 px window-breakpoint collision,
-  T192's panel de-duplication and the six elements still carrying two
-  panel classes (its `scrollbar-gutter` half landed in `be06ca8`),
-  T188's `font-synthesis`
-  T195's `<label>`-wraps-a-compound-control (fixing it means changing the CSS
-  selectors that style those wrappers, so it cannot be done honestly in one
-  file), T197 closed in `3d307ac` (single dark
-  theme, one `@color/app_canvas` for all four chrome slots, verified by
-  `:app:processDebugResources`; the `colorPrimary` "drift" it asked for was
-  checked and is not one - #66E3A4 is the brand mint the identity master names), T198/T029 (13 duplicated
+  about identity correlation, not a bug), T193/T194's clipped ping ring and the
+  900 px window-breakpoint collision, T192's panel de-duplication and the six
+  elements still carrying two panel classes (its `scrollbar-gutter` half landed
+  in `be06ca8`), T188's `font-synthesis` re-tune, which needs eyes on a
+  renderer, and T195's `<label>`-wraps-a-compound-control (fixing it means
+  changing the CSS selectors that style those wrappers, so it cannot be done
+  honestly in one file).
+- T198/T029 (13 duplicated
   frontend files, `useScanner`/`useLogs`/`useRuntime` fully forked), T019
   (generated bindings; BC-08 is today enforced by hand-maintained types +
   name-parity gates only), T022 (`EndpointRegistry` actor), T230,
