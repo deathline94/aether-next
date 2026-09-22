@@ -1,96 +1,113 @@
 /*
- * Shared design tokens for both Aether frontends.
+ * Aether shared design tokens — the single source of truth for both frontends.
  *
  * Contract: specs/015-full-audit-remediation/contracts/ui-design-contract.md
- * Rule U-B5: colour literals live in this file (and the app sheets that
- * consume these variables) — components must not hardcode hex values.
+ * Rule U-B5: colour literals live here; components must not hardcode hex.
  *
- * The values below are the corrected ones from the audit; the migration of the
- * existing app stylesheets onto them is tasks T188-T194.
+ * HOW THIS REACHES THE APPS
+ * The span between /*==SHARED-BEGIN==* / and /*==SHARED-END==* / below is
+ * INLINED into apps/desktop/src/App.css and apps/android/src/App.css by
+ * scripts/sync-tokens.mjs (npm run sync-tokens; also wired to each app's
+ * `prebuild`, so `npm run build` and the Vite dev server both ship it). In each
+ * sheet the inlined copy is fenced by /*==AETHER-TOKENS-START==* / ...
+ * /*==AETHER-TOKENS-END==* /.
+ *
+ * This is a BUILD-TIME include, not a runtime `@import`, on purpose: the repo's
+ * BC-11 invariant gate (scripts/verify-invariants.mjs) resolves every
+ * `var(--x)` against definitions found in the SAME file and cannot see across an
+ * @import, so the literals must be physically present in each sheet. Every token
+ * defined here is consumed by at least one sheet (the old tokens.css carried ~20
+ * unreferenced names and was imported by nothing). Edit values HERE and re-run
+ * the sync; never hand-edit the fenced block inside the sheets.
  */
 
+/*==SHARED-BEGIN==*/
 :root {
-  /* UA defaults the audit found absent (0 occurrences, contract U-D5). */
+  /* UA dark palette: form controls, scrollbars and <select> popups resolve to
+     dark instead of the light UA defaults (contract U-D5). */
   color-scheme: dark;
+
+  /* Type families — the real Geist faces are bundled by @fontsource-variable and
+     imported in App.tsx; the system fallbacks only back them up. */
+  --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 
   /* Surfaces */
   --bg-app: #07090b;
+  --bg-sidebar: #090c0f;
   --panel: #0d1116;
   --panel-2: #11161d;
+  --panel-hover: #141b24;
+  --panel-active: #17202b;
   --panel-nested: #0d131a;
-  --panel-hover: #161c24;
 
   /*
-   * Edges. Two tiers, per WCAG 1.4.11: a boundary that is the sole means of
-   * identifying an interactive control needs 3:1; a decorative panel
-   * separation does not, and is kept below that on purpose so it stays quiet.
-   * Both are opaque composited colours rather than raw alpha over a surface,
-   * because a 1px alpha hairline antialiases away at Windows 125%/150% scaling.
-   * Ratios below are measured (WCAG relative luminance) against every surface
-   * each token actually sits on — the darkest is --panel-2 #11161d, the
-   * lightest --panel-hover #161c24, and both tiers clear their floor there.
-   * Do not "fix" a low ratio by raising an rgba() alpha: still translucent,
-   * still antialiased (contract U-E1).
+   * Opaque edge tokens (WCAG 1.4.11, contract U-E1). Raw alpha hairlines
+   * antialias away at Windows 125%/150% scaling and vanish on any surface but
+   * the exact one they were blended against, so boundaries are pre-resolved
+   * opaque composites. Ratios measured (WCAG relative luminance) against every
+   * surface each token sits on; the binding worst case is --panel-active #17202b.
    */
-  --edge: #3b4652;            /* decorative separation: 1.97:1 vs --panel, 1.89 vs --panel-2, 1.94 vs --panel-nested, 2.07 vs --bg-app, floor 1.78 vs --panel-hover — >=1.6 */
-  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.48 vs --panel-2, 3.57 vs --panel-nested, 3.82 vs --bg-app, floor 3.28 vs --panel-hover — >=3 (WCAG 1.4.11) */
-  --edge-strong: #6b7b8a;     /* hover/emphasis step only: 4.35:1 vs --panel; never a resting state, so it cannot outrank --emerald (12.47:1) .active */
+  --edge: #3b4652;             /* decorative separation: 1.97:1 vs --panel, 1.71 vs --panel-active — >=1.6 */
+  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.14 vs --panel-active — >=3 (WCAG 1.4.11) */
+  --edge-strong: #6b7b8a;      /* hover/emphasis step only: 4.35:1 vs --panel; never resting, cannot outrank --emerald .active (12.47:1) */
 
-  /* Text */
-  --text: #edf2f5;
-  --text-secondary: #a9b6c1;
-  /* Was #47535e (2.40-2.60:1) — failed AA and AAA-large for every label. */
-  --muted: #8b98a3;
-  --muted-strong: #7d8b96;
+  /* Micro-borders & architectural highlights (derived from the edge tiers) */
+  --border-subtle: var(--edge);
+  --border-card: var(--edge);
+  --border-strong: var(--edge-interactive);
+  --line: var(--edge);
+  --inner-highlight: inset 0 1px 0 0 var(--edge);
+  --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
 
-  /* Signal colours */
+  /* Primary phosphor emerald accent */
   --emerald: #00f08a;
   --emerald-dim: rgba(0, 240, 138, 0.12);
-  --emerald-border: rgba(0, 240, 138, 0.55);
+  --emerald-border: rgba(0, 240, 138, 0.55); /* sheets carried .32 vs this file's .55 — reconciled to .55 */
+  --emerald-glow: 0 0 28px rgba(0, 240, 138, 0.24);
+  --green: #00f08a;
+  --green-dark: #092618;
+
+  /* Tactical signal accents */
   --coral: #ff5c5c;
   --coral-dim: rgba(255, 92, 92, 0.12);
-  --amber: #facc15;
-  --blue: #5cc8ff;
+  --coral-border: rgba(255, 92, 92, 0.32);
+  --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
+  --yellow: #facc15;
+  --yellow-dim: rgba(250, 204, 21, 0.12);
+  --yellow-border: rgba(250, 204, 21, 0.32);
+  --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
   --blue-dim: rgba(92, 200, 255, 0.12);
+  --blue-border: rgba(92, 200, 255, 0.32);
+  --amber: #facc15;
   --violet: #a78bfa;
 
-  /* Type */
-  /* Weight tiers are real steps (500/600/700), not 550/650/750: with the
-   * fallback stack (Segoe UI / system-ui) the odd tiers either snap to the
-   * same face or need synthesis, so `font-synthesis: none` is deliberately
-   * NOT set — synthetic emphasis is allowed rather than silently flattening
-   * half the scale to 400 (contract U-C2). */
-  --font-sans: "Geist Variable", "Geist", system-ui, "Segoe UI", sans-serif;
-  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
-  --text-micro: 11px;   /* floor: nothing legible-bearing renders smaller */
-  --text-small: 12px;
-  --text-base: 13px;
-  --text-lg: 15px;
-  --text-xl: 18px;
+  /*
+   * Text greys. --muted is reconciled to this file's #8b98a3 (sheets had
+   * #7d8b96): 6.42:1 on --panel, 6.16 on --panel-2. --muted-strong is the
+   * accessible AA floor value; --muted-dark aliases it.
+   */
+  --muted: #8b98a3;
+  --muted-light: #a4b3be;
+  --muted-strong: #7d8b96;
+  /*
+   * --muted-dark was #47535e — 2.40:1 on --panel and 2.53:1 on --bg-app, below
+   * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
+   * non-text floor for the .heartbeat-dot state LED. It now aliases
+   * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
+   * --panel-hover (all >=4.5) and >=3.14:1 as the dot. One repoint fixes all 12
+   * consumers at once.
+   */
+  --muted-dark: var(--muted-strong);
 
-  /* Radius scale (was 12 distinct values) */
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-pill: 999px;
-
-  /* Spacing scale */
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-
-  /* Interaction (was 6 distinct disabled values) */
-  --opacity-disabled: 0.45;
-  --shadow-panel: 0 8px 28px rgba(0, 0, 0, 0.35);
+  /* Motion curves — sheets carried two different --ease-spring values; reconciled */
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
   --duration-fast: 150ms;
 }
 
 /*
- * UA defaults the audit found with zero occurrences in the whole codebase
+ * UA defaults the audit found with zero occurrences in the codebase
  * (contract U-D5): `option` inherited the light UA popup palette — #edf2f5 on
  * #ffffff measures 1.13:1, i.e. invisible — and the UA selection highlight
  * measured 1.24:1 (#d8e2ec on #accef7), so selected text disappeared.
@@ -98,7 +115,7 @@
 option {
   padding: 8px 10px;
   background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
-  color: var(--text);
+  color: #edf2f5;
 }
 option:disabled { color: var(--muted); }
 
@@ -106,3 +123,4 @@ option:disabled { color: var(--muted); }
   background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
   color: var(--bg-app);
 }
+/*==SHARED-END==*/

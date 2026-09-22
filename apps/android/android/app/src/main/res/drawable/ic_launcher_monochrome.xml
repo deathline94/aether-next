@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon monochrome layer (P1-2): a single-colour silhouette the launcher
+     tints for the themed / Android 13+ icon shapes. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108"
+    android:tint="#FFFFFF">
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="6"
+        android:strokeLineCap="round"
+        android:pathData="M40,54 V44 A14,14 0 0 1 68,44 V54" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M40,54 h28 a6,6 0 0 1 6,6 v18 a6,6 0 0 1 -6,6 h-28 a6,6 0 0 1 -6,-6 v-18 a6,6 0 0 1 6,-6 z" />
+</vector>

@@ -1,0 +1,16 @@
+{
+  "name": "aether-workspace",
+  "private": true,
+  "version": "1.3.0",
+  "type": "module",
+  "description": "npm workspace tying the shared @aether/ui package to the desktop and Android frontends so both consume one token source.",
+  "workspaces": [
+    "packages/*",
+    "apps/desktop",
+    "apps/android"
+  ],
+  "scripts": {
+    "sync-tokens": "node scripts/sync-tokens.mjs",
+    "verify-invariants": "node scripts/sync-tokens.mjs --check && node scripts/verify-invariants.mjs"
+  }
+}

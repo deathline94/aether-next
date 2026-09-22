@@ -1,93 +1,123 @@
-@import "tailwindcss";
+/*==AETHER-TOKENS-START==*/
+/* GENERATED from packages/ui/tokens.css by scripts/sync-tokens.mjs — do not edit this block. */
+:root {
+  /* UA dark palette: form controls, scrollbars and <select> popups resolve to
+     dark instead of the light UA defaults (contract U-D5). */
+  color-scheme: dark;
+
+  /* Type families — the real Geist faces are bundled by @fontsource-variable and
+     imported in App.tsx; the system fallbacks only back them up. */
+  --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+
+  /* Surfaces */
+  --bg-app: #07090b;
+  --bg-sidebar: #090c0f;
+  --panel: #0d1116;
+  --panel-2: #11161d;
+  --panel-hover: #141b24;
+  --panel-active: #17202b;
+  --panel-nested: #0d131a;
+
+  /*
+   * Opaque edge tokens (WCAG 1.4.11, contract U-E1). Raw alpha hairlines
+   * antialias away at Windows 125%/150% scaling and vanish on any surface but
+   * the exact one they were blended against, so boundaries are pre-resolved
+   * opaque composites. Ratios measured (WCAG relative luminance) against every
+   * surface each token sits on; the binding worst case is --panel-active #17202b.
+   */
+  --edge: #3b4652;             /* decorative separation: 1.97:1 vs --panel, 1.71 vs --panel-active — >=1.6 */
+  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.14 vs --panel-active — >=3 (WCAG 1.4.11) */
+  --edge-strong: #6b7b8a;      /* hover/emphasis step only: 4.35:1 vs --panel; never resting, cannot outrank --emerald .active (12.47:1) */
+
+  /* Micro-borders & architectural highlights (derived from the edge tiers) */
+  --border-subtle: var(--edge);
+  --border-card: var(--edge);
+  --border-strong: var(--edge-interactive);
+  --line: var(--edge);
+  --inner-highlight: inset 0 1px 0 0 var(--edge);
+  --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
+
+  /* Primary phosphor emerald accent */
+  --emerald: #00f08a;
+  --emerald-dim: rgba(0, 240, 138, 0.12);
+  --emerald-border: rgba(0, 240, 138, 0.55); /* sheets carried .32 vs this file's .55 — reconciled to .55 */
+  --emerald-glow: 0 0 28px rgba(0, 240, 138, 0.24);
+  --green: #00f08a;
+  --green-dark: #092618;
+
+  /* Tactical signal accents */
+  --coral: #ff5c5c;
+  --coral-dim: rgba(255, 92, 92, 0.12);
+  --coral-border: rgba(255, 92, 92, 0.32);
+  --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
+  --yellow: #facc15;
+  --yellow-dim: rgba(250, 204, 21, 0.12);
+  --yellow-border: rgba(250, 204, 21, 0.32);
+  --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
+  --blue-dim: rgba(92, 200, 255, 0.12);
+  --blue-border: rgba(92, 200, 255, 0.32);
+  --amber: #facc15;
+  --violet: #a78bfa;
+
+  /*
+   * Text greys. --muted is reconciled to this file's #8b98a3 (sheets had
+   * #7d8b96): 6.42:1 on --panel, 6.16 on --panel-2. --muted-strong is the
+   * accessible AA floor value; --muted-dark aliases it.
+   */
+  --muted: #8b98a3;
+  --muted-light: #a4b3be;
+  --muted-strong: #7d8b96;
+  /*
+   * --muted-dark was #47535e — 2.40:1 on --panel and 2.53:1 on --bg-app, below
+   * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
+   * non-text floor for the .heartbeat-dot state LED. It now aliases
+   * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
+   * --panel-hover (all >=4.5) and >=3.14:1 as the dot. One repoint fixes all 12
+   * consumers at once.
+   */
+  --muted-dark: var(--muted-strong);
+
+  /* Motion curves — sheets carried two different --ease-spring values; reconciled */
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-fast: 150ms;
+}
+
+/*
+ * UA defaults the audit found with zero occurrences in the codebase
+ * (contract U-D5): `option` inherited the light UA popup palette — #edf2f5 on
+ * #ffffff measures 1.13:1, i.e. invisible — and the UA selection highlight
+ * measured 1.24:1 (#d8e2ec on #accef7), so selected text disappeared.
+ */
+option {
+  padding: 8px 10px;
+  background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
+  color: #edf2f5;
+}
+option:disabled { color: var(--muted); }
+
+::selection {
+  background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
+  color: var(--bg-app);
+}
+/*==AETHER-TOKENS-END==*/
 
 :root {
-  --font-sans: "Geist Variable", "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
-
-  /* UA dark palette: form controls, scrollbars and <select> popups resolve to
-     dark instead of the light UA defaults. Was absent (contract U-D5). */
-  color-scheme: dark;
-
+  /* Element base styles only — the token block above is GENERATED from
+     packages/ui/tokens.css by scripts/sync-tokens.mjs. Geist is bundled via
+     @fontsource-variable and imported in App.tsx/main.tsx, so the sheet DOES
+     carry webfonts; synthetic emphasis stays on so the 500/600/700 tiers the
+     fallback faces can reach are never flattened to 400 (contract U-C2). */
   font-family: var(--font-sans);
   color: #edf2f5;
-  background-color: #07090b;
-  /* font-synthesis: none was removed (contract U-C2 / T188): the sheet loads no
-     @font-face, so the real rendering font is static-weight Segoe UI and the
-     550/650/750 tiers need synthetic emphasis — suppressing it flattened half
-     the scale to 400. Synthesis stays ON and the tiers are rounded to the
-     500/600/700 steps the fallback can actually reach. */
+  background-color: var(--bg-app);
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* Was -0.012em, tracked for Geist metrics; Segoe UI needs ~half that or
-     11-13px labels close up. */
+  /* Was -0.012em, tracked for Geist metrics; the system fallback needs ~half
+     that or 11-13px labels close up. */
   letter-spacing: -0.006em;
-
-  /* Surfaces & Canvas */
-  --bg-app: #07090b;
-  --bg-sidebar: #090c0f;
-  --panel: #0d1116;
-  --panel-2: #11161d;
-  --panel-hover: #141b24;
-  --panel-active: #17202b;
-  --panel-nested: #090d12;
-
-  /*
-   * Opaque edge tokens (WCAG 1.4.11, contract U-E1). Raw alpha hairlines
-   * antialias away at Windows 125%/150% scaling and vanish on any surface but
-   * the exact one they were blended against, so boundaries are pre-resolved
-   * opaque composites. Ratios are measured (WCAG relative luminance) against
-   * every surface each token is used on; the lightest of those (--panel-active
-   * #17202b) is the binding worst case. Replacing the old tokens:
-   *   --border-subtle rgba(255,255,255,.05) -> 1.12:1 vs --panel
-   *   --border-card   rgba(255,255,255,.07) -> 1.18:1 vs --panel
-   *   --line          rgba(255,255,255,.07) -> 1.18:1 vs --panel
-   * Raising those alphas is not a fix (still translucent, still antialiased).
-   */
-  --edge: #3b4652;            /* decorative separation: 1.97:1 vs --panel, 1.89 vs --panel-2, 2.03 vs --panel-nested, 2.07 vs --bg-app, 1.94 vs #0d131a (profile cards), floor 1.71 vs --panel-active — >=1.6 */
-  --edge-interactive: #606e7c; /* control boundary, the sole affordance on inputs/actionable cards: 3.62:1 vs --panel, 3.48 vs --panel-2, 3.73 vs --panel-nested, 3.82 vs --bg-app, 3.57 vs #0d131a (profile cards), floor 3.14 vs --panel-active — >=3, WCAG 1.4.11 */
-  --edge-strong: #6b7b8a;     /* hover/emphasis step only: 4.35:1 vs --panel; never resting, so it cannot outrank --emerald .active (12.47:1) */
-
-  /* Micro-Borders & Architectural Highlights */
-  --border-subtle: var(--edge);
-  --border-card: var(--edge);
-  --border-strong: var(--edge-interactive);
-  --line: var(--edge);
-  --inner-highlight: inset 0 1px 0 0 var(--edge);
-  --inner-highlight-glow: inset 0 1px 1px 0 rgba(0, 240, 138, 0.25);
-
-
-  /* Primary Phosphor Emerald Accent */
-  --emerald: #00f08a;
-  --emerald-dim: rgba(0, 240, 138, 0.12);
-  --emerald-border: rgba(0, 240, 138, 0.32);
-  --emerald-glow: 0 0 28px rgba(0, 240, 138, 0.24);
-  --green: #00f08a;
-  --green-dark: #092618;
-
-  /* Tactical Color Accents */
-  --coral: #ff5c5c;
-  --coral-dim: rgba(255, 92, 92, 0.12);
-  --coral-border: rgba(255, 92, 92, 0.32);
-  --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
-  
-  --yellow: #facc15;
-  --yellow-dim: rgba(250, 204, 21, 0.12);
-  --yellow-border: rgba(250, 204, 21, 0.32);
-  
-  --blue: #38bdf8;
-  --blue-dim: rgba(56, 189, 248, 0.12);
-  --blue-border: rgba(56, 189, 248, 0.32);
-
-  --amber: #facc15;
-  --violet: #a78bfa;
-  --muted: #7d8b96;
-  --muted-light: #a4b3be;
-  --muted-dark: #47535e;
-
-  /* Motion Curves */
-  --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 * { box-sizing: border-box; }
@@ -111,27 +141,28 @@ button:focus-visible, input:focus-visible, select:focus-visible {
   outline: 2px solid var(--emerald);
   outline-offset: 2px;
 }
+/*
+ * P2-6: the primary connect control and the tactile switch call `outline: none`
+ * and are not plain form fields the rule above reaches. Give them an explicit
+ * substitute; `.tactile-toggle` may wrap a visually-hidden input, so :focus-within
+ * covers that structure as well. An inset ring is used for the switch so an
+ * ancestor `overflow: hidden` panel cannot clip it.
+ */
+.master-toggle-btn:focus-visible {
+  outline: 2px solid var(--emerald);
+  outline-offset: 2px;
+}
+.tactile-toggle:focus-visible,
+.tactile-toggle:focus-within {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--emerald), inset 0 0 0 1px var(--edge-interactive);
+}
 input[type="number"]::-webkit-outer-spin-button,
 input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
 
-/*
- * UA defaults with 0 occurrences in the codebase before T188 (contract U-D5).
- * <option> rendered on the light UA popup surface: #edf2f5 on #ffffff = 1.13:1.
- * The UA selection highlight was #d8e2ec on #accef7 = 1.24:1 — selected text
- * was effectively invisible.
- */
-option {
-  padding: 8px 10px;
-  background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
-  color: #edf2f5;
-}
-option:disabled { color: var(--muted); }
-
-::selection {
-  background: var(--blue); /* #07090b on #38bdf8 = 9.31:1, was 1.24:1 */
-  color: var(--bg-app);
-}
+/* option / ::selection UA defaults now ship once, from the generated token
+   fence at the top of this sheet (packages/ui/tokens.css). */
 
 /* Tabular figures on all numerical readouts */
 .tabular-nums,
@@ -154,6 +185,16 @@ code, kbd, pre {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
+
+/*
+ * Tailwind (`@import "tailwindcss"`) was dropped from the surface (P1-5): it sat
+ * beside ~3300 handwritten lines to serve a handful of utilities, and the
+ * unlayered sheet already outranked its `@layer utilities` so `text-red-400` was
+ * inert. These are the only Tailwind utilities genuinely referenced by the
+ * components, re-declared against our own tokens so the sheet stands alone.
+ */
+.font-mono { font-family: var(--font-mono); }
+.text-red-400 { color: var(--coral); } /* error/warning glyph → sheet red #ff5c5c (was #f87171) */
 
 /* ─── App Shell & Layout ───────────────────────────────────────────────────── */
 .app-shell {
@@ -265,7 +306,7 @@ code, kbd, pre {
 }
 .nav-pill-label {
   font-size: 13px;
-  font-weight: 550;
+  font-weight: 500;
   flex: 1;
 }
 .nav-pill-trailing {
@@ -416,7 +457,7 @@ code, kbd, pre {
 }
 .beacon-status-text {
   font-size: 12.5px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
 }
 .beacon-tag {
@@ -492,7 +533,7 @@ code, kbd, pre {
 .topbar-heading {
   margin: 0;
   font-size: 22px;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.025em;
   color: #ffffff;
 }
@@ -636,7 +677,7 @@ code, kbd, pre {
   gap: 8px;
   align-items: center;
   font-size: 10px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--emerald);
@@ -649,7 +690,7 @@ code, kbd, pre {
   margin: 14px 0 10px;
   font-size: clamp(28px, 3.6vw, 42px);
   line-height: 1.08;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.03em;
   color: #ffffff;
 }
@@ -936,7 +977,7 @@ code, kbd, pre {
 .bento-category {
   display: block;
   font-size: 9.5px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--muted);
@@ -946,7 +987,7 @@ code, kbd, pre {
   display: block;
   margin-top: 2px;
   font-size: 15px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
   letter-spacing: -0.01em;
   overflow: hidden;
@@ -1011,7 +1052,7 @@ code, kbd, pre {
 }
 .stat-value {
   font-size: 13.5px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
 }
 
@@ -1281,7 +1322,7 @@ code, kbd, pre {
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
   font-size: 9px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.06em;
   font-family: var(--font-mono);
 }
@@ -1327,7 +1368,7 @@ code, kbd, pre {
 .section-heading p {
   margin: 0;
   font-size: 9.5px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--muted);
@@ -1336,7 +1377,7 @@ code, kbd, pre {
   margin: 2px 0 0;
   color: #ffffff;
   font-size: 16px;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.01em;
 }
 
@@ -1422,7 +1463,7 @@ code, kbd, pre {
   background: #143525;
   color: #e2faee;
   font-size: 11.5px;
-  font-weight: 650;
+  font-weight: 600;
   cursor: pointer;
   transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
 }@media (hover: hover) and (pointer: fine){
@@ -1474,13 +1515,13 @@ code, kbd, pre {
   margin: 0 0 3px;
   color: var(--muted-dark);
   font-size: 9.5px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.1em;
 }
 .about-panel h3 {
   margin: 0;
   font-size: 15px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
 }
 .about-panel span {
@@ -1491,7 +1532,7 @@ code, kbd, pre {
 }
 .about-panel strong {
   color: var(--emerald);
-  font-weight: 650;
+  font-weight: 600;
 }
 .about-panel code {
   padding: 6px 12px;
@@ -1540,7 +1581,7 @@ code, kbd, pre {
 .lock-banner-text strong {
   display: block;
   font-size: 11px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--yellow);
 }
@@ -1562,7 +1603,7 @@ code, kbd, pre {
 .panel-eyebrow {
   margin: 0 0 4px;
   font-size: 9.5px;
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.12em;
   color: var(--emerald);
   text-transform: uppercase;
@@ -1596,7 +1637,7 @@ code, kbd, pre {
 }
 .setting-label-row strong {
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
 }
 .setting-row > div > span {
@@ -1656,7 +1697,7 @@ code, kbd, pre {
   align-items: center;
   gap: 8px;
   font-size: 10px;
-  font-weight: 750;
+  font-weight: 700;
   color: var(--yellow);
   letter-spacing: 0.1em;
   margin-bottom: 12px;
@@ -1694,7 +1735,7 @@ code, kbd, pre {
 }
 .field-meta strong {
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 600;
   color: #ffffff;
 }
 .field-hint {
@@ -1763,7 +1804,7 @@ code, kbd, pre {
   background: #07090b;
   color: #edf2f5;
   font-size: 11.5px;
-  font-weight: 550;
+  font-weight: 500;
   outline: none;
   cursor: pointer;
   appearance: none;
@@ -1827,6 +1868,16 @@ code, kbd, pre {
   animation: spin 0.8s linear infinite;
   flex-shrink: 0;
 }
+/* Idle save-state indicator, sibling of .save-sync-pulse (SettingsTab.tsx).
+   Decorative (aria-hidden) but state-bearing: --muted-dark resolves to
+   #7d8b96 = 5.42:1 on --panel, clearing the 3:1 non-text floor. */
+.save-idle-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted-dark);
+  flex-shrink: 0;
+}
 .save-indicator {
   display: flex;
   align-items: center;
@@ -1838,7 +1889,7 @@ code, kbd, pre {
   background: var(--emerald-dim);
   color: var(--emerald);
   font-size: 11.5px;
-  font-weight: 650;
+  font-weight: 600;
   flex-shrink: 0;
 }
 .save-indicator.blocked {
@@ -1919,7 +1970,7 @@ code, kbd, pre {
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--muted-dark);
-  font-weight: 650;
+  font-weight: 600;
   text-transform: uppercase;
   user-select: none;
 }
@@ -1983,7 +2034,7 @@ code, kbd, pre {
   background: transparent;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 550;
+  font-weight: 500;
   cursor: pointer;
   transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
 }@media (hover: hover) and (pointer: fine){
@@ -2129,7 +2180,7 @@ code, kbd, pre {
   align-items: center;
   gap: 10px;
   font-size: 13.5px;
-  font-weight: 650;
+  font-weight: 600;
   cursor: pointer;
   border: 1px solid;
   transition: color 0.2s var(--ease-spring), background-color 0.2s var(--ease-spring), border-color 0.2s var(--ease-spring), box-shadow 0.2s var(--ease-spring), transform 0.2s var(--ease-spring), opacity 0.2s var(--ease-spring);
@@ -2171,7 +2222,7 @@ code, kbd, pre {
   font-size: 11px;
 }
 .progress-label {
-  font-weight: 750;
+  font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--emerald);
   font-size: 10px;
@@ -2317,7 +2368,7 @@ code, kbd, pre {
   font-size: 12.5px;
   color: #ffffff;
   font-family: var(--font-mono);
-  font-weight: 550;
+  font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2367,7 +2418,7 @@ code, kbd, pre {
   border-radius: 6px;
   font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
   border: 1px solid;
 }
 .rtt-dot {
@@ -2406,7 +2457,7 @@ code, kbd, pre {
   background: #143525;
   color: #e2faee;
   font-size: 11.5px;
-  font-weight: 650;
+  font-weight: 600;
   cursor: pointer;
   transition: color 0.15s var(--ease-spring), background-color 0.15s var(--ease-spring), border-color 0.15s var(--ease-spring), box-shadow 0.15s var(--ease-spring), transform 0.15s var(--ease-spring), opacity 0.15s var(--ease-spring);
 }@media (hover: hover) and (pointer: fine){
@@ -2693,14 +2744,14 @@ code, kbd, pre {
   border-radius: 50%;
   display: inline-block;
 }
-.win-dot.red { background: #ff5f56; box-shadow: 0 0 6px rgba(255, 95, 86, 0.4); }
-.win-dot.yellow { background: #ffbd2e; box-shadow: 0 0 6px rgba(255, 189, 46, 0.4); }
-.win-dot.green { background: #27c93f; box-shadow: 0 0 6px rgba(39, 201, 63, 0.4); }
+.win-dot.red { background: var(--coral); }
+.win-dot.yellow { background: var(--amber); }
+.win-dot.green { background: var(--emerald); }
 .terminal-title-text {
   margin-left: 8px;
   font-size: 11px;
   color: var(--muted);
-  font-weight: 550;
+  font-weight: 500;
   letter-spacing: 0.04em;
   white-space: nowrap;
   overflow: hidden;
@@ -2880,7 +2931,7 @@ code, kbd, pre {
 .log-message-body {
   margin: 0;
   overflow-wrap: anywhere;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 /* Color Coding Levels */
@@ -3061,7 +3112,7 @@ code, kbd, pre {
   background: #143525;
   color: #ffffff;
   font-size: 12px;
-  font-weight: 650;
+  font-weight: 600;
   cursor: pointer;
 }
 

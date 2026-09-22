@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Aether brand colours (P1-2). Mint lock on near-black, matching the
+         identity master packages/ui/brand/aether-mark.svg and themes.xml. -->
+    <color name="ic_launcher_background">#0B0F11</color>
+    <color name="ic_launcher_foreground">#66E3A4</color>
+</resources>

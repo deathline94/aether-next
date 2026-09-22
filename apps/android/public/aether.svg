@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Aether">
+  <!--
+    Aether identity master (P1-1). A single, clean vector in the repo's existing
+    mint/emerald language: the same padlock silhouette already sketched at
+    res/drawable/ic_launcher.xml and the #66E3A4 / #173026 pair themes.xml uses as
+    colorPrimary / colorPrimaryVariant. This file is the one true mark that the
+    desktop raster set (via `tauri icon`) and the Android adaptive layers derive
+    from — the shipped app icons were previously the stock third-party Tauri mark.
+  -->
+  <rect width="1024" height="1024" rx="224" fill="#0b0f11"/>
+  <rect x="22" y="22" width="980" height="980" rx="204" fill="none" stroke="#173026" stroke-width="20"/>
+  <path fill="none" stroke="#66e3a4" stroke-width="52" d="M388 560 V440 A124 124 0 0 1 636 440 V560"/>
+  <path fill="#66e3a4" d="M356 512 h312 a56 56 0 0 1 56 56 v256 a56 56 0 0 1 -56 56 h-312 a56 56 0 0 1 -56 -56 v-256 a56 56 0 0 1 56 -56 z"/>
+  <circle cx="512" cy="676" r="58" fill="#0b0f11"/>
+  <rect x="494" y="676" width="36" height="104" rx="18" fill="#0b0f11"/>
+</svg>

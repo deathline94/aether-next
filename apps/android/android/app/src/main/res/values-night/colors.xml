@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Night-mode icon colours (P1-2) — there was no values-night variant at
+         all. The adaptive background dips to the app canvas and the lock lifts a
+         touch for contrast against a dark home screen. -->
+    <color name="ic_launcher_background">#07090B</color>
+    <color name="ic_launcher_foreground">#7CF0B8</color>
+</resources>
