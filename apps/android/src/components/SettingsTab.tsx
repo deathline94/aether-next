@@ -398,6 +398,30 @@ export function SettingsTab({
             )}
           </select>
         </div>
+
+        {/* `launchAtLogin` was persisted, validated and honoured by BootReceiver
+            while nothing in the app could turn it on — the feature existed only
+            for a config hand-edited onto the device. The wording matters: after a
+            boot the receiver posts a notification to tap, it cannot start a VPN
+            on its own. */}
+        <div className="setting-row">
+          <div>
+            <div className="setting-label-row">
+              <strong>Resume After Reboot</strong>
+              <span className="tactical-chip">BOOT</span>
+            </div>
+            <span>
+              Post a “tap to start” notification when the device boots — Android does not let an
+              app open the tunnel by itself
+            </span>
+          </div>
+          <Toggle
+            label="Resume after reboot"
+            checked={settings.launchAtLogin}
+            disabled={settingsLocked}
+            onChange={(launchAtLogin) => patchSettings({ launchAtLogin })}
+          />
+        </div>
       </section>
 
       {/* ─── Panel 4: Local Ports & Listeners ────────────────────────────── */}

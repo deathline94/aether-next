@@ -931,10 +931,6 @@ class SessionController(
             if (s.transport.lowercase() !in validTransports) {
                 throw SettingRejected("transport", "Invalid transport '${s.transport}'. Allowed: $validTransports")
             }
-            val validPresets = setOf("warp", "gool")
-            if (s.endpointPreset.lowercase() !in validPresets) {
-                throw SettingRejected("endpointPreset", "Invalid endpointPreset '${s.endpointPreset}'. Allowed: $validPresets")
-            }
             val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "thorough", "ironclad")
             if (s.scanMode.lowercase() !in validScanModes) {
                 throw SettingRejected("scanMode", "Invalid scanMode '${s.scanMode}'. Allowed: $validScanModes")

@@ -44,16 +44,18 @@ export type Settings = {
   routingMode: "system-proxy" | "proxy-only" | "tun";
   socksPort: number;
   httpPort: number;
-  startMinimized: boolean;
+  /**
+   * Honoured by `BootReceiver`: after a reboot it posts the "tap to start"
+   * notification. Android will not let a boot receiver start a VPN itself, so
+   * the Settings row says "notification", not "auto-connect".
+   */
   launchAtLogin: boolean;
-  enginePath: string;
   /** Forced peer endpoint (set by Scanner "Connect Direct"); empty = auto-scan. */
   peer: string;
   /** H3 anti-DPI: split the QUIC Initial ClientHello across two datagrams. */
   quicInitialFrag: boolean;
   /** H3 anti-DPI: bytes of ClientHello in the first Initial (16–512). */
   quicInitialFragSize: number;
-  endpointPreset?: "warp" | "gool";
 };
 
 export type RuntimeState = {
@@ -89,9 +91,7 @@ export const defaults: Settings = {
   routingMode: "tun",
   socksPort: 1819,
   httpPort: 1820,
-  startMinimized: false,
   launchAtLogin: false,
-  enginePath: "",
   peer: "",
   quicInitialFrag: false,
   quicInitialFragSize: 96,

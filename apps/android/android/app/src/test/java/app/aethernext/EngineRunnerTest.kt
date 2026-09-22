@@ -19,7 +19,7 @@ class TestableEngineRunner(
     onExit: (Int?, Boolean) -> Unit = { _, _ -> },
     launcher: ProcessLauncher
 ) : EngineRunner(context, onLine, onExit, launcher) {
-    override fun resolveEngine(configured: String): File = fakeBinary
+    override fun resolveEngine(): File = fakeBinary
     override fun configKey(): String = "a2V5" // base64("key"); no keystore in a unit test
     override fun configureProcessEnvironment(settings: Settings, binary: File): Map<String, String> {
         return mapOf("TEST_ENV" to "1")

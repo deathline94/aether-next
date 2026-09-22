@@ -1,6 +1,7 @@
 package app.aethernext
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
@@ -106,23 +107,41 @@ class SettingsStoreTest {
         assertEquals("tun", freshInstall.routingMode)
     }
 
+    /**
+     * The persisted payload is a contract with the WebView, not a place to park
+     * fields. `startMinimized`, `enginePath` and `endpointPreset` were desktop
+     * carry-overs: stored, echoed back, and read by nothing (`resolveEngine`
+     * ignored a custom path by design) — so `endpointPreset` could even be
+     * *rejected* on save without affecting a single behaviour. Pinning the key
+     * set here means a new field has to arrive with the code that consumes it.
+     */
     @Test
-    fun testValidateSettingsAcceptsAllPresets() {
-        val presets = listOf("warp", "gool")
-        for (preset in presets) {
-            val s = Settings(endpointPreset = preset)
-            SessionController.validateSettings(s)
-            assertEquals(preset, s.endpointPreset)
-        }
+    fun testPersistedKeysAreExactlyTheOnesNativeCodeReads() {
+        val keys = Settings().toJson().keys().asSequence().toSet()
+        assertEquals(
+            setOf(
+                "protocol", "transport", "scanMode", "ipVersion",
+                "noize", "noizeJc", "noizeJmin", "noizeJmax", "noizeIntervalMs",
+                "routingMode", "socksPort", "httpPort", "launchAtLogin", "peer",
+                "quicInitialFrag", "quicInitialFragSize",
+            ),
+            keys,
+        )
     }
 
     @Test
-    fun testValidateSettingsRejectsInvalidPreset() {
-        val s = Settings(endpointPreset = "unknown_preset")
-        val err = assertThrows(IllegalArgumentException::class.java) {
-            SessionController.validateSettings(s)
-        }
-        org.junit.Assert.assertTrue(err.message!!.contains("Invalid endpointPreset 'unknown_preset'"))
+    fun testDesktopCarryOverKeysAreDroppedOnReload() {
+        // A payload written by an older build still carries them; loading must not
+        // fail and re-saving must not put them back.
+        val legacy = org.json.JSONObject(
+            """{"protocol":"masque","startMinimized":true,"enginePath":"/data/local/tmp/x","endpointPreset":"gool"}"""
+        )
+        val s = Settings.fromJson(legacy)
+        assertEquals("masque", s.protocol)
+        val resaved = s.toJson()
+        assertFalse(resaved.has("startMinimized"))
+        assertFalse(resaved.has("enginePath"))
+        assertFalse(resaved.has("endpointPreset"))
     }
 
     @Test

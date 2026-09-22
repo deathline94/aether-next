@@ -204,7 +204,7 @@ open class EngineRunner(
         if (running.get() || supervisorState.get() != SupervisorState.IDLE) {
             return "Aether is already running"
         }
-        val binary = resolveEngine(settings.enginePath)
+        val binary = resolveEngine()
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
         scanMode.set(false)
         running.set(true)
@@ -356,7 +356,7 @@ open class EngineRunner(
         if (running.get() || supervisorState.get() != SupervisorState.IDLE) {
             return "Aether is already running"
         }
-        val binary = resolveEngine("")
+        val binary = resolveEngine()
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
         scanMode.set(true)
         running.set(true)
@@ -465,12 +465,13 @@ open class EngineRunner(
         stopAndWait(5000)
     }
 
-    protected open fun resolveEngine(configured: String): File? {
-        // Never run arbitrary user paths (bridge can set enginePath). Only APK natives / staged assets.
-        if (configured.isNotBlank()) {
-            Log.w(TAG, "ignoring custom enginePath for security: $configured")
-        }
-
+    protected open fun resolveEngine(): File? {
+        // The only engine this will run is the one signed inside the APK. There is
+        // deliberately no "custom path" input: on API 29+ the payload can only be
+        // executed from `nativeLibraryDir`, and a path supplied from the WebView —
+        // the settings JSON — is exactly the input that must never reach
+        // `ProcessBuilder`.
+        //
         // 1) APK native lib dir — the only place Android allows executing our payload
         // on API 29+. This is a hard dependency on the manifest packing the native
         // libraries *extracted* (`extractNativeLibs="true"`, matched by

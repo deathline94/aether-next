@@ -3,6 +3,14 @@ package app.aethernext
 import android.content.Context
 import org.json.JSONObject
 
+/**
+ * Every field here must be reachable from the React settings surface and read by
+ * native code. Three desktop carry-overs (`startMinimized`, `enginePath`,
+ * `endpointPreset`) were persisted, and `endpointPreset` even validated with a
+ * user-visible rejection, while no Android code path consumed them — `resolveEngine`
+ * deliberately ignored a custom path. Unknown keys in a stored payload are dropped
+ * on the next save.
+ */
 data class Settings(
     var protocol: String = "masque",
     var transport: String = "h2",
@@ -16,13 +24,10 @@ data class Settings(
     var routingMode: String = "tun",
     var socksPort: Int = 1819,
     var httpPort: Int = 1820,
-    var startMinimized: Boolean = false,
     var launchAtLogin: Boolean = false,
-    var enginePath: String = "",
     var peer: String = "",
     var quicInitialFrag: Boolean = false,
     var quicInitialFragSize: Int = 96,
-    var endpointPreset: String = "warp",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("protocol", protocol)
@@ -37,13 +42,10 @@ data class Settings(
         put("routingMode", routingMode)
         put("socksPort", socksPort)
         put("httpPort", httpPort)
-        put("startMinimized", startMinimized)
         put("launchAtLogin", launchAtLogin)
-        put("enginePath", enginePath)
         put("peer", peer)
         put("quicInitialFrag", quicInitialFrag)
         put("quicInitialFragSize", quicInitialFragSize)
-        put("endpointPreset", endpointPreset)
     }
 
     companion object {
@@ -60,13 +62,10 @@ data class Settings(
             routingMode = o.optString("routingMode", "tun"),
             socksPort = o.optInt("socksPort", 1819),
             httpPort = o.optInt("httpPort", 1820),
-            startMinimized = o.optBoolean("startMinimized", false),
             launchAtLogin = o.optBoolean("launchAtLogin", false),
-            enginePath = o.optString("enginePath", ""),
             peer = o.optString("peer", ""),
             quicInitialFrag = o.optBoolean("quicInitialFrag", false),
             quicInitialFragSize = o.optInt("quicInitialFragSize", 96),
-            endpointPreset = o.optString("endpointPreset", o.optString("preset", "warp")),
         )
     }
 }

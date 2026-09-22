@@ -385,6 +385,65 @@ const GATES = [
     },
   },
   {
+    name: 'android-settings-parity',
+    invariant: 'BC-09',
+    summary: 'every Android Settings field is persisted by Kotlin *and* settable from the UI',
+    scan(api) {
+      const KT = 'apps/android/android/app/src/main/java/app/aethernext/SettingsStore.kt';
+      if (!existsRel(KT)) return ['SettingsStore.kt missing'];
+      const kt = readFileSync(join(ROOT, KT), 'utf8');
+      const open = kt.indexOf('data class Settings(');
+      const close = kt.indexOf('\n) {', open);
+      if (open < 0 || close < 0) return ['no `data class Settings(…)` in SettingsStore.kt — parity is unverifiable'];
+      const native = new Set(
+        [...kt.slice(open, close).matchAll(/^ +var ([A-Za-z]\w*)/gm)].map((m) => m[1]),
+      );
+      if (!native.size) return ['SettingsStore.kt `Settings` has no fields — parity is unverifiable'];
+
+      // The file declaring the type also declares `defaults`, so it mentions every
+      // key by construction. A field is only reachable if some *other* module reads
+      // or patches it — that is what `startMinimized`, `enginePath` and
+      // `endpointPreset` lacked while they survived in the persisted payload.
+      const declared = new Map();
+      const rest = [];
+      for (const f of api.files('apps/android/src', /\.(ts|tsx)$/)) {
+        const src = api.read(f);
+        if (/\.test\.tsx?$/.test(f)) continue;
+        const block = src.match(/export type Settings\s*=\s*\{([\s\S]*?)\n\};/);
+        if (block) {
+          for (const k of block[1].matchAll(/^ {2}([A-Za-z]\w*)\??:/gm)) declared.set(k[1], [f, src, k.index]);
+          continue;
+        }
+        rest.push([f, src]);
+      }
+      if (!declared.size) return ['no `export type Settings = { … }` under apps/android/src — parity is unverifiable'];
+
+      const v = [];
+      for (const [key, [f, src, idx]] of declared) {
+        if (!native.has(key)) {
+          v.push(`${locate(f, src, idx)} "${key}" is sent to the shell but SettingsStore.kt persists no such field`);
+        }
+        const word = new RegExp(`(^|[^A-Za-z0-9_$])${key}([^A-Za-z0-9_$]|$)`);
+        const user = rest.find(([, s]) => word.test(s));
+        if (!user) {
+          v.push(`${locate(f, src, idx)} "${key}" is persisted by both layers but no component ever reads or patches it`);
+        }
+      }
+      for (const key of native) {
+        if (!declared.has(key)) {
+          v.push(`${rel(join(ROOT, KT))}: SettingsStore.kt persists "${key}", which apps/android/src never sends`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/android/src/__selftest__.ts',
+        content: 'export type Settings = {\n  phantomSettingZz: boolean;\n};\n',
+      };
+    },
+  },
+  {
     name: 'tls-no-ambient-bypass',
     invariant: 'BC-03',
     summary: 'no env-var TLS kill-switch; insecure policy is debug-only',
