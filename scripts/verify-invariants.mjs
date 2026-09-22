@@ -313,15 +313,33 @@ const GATES = [
   {
     name: 'ipc-command-parity',
     invariant: 'BC-09',
-    summary: 'registered commands == invoked commands, both directions',
+    summary: 'desktop commands registered in the shell == invoked by the desktop UI, both directions',
     scan(api) {
-      if (!existsRel('apps/desktop/src-tauri/src/lib.rs')) return ['shell lib.rs missing'];
-      const t = readFileSync(join(ROOT, 'apps/desktop/src-tauri/src/lib.rs'), 'utf8');
-      const m = t.match(/generate_handler!\s*\[([^\]]*)\]/);
-      if (!m) return ['generate_handler! not found — parity is unverifiable'];
-      const registered = new Set(m[1].split(',').map((s) => s.trim()).filter(Boolean));
+      // The registry is collected from every file under src-tauri/src rather than
+      // lib.rs alone: the shell is being split into modules, and a gate that reads
+      // one named file goes silently blind the moment the handler list moves.
+      const shellDir = join(ROOT, 'apps/desktop/src-tauri/src');
+      const registered = new Set();
+      let sawList = false;
+      for (const f of readdirSync(shellDir)) {
+        if (!f.endsWith('.rs')) continue;
+        const src = readFileSync(join(shellDir, f), 'utf8');
+        for (const m of src.matchAll(/generate_handler!\s*\[([^\]]*)\]/g)) {
+          sawList = true;
+          for (const part of m[1].split(',')) {
+            const cmd = part.trim();
+            if (cmd) registered.add(cmd);
+          }
+        }
+      }
+      if (!sawList) return ['no generate_handler! list under src-tauri/src — parity is unverifiable'];
       const invoked = new Set();
-      for (const f of api.files('apps', /\.(ts|tsx)$/)) {
+      // Desktop only. Android talks to a different plane — the Capacitor-style
+      // `window.AetherAndroid.invoke(...)` bridge in AetherBridge.kt — and comparing
+      // its command names against the Tauri registry reported a perfectly good
+      // bridge command (`get_result`) as a missing shell command, which is how a
+      // check with the wrong scope teaches you to rename working code.
+      for (const f of api.files('apps/desktop/src', /\.(ts|tsx)$/)) {
         const src = api.read(f);
         for (const x of src.matchAll(/invoke[^()"']*\(\s*["'`]([a-z_]+)["'`]/g)) invoked.add(x[1]);
       }
@@ -336,6 +354,33 @@ const GATES = [
       return {
         file: 'apps/desktop/src/__selftest__.ts',
         content: 'export const go = () => window.__TAURI__.core.invoke("no_such_command_zz");',
+      };
+    },
+  },
+  {
+    name: 'android-bridge-parity',
+    invariant: 'BC-09',
+    summary: 'the Android UI invokes only bridge commands the Kotlin handler implements, and all are reachable',
+    scan(api) {
+      const BRIDGE = 'apps/android/android/app/src/main/java/app/aethernext/AetherBridge.kt';
+      if (!existsRel(BRIDGE)) return ['AetherBridge.kt missing'];
+      const src = readFileSync(join(ROOT, BRIDGE), 'utf8');
+      const handled = new Set();
+      for (const m of src.matchAll(/"([a-z_]+)"\s*->/g)) handled.add(m[1]);
+      if (!handled.size) return ['no `"command" ->` dispatch table in AetherBridge.kt — parity is unverifiable'];
+      const invoked = new Set();
+      for (const f of api.files('apps/android/src', /\.(ts|tsx)$/)) {
+        for (const x of api.read(f).matchAll(/invoke[^()"']*\(\s*["'`]([a-z_]+)["'`]/g)) invoked.add(x[1]);
+      }
+      const v = [];
+      for (const cmd of invoked) if (!handled.has(cmd)) v.push(`invoke("${cmd}") is not implemented by the Kotlin bridge`);
+      for (const cmd of handled) if (!invoked.has(cmd) && cmd !== 'default') v.push(`bridge command "${cmd}" is implemented but never called`);
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/android/src/__selftest__.ts',
+        content: 'export const go = () => window.AetherAndroid.invoke("no_such_bridge_command_zz", "{}");',
       };
     },
   },
