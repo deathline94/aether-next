@@ -3366,21 +3366,26 @@ code, kbd, pre {
   color: var(--violet);
 }
 
+/* Second mobile block, formerly `@media (max-width: 680px)` with 12 !important
+   declarations whose only job was to beat the first block by source order. The
+   rules below are single-class selectors, this block is last, so the cascade
+   already says the same thing without the flag; the flags also meant any future
+   rule for these elements had to escalate to !important too. */
 @media (max-width: 680px) {
   .app-shell {
-    padding-bottom: calc(62px + env(safe-area-inset-bottom, 0px)) !important;
+    padding-bottom: calc(62px + env(safe-area-inset-bottom, 0px));
   }
   .sidebar {
-    height: calc(62px + env(safe-area-inset-bottom, 0px)) !important;
-    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px)) !important;
+    height: calc(62px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
   }
   .topbar {
-    padding-top: calc(10px + env(safe-area-inset-top, 0px)) !important;
-    padding-bottom: 10px !important;
-    background: #07090b !important;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-bottom: 10px;
+    background: #07090b;
   }
   .tactical-activity-view {
-    padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)) !important;
+    padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   }
   .discovered-list {
     padding: 10px 14px;
@@ -3416,13 +3421,13 @@ code, kbd, pre {
 
   /* ─── Tactical Terminal Header Mobile Layout ─── */
   .terminal-header-chrome {
-    display: grid !important;
-    grid-template-columns: 1fr auto !important;
+    display: grid;
+    grid-template-columns: 1fr auto;
     grid-template-areas:
       "controls telemetry"
-      "actions actions" !important;
-    gap: 10px 12px !important;
-    padding: 10px 14px !important;
+      "actions actions";
+    gap: 10px 12px;
+    padding: 10px 14px;
   }
   .terminal-window-controls {
     grid-area: controls;
