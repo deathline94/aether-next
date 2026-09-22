@@ -213,19 +213,3 @@ export function NumberField({
   );
 }
 
-export function Badge({
-  children,
-  variant = "emerald",
-  className = "",
-}: {
-  children: React.ReactNode;
-  variant?: "emerald" | "cyan" | "amber" | "coral" | "violet" | "muted";
-  className?: string;
-}) {
-  return (
-    <span className={`tactile-badge badge-${variant} ${className}`}>
-      {children}
-    </span>
-  );
-}
-

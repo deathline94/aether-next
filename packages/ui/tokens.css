@@ -41,6 +41,23 @@
      a decision in one place rather than 44 accidents. */
   --text-micro: 11px;
 
+  /* Stacking, by what the layer is for. The numbers only carry meaning relative
+     to each other, and the low cluster is deliberate rather than accidental: the
+     ping rings sit under the copy, the copy under the switch chassis and label,
+     and the whole assembly above them — which is why they are 1/2/3/4 and not
+     four uses of one value. Named by role so a new overlay is placed by asking
+     what it is, not by picking a number larger than the last one seen. */
+  --z-decor: 1;
+  --z-copy: 2;
+  --z-chassis: 3;
+  --z-switch: 4;
+  --z-dock: 10;
+  --z-topbar: 20;
+  --z-sidebar: 30;
+  /* Android's mobile nav detaches the sidebar from the page and floats it over
+     everything else, so it has to outrank the desktop sidebar it replaces. */
+  --z-overlay: 40;
+
   /* Surfaces */
   --bg-app: #07090b;
   --bg-sidebar: #090c0f;
