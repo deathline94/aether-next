@@ -2351,6 +2351,9 @@ code, kbd, pre {
   gap: 10px;
   max-height: 420px;
   overflow-y: auto;
+  /* Reserve the gutter: the list gains its scrollbar somewhere between the 20th
+     and 21st endpoint, and without this every row jumps left at that moment. */
+  scrollbar-gutter: stable;
 }
 .discovered-row {
   padding: 12px 16px;
@@ -2879,6 +2882,8 @@ code, kbd, pre {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* The console is always scrolling; the gutter keeps the time column fixed. */
+  scrollbar-gutter: stable;
   padding: 10px 0;
   background: #040608;
   font-family: var(--font-mono);
