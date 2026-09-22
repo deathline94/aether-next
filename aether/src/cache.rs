@@ -526,10 +526,28 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Run `f` under the cross-process lock: acquire, load (pruning stale), mutate,
 /// then persist atomically. The single entry point for every mutation.
-fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) {
+/// Whether a mutation actually reached the file.
+///
+/// `with_cache` deliberately **skips** rather than writing unlocked when another
+/// process holds the lock, so "we updated the cache" was a claim nobody could
+/// check: the caller could not retry, the log could not say which endpoint stayed
+/// stale, and a test could not tell a lost update apart from an intentional skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    Applied,
+    Skipped,
+}
+
+impl Mutation {
+    pub fn was_skipped(self) -> bool {
+        self == Mutation::Skipped
+    }
+}
+
+fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) -> Mutation {
     let path = cache_path(base_config);
     let Some(_guard) = CacheGuard::acquire(&path) else {
-        return;
+        return Mutation::Skipped;
     };
     if !parses_as_cache(&path) {
         quarantine_corrupt(&path);
@@ -539,6 +557,7 @@ fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) {
     cache.version = CACHE_VERSION;
     cache.written_at = now_secs();
     save_endpoints(base_config, &cache);
+    Mutation::Applied
 }
 
 /// Read the cache. Never writes, never renames: a read that destroyed evidence
@@ -603,11 +622,11 @@ fn upsert(
     list.truncate(MAX_CACHED);
 }
 
-pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) {
+pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) -> Mutation {
     let transport = active_masque_transport();
     with_cache(base_config, move |cache| {
         upsert(&mut cache.masque, endpoints, transport)
-    });
+    })
 }
 
 /// Cached masque endpoints that were measured over `transport`, best first.
@@ -622,10 +641,10 @@ pub fn get_masque_sorted(base_config: &str) -> Vec<(SocketAddr, u32)> {
     get_masque_sorted_for(base_config, active_masque_transport())
 }
 
-pub fn add_to_wireguard_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) {
+pub fn add_to_wireguard_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) -> Mutation {
     with_cache(base_config, |cache| {
         upsert(&mut cache.wireguard, endpoints, TransportKind::default())
-    });
+    })
 }
 
 /// Cached wireguard endpoints sorted by trust score (highest first).
@@ -641,7 +660,7 @@ fn sorted(mut eps: Vec<CachedEndpoint>) -> Vec<(SocketAddr, u32)> {
 
 /// Record a successful connection. Upserts: an endpoint reached via the
 /// enroll/anycast fallback (never a scan hit) still accrues trust.
-pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) {
+pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) -> Mutation {
     let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
     with_cache(base_config, move |cache| {
         let list = if is_masque {
@@ -650,7 +669,7 @@ pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) {
             &mut cache.wireguard
         };
         record_success_on(list, addr, transport, now_secs());
-    });
+    })
 }
 
 fn record_success_on(
@@ -688,7 +707,7 @@ fn record_success_on(
 /// gateway over QUIC used to add a failure that evicted it from the H2 list too,
 /// so a gateway that had never once failed over the transport in use was deleted
 /// after three failures of a transport we were not even using.
-pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) {
+pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) -> Mutation {
     let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
     with_cache(base_config, move |cache| {
         let list = if is_masque {
@@ -697,7 +716,7 @@ pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) {
             &mut cache.wireguard
         };
         record_failure_on(list, addr, transport, now_secs());
-    });
+    })
 }
 
 fn record_failure_on(

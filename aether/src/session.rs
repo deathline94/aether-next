@@ -270,9 +270,13 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // Feed the real connect outcome into the trust cache so endpoint
             // ranking learns from actual connections, not just scan reachability.
             if result.is_ok() {
-                crate::cache::record_success(&base_config, peer, true);
+                if crate::cache::record_success(&base_config, peer, true).was_skipped() {
+                    log::warn!("[cache] update for {peer} was skipped: another process holds the cache lock");
+                }
             } else {
-                crate::cache::record_failure(&base_config, peer, true);
+                if crate::cache::record_failure(&base_config, peer, true).was_skipped() {
+                    log::warn!("[cache] failure record for {peer} was skipped: another process holds the cache lock");
+                }
             }
             result
         }
@@ -564,7 +568,9 @@ async fn select_peer(
                         };
                         if let Ok(_rtt) = verified {
                             log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
-                            crate::cache::record_success(base_config, peer_addr, true);
+                            if crate::cache::record_success(base_config, peer_addr, true).was_skipped() {
+                                log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
+                            }
                             session_event::emit(SessionEvent::EndpointSelected {
                                 addr: peer_addr.to_string(),
                                 protocol: "masque".into(),
@@ -574,7 +580,9 @@ async fn select_peer(
                             log::warn!("[-] cached gateway {peer_addr} no longer works; scanning fresh");
                             // Evict the dead peer from the trust cache so we stop
                             // trying it first on every reconnect after a network change.
-                            crate::cache::record_failure(base_config, peer_addr, true);
+                            if crate::cache::record_failure(base_config, peer_addr, true).was_skipped() {
+                                log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
+                            }
                         }
                     }
                 }

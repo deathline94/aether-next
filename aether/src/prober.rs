@@ -246,7 +246,11 @@ impl CacheKind {
         }
     }
 
-    pub fn write_with_rtt(&self, config_path: &str, endpoints: Vec<(SocketAddr, u32)>) {
+    pub fn write_with_rtt(
+        &self,
+        config_path: &str,
+        endpoints: Vec<(SocketAddr, u32)>,
+    ) -> crate::cache::Mutation {
         match self {
             CacheKind::Masque => crate::cache::add_to_masque_with_rtt(config_path, endpoints),
             CacheKind::WireGuard => crate::cache::add_to_wireguard_with_rtt(config_path, endpoints),
@@ -320,10 +324,17 @@ pub async fn race_cached_endpoints(
                     Some(Some(pr)) => {
                         log::info!("[⚡] Tier-0 race winner {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                         let rtt_ms = pr.rtt.as_millis() as u32;
-                        cache_kind.write_with_rtt(
-                            config_path,
-                            vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
-                        );
+                        if cache_kind
+                            .write_with_rtt(
+                                config_path,
+                                vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
+                            )
+                            .was_skipped()
+                        {
+                            log::warn!(
+                                "[scan] could not record the winner: another process holds the cache lock"
+                            );
+                        }
                         return Tier0Outcome::Winner(pr);
                     }
                     Some(None) => continue,
