@@ -21,6 +21,32 @@ const isHit = (l: LogEntry) => {
     l.message.includes("best:")
   );
 };
+/**
+ * A hit is an endpoint, not a line that mentioned one. The engine writes both a
+ * structured `scan_hit` and a human "candidate ok" line for the same address, so
+ * counting lines counted one endpoint two and three times. Keep the first line per
+ * address so the list under "Hits" and the number beside it are the same fact.
+ */
+const hitKey = (l: LogEntry): string | null =>
+  IP_SOCKET_REGEX.exec(l.message)?.[0]?.toLowerCase() ?? null;
+
+export function uniqueHits(logs: LogEntry[]): LogEntry[] {
+  const seen = new Set<string>();
+  const out: LogEntry[] = [];
+  for (const l of logs) {
+    if (!isHit(l)) continue;
+    const key = hitKey(l);
+    if (key === null) {
+      out.push(l);
+      continue;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(l);
+  }
+  return out;
+}
+
 const isError = (l: LogEntry) => l.level === "error" || l.level === "warn";
 // milestones: exclude noisy progress and probe error lines so high-level transitions stand out
 const isMilestone = (l: LogEntry) =>
@@ -51,16 +77,20 @@ export function useLogs() {
     setLogs((current) => [...current.slice(-(MAX_LOGS - 1)), full]);
   }, []);
 
-  const filteredLogs = useMemo(() => logs.filter(predicates[logFilter]), [logs, logFilter]);
+  const hits = useMemo(() => uniqueHits(logs), [logs]);
+  const filteredLogs = useMemo(
+    () => (logFilter === "hits" ? hits : logs.filter(predicates[logFilter])),
+    [logs, logFilter, hits],
+  );
 
   const filterCounts = useMemo(
     () => ({
       milestones: logs.filter(isMilestone).length,
-      hits: logs.filter(isHit).length,
+      hits: hits.length,
       errors: logs.filter(isError).length,
       raw: logs.length,
     }),
-    [logs],
+    [logs, hits],
   );
 
   const visibleLogs = useMemo(() => {

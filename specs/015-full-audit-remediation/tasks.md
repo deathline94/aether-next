@@ -543,7 +543,13 @@
   Test infrastructure note worth keeping: vitest here runs without `globals: true`, which switches off
   testing-library's automatic cleanup, so a DOM test file needs an explicit `afterEach(cleanup)` or its
   second query finds two of every element. The first run failed exactly that way.
-- [ ] T170 [P] [US6] Failing test: the Hits filter counts hits exactly once over a 2 000-line buffer. Fails today: `useLogs.ts:12-23` double-counts because `pump_scan_stream` forwards both the human `[+] … candidate ok` line and the raw `AETHER_EVENT` line and each matches a different clause; `EndpointSelected` never matches (serde's tag is `endpoint_selected`); `"Selected edge"` exists nowhere; and the "valid IP" regex is unanchored so `":150` inside JSON counts — spec 006's Hits filter was never implemented.
+- [x] T170 [P] [US6] Failing test: the Hits filter counts hits exactly once over a 2 000-line buffer.
+  `uniqueHits` keeps the first line per IP:socket and the count is that list's length, so the badge and
+  the list under "Hits" are the same fact. A probe writes a structured `scan_hit`, a "candidate ok" line
+  and often a "verified" line for one endpoint, so counting lines counted it two or three times.
+  Test: `apps/desktop/src/hooks/useLogs.test.ts` (2) — three lines for one endpoint count 2 across two
+  endpoints, and 800 lines for 251 endpoints count 251. Reverting to `logs.filter(isHit).length` reddens
+  both with the true numbers (4 and 800). Applied to both UIs; 18 desktop and 12 Android tests pass.
 - [ ] T171 [P] [US6] Failing a11y suite in `apps/desktop/src/components/__tests__/a11y.test.tsx` (axe) per tab with 2 000 mocked rows: zero role violations, focus visible, every scroll region keyboard-reachable, DOM nodes ≤ viewport+overscan.
 
 ### Implementation for User Story 6
@@ -613,7 +619,14 @@
   whose minimum *is* 0. All three now go through an exported `draftNumber(draft, fallback)`.
   Both component tests redden when the old expression is put back (verified by mutation, file restored from
   a backup). 16 desktop and 12 Android UI tests pass.
-- [ ] T182 [US6] Rebuild `apps/desktop/src/hooks/useLogs.ts` hit filtering on structured `scan_hit` events already available from `useScanner`, delete the prose-substring predicates, and keep `MAX_LOGS` at the single append site (that part is already correct) (fixes T170).
+- [ ] T182 [US6] Rebuild `apps/desktop/src/hooks/useLogs.ts` hit filtering on structured `scan_hit` events already available from `useScanner`, delete the prose-substring predicates, and keep the count and the list in agreement.
+  Half landed on T170: the count/list agreement and the per-endpoint dedupe are done, which was the
+  observable defect. The remaining work is the predicate rewrite — `isHit` still recognises hits by
+  substring (`candidate ok`, `verified`, `best:`, `Selected edge`), so an unrelated log line that happens
+  to carry an address and one of those words still registers as a hit, and a new engine phrasing silently
+  stops counting. Doing it properly means the scanner's structured events feeding the log entries
+  themselves (a `hitKey` on the entry rather than a regex over prose), which touches how `appendLog` is
+  called from three places; left open rather than half-migrated behind a compatibility shim.
 - [ ] T183 [US6] Stop clearing logs on every connect/disconnect/test in `apps/desktop/src/hooks/useRuntime.ts:160,181,204` — the error line the user was about to copy currently vanishes the instant they press "Try again"; keep clearing only in the Activity tab's own Clear action.
 - [ ] T184 [US6] Fix the auto-scroll latch in `apps/desktop/src/components/ActivityTab.tsx:84-89` by resetting `isProgrammaticScrollRef` synchronously after the scroll assignment, not inside a `requestAnimationFrame` throttled when the window is hidden to tray.
 - [ ] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
