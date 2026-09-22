@@ -5,9 +5,17 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- The declared type for a VpnService's foreground service; see AetherVpnService. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- extractNativeLibs must stay "true" while `packaging.jniLibs.useLegacyPackaging
+         = true` in app/build.gradle.kts: the engine is *executed* from
+         nativeLibraryDir/libaether.so, and that path only exists when the installer
+         unpacks the native libraries. (An XML comment cannot live between the
+         attributes of a start tag — that is not well-formed XML, and the manifest
+         merger fails the whole build with nothing but "Error parsing".) -->
     <application
         android:name=".AetherApp"
         android:allowBackup="false"
@@ -46,13 +54,10 @@
             android:name=".AetherVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="systemExempted">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="vpn tunnel" />
         </service>
 
         <receiver

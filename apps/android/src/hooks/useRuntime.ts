@@ -58,6 +58,23 @@ export function useRuntime(
         );
         if (disposed) { unlistenLog(); return; }
         cleanup.push(unlistenLog);
+
+        // The shell coalesces engine chatter (`RUST_LOG=info` during a scan is
+        // hundreds of lines a second) into one post per interval instead of one
+        // `evaluateJavascript` per line. Both shapes are accepted so a dev server
+        // talking to an older shell, or a newer shell talking to a cached page, still
+        // streams — a log line that cannot be rendered must never be the reason the
+        // runtime status stops updating.
+        const unlistenLogs = await listen<{
+          entries?: { level: "info" | "warn" | "error"; message: string }[];
+        }>("session://logs", (event) => {
+          const entries = Array.isArray(event.payload?.entries) ? event.payload.entries : [];
+          for (const entry of entries) {
+            if (entry && typeof entry.message === "string") appendLog(entry);
+          }
+        });
+        if (disposed) { unlistenLogs(); return; }
+        cleanup.push(unlistenLogs);
       } catch (error) {
         appendLog({ level: "warn", message: errorMessage(error) });
       }

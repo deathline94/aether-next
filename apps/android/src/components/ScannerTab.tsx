@@ -250,8 +250,8 @@ export function ScannerTab({
               </div>
               <NumberField
                 label="Scan concurrency"
-                min={1}
-                max={2000}
+                min={SCAN_LIMITS.minConcurrency}
+                max={SCAN_LIMITS.maxConcurrency}
                 step={10}
                 value={concurrency}
                 disabled={active}

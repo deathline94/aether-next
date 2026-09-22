@@ -133,6 +133,35 @@ export type ScanEvent =
     )
   | ({ type: "scan_failed"; message: string } & ScanRunScope);
 
+/**
+ * The scanner's numeric bounds — the *only* place the UI states them.
+ *
+ * The Timeout field used to advertise 100–30000 ms while the native bridge coerced
+ * the same value to `>= 3000` (`>= 6000` for the MASQUE family, whose handshake does
+ * not fit inside 3 s): two clamp implementations, disagreeing, and the number the
+ * user typed was never the number the engine ran. These mirror `ScanLimits` in
+ * `app/src/main/java/app/aethernext/EngineProfiles.kt`; the input is disabled below
+ * the floor instead of silently rewriting what was typed.
+ */
+export const SCAN_LIMITS = {
+  minTimeoutMs: 3000,
+  masqueMinTimeoutMs: 6000,
+  maxTimeoutMs: 30000,
+  minConcurrency: 1,
+  maxConcurrency: 2000,
+} as const;
+
+/** The floor that applies to a given protocol, mirroring the shell's `clampTimeout`. */
+export function scanTimeoutFloor(protocol: string): number {
+  const p = protocol.toLowerCase();
+  return p.includes("h3") || p === "masque" ? SCAN_LIMITS.masqueMinTimeoutMs : SCAN_LIMITS.minTimeoutMs;
+}
+
+/** The value actually sent for `timeoutMs`, after the shell's clamp. */
+export function effectiveScanTimeout(protocol: string, timeoutMs: number): number {
+  return Math.min(SCAN_LIMITS.maxTimeoutMs, Math.max(scanTimeoutFloor(protocol), timeoutMs));
+}
+
 /** One-click speed presets, shared by Connection tab. */
 export const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = [
   { id: "masque-h3", label: "MASQUE H3", hint: "MASQUE h3 · noise off · balanced · full VPN", patch: { protocol: "masque", transport: "h3", noize: "off", scanMode: "balanced", ipVersion: "v4", routingMode: "tun", peer: "" } },

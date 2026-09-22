@@ -43,15 +43,65 @@ function isAndroid(): boolean {
   return typeof window.AetherAndroid?.invoke === "function";
 }
 
+/**
+ * Whether the mocked runtime may answer at all.
+ *
+ * `vite build` — the only way this bundle reaches an APK — bakes `DEV` to `false`, so
+ * a release build can never fall through to `mockInvoke`. That mattered because the
+ * fallback reported `connected / "VPN active (full device)"` (see `mockInvoke`) with no
+ * tunnel behind it: a release WebView that failed to install `AetherAndroid` — an
+ * origin-gated page, a stripped `@JavascriptInterface`, a second WebView — showed a
+ * green badge and a fake pid instead of an error.
+ */
+const MOCK_ALLOWED = import.meta.env.DEV;
+
+/** The envelope of a dispatched command that has not settled yet. */
+type PendingEnvelope = { pending: string; pollMs?: number };
+
+function isPending(data: unknown): data is PendingEnvelope {
+  return isRecord(data) && typeof data.pending === "string" && data.pending.length > 0;
+}
+
+type ResultEnvelope = { state: "pending" } | { state: "done"; envelope: unknown };
+
+/**
+ * Collect the result of a command the shell dispatched to a worker.
+ *
+ * The native `invoke` is a synchronous, return-valued call that runs on the WebView's
+ * JavaBridge thread — so a handler that blocks (connect: keystore retries plus a
+ * process poll; test_connection: a 12 s HTTP call) blocks the page's JS with it. The
+ * shell now answers those commands with a token and the result is polled here, which
+ * keeps `await invoke(...)`'s contract — resolve on success, throw on rejection —
+ * without freezing the renderer.
+ */
+async function awaitResult<T>(id: string, pollMs: number, budgetMs: number): Promise<T> {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    const raw = window.AetherAndroid?.invoke("get_result", JSON.stringify({ id }));
+    if (typeof raw !== "string") {
+      throw new Error("bridge disappeared while a command was in flight");
+    }
+    const res = unwrapEnvelope<ResultEnvelope>(raw);
+    if (res.state === "done") return unwrapEnvelope<T>(res.envelope);
+    if (Date.now() > deadline) {
+      throw new Error(`bridge command ${id} did not settle within ${budgetMs} ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+/** How long a dispatched command may take before the UI gives up on it. */
+const SETTLE_BUDGET_MS = 90_000;
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
 }
 
 /** Validate and unwrap the native `{ ok, data?, error? }` envelope. */
-function unwrapEnvelope<T>(raw: string): T {
+function unwrapEnvelope<T>(raw: string | unknown): T {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
   } catch {
     throw new Error("native bridge returned malformed JSON");
   }
@@ -114,7 +164,25 @@ export async function invoke<T = unknown>(
     } catch (e) {
       throw new Error(`bridge call ${cmd} failed: ${String(e)}`);
     }
-    return unwrapEnvelope<T>(raw);
+    const data = unwrapEnvelope<unknown>(raw);
+    // A dispatched command answers with a token; the page keeps running while the
+    // shell works, and the settled envelope is collected below.
+    if (isPending(data)) {
+      return awaitResult<T>(data.pending, data.pollMs ?? 120, SETTLE_BUDGET_MS);
+    }
+    return data as T;
+  }
+  if (!MOCK_ALLOWED) {
+    // Release builds must fail loudly. Falling through to the mock here is how a
+    // phone with a broken bridge ends up showing "VPN active" for a VPN that was never
+    // started.
+    throw new IpcRejection({
+      code: "bridge_unavailable",
+      message:
+        "The native bridge (AetherAndroid) is not available in this WebView, so no command " +
+        "can reach the engine. Reload the app; if it persists, the packaged UI was loaded " +
+        "outside the Aether activity.",
+    });
   }
   return mockInvoke<T>(cmd, args);
 }

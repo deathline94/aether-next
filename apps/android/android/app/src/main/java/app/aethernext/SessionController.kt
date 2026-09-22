@@ -33,11 +33,82 @@ class SessionController(
     private val stateLock = Any()
 
     fun setEmitter(fn: (event: String, payload: JSONObject) -> Unit) {
-        emit = fn
+        defaultEmitter = fn
     }
 
+    /** The process-wide sink, set by [get]; per-activity sinks go through [attachUi]. */
     @Volatile
-    private var emit: (event: String, payload: JSONObject) -> Unit = emitter
+    private var defaultEmitter: (event: String, payload: JSONObject) -> Unit = emitter
+
+    /** The one path every event takes: [fanOut]. Never reassigned, so a lifecycle
+     *  change in one activity cannot silence another activity's events. */
+    private val emit: (event: String, payload: JSONObject) -> Unit = { event, payload ->
+        fanOut(event, payload)
+    }
+
+    /**
+     * The sinks that are actually attached, keyed by their owner (an activity).
+     *
+     * The controller is a process singleton, so the single `emit` field gave a task
+     * swipe two equally wrong options: leave a dead WebView as the sink, or silence
+     * the whole session — which is what happened, and left the engine and a
+     * full-device tunnel running with no way for any UI to see or stop them (T2xx).
+     * Sinks are now registered per owner and removed when that owner dies; the
+     * session only goes silent when the last one is gone, and that is a fact callers
+     * can act on.
+     */
+    private val emitterLock = Any()
+    private val uiEmitters = LinkedHashMap<Any, (event: String, payload: JSONObject) -> Unit>()
+
+    /** Attach [owner]'s sink. Idempotent per owner, so `onResume` may re-attach. */
+    fun attachUi(owner: Any, fn: (event: String, payload: JSONObject) -> Unit) {
+        synchronized(emitterLock) { uiEmitters[owner] = fn }
+    }
+
+    /**
+     * Remove [owner]'s sink.
+     *
+     * @return true when nothing is listening any more — the caller's cue that a
+     *   tunnel no UI can reach should not stay up.
+     */
+    fun detachUi(owner: Any): Boolean = synchronized(emitterLock) {
+        uiEmitters.remove(owner)
+        uiEmitters.isEmpty()
+    }
+
+    /** Whether at least one UI sink is registered. */
+    fun hasUi(): Boolean = synchronized(emitterLock) { uiEmitters.isNotEmpty() }
+
+    private fun fanOut(event: String, payload: JSONObject) {
+        try {
+            defaultEmitter(event, payload)
+        } catch (e: Exception) {
+            Log.w(TAG, "the process sink threw for $event: ${e.message}")
+        }
+        val sinks = synchronized(emitterLock) { uiEmitters.values.toList() }
+        for (sink in sinks) {
+            try {
+                sink(event, payload)
+            } catch (e: Exception) {
+                Log.w(TAG, "a UI sink threw for $event and was dropped: ${e.message}")
+                synchronized(emitterLock) { uiEmitters.values.removeIf { it === sink } }
+            }
+        }
+    }
+
+    /**
+     * Tear the session down because no UI is left that could ever stop it.
+     *
+     * Safe to call from any thread and cheap to call twice: [disconnect] is guarded
+     * by `tearingDown`. The activity's `onDestroy` may not block, so this is the form
+     * it calls.
+     */
+    fun shutdownHeadless(reason: String = "no interface left to control the tunnel") {
+        if (hasUi()) return
+        if (runtime.status == "disconnected" && !VpnTunnel.up && !runner.isRunning()) return
+        Log.w(TAG, "stopping the session headlessly: $reason")
+        disconnect()
+    }
 
     private val store = SettingsStore(context)
     private val connectedOnce = AtomicBoolean(false)
@@ -60,8 +131,36 @@ class SessionController(
     /// Whether the running scan has already produced a terminal event of its own.
     private val scanTerminalSent = AtomicBoolean(false)
 
+    ///
+    /// The standalone-scan run the UI started, echoed onto every `scan://event`.
+    ///
+    /// The UI drops a scan event whose run id is not the one it started, so a late
+    /// terminal event from a cancelled scan cannot end the scan that is actually
+    /// running. That guard was unreachable: the bridge accepted the id, this
+    /// controller rebuilt the payload without it, and every event arrived
+    /// unattributed (T2xx).
+    @Volatile
+    private var scanRunId: String = ""
+
     @Volatile
     private var settings = store.load()
+
+    // ─── log coalescing (T2xx) ────────────────────────────────────────────────
+    private val logLock = Any()
+    private val logBatch = mutableListOf<JSONObject>()
+    private val logDropped = java.util.concurrent.atomic.AtomicInteger(0)
+    private val logFlushScheduled = AtomicBoolean(false)
+
+    /**
+     * A plain JVM scheduler on purpose: a `Handler(Looper.getMainLooper())` cannot be
+     * constructed in a unit test, and the flush only ever calls [emit] — which the
+     * activity already marshals to the UI thread.
+     */
+    private val logScheduler: java.util.concurrent.ScheduledExecutorService by lazy {
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "aether-log-batch").apply { isDaemon = true }
+        }
+    }
 
     private fun resetSessionFlags() {
         connectedOnce.set(false)
@@ -74,7 +173,7 @@ class SessionController(
 
     private fun handleExit(code: Int?, isScan: Boolean) {
         if (isScan) {
-            scanExitEvent(scanTerminalSent.get())?.let { emit("scan://event", it) }
+            scanExitEvent(scanTerminalSent.get())?.let { emitScan(it) }
             if (runtime.status != "connected") {
                 setRuntime("disconnected", "Ready", null, null)
             }
@@ -117,21 +216,48 @@ class SessionController(
      * always read together with the tunnel's own view of itself, so a
      * `status="connected"` can no longer be handed to the UI alongside a tunnel
      * that does not exist (T215).
+     *
+     * The reconciliation used to be a read-only lie detector: it returned
+     * "connecting" while the published state stayed `connected` and
+     * [connectedOnce] stayed set, so the next engine event re-asserted the green
+     * badge over the same dead path. It now *revokes* the claim: the one-shot that
+     * authorised "connected" is cleared, the correction is published once, and the
+     * user is told the path went away underneath them rather than left on a
+     * spinner (T2xx).
      */
     fun getState(): RuntimeState {
         val snapshot = runtime
-        // Fail-closed reconciliation: in tun mode the service's own view of the fd
-        // is the ground truth. If it is gone, "connected" is a lie whatever this
-        // controller last believed, and the UI must not show a green badge over it.
-        if (snapshot.status == "connected" && settings.routingMode == "tun" && !VpnTunnel.up) {
-            return RuntimeState(
-                status = "connecting",
-                detail = "Waiting for the VPN tunnel",
-                pid = snapshot.pid,
-                endpoint = snapshot.endpoint,
-            )
+        val dead = deadPathReason(snapshot.status) ?: return snapshot
+        connectedOnce.set(false)
+        vpnEstablished.set(false)
+        engineAssertedConnected.set(false)
+        setRuntime("error", dead, null, snapshot.endpoint)
+        return runtime
+    }
+
+    /**
+     * Why a published `connected` cannot be believed right now, or `null` when it
+     * can. Every clause asks a component that owns the fact rather than trusting
+     * this controller's memory of it.
+     */
+    internal fun deadPathReason(status: String): String? {
+        if (status != "connected") return null
+        if (!runner.isRunning()) {
+            return "The engine process is gone — nothing is carrying this device's traffic any more."
         }
-        return snapshot
+        if (settings.routingMode != "tun") return null
+        if (!VpnTunnel.up) {
+            return "The VPN tunnel dropped — Aether is connected but the device is no longer routed through it."
+        }
+        // The service still exists but has released its descriptor: `VpnTunnel` can
+        // lag behind a hard teardown, and a live service is the only witness that
+        // matters here.
+        AetherVpnService.current?.let { service ->
+            if (!service.isTunnelUp()) {
+                return "The VPN tunnel closed — the device is no longer routed through Aether."
+            }
+        }
+        return null
     }
 
     internal fun malformedEventCount(): Int = malformedEvents.get()
@@ -185,6 +311,17 @@ class SessionController(
             }
         }
         validate(s)
+        // The permission check runs *before* anything is persisted. Answering
+        // `VPN_PERMISSION_REQUIRED` after the save used to leave a device with a
+        // stored `routingMode=tun` and no session behind it, so the next launch
+        // started in a mode it had never been granted and the consent sheet came
+        // back on every connect.
+        if (s.routingMode == "tun") {
+            val prep = VpnService.prepare(context)
+            if (prep != null) {
+                return "VPN_PERMISSION_REQUIRED"
+            }
+        }
         store.save(s)
         settings = s
         resetSessionFlags()
@@ -197,13 +334,6 @@ class SessionController(
             if (stale != null) {
                 setRuntime("error", stale, null, null)
                 return stale
-            }
-        }
-
-        if (s.routingMode == "tun") {
-            val prep = VpnService.prepare(context)
-            if (prep != null) {
-                return "VPN_PERMISSION_REQUIRED"
             }
         }
 
@@ -236,20 +366,24 @@ class SessionController(
         concurrency: Int,
         timeoutMs: Int,
         noize: String,
+        runId: String = "",
     ): String? {
+        // Recorded before anything can emit: the first `scan_start` must carry the id
+        // the UI is filtering on.
+        scanRunId = runId
         if (runner.isRunning()) {
             if (!runner.stopAndWait(3000)) {
                 val err = "Previous engine process is still terminating; scan aborted"
                 emitLog("scan error: $err")
                 scanTerminalSent.set(true)
-                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
+                emitScan(JSONObject().put("type", "scan_failed").put("message", err))
                 return err
             }
             if (runner.isRunning()) {
                 val err = "Engine could not be stopped for scan"
                 emitLog("scan error: $err")
                 scanTerminalSent.set(true)
-                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
+                emitScan(JSONObject().put("type", "scan_failed").put("message", err))
                 return err
             }
         }
@@ -258,7 +392,7 @@ class SessionController(
         if (err != null) {
             emitLog("scan error: $err")
             scanTerminalSent.set(true)
-            emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
+            emitScan(JSONObject().put("type", "scan_failed").put("message", err))
             return err
         }
         return null
@@ -384,8 +518,7 @@ class SessionController(
                     setEndpoint(ev.addr)
                     // The connect path emits no scan_done — close the live scan card
                     // once a gateway is chosen so it does not linger during the tunnel.
-                    emit(
-                        "scan://event",
+                    emitScan(
                         JSONObject().put("type", "scan_done")
                             .put("addr", ev.addr).put("rtt", "").put("protocol", ev.protocol),
                     )
@@ -416,7 +549,7 @@ class SessionController(
                     rollbackStartup(ev.message)
                 } else {
                     scanTerminalSent.set(true)
-                    emit("scan://event", JSONObject().put("type", "scan_failed").put("message", ev.message))
+                    emitScan(JSONObject().put("type", "scan_failed").put("message", ev.message))
                 }
             }
 
@@ -488,10 +621,10 @@ class SessionController(
      */
     internal fun stopVpnService(): String? {
         var refused: Throwable? = null
+        val stop = Intent(context, AetherVpnService::class.java).apply {
+            action = AetherVpnService.ACTION_STOP
+        }
         try {
-            val stop = Intent(context, AetherVpnService::class.java).apply {
-                action = AetherVpnService.ACTION_STOP
-            }
             // The cooperative stop is what actually closes the fd; `stopService`
             // alone can be answered by the system after the process is long gone.
             context.startService(stop)
@@ -499,6 +632,20 @@ class SessionController(
         } catch (e: Exception) {
             refused = e
             Log.e(TAG, "VPN stop request failed: ${e.message}", e)
+            if (e is IllegalStateException) {
+                // API 26+ answers `startService` from a backgrounded app with
+                // IllegalStateException. The stop must still reach a service that may
+                // be carrying the device, so escalate — [AetherVpnService] answers an
+                // ACTION_STOP by taking itself into the foreground first, which is what
+                // makes `startForegroundService` legal on this path. The refusal is
+                // still reported: an escalation is a request, not a confirmation.
+                try {
+                    context.startForegroundService(stop)
+                } catch (e2: Exception) {
+                    refused = e2
+                    Log.e(TAG, "escalated VPN stop request also failed: ${e2.message}", e2)
+                }
+            }
         }
         try {
             context.stopService(Intent(context, AetherVpnService::class.java))
@@ -527,6 +674,19 @@ class SessionController(
         VpnTunnel.established(true, settings.socksPort)
         emitLog("VPN: tun2socks established")
         evaluateReadiness()
+    }
+
+    /**
+     * The watchdog found the data path dead and is restarting the tunnel. The badge
+     * comes down *now* — a tunnel that is being rebuilt is not one that is carrying
+     * the user's traffic — and the revocation is what lets [markConnected] re-authorise
+     * it if the restart succeeds.
+     */
+    fun onVpnRestartScheduled(attempt: Int) {
+        connectedOnce.set(false)
+        vpnEstablished.set(false)
+        emitLog("VPN: data path unresponsive, supervised restart #$attempt")
+        setRuntime("connecting", "Recovering the tunnel (attempt $attempt)", runtime.pid, runtime.endpoint)
     }
 
     /** The service confirmed the tun is closed; only now may the session say "Ready". */
@@ -640,24 +800,110 @@ class SessionController(
                 .put("rtt", src.optString("rtt"))
                 .put("protocol", src.optString("protocol"))
         }
-        emit("scan://event", out)
+        emitScan(out)
+    }
+
+    /**
+     * The one exit for a scan event: it stamps the run id (see [scanRunId]) so the
+     * UI can tell a live run's events from a cancelled one's.
+     */
+    private fun emitScan(payload: JSONObject) {
+        val id = scanRunId
+        if (id.isNotEmpty() && payload.isNull("runId")) payload.put("runId", id)
+        emit("scan://event", payload)
     }
 
     fun emitLog(message: String) {
-        val lower = message.lowercase()
-        val level = when {
-            lower.contains("error") || lower.contains("failed") -> "error"
-            lower.contains("warn") || lower.contains("[-]") -> "warn"
-            else -> "info"
+        val level = logLevelOf(message)
+        emitAt(level, message)
+    }
+
+    /** A warning that must not be classified out of existence by its wording. */
+    fun emitWarn(message: String) = emitAt("warn", message)
+
+    internal fun logLevelOf(message: String): String = when {
+        message.lowercase().contains("error") || message.lowercase().contains("failed") -> "error"
+        message.lowercase().contains("warn") || message.lowercase().contains("[-]") -> "warn"
+        else -> "info"
+    }
+
+    /**
+     * Publish one log line, batching the chatty ones (T2xx).
+     *
+     * `RUST_LOG=info` during a scan is hundreds of lines a second, and each used to
+     * be its own `evaluateJavascript` post on the main thread *and* its own copy of
+     * the web layer's log array — the flood was the UI, not the engine. Info lines
+     * are therefore queued and flushed as a single `session://logs` event every
+     * [LOG_FLUSH_INTERVAL_MS] or every [LOG_BATCH_MAX_LINES] lines, whichever comes
+     * first.
+     *
+     * `warn` and `error` are never queued: they flush the pending batch (so ordering
+     * survives) and go out on their own, immediately. Dropping the oldest lines of an
+     * info burst is reported rather than silent, because a log that quietly loses its
+     * middle is worse than no log.
+     */
+    private fun emitAt(level: String, message: String) {
+        if (level != "info") {
+            flushLogs()
+            emit("session://log", JSONObject().put("level", level).put("message", message))
+            return
         }
-        emit(
-            "session://log",
-            JSONObject().put("level", level).put("message", message),
-        )
+        val full: Boolean
+        synchronized(logLock) {
+            if (logBatch.size >= LOG_HARD_CAP) {
+                // Bounded: the burst is reported as dropped, never allowed to grow
+                // the queue without limit.
+                logDropped.incrementAndGet()
+                full = false
+            } else {
+                logBatch.add(JSONObject().put("level", level).put("message", message))
+                full = logBatch.size >= LOG_BATCH_MAX_LINES
+            }
+        }
+        if (full) flushLogs() else scheduleLogFlush()
+    }
+
+    private fun scheduleLogFlush() {
+        if (logFlushScheduled.getAndSet(true)) return
+        logScheduler.schedule({ flushLogs() }, LOG_FLUSH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
+    /** Emit whatever info lines are queued. Safe from any thread, and idempotent. */
+    internal fun flushLogs() {
+        var batch: List<JSONObject>
+        val dropped: Int
+        synchronized(logLock) {
+            logFlushScheduled.set(false)
+            if (logBatch.isEmpty()) return
+            batch = logBatch.toList()
+            logBatch.clear()
+            dropped = logDropped.getAndSet(0)
+        }
+        if (dropped > 0) {
+            batch += JSONObject().put("level", "warn")
+                .put("message", "$dropped log lines were dropped during this burst")
+        }
+        if (batch.size == 1) {
+            emit("session://log", batch[0])
+        } else {
+            emit(
+                "session://logs",
+                JSONObject().put("entries", org.json.JSONArray(batch)),
+            )
+        }
     }
 
     companion object {
         private const val TAG = "SessionController"
+
+        /** The UI's own caps for the custom noise profile; a save beyond them is junk input. */
+        const val NOIZE_JC_MAX = 64
+        const val NOIZE_SIZE_MAX = 2048
+
+        /** Log coalescing cadence and burst bounds (T2xx). */
+        const val LOG_FLUSH_INTERVAL_MS = 40L
+        const val LOG_BATCH_MAX_LINES = 64
+        const val LOG_HARD_CAP = 2_000
 
         @Volatile
         private var instance: SessionController? = null
@@ -687,9 +933,14 @@ class SessionController(
             if (s.routingMode.lowercase() !in validRoutingModes) {
                 throw SettingRejected("routingMode", "Invalid routingMode '${s.routingMode}'. Allowed: $validRoutingModes")
             }
-            val validNoize = setOf("off", "on", "random", "m1", "m2", "light", "medium", "high", "max", "custom")
+            val validNoize = NoizeProfiles.appValues
             if (s.noize.lowercase() !in validNoize) {
-                throw SettingRejected("noize", "Invalid noize mode '${s.noize}'. Allowed: $validNoize")
+                throw SettingRejected(
+                    "noize",
+                    "Invalid noize mode '${s.noize}'. Allowed: $validNoize — the engine " +
+                        "understands ${NoizeProfiles.engineValues.joinToString("|")}, and this shell " +
+                        "translates rather than silently downgrading.",
+                )
             }
             if (s.httpPort !in 1024..65535) {
                 throw SettingRejected("httpPort", "HTTP port must be 1024-65535 (got ${s.httpPort})")
@@ -704,11 +955,17 @@ class SessionController(
                 throw SettingRejected("quicInitialFragSize", "quicInitialFragSize must be between 16 and 512")
             }
             // One message for three inputs told the user nothing about which one.
-            if (s.noizeJc < 0) {
-                throw SettingRejected("noizeJc", "noizeJc must be >= 0")
+            // Bounded on both sides: the UI caps these at 64 / 2048 bytes, and a
+            // validation that only checked `>= 0` accepted 999999 junk packets per
+            // probe and handed them to the engine as if the user had asked for them.
+            if (s.noizeJc !in 0..NOIZE_JC_MAX) {
+                throw SettingRejected("noizeJc", "noizeJc must be 0-$NOIZE_JC_MAX (got ${s.noizeJc})")
             }
-            if (s.noizeJmin < 0) {
-                throw SettingRejected("noizeJmin", "noizeJmin must be >= 0")
+            if (s.noizeJmin !in 0..NOIZE_SIZE_MAX) {
+                throw SettingRejected("noizeJmin", "noizeJmin must be 0-$NOIZE_SIZE_MAX (got ${s.noizeJmin})")
+            }
+            if (s.noizeJmax !in 0..NOIZE_SIZE_MAX) {
+                throw SettingRejected("noizeJmax", "noizeJmax must be 0-$NOIZE_SIZE_MAX (got ${s.noizeJmax})")
             }
             if (s.noizeJmax < s.noizeJmin) {
                 throw SettingRejected("noizeJmax", "noizeJmax (${s.noizeJmax}) must be >= noizeJmin (${s.noizeJmin})")

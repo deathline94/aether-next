@@ -81,22 +81,34 @@ open class EngineRunner(
 
     open fun configureProcessEnvironment(settings: Settings, binary: File): Map<String, String> {
         val configDir = File(context.filesDir, "config").apply { mkdirs() }
-        val configPath = File(configDir, "aether.toml").absolutePath
-        val homeDir = context.filesDir.absolutePath
+        return engineEnv(
+            settings = settings,
+            configPath = File(configDir, "aether.toml").absolutePath,
+            homeDir = context.filesDir.absolutePath,
+            tmpDir = context.cacheDir.absolutePath,
+        )
+    }
 
-        val protocolEnv = when (settings.protocol.lowercase()) {
-            "wireguard", "wg" -> "wg"
-            "masque-h2" -> "masque"
-            "masque", "masque-h3" -> "masque"
-            else -> "masque"
-        }
-        val isH2 = settings.protocol.lowercase() == "masque-h2" || settings.transport.lowercase() == "h2"
+    /**
+     * The engine's environment, as a pure function.
+     *
+     * It used to be reachable only through an overridable method that needed a
+     * `Context`, which is how the test suite ended up asserting a stub of it instead
+     * of the values the child actually receives (T2xx).
+     */
+    internal fun engineEnv(
+        settings: Settings,
+        configPath: String,
+        homeDir: String,
+        tmpDir: String,
+    ): Map<String, String> {
+        val protocolEnv = protocolEnv(settings.protocol, settings.transport)
 
         val env = mutableMapOf<String, String>(
             "AETHER_PROTOCOL" to protocolEnv,
             "AETHER_SCAN" to settings.scanMode,
             "AETHER_IP" to settings.ipVersion,
-            "AETHER_NOIZE" to settings.noize,
+            "AETHER_NOIZE" to noizeEnv(settings.noize),
             "AETHER_SOCKS" to "127.0.0.1:${settings.socksPort}",
             "AETHER_HTTP" to "127.0.0.1:${settings.httpPort}",
             "AETHER_CONFIG" to configPath,
@@ -104,14 +116,14 @@ open class EngineRunner(
             // handoffConfigKey); a process environment lives as long as the
             // process and is readable by anything that can open it.
             "AETHER_CONFIG_KEY_STDIN" to "1",
-            "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
-            "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
+            "AETHER_MASQUE_HTTP2" to (if (isHttp2(settings.protocol, settings.transport)) "1" else "0"),
+            "AETHER_QUIC_INITIAL_FRAG" to quicFragEnv(settings),
             "AETHER_TUN" to "0",
             "AETHER_WG_NO_PROFILE_RETRY" to "1",
             "AETHER_CONTROL_STDIN" to "1",
             "RUST_LOG" to "info",
             "HOME" to homeDir,
-            "TMPDIR" to context.cacheDir.absolutePath
+            "TMPDIR" to tmpDir
         )
         if (settings.peer.isNotBlank()) {
             env["AETHER_PEER"] = settings.peer.trim()
@@ -137,17 +149,55 @@ open class EngineRunner(
      */
     open fun configKey(): String = ConfigKeyStore.loadOrCreate(context)
 
-    private fun handoffConfigKey(proc: Process): Boolean = try {
+    /**
+     * Send the envelope key down the control pipe the engine already listens on.
+     *
+     * @return `null` on success, otherwise the *cause* — not a verdict. The failure
+     *   this replaces reported a keystore that never came back, a child that closed
+     *   its stdin, and an I/O error as one indistinguishable "could not receive its
+     *   configuration key", so a KeyStore that needs re-provisioning looked exactly
+     *   like a broken download (T2xx).
+     */
+    private fun handoffConfigKey(proc: Process): String? = try {
         val key = configKey()
         val stream = proc.outputStream
         stream.write("key ".toByteArray(Charsets.US_ASCII))
         stream.write(key.toByteArray(Charsets.US_ASCII))
         stream.write(byteArrayOf(0x0A)) // line terminator for the control channel
         stream.flush()
-        true
+        null
     } catch (e: Exception) {
         Log.e(TAG, "config key handoff failed: ${e.message}", e)
-        false
+        // The cause chain, verbatim: `ConfigKeyStore.loadOrCreate` throws the real
+        // reason (keystore unavailable, a KeyStoreException, a failed retry loop) and
+        // it used to die in a log line no user ever sees.
+        "${e.javaClass.simpleName}: ${e.message ?: e.toString()}"
+    }
+
+    /**
+     * A daemon reader thread for one child's stdout.
+     *
+     * Raw non-daemon `Thread().start()` per child meant a wedged pipe held the JVM
+     * open after the service was torn down, and nothing bounded how many such threads
+     * a flapping engine could leave behind.
+     */
+    private fun startIoThread(name: String, body: () -> Unit) {
+        Thread(body, name).apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Release the child's pipes. The control stream is deliberately left open while
+     * the child runs — it is how `shutdown`/`cancel` reach it — so the only moment it
+     * is safe to close it is once the process is gone.
+     */
+    internal fun closeChildStreams(proc: Process?) {
+        proc ?: return
+        listOf(proc.outputStream, proc.errorStream, proc.inputStream).forEach { stream ->
+            try {
+                stream.close()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     fun start(settings: Settings): String? = synchronized(lifecycleLock) {
@@ -174,15 +224,17 @@ open class EngineRunner(
             }
 
             processRef.set(proc)
-            if (!handoffConfigKey(proc)) {
+            val handoffFailure = handoffConfigKey(proc)
+            if (handoffFailure != null) {
                 proc.destroy()
                 proc.destroyForcibly()
+                closeChildStreams(proc)
                 running.set(false)
                 supervisorState.set(SupervisorState.IDLE)
                 processRef.set(null)
-                return "Engine started but could not receive its configuration key"
+                return "Engine started but could not receive its configuration key — $handoffFailure"
             }
-            Thread({
+            startIoThread("aether-engine-io") {
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                         var line: String?
@@ -198,6 +250,9 @@ open class EngineRunner(
                     } catch (_: Exception) {
                         null
                     }
+                    // The child is gone: its control pipe can be closed now, and not a
+                    // moment earlier — it is how `shutdown` reaches a living engine.
+                    closeChildStreams(proc)
                     // EOF on stdout is not process death. A child that closes or
                     // redirects stdout used to flip the runner to IDLE while the
                     // engine was still up, and the supervisor then launched a
@@ -211,7 +266,7 @@ open class EngineRunner(
                         onExit(code, false)
                     }
                 }
-            }, "aether-engine-io").start()
+            }
             null
         } catch (e: Exception) {
             running.set(false)
@@ -230,37 +285,62 @@ open class EngineRunner(
         noize: String,
     ): Map<String, String> {
         val configDir = File(context.filesDir, "config").apply { mkdirs() }
-        val configPath = File(configDir, "aether.toml").absolutePath
-        val homeDir = context.filesDir.absolutePath
-
-        val protocolEnv = if (protocol == "wireguard") "wg" else "masque"
-        val isH2 = protocol == "masque-h2"
         val settings = SettingsStore(context).load()
-
-        return mutableMapOf<String, String>(
-            "AETHER_PROTOCOL" to protocolEnv,
-            "AETHER_SCAN_ONLY" to "1",
-            "AETHER_SCAN_EXHAUSTIVE" to "1",
-            "AETHER_SCAN" to "balanced",
-            "AETHER_IP" to ipVersion,
-            "AETHER_NOIZE" to noize,
-            "AETHER_SCAN_CONCURRENCY" to concurrency.toString(),
-            "AETHER_SCAN_TIMEOUT_MS" to timeoutMs.toString(),
-            "AETHER_CONFIG" to configPath,
-            // The key is handed over on the child's stdin (see
-            // handoffConfigKey); a process environment lives as long as the
-            // process and is readable by anything that can open it.
-            "AETHER_CONFIG_KEY_STDIN" to "1",
-            "AETHER_MASQUE_HTTP2" to (if (isH2) "1" else "0"),
-            "AETHER_QUIC_INITIAL_FRAG" to (if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"),
-            "AETHER_TUN" to "0",
-            "AETHER_WG_NO_PROFILE_RETRY" to "1",
-            "AETHER_CONTROL_STDIN" to "1",
-            "RUST_LOG" to "info",
-            "HOME" to homeDir,
-            "TMPDIR" to context.cacheDir.absolutePath
+        return scanEnv(
+            protocol = protocol,
+            ipVersion = ipVersion,
+            concurrency = concurrency,
+            timeoutMs = timeoutMs,
+            noize = noize,
+            settings = settings,
+            configPath = File(configDir, "aether.toml").absolutePath,
+            homeDir = context.filesDir.absolutePath,
+            tmpDir = context.cacheDir.absolutePath,
         )
     }
+
+    /**
+     * The scan child's environment, as a pure function (see [engineEnv]).
+     *
+     * Two mappings used to be wrong here and both were invisible: the protocol line
+     * knew only the long name, so a user who had chosen `wg` — a value this app
+     * validates and stores — got a MASQUE probe set instead, and `AETHER_SCAN` was
+     * hardcoded to `balanced`, so the scan mode the user picked in Settings was thrown
+     * away the moment they pressed Scan.
+     */
+    internal fun scanEnv(
+        protocol: String,
+        ipVersion: String,
+        concurrency: Int,
+        timeoutMs: Int,
+        noize: String,
+        settings: Settings,
+        configPath: String,
+        homeDir: String,
+        tmpDir: String,
+    ): Map<String, String> = mutableMapOf<String, String>(
+        "AETHER_PROTOCOL" to protocolEnv(protocol, settings.transport),
+        "AETHER_SCAN_ONLY" to "1",
+        "AETHER_SCAN_EXHAUSTIVE" to "1",
+        "AETHER_SCAN" to ScanLimits.scanProfile(settings.scanMode),
+        "AETHER_IP" to ipVersion,
+        "AETHER_NOIZE" to noizeEnv(noize),
+        "AETHER_SCAN_CONCURRENCY" to concurrency.toString(),
+        "AETHER_SCAN_TIMEOUT_MS" to timeoutMs.toString(),
+        "AETHER_CONFIG" to configPath,
+        // The key is handed over on the child's stdin (see
+        // handoffConfigKey); a process environment lives as long as the
+        // process and is readable by anything that can open it.
+        "AETHER_CONFIG_KEY_STDIN" to "1",
+        "AETHER_MASQUE_HTTP2" to (if (isHttp2(protocol, settings.transport)) "1" else "0"),
+        "AETHER_QUIC_INITIAL_FRAG" to quicFragEnv(settings),
+        "AETHER_TUN" to "0",
+        "AETHER_WG_NO_PROFILE_RETRY" to "1",
+        "AETHER_CONTROL_STDIN" to "1",
+        "RUST_LOG" to "info",
+        "HOME" to homeDir,
+        "TMPDIR" to tmpDir,
+    )
 
     /**
      * Start the engine in scan-only mode (no tunnel, no VPN).
@@ -288,15 +368,17 @@ open class EngineRunner(
 
             val proc = launcher.launch(command, env)
             processRef.set(proc)
-            if (!handoffConfigKey(proc)) {
+            val handoffFailure = handoffConfigKey(proc)
+            if (handoffFailure != null) {
                 proc.destroy()
                 proc.destroyForcibly()
+                closeChildStreams(proc)
                 running.set(false)
                 supervisorState.set(SupervisorState.IDLE)
                 processRef.set(null)
-                return "Engine started but could not receive its configuration key"
+                return "Engine started but could not receive its configuration key — $handoffFailure"
             }
-            Thread({
+            startIoThread("aether-scan-io") {
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                         var line: String?
@@ -308,6 +390,7 @@ open class EngineRunner(
                     Log.w(TAG, "scan reader ended: ${e.message}")
                 } finally {
                     val code = try { proc.waitFor() } catch (_: Exception) { null }
+                    closeChildStreams(proc)
                     // EOF on stdout is not process death. A child that closes or
                     // redirects stdout used to flip the runner to IDLE while the
                     // engine was still up, and the supervisor then launched a
@@ -321,7 +404,7 @@ open class EngineRunner(
                         onExit(code, true)
                     }
                 }
-            }, "aether-scan-io").start()
+            }
             null
         } catch (e: Exception) {
             running.set(false)
@@ -372,6 +455,8 @@ open class EngineRunner(
             running.set(false)
             supervisorState.set(SupervisorState.IDLE)
             processRef.compareAndSet(p, null)
+            // The child is gone, so the control pipe no longer has a reader.
+            closeChildStreams(p)
             true
         }
     }
@@ -386,7 +471,13 @@ open class EngineRunner(
             Log.w(TAG, "ignoring custom enginePath for security: $configured")
         }
 
-        // 1) APK native lib dir — only place Android allows executing our payload on API 29+.
+        // 1) APK native lib dir — the only place Android allows executing our payload
+        // on API 29+. This is a hard dependency on the manifest packing the native
+        // libraries *extracted* (`extractNativeLibs="true"`, matched by
+        // `packaging.jniLibs.useLegacyPackaging = true`): with the modern in-APL
+        // packaging the loader `dlopen`s `libaether.so` straight out of the archive and
+        // no path under `nativeLibraryDir` exists on disk, so every engine start here
+        // would fail with "binary not found". The two settings must move together.
         val libDir = File(context.applicationInfo.nativeLibraryDir)
         listOf("libaether.so", "aether").forEach { name ->
             val f = File(libDir, name)
@@ -404,5 +495,33 @@ open class EngineRunner(
 
     companion object {
         private const val TAG = "EngineRunner"
+
+        /** The engine's protocol token. `wg` and `wireguard` are the same choice. */
+        internal fun protocolEnv(protocol: String, transport: String): String =
+            when (protocol.lowercase().trim()) {
+                "wireguard", "wg" -> "wg"
+                "masque", "masque-h2", "masque-h3" -> "masque"
+                "gool" -> "gool"
+                else -> "masque"
+            }
+
+        internal fun isHttp2(protocol: String, transport: String): Boolean =
+            protocol.lowercase() == "masque-h2" || transport.lowercase() == "h2"
+
+        internal fun quicFragEnv(settings: Settings): String =
+            if (settings.quicInitialFrag) settings.quicInitialFragSize.coerceIn(16, 512).toString() else "0"
+
+        /**
+         * The noise token handed to the engine, or a refusal.
+         *
+         * Translating is fine — the app's `high` and the engine's `heavy` are one
+         * feature with two names. Guessing is not: an unmappable value used to be sent
+         * through verbatim, where the engine's own fallback decided what the user got.
+         */
+        internal fun noizeEnv(noize: String): String =
+            NoizeProfiles.forEngine(noize) ?: throw IllegalArgumentException(
+                "noise profile '$noize' has no engine equivalent; the engine understands " +
+                    "${NoizeProfiles.engineValues.joinToString("|")}. Re-select it in Settings.",
+            )
     }
 }

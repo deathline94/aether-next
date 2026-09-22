@@ -26,6 +26,14 @@ pub async fn run() -> Result<()> {
 
     install_panic_guard();
 
+    // The engine binary reported nothing about itself: only the shell exposed a
+    // version, so a support thread could not ask the one component that matters
+    // "which build are you". Read-only, and before anything can touch the host.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("aether {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Read-only export, before anything can touch the host. The support path had
     // no machine-checkable answer to "what did the engine actually resolve?".
     if std::env::args().any(|a| a == "--diagnostics") {

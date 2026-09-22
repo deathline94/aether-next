@@ -54,6 +54,12 @@ class AetherVpnService : VpnService() {
     private val lifecycleLock = Any()
     private val vpnGeneration = java.util.concurrent.atomic.AtomicLong(0)
 
+    /**
+     * Descriptors handed to the worker for a bounded close. While it is non-zero the
+     * tunnel is not yet fully released, so no path may publish "there is no tunnel".
+     */
+    private val pendingCloses = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** The generation handed to the most recent start request, main thread only. */
     @Volatile
     private var latestStartGen = NO_LISTENER
@@ -66,8 +72,15 @@ class AetherVpnService : VpnService() {
 
     internal fun getVpnGeneration(): Long = vpnGeneration.get()
 
-    /** Whether this service currently holds an open tun fd (T206's ground truth). */
-    internal fun isTunnelUp(): Boolean = synchronized(lifecycleLock) { tun != null }
+    /**
+     * Whether this service currently holds an open tun fd (T206's ground truth).
+     *
+     * Deliberately a plain volatile read: `onRevoke` and the session's fail-closed
+     * reconciliation both ask this question, and taking `lifecycleLock` here let a
+     * teardown that is waiting on hev block the very call that was supposed to
+     * notice the tunnel is gone.
+     */
+    internal fun isTunnelUp(): Boolean = tun != null
 
     override fun onCreate() {
         super.onCreate()
@@ -82,7 +95,16 @@ class AetherVpnService : VpnService() {
             // user did not ask about.
             latestStartGen = NO_LISTENER
             stopRequested = true
-            // Do not call startForeground on STOP — just tear down.
+            // Do not *keep* a foreground service running for a stop — but a stop can
+            // arrive as `startForegroundService` (that is the only form a backgrounded
+            // app may send, and `SessionController.stopVpnService` escalates to it),
+            // and Android answers a `startForegroundService` that never calls
+            // `startForeground` with a crash. Take the notification, tear down, stop.
+            try {
+                startForegroundNotification()
+            } catch (e: Exception) {
+                Log.w(TAG, "stop path could not take the foreground notification: ${e.message}")
+            }
             worker.execute {
                 stopTunnel()
                 mainHandler.post { stopSelf() }
@@ -158,23 +180,19 @@ class AetherVpnService : VpnService() {
     internal fun ownsTunnel(gen: Long): Boolean =
         ownsTunnel(gen, vpnGeneration.get(), stopRequested)
 
+    /**
+     * Applies [TunConfig]'s plan. The plan itself — which address, which prefix,
+     * which single DNS server — lives in [TunConfig] so it can be asserted without
+     * a device; this function's only job is to hand it to Android.
+     */
     internal fun configureTunBuilder(): Builder {
         val builder = Builder()
-            .setSession("Aether Next")
-            .setMtu(MTU)
+            .setSession(TunConfig.SESSION_NAME)
+            .setMtu(TunConfig.MTU)
             .setBlocking(false)
-            // /24 ensures 198.18.0.2 (MAPPED_DNS) is in the local subnet so Android DnsManager routes to it
-            .addAddress(TUN_ADDR, 24)
-            // Exclusively advertise MAPPED_DNS so all lookups hit mapdns fake-IP synthesis (and NODATA on AAAA).
-            // Do NOT add public resolvers (1.1.1.1, 2606:4700:4700::1111) which cause netd to leak queries
-            // or return real IPv6 addresses that bypass the tunnel on mobile data.
-            .addDnsServer(MAPPED_DNS)
-            .addRoute("0.0.0.0", 0)
-            // /15 covers both 198.18.0.0/16 (interface & DNS) and 198.19.0.0/16 (mapdns fake-IP range)
-            .addRoute("198.18.0.0", 15)
-            // Trap all IPv6 inside the TUN interface with point-to-point host prefix 128 (prevent carrier bypass)
-            .addAddress(TUN_ADDR_V6, 128)
-            .addRoute("::", 0)
+        TunConfig.addressPlan().forEach { (addr, prefix) -> builder.addAddress(addr, prefix) }
+        TunConfig.dnsPlan().forEach { builder.addDnsServer(it) }
+        TunConfig.routePlan().forEach { (target, prefix) -> builder.addRoute(target, prefix) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {
@@ -193,6 +211,46 @@ class AetherVpnService : VpnService() {
      */
     internal fun loopAvoidancePackages(): List<String> = listOf(packageName)
 
+    /**
+     * The capability probe [UnderlyingNetworks] filters with. A network this
+     * service created carries `NET_CAPABILITY_VPN`; adopting it as our own
+     * underlying network tells the tunnel to carry itself.
+     *
+     * Fails closed: a network whose capabilities cannot be read is not one we
+     * publish.
+     */
+    private fun hasVpnCapability(network: Network): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) {
+            // Below API 33 the platform exposes no bit to read, so the tunnel
+            // cannot be identified by capability. Refusing to adopt is the safe
+            // answer: the failure we are guarding against is handing the tunnel
+            // its own network to carry.
+            return true
+        }
+        return try {
+            connectivityManager?.getNetworkCapabilities(network)
+                ?.hasCapability(NET_CAPABILITY_VPN) == true
+        } catch (e: Exception) {
+            Log.w(TAG, "getNetworkCapabilities failed for $network: ${e.message}")
+            true
+        }
+    }
+
+    /** Publish [network] as the underlying network unless it is our own tunnel. */
+    private fun publishUnderlyingNetwork(network: Network, where: String) {
+        val adopted = UnderlyingNetworks.pick(listOf(network), ::hasVpnCapability)
+        val arg = UnderlyingNetworks.toUnderlyingArg(adopted) { it.toTypedArray() }
+        if (arg == null) {
+            Log.i(TAG, "$where: not adopting $network — it is a VPN network (ours)")
+            return
+        }
+        try {
+            setUnderlyingNetworks(arg)
+        } catch (e: Exception) {
+            Log.w(TAG, "setUnderlyingNetworks $where failed: ${e.message}")
+        }
+    }
+
     internal fun registerUnderlyingNetworkCallbacks() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             try {
@@ -201,15 +259,14 @@ class AetherVpnService : VpnService() {
                 val callback = object : ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(network: Network) {
                         Log.i(TAG, "underlying network available: $network")
-                        try {
-                            setUnderlyingNetworks(arrayOf(network))
-                        } catch (e: Exception) {
-                            Log.w(TAG, "setUnderlyingNetworks onAvailable failed: ${e.message}")
-                        }
+                        publishUnderlyingNetwork(network, "onAvailable")
                     }
 
                     override fun onLost(network: Network) {
                         Log.i(TAG, "underlying network lost: $network")
+                        // Only a network we were allowed to adopt can be worth
+                        // clearing; losing our own VPN network is not an outage.
+                        if (hasVpnCapability(network)) return
                         try {
                             setUnderlyingNetworks(null)
                         } catch (e: Exception) {
@@ -221,11 +278,7 @@ class AetherVpnService : VpnService() {
                         network: Network,
                         networkCapabilities: NetworkCapabilities,
                     ) {
-                        try {
-                            setUnderlyingNetworks(arrayOf(network))
-                        } catch (e: Exception) {
-                            Log.w(TAG, "setUnderlyingNetworks onCapabilitiesChanged failed: ${e.message}")
-                        }
+                        publishUnderlyingNetwork(network, "onCapabilitiesChanged")
                     }
                 }
                 networkCallback = callback
@@ -278,39 +331,154 @@ class AetherVpnService : VpnService() {
             Log.i(TAG, "starting hev tun2socks fd=${established.fd} socks=127.0.0.1:$socksPort conf=$configPath")
             TProxyStartService(configPath, established.fd)
             hevStarted = true
+            tunSocksPort = socksPort
+            // `TProxyGetStats()` is zeroed on every hev entry, so the baseline can only
+            // be taken after the start returned — a sample from before it is not a
+            // baseline, it is a different session's counters.
+            startLivenessWatchdog()
             Log.i(TAG, "VPN + hev-socks5-tunnel active")
             return true
         }
     }
 
+    // ─── data-path liveness (T203/T209, wired) ────────────────────────────────
+
+    /**
+     * The window tracker behind the watchdog. One per service instance; [reset] is
+     * called for every tunnel, so a supervised restart does not inherit the streaks
+     * of the tunnel that just died.
+     */
+    private val liveness = LivenessTracker()
+
+    @Volatile
+    private var livenessPoll: java.util.concurrent.ScheduledFuture<*>? = null
+
+    /** The SOCKS port the running tunnel forwards to — what a restart re-uses. */
+    @Volatile
+    private var tunSocksPort = -1
+
+    private fun startLivenessWatchdog() {
+        cancelLivenessWatchdog()
+        liveness.reset()
+        if (!nativeLoaded) return
+        try {
+            liveness.baseline(TProxyGetStats(), elapsedRealtime())
+        } catch (e: UnsatisfiedLinkError) {
+            Log.w(TAG, "hev stats unavailable, liveness watchdog disabled: ${e.message}")
+            return
+        } catch (e: Exception) {
+            Log.w(TAG, "liveness baseline failed: ${e.message}")
+            return
+        }
+        livenessPoll = worker.scheduleWithFixedDelay(
+            { pollLiveness() },
+            WINDOW_MS,
+            WINDOW_MS,
+            java.util.concurrent.TimeUnit.MILLISECONDS,
+        )
+    }
+
+    private fun cancelLivenessWatchdog() {
+        livenessPoll?.cancel(false)
+        livenessPoll = null
+    }
+
+    /** Monotonic clock, with a wall-clock fallback so a stubbed `SystemClock` cannot stall the window. */
+    private fun elapsedRealtime(): Long = try {
+        android.os.SystemClock.elapsedRealtime()
+    } catch (_: Throwable) {
+        System.currentTimeMillis()
+    }
+
+    /**
+     * One poll of hev's own counters.
+     *
+     * This is the only thing in the app that can tell "the interface is up" from
+     * "the interface is carrying anything", and until now nothing asked: the fd was
+     * the whole truth, so a QUIC socket left bound to a vanished interface produced
+     * a green badge over a total blackhole. A dead verdict costs one restart from
+     * [LivenessTracker]'s budget; a spent budget is published to the user as
+     * [RECONNECT_REQUIRED] instead of being retried forever.
+     */
+    private fun pollLiveness() {
+        try {
+            if (stopRequested || tun == null) return
+            val sample = try {
+                TProxyGetStats()
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(TAG, "liveness poll disabled: ${e.message}")
+                cancelLivenessWatchdog()
+                return
+            }
+            val decision = liveness.onSample(sample, elapsedRealtime(), probeFailed = foregroundProbeFailed())
+            if (decision !is LivenessDecision.Alive) {
+                Log.w(TAG, "tunnel liveness: $decision (frozen=${liveness.frozenWindowCount()} silent=${liveness.silentWindowCount()})")
+            }
+            if (!decision.isDead) return
+            when (val plan = liveness.consumeRestart()) {
+                is RestartPlan.RetryAfter -> restartTunnel(plan.delayMs, plan.attempt)
+                RestartPlan.GiveUp -> {
+                    cancelLivenessWatchdog()
+                    stopTunnel(blocking = false)
+                    SessionController.getOrNull()?.onVpnFailed(RECONNECT_REQUIRED)
+                }
+            }
+        } catch (e: Exception) {
+            // A watchdog that dies quietly is worse than no watchdog: keep polling and
+            // say that this window was lost.
+            Log.w(TAG, "liveness poll failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Did the device itself lose the network the tunnel rides on? Used to gate the
+     * fully-silent verdict, which an idle device also produces.
+     */
+    private fun foregroundProbeFailed(): Boolean {
+        val cm = connectivityManager ?: return false
+        return try {
+            cm.allNetworks.none { network ->
+                val caps = cm.getNetworkCapabilities(network) ?: return@none false
+                !caps.hasCapability(NET_CAPABILITY_VPN) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun restartTunnel(delayMs: Long, attempt: Int) {
+        val port = tunSocksPort
+        if (port !in 1024..65535) {
+            SessionController.getOrNull()?.onVpnFailed(RECONNECT_REQUIRED)
+            return
+        }
+        Log.w(TAG, "data path dead: supervised restart #$attempt in ${delayMs}ms")
+        SessionController.getOrNull()?.onVpnRestartScheduled(attempt)
+        worker.schedule({
+            if (stopRequested || tun != null) return@schedule
+            stopTunnel()
+            val gen = vpnGeneration.incrementAndGet()
+            latestStartGen = gen
+            try {
+                if (establishTun(port, gen) && ownsTunnel(gen)) {
+                    mainHandler.post { SessionController.getOrNull()?.onVpnEstablished() }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "supervised restart failed: ${e.message}", e)
+                stopTunnel()
+                mainHandler.post {
+                    if (reportsToUser(gen)) {
+                        SessionController.getOrNull()?.onVpnFailed(e.message ?: RECONNECT_REQUIRED)
+                    }
+                }
+            }
+        }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+
     private fun writeHevConfig(socksPort: Int): String {
         val conf = File(noBackupFilesDir, "hev-socks5-tunnel.yml")
-        // udp:udp — aether implements standard SOCKS5 UDP ASSOCIATE (not UDP-in-TCP).
-        // mapdns — resolve names via SOCKS so apps do not depend on raw UDP DNS.
-        // network: 198.19.0.0/16 — RFC 2544 benchmark unicast space, non-overlapping with TUN_ADDR (198.18.0.1) and MAPPED_DNS (198.18.0.2).
-        // icmp: reject — immediately reject unrouteable / IPv6 flows with ECONNREFUSED/RST so Happy Eyeballs fails fast to IPv4.
-        val yaml = """
-            |tunnel:
-            |  mtu: $MTU
-            |  ipv4: $TUN_ADDR
-            |  ipv6: '$TUN_ADDR_V6'
-            |  icmp: 'reject'
-            |socks5:
-            |  port: $socksPort
-            |  address: 127.0.0.1
-            |  udp: 'udp'
-            |mapdns:
-            |  address: $MAPPED_DNS
-            |  port: 53
-            |  network: $MAPPED_NETWORK
-            |  netmask: 255.255.0.0
-            |  cache-size: 10000
-            |misc:
-            |  task-stack-size: 81920
-            |  connect-timeout: 5000
-            |  log-level: warn
-            |""".trimMargin()
-        FileOutputStream(conf, false).use { it.write(yaml.toByteArray(Charsets.UTF_8)) }
+        FileOutputStream(conf, false).use { it.write(TunConfig.hevYaml(socksPort).toByteArray(Charsets.UTF_8)) }
         try {
             conf.setReadable(true, true)
             conf.setWritable(true, true)
@@ -346,53 +514,109 @@ class AetherVpnService : VpnService() {
                 this,
                 NOTIF_ID,
                 n,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                // Android's documented type for a VPN service. `specialUse` is the
+                // "everything else" bucket and asks for a justification Play reviewers
+                // reject for a VpnService; `systemExempted` is the declared one.
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
             )
         } else {
             startForeground(NOTIF_ID, n)
         }
     }
 
-    private fun stopTunnel() {
+    /**
+     * Tear the tunnel down.
+     *
+     * The descriptor may only be closed once hev's threads are out of it, and that
+     * was previously "guaranteed" by `Thread.sleep(150)` — a guess that cost the
+     * main thread 150 ms on every `onRevoke` and still left a SIGSEGV window when
+     * hev was slow. It now goes through [HevStop], which waits for the real
+     * acknowledgement inside a bounded budget (T214).
+     *
+     * With [blocking] false the caller returns immediately: `onRevoke` runs on the
+     * main thread, and Android's Quick Settings tap used to ANR there (T2xx). The
+     * `tun` reference is cleared under the lock either way, so [isTunnelUp] and the
+     * session's fail-closed reconciliation stop claiming a tunnel right away; only
+     * the descriptor close moves to the worker.
+     */
+    private fun stopTunnel(blocking: Boolean = true) {
+        val fd: ParcelFileDescriptor?
+        val mustStopHev: Boolean
         synchronized(lifecycleLock) {
             vpnGeneration.incrementAndGet()
-            if (hevStarted) {
-                try {
-                    TProxyStopService()
-                } catch (e: Exception) {
-                    Log.w(TAG, "hev stop: ${e.message}")
-                } catch (e: UnsatisfiedLinkError) {
-                    Log.w(TAG, "hev stop native: ${e.message}")
-                }
-                hevStarted = false
-                // Give hev threads a beat to release the TUN fd before close (avoids SIGSEGV).
-                try {
-                    Thread.sleep(150)
-                } catch (_: InterruptedException) {
-                }
-            }
-            try {
-                tun?.close()
-            } catch (_: Exception) {
-            }
+            cancelLivenessWatchdog()
+            fd = tun
             tun = null
-            VpnTunnel.established(false, -1)
-
+            mustStopHev = hevStarted
+            hevStarted = false
+            tunSocksPort = -1
+            unregisterNetworkCallbacksLocked()
+        }
+        if (!mustStopHev) {
+            releaseAfterClose(fd, ownsPendingSlot = false)
+            return
+        }
+        if (blocking) {
+            reportHevStop(HevStop.stopAndAwait(stop = { TProxyStopService() }))
+            releaseAfterClose(fd, ownsPendingSlot = false)
+            return
+        }
+        pendingCloses.incrementAndGet()
+        worker.execute {
             try {
-                networkCallback?.let { cb ->
-                    connectivityManager?.unregisterNetworkCallback(cb)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "unregisterNetworkCallback failed: ${e.message}")
+                reportHevStop(HevStop.stopAndAwait(stop = { TProxyStopService() }))
+            } finally {
+                releaseAfterClose(fd, ownsPendingSlot = true)
             }
-            networkCallback = null
-            connectivityManager = null
         }
     }
 
+    private fun reportHevStop(outcome: HevStopOutcome) {
+        when (outcome) {
+            is HevStopOutcome.TimedOut -> Log.e(
+                TAG,
+                "hev never acknowledged the stop (waited ${outcome.waitedMs}ms); closing the " +
+                    "descriptor anyway so the device is not left without an owner",
+            )
+
+            is HevStopOutcome.Failed -> Log.e(TAG, "hev stop call failed: ${outcome.reason}")
+            HevStopOutcome.Acknowledged -> Unit
+        }
+    }
+
+    /**
+     * Close [fd] and publish "there is no tunnel". The publish is withheld while
+     * another close is still in flight, so a non-blocking revoke cannot let the
+     * session announce "Ready" over a descriptor its worker has not closed yet.
+     */
+    private fun releaseAfterClose(fd: ParcelFileDescriptor?, ownsPendingSlot: Boolean) {
+        try {
+            fd?.close()
+        } catch (_: Exception) {
+        }
+        if (ownsPendingSlot) pendingCloses.decrementAndGet()
+        if (pendingCloses.get() <= 0) VpnTunnel.established(false, -1)
+    }
+
+    private fun unregisterNetworkCallbacksLocked() {
+        try {
+            networkCallback?.let { cb ->
+                connectivityManager?.unregisterNetworkCallback(cb)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "unregisterNetworkCallback failed: ${e.message}")
+        }
+        networkCallback = null
+        connectivityManager = null
+    }
+
+    /**
+     * Android owns the revocation: it can arrive while a start is in flight, on the
+     * main thread, with no second chance. Nothing here may wait for hev.
+     */
     override fun onRevoke() {
         stopRequested = true
-        stopTunnel()
+        stopTunnel(blocking = false)
         SessionController.getOrNull()?.onVpnFailed("VPN permission revoked")
         stopSelf()
         super.onRevoke()
@@ -413,19 +637,19 @@ class AetherVpnService : VpnService() {
     }
 
     companion object {
+        /**
+         * `NetworkCapabilities.NET_CAPABILITY_VPN` became public API only at level
+         * 33, and its value is stable, so the number is bound here rather than
+         * through the symbol the compile SDK may not declare. Every read is
+         * guarded by the SDK_INT check in [hasVpnCapability].
+         */
+        private const val NET_CAPABILITY_VPN = 33
         private const val TAG = "AetherVpn"
         private const val CHANNEL = "aether_vpn"
         private const val NOTIF_ID = 43
-        private const val MTU = 1280
-        private const val TUN_ADDR = "198.18.0.1"
-        // Unique local address for dual-stack IPv6 tunnel.
-        private const val TUN_ADDR_V6 = "fd00:ae::1"
-        private const val MAPPED_DNS = "198.18.0.2"
-        // RFC 2544 benchmark range isolated from TUN_ADDR (198.18.0.1) and MAPPED_DNS (198.18.0.2)
-        private const val MAPPED_NETWORK = "198.19.0.0"
         @Volatile
         private var nativeLoaded = false
-        private val worker = Executors.newSingleThreadExecutor { r ->
+        private val worker = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "aether-vpn-worker").apply { isDaemon = true }
         }
         private val mainHandler = Handler(Looper.getMainLooper())
@@ -472,6 +696,14 @@ class AetherVpnService : VpnService() {
         @androidx.annotation.Keep
         private external fun TProxyStopService()
 
+        /**
+         * hev's own packet counters: `[tx_packets, tx_bytes, rx_packets, rx_bytes]`
+         * as seen from the tun, zeroed on every `hev_socks5_tunnel_main()` entry.
+         *
+         * Declared, called from [pollLiveness], and kept `@Keep` because hev-jni binds
+         * the whole method table of this class: deleting an unused sibling here is not
+         * a cosmetic change on a device.
+         */
         @JvmStatic
         @androidx.annotation.Keep
         private external fun TProxyGetStats(): LongArray

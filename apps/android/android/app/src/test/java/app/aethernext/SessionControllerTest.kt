@@ -9,6 +9,8 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -238,8 +240,24 @@ class SessionControllerTest {
         VpnTunnel.established(false, -1)
 
         val after = h.controller.getState()
-        assertEquals("a vanished tun cannot be reported as connected", "connecting", after.status)
-        assertEquals("Waiting for the VPN tunnel", after.detail)
+        // Not "connecting, waiting for the tunnel": a session whose engine still
+        // reports connected while the tun is gone means the device is no longer
+        // routed anywhere it is being protected. That is an error the user has to
+        // see, and rendering it as a transient wait is the same lie as the
+        // spinner that says "saving" when nothing is pending.
+        assertNotEquals("a vanished tun cannot be reported as connected", "connected", after.status)
+        assertEquals("error", after.status)
+        assertTrue(
+            "the message must name the dropped tunnel, got: ${after.detail}",
+            after.detail.contains("tunnel", ignoreCase = true) &&
+                after.detail.contains("no longer routed", ignoreCase = true),
+        )
+        // And the one-shot must actually be revoked, so a later engine event cannot
+        // re-assert the green badge over the dead path. (Whether it lands on
+        // "connecting" or straight back on "error" is the recheck's business; what
+        // must never happen is "connected" again while `VpnTunnel.up` is false.)
+        h.feed("""AETHER_EVENT {"type":"connected","detail":"quic up"}""")
+        assertNotEquals("connected", h.controller.getState().status)
     }
 
     // ─── T206: teardown must report what actually happened ────────────────────

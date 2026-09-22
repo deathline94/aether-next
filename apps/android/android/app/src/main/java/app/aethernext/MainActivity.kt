@@ -23,7 +23,23 @@ import java.io.ByteArrayInputStream
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var session: SessionController
+
+    /**
+     * Set when a connect is waiting on the VPN consent sheet.
+     *
+     * Main thread only, and it has to stay that way: [requestVpnPermission] is called
+     * from the WebView's JavaBridge thread and `onActivityResult` on the main one, so
+     * as a plain field this was a cross-thread write whose value the reader was free
+     * never to see — the consent result could come back and find nothing pending, or
+     * the reverse. Every entry point now marshals to the main thread first, so the
+     * flag has exactly one owner thread.
+     */
     private var pendingConnectAfterVpn = false
+
+    /** Runs the headless teardown off the main thread; see [onDestroy]. */
+    private val teardownExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "aether-teardown").apply { isDaemon = true }
+    }
 
     /**
      * The document currently loaded, captured on the UI thread in `onPageStarted`
@@ -49,9 +65,12 @@ class MainActivity : AppCompatActivity() {
         }
         setContentView(webView)
 
-        session = SessionController.get(this) { event, payload ->
-            runOnUiThread { emitToJs(event, payload) }
-        }
+        // The sink belongs to *this* WebView, so it is registered per owner: the
+        // session is a process singleton, and handing its one emitter to whichever
+        // activity happened to start first is what let a task swipe silence a running
+        // tunnel (T2xx).
+        session = SessionController.get(this) { _, _ -> }
+        attachUiSink()
 
         // file:///android_asset/ + ES modules often fail (blank white page).
         // Serve assets via the official https virtual host instead.
@@ -73,7 +92,11 @@ class MainActivity : AppCompatActivity() {
 
         webView.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                if (consoleMessage != null) {
+                // The packaged UI is the engine's stdout for a user who has no
+                // terminal: echoing every line it logs into logcat in a release build
+                // puts probe targets, endpoints and any future diagnostic in a
+                // world-readable buffer. Debug builds keep the flood.
+                if (consoleMessage != null && BuildConfig.DEBUG) {
                     Log.d(
                         TAG,
                         "js ${consoleMessage.messageLevel()}: ${consoleMessage.message()} " +
@@ -179,6 +202,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * The answer to [maybeRequestNotificationPermission].
+     *
+     * There was none, which mattered because a foreground service whose notification is
+     * suppressed is still a foreground service: the tunnel runs, the system counts it
+     * against the user's battery, and nothing on screen says so. A denial is therefore
+     * reported into the UI, where the user can act on it.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        @Suppress("DEPRECATION")
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_NOTIFICATIONS) return
+        val denied = grantResults.isEmpty() ||
+            grantResults[0] != android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!denied) return
+        val message = "Notifications are off: the VPN foreground service keeps running with no " +
+            "visible notification, so nothing on this device shows that traffic is being routed. " +
+            "Enable notifications in system Settings to keep the tunnel visible."
+        Log.w(TAG, message)
+        if (::session.isInitialized) session.emitWarn(message)
+    }
+
+    /**
      * The "UI failed to load" page.
      *
      * Two hardening rules live here (T219): the bridge is detached *before* this
@@ -220,15 +270,54 @@ class MainActivity : AppCompatActivity() {
         if (::session.isInitialized) session.emitLog(pending)
     }
 
+    /**
+     * Ask for the VPN permission.
+     *
+     * Called from the bridge — that is, from the WebView's JavaBridge thread — and
+     * `startActivityForResult` on anything but the UI thread is both a crash risk and
+     * the reason the consent sheet used to appear at an arbitrary point in the
+     * lifecycle. The whole body is therefore posted, and the flag it owns is only ever
+     * touched on the main thread.
+     */
     fun requestVpnPermission() {
-        pendingConnectAfterVpn = true
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            @Suppress("DEPRECATION")
-            startActivityForResult(intent, REQ_VPN)
-        } else {
-            retryConnect()
+        runOnUiThread {
+            pendingConnectAfterVpn = true
+            val intent = try {
+                VpnService.prepare(this)
+            } catch (e: Exception) {
+                // A prepared-check that throws must not be reported as "granted": the
+                // connect would then hang waiting for a tunnel nobody authorised.
+                Log.e(TAG, "VpnService.prepare failed: ${e.message}", e)
+                pendingConnectAfterVpn = false
+                emitToJs(
+                    "session://state",
+                    RuntimeState(
+                        status = "error",
+                        detail = "VPN permission could not be checked: ${e.message ?: e.javaClass.simpleName}",
+                        pid = null,
+                        endpoint = null,
+                    ).toJson(),
+                )
+                return@runOnUiThread
+            }
+            if (intent != null) {
+                @Suppress("DEPRECATION")
+                startActivityForResult(intent, REQ_VPN)
+            } else {
+                retryConnect()
+            }
         }
+    }
+
+    private fun attachUiSink() {
+        session.attachUi(this) { event, payload -> runOnUiThread { emitToJs(event, payload) } }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // A configuration change or a re-created activity replaces its WebView; the
+        // sink has to follow it, or events go to a destroyed page forever.
+        if (::session.isInitialized) attachUiSink()
     }
 
     @Deprecated("Deprecated in Java")
@@ -272,11 +361,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // NOTE (T213, not this task): the controller is a process singleton, so
-        // silencing it here also silences any other live activity's events. The
-        // per-activity listener registry is the fix; until then the behaviour is
-        // unchanged apart from detaching this WebView's bridge.
-        session.setEmitter { _, _ -> }
+        // Detach *this* activity's sink and, if it was the last one, stop the tunnel —
+        // off the main thread, because a full teardown waits on the engine child and on
+        // hev. The previous code called `setEmitter { _, _ -> }` on a process singleton:
+        // it silenced every listener, so the engine and a full-device VPN kept running
+        // with nothing attached to see or stop them (T2xx).
+        if (::session.isInitialized) {
+            val lastUi = session.detachUi(this)
+            if (lastUi && !isChangingConfigurations) {
+                val executor = teardownExecutor
+                val controller = session
+                executor.execute {
+                    try {
+                        controller.shutdownHeadless()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "headless teardown failed: ${e.message}", e)
+                    }
+                }
+            }
+        }
         if (::webView.isInitialized) {
             webView.removeJavascriptInterface("AetherAndroid")
             webView.destroy()

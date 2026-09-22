@@ -63,11 +63,18 @@ android {
     }
     packaging {
         jniLibs {
-            // Legacy packaging extracts the .so at install time, which puts the
-            // loader in charge of page alignment and defeats the 16 KB page-size
-            // requirement for apps targeting 35+. Uncompressed + page-aligned in
-            // the APK is what Android 15 devices need.
-            useLegacyPackaging = false
+            // MUST agree with `android:extractNativeLibs` in AndroidManifest.xml, and
+            // the value is set by the engine, not by packaging taste: `EngineRunner`
+            // launches `nativeLibraryDir/libaether.so` with a `ProcessBuilder`, and a
+            // payload that stays compressed inside the APK has no path on disk to exec
+            // (W^X also rules out extracting it to filesDir). `true` here and
+            // `extractNativeLibs="true"` there is the pair that keeps the engine
+            // launchable; AGP rejects any other combination outright.
+            //
+            // 16 KB page devices are still served: extraction hands the loader
+            // file-system-backed pages, so the in-APK alignment requirement that
+            // `useLegacyPackaging = false` exists to satisfy does not apply.
+            useLegacyPackaging = true
         }
     }
     testOptions {

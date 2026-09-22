@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
-import { initialScanState } from "../types";
+import { initialScanState, effectiveScanTimeout } from "../types";
 import { errorMessage } from "../ipcError";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 
@@ -27,6 +27,13 @@ export function useScanner(
   // than merged, so a late terminal event from a cancelled scan cannot end the
   // one that is actually running.
   const runIdRef = useRef<string>("");
+  /**
+   * The run's rows, as a ref as well as state: the `bestRtt` the progress card shows
+   * has to be derived from the whole list at the moment a hit lands, and reading
+   * `endpoints` from inside the listener's closure would read the list as of the
+   * render that installed it.
+   */
+  const endpointsRef = useRef<DiscoveredEndpoint[]>([]);
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
 
@@ -50,19 +57,30 @@ export function useScanner(
           });
           break;
         case "scan_progress":
+          // The engine's own tally. Nothing else writes `working`: the per-hit
+          // `prev.working + 1` this replaces used to race the progress frame — the
+          // list grew by a hit, the next frame overwrote the count with a number that
+          // is only right as of fifty probes ago — so the "N healthy" chip oscillated
+          // downwards while the scan was still finding endpoints.
           setScanState((prev) => ({ ...prev, scanned: ev.scanned, total: ev.total, working: ev.working }));
           break;
-        case "scan_hit":
-          setScanState((prev) => ({ ...prev, working: prev.working + 1, bestRtt: ev.rtt || prev.bestRtt }));
-          setEndpoints((prev) => {
-            // One IP:port can answer on h2 and on h3; keyed on the address alone the
-            // second protocol's hit was discarded as a duplicate of the first.
-            if (prev.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) return prev;
-            return [...prev, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
+        case "scan_hit": {
+          const current = endpointsRef.current;
+          // Keyed on addr + protocol: one address answers the h2 and the h3 handshake
+          // and keying on the address alone threw the second one away.
+          if (!current.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) {
+            const next = [...current, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
               (a, b) => a.rttMs - b.rttMs,
             );
-          });
+            endpointsRef.current = next;
+            setEndpoints(next);
+            // `bestRtt` is derived from the run's own rows, fastest first — not from
+            // `ev.rtt || prev.bestRtt`, which kept the first hit's text alive for the
+            // rest of the run and showed `0ms` for an honest zero.
+            setScanState((prev) => ({ ...prev, bestRtt: next[0]?.rtt ?? prev.bestRtt }));
+          }
           break;
+        }
         case "scan_done":
           setScanState((prev) => ({ ...prev, active: false, phase: "Verified" }));
           if (ev.addr) appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
@@ -92,6 +110,7 @@ export function useScanner(
     // The counters and `bestRtt` restart with the run, so the list has to as well:
     // keeping earlier protocols' rows meant a table of nine under "3 working".
     setEndpoints([]);
+    endpointsRef.current = [];
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
       level: "info",
@@ -101,7 +120,9 @@ export function useScanner(
       if (running) {
         await invoke("disconnect");
       }
-      const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
+      // Same clamp the shell applies (`ScanLimits.clampTimeout`), so what the field
+      // shows and what the engine runs are one number.
+      const effectiveTimeout = effectiveScanTimeout(protocol, timeoutMs);
       const runId = crypto.randomUUID();
       runIdRef.current = runId;
       await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });

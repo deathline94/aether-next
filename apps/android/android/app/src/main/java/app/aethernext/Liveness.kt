@@ -130,9 +130,18 @@ fun backoffFor(attempt: Int): Long = when (attempt) {
     else -> 30_000L
 }
 
-/** Whether a decision means "this tunnel cannot be trusted any more". */
+/**
+ * Whether a decision means "this tunnel cannot be trusted any more".
+ *
+ * [LivenessDecision.Exhausted] belongs here: a spent restart budget is the one
+ * verdict that must reach the user, and excluding it meant `if (decision.isDead)`
+ * callers — the only shape this shell writes — silently ignored a tunnel that had
+ * already failed three supervised restarts and kept showing a green badge over it.
+ */
 val LivenessDecision.isDead: Boolean
-    get() = this == LivenessDecision.DeadRxOnly || this == LivenessDecision.DeadSilent
+    get() = this == LivenessDecision.DeadRxOnly ||
+        this == LivenessDecision.DeadSilent ||
+        this == LivenessDecision.Exhausted
 
 /**
  * The window counter the service polls every [WINDOW_MS] from `TProxyGetStats()`.

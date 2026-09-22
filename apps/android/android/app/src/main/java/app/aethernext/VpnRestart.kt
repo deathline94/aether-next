@@ -28,35 +28,8 @@ sealed interface RestartPlan {
 }
 
 /**
- * A budget of restart attempts.
- *
- * [next] is called *before* each attempt, so a caller that never attempts cannot
- * spend the budget, and [reset] is what a user-initiated `connect()` owes it —
- * without which a device that failed once could never recover until the app was
- * restarted.
+ * A budget of restart attempts is held by [LivenessTracker], which owns the window
+ * state the budget is counted against; a second counter alongside it was the kind of
+ * duplicated rule that quietly disagrees with the first, so it is gone. What remains
+ * here is the *shape* of a plan, which is all the service needs to act on.
  */
-class VpnRestartBudget(
-    private val maxAttempts: Int = MAX_ATTEMPTS,
-) {
-    @Volatile
-    var attempts: Int = 0
-        private set
-
-    val spent: Boolean get() = attempts >= maxAttempts
-
-    /** Number of attempts already performed; what the UI is told. */
-    fun attemptsUsed(): Int = attempts
-
-    /** Take the next attempt, or report that the budget is gone. */
-    fun next(): RestartPlan {
-        if (attempts >= maxAttempts) return RestartPlan.GiveUp
-        val plan = RestartPlan.RetryAfter(backoffFor(attempts), attempts + 1)
-        attempts += 1
-        return plan
-    }
-
-    /** The budget a user-initiated session starts from. */
-    fun reset() {
-        attempts = 0
-    }
-}

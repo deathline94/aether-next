@@ -25,7 +25,7 @@ class BridgeError(
  */
 class SettingRejected(val field: String, detail: String) : IllegalArgumentException(detail)
 
-internal fun bridgeOk(data: Any?): String {
+internal fun bridgeOkObject(data: Any?): JSONObject {
     val o = JSONObject().put("ok", true)
     when (data) {
         null, JSONObject.NULL -> o.put("data", JSONObject.NULL)
@@ -35,11 +35,16 @@ internal fun bridgeOk(data: Any?): String {
         is String -> o.put("data", data)
         else -> o.put("data", data.toString())
     }
-    return o.toString()
+    return o
 }
 
-internal fun bridgeErr(code: String, message: String, field: String?): String {
+internal fun bridgeErrObject(code: String, message: String, field: String?): JSONObject {
     val error = JSONObject().put("code", code).put("message", message)
     if (field != null) error.put("field", field)
-    return JSONObject().put("ok", false).put("error", error).toString()
+    return JSONObject().put("ok", false).put("error", error)
 }
+
+internal fun bridgeOk(data: Any?): String = bridgeOkObject(data).toString()
+
+internal fun bridgeErr(code: String, message: String, field: String?): String =
+    bridgeErrObject(code, message, field).toString()
