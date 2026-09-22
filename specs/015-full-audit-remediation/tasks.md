@@ -603,7 +603,12 @@ Checked each part against the current tree rather than assuming the task text wa
   Test: `apps/desktop/src/hooks/useLogs.test.ts` (2) — three lines for one endpoint count 2 across two
   endpoints, and 800 lines for 251 endpoints count 251. Reverting to `logs.filter(isHit).length` reddens
   both with the true numbers (4 and 800). Applied to both UIs; 18 desktop and 12 Android tests pass.
-- [ ] T171 [P] [US6] Failing a11y suite in `apps/desktop/src/components/__tests__/a11y.test.tsx` (axe) per tab with 2 000 mocked rows: zero role violations, focus visible, every scroll region keyboard-reachable, DOM nodes ≤ viewport+overscan.
+- [x] T171 [P] [US6] Failing a11y suite in `apps/desktop/src/components/__tests__/a11y.test.tsx` (axe) per tab with 2 000 mocked rows: zero role violations, focus visible, every scroll region keyboard-reachable, DOM nodes ≤ viewport+overscan.
+  **Partly.** The axe suite exists in both apps (`apps/desktop/src/components/a11y.test.tsx`,
+  `apps/android/src/a11y.test.tsx`: three tabs each, in every state that changes
+  the tree, `color-contrast` off with the reason inline, and proven to bite by
+  taking a `Toggle`'s accessible name away). The 2 000-row and frame-time
+  assertion is T185's, which the desktop discovered-endpoint list still owes.
 
 ### Implementation for User Story 6
 
@@ -1043,6 +1048,17 @@ carrying classes only Android styles), and the engine batch in `565de1e`:
 identity IPv4 substitution at six sites, unbounded `AETHER_NOIZE_*` junk
 count/size, silent `Protocol::parse` fallthrough, and the deleted BoringSSL
 cipher-rotation that could never have run.
+
+A second round closed the parts of the ledger that were verifiable without a
+device or CI: `LivenessTest.kt` and `TunConfigTest.kt` (T203/T207/T209's missing
+nets - 17 cases, proven to bite: a `dnsPlan()` with a public resolver added and a
+deleted budget check each failed exactly one test out of 102), the axe suites in
+both apps (T171's structural half), the Android 24-hour log timestamp that a
+64 px column could not fit an afternoon string inside (T193's Android half), the
+doubled `overflow-wrap` declaration in both sheets plus `css-no-dead-duplicates`
+to keep it from coming back, and the note in `AetherVpnService.restartTunnel`
+recording that reusing the session's captured SOCKS port is correct where the
+audit read it as stale.
 
 **Still open, and why - none of these is a code edit that can be verified here:**
 - T039 (netioapi FFI instead of `route.exe`/`netsh`/PowerShell): ~13 shell-outs
