@@ -636,11 +636,13 @@ async fn verify_dataplane(
     mut probe_src: std::net::Ipv4Addr,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
-    let mut confirms = 0u8;
+    // The probe and the acceptance test have to name the same resolver, so both
+    // come from the one knob (`AETHER_DATAPLANE_PROBE_IP`) the H3 path uses.
+    let resolver = crate::dns::dataplane_probe_target();
     let mut resend_at = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= resend_at {
-            let probe = crate::dns::build_dataplane_probe(probe_src, std::net::Ipv4Addr::new(8, 8, 8, 8));
+            let probe = crate::dns::build_dataplane_probe(probe_src, resolver);
             send_ip_batch(send, vec![probe]).await?;
             resend_at = Instant::now() + Duration::from_millis(700);
         }
@@ -655,13 +657,22 @@ async fn verify_dataplane(
                 capsules.push(&chunk);
                 loop {
                     match capsules.next() {
-                        Ok(Some(Capsule::Datagram(_pkt))) => {
-                            // S4 fix rollback: accept any datagram as proof.
-                            confirms += 1;
-                            if confirms >= 1 {
-                                log::info!("[h2] data-plane verified (datagram received)");
+                        Ok(Some(Capsule::Datagram(pkt))) => {
+                            // Readiness used to be "any datagram at all", so an
+                            // edge that echoed our own probe back — or answered
+                            // CONNECT-IP and then black-holed everything — marked
+                            // the tunnel ready and got promoted into the trust
+                            // cache. The predicate is the one the H2 tests already
+                            // exercised with no production caller.
+                            if crate::dns::is_dns_reply(&pkt, resolver) {
+                                confirms += 1;
+                                log::info!("[h2] data-plane verified (DNS reply from {resolver})");
                                 return Ok(());
                             }
+                            log::debug!(
+                                "[h2] ignoring {}-byte datagram that is not a DNS reply from {resolver}",
+                                pkt.len()
+                            );
                         }
                         Ok(Some(Capsule::AddressAssign(addrs))) => {
                             for a in addrs {
@@ -850,13 +861,38 @@ mod tests {
         let p = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
         assert!(!dns::is_dns_reply(&p, resolver));
 
-        // Minimal IPv4/UDP datagram from 1.1.1.1:53 must be accepted.
-        let mut reply = vec![0u8; 28];
+        // A real answer: from the resolver, source port 53, DNS flags with QR set.
+        let mut reply = vec![0u8; 32];
         reply[0] = 0x45; // IPv4, IHL=5
         reply[9] = 17; // UDP
         reply[12..16].copy_from_slice(&[8, 8, 8, 8]); // src = 8.8.8.8
         reply[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port 53
+        reply[24] = 0x81; // flags: QR + RD
         assert!(dns::is_dns_reply(&reply, resolver));
+    }
+
+    /// The predicate behind the CONNECT-IP(H2) readiness gate.
+    ///
+    /// `verify_dataplane` used to accept *any* datagram, so an edge that echoed
+    /// our own probe back — the cheapest possible fake — marked the tunnel ready,
+    /// and the endpoint was credited and cached as working.
+    #[test]
+    fn an_echoed_probe_is_not_data_plane_proof() {
+        let resolver = std::net::Ipv4Addr::new(8, 8, 8, 8);
+        let echo = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
+        assert!(!dns::is_dns_reply(&echo, resolver), "echo accepted as a reply");
+
+        // The same packet with the source address and port rewritten to look like
+        // the resolver's: still a query (QR clear), still not proof.
+        let mut spoof = echo.clone();
+        spoof[12..16].copy_from_slice(&resolver.octets());
+        spoof[20..22].copy_from_slice(&53u16.to_be_bytes());
+        assert!(!dns::is_dns_reply(&spoof, resolver), "spoofed echo accepted");
+
+        // And a genuine reply must pass, or the gate would fail closed.
+        let mut real = spoof.clone();
+        real[24] |= 0x80;
+        assert!(dns::is_dns_reply(&real, resolver), "real reply rejected");
     }
 
     #[test]

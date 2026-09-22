@@ -17,6 +17,15 @@ use crate::{consts, error::AetherError, error::Result};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const NET_QUEUE: usize = 2048;
+/// Outbound IP packets handed to quiche per select wakeup.
+///
+/// The batch this replaces drained the whole 2048-deep egress queue in one pass,
+/// with no flush and no yield in between: one wakeup could push thousands of
+/// frames through the connection while ingress, `on_timeout` and the keepalive
+/// timer all waited behind it — the same unbounded per-tick work `c151591` set
+/// out to bound. A capped batch still fits inside one flush cycle, and the queue
+/// is picked up again on the next wakeup.
+const MAX_EGRESS_PER_TICK: usize = 32;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -127,20 +136,31 @@ fn h3_trace_on() -> bool {
 /// Attach qlog (when `AETHER_QLOG_DIR` is set) and TLS keylog (`SSLKEYLOGFILE`) to
 /// a fresh connection for offline decryption/analysis. Must be called right
 /// after `quiche::connect`, before the first flush, or early events are lost.
-fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
+///
+/// Every filesystem call goes through `spawn_blocking`: this runs inside the
+/// tunnel loop, on the task that has to answer the peer's retransmits, and a
+/// `create_dir_all` on a cold disk or a roaming/network home directory takes
+/// long enough to be measured in QUIC timeouts.
+async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
     if let Some(dir) = crate::runtime_env::var("AETHER_QLOG_DIR") {
         let dir = dir.trim().to_string();
         if !dir.is_empty() {
-            let _ = std::fs::create_dir_all(&dir);
             let seq = QLOG_SEQ.fetch_add(1, Ordering::Relaxed);
             let file =
                 std::path::Path::new(&dir).join(format!("{tag}-{}-{seq}.qlog", std::process::id()));
-            match std::fs::File::create(&file) {
-                Ok(f) => {
+            let (dir_task, file_task) = (dir.clone(), file.clone());
+            match tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&dir_task)?;
+                std::fs::File::create(&file_task)
+            })
+            .await
+            {
+                Ok(Ok(f)) => {
                     conn.set_qlog(Box::new(f), "aether-h3".to_string(), format!("qlog {tag}"));
                     log::info!("[h3] qlog -> {}", file.display());
                 }
-                Err(e) => log::debug!("[h3] qlog create failed: {e}"),
+                Ok(Err(e)) => log::debug!("[h3] qlog create failed: {e}"),
+                Err(e) => log::debug!("[h3] qlog setup task failed: {e}"),
             }
         }
     }
@@ -150,9 +170,21 @@ fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
     if let Some(path) = keylog {
         let path = path.trim().to_string();
         if !path.is_empty() {
-            if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                conn.set_keylog(Box::new(f));
-                log::info!("[h3] keylog -> {path}");
+            let shown = path.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+            })
+            .await;
+            match opened {
+                Ok(Ok(f)) => {
+                    conn.set_keylog(Box::new(f));
+                    log::info!("[h3] keylog -> {shown}");
+                }
+                Ok(Err(e)) => log::debug!("[h3] keylog open failed: {e}"),
+                Err(e) => log::debug!("[h3] keylog setup task failed: {e}"),
             }
         }
     }
@@ -444,7 +476,7 @@ pub async fn run(
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
     let mut conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
-    maybe_enable_diagnostics(&mut conn, "tunnel");
+    maybe_enable_diagnostics(&mut conn, "tunnel").await;
 
     if let Some(ref ech) = current_ech {
         tls::inject_ech(&mut conn, ech)?;
@@ -456,6 +488,12 @@ pub async fn run(
     let mut h3_conn: Option<h3::Connection> = None;
     let mut req_stream: Option<u64> = None;
     let mut capsules = CapsuleParser::new();
+    // Scratch buffer for the CONNECT-IP response body, allocated once for the
+    // life of the tunnel rather than once per wakeup.
+    let mut h3_body = vec![0u8; 65535];
+    // Same for the per-flush QUIC datagram buffer: it is exactly
+    // `MAX_DATAGRAM_SIZE`, so a stack array costs nothing and allocates nothing.
+    let mut flush_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut established_ever = false;
     let mut ech_retried = false;
     let mut udp_seen = false;
@@ -474,7 +512,7 @@ pub async fn run(
         noize::pre_handshake(sock.as_ref(), peer, &cfg.noize).await;
     }
 
-    flush(&mut conn, &sockets).await?;
+    flush(&mut conn, &sockets, &mut flush_buf).await?;
 
     let mut keepalive = Keepalive::default();
     let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -502,8 +540,11 @@ pub async fn run(
         let timeout = conn.timeout();
 
         tokio::select! {
-            biased;
-            
+            // No `biased`: the branches are polled in randomised order, which is
+            // what keeps a 2048-deep `net_rx` from being served ahead of egress on
+            // every wakeup. Ordering them by hand put TCP ACKs and CONNECT-IP
+            // payload behind an unbounded ingress stream during exactly the
+            // downloads that need them most, and the peer just kept sending.
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
                     match keepalive.tick() {
@@ -534,9 +575,23 @@ pub async fn run(
                             udp_seen = true;
                             h3_stage("udp_first_reply", &format!("from {from} bytes {}", data.len()));
                         }
-                        let mut hdr_buf = data.clone();
-                        if let Ok(hdr) = quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
-                            log::debug!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
+                        // The header parse exists only for the log line, and it
+                        // needs a mutable copy: cloning every inbound datagram to
+                        // render a debug message is a per-packet allocation on the
+                        // hottest path in the tunnel.
+                        if log::log_enabled!(log::Level::Debug) {
+                            let mut hdr_buf = data.clone();
+                            if let Ok(hdr) =
+                                quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN)
+                            {
+                                log::debug!(
+                                    "recv {} bytes type={:?} version=0x{:x} from {}",
+                                    data.len(),
+                                    hdr.ty,
+                                    hdr.version,
+                                    from
+                                );
+                            }
                         }
                         let info = quiche::RecvInfo { from, to: to_local };
                         let received = conn.recv(&mut data, info);
@@ -571,10 +626,28 @@ pub async fn run(
                         let use_capsule = h3_dgram_mode.use_capsule(dgram_by_peer);
                         if let (Some(sid), Some(h3c)) = (req_stream, h3_conn.as_mut()) {
                             send_ip_h3(&mut conn, h3c, sid, &ip_packet, use_capsule);
-                            // Batch remaining IP packets same tick.
-                            while let Ok(more) = internals.outbound_rx.try_recv() {
-                                send_ip_h3(&mut conn, h3c, sid, &more, use_capsule);
+                            // Batch the rest of this tick's egress, up to the cap,
+                            // then fall back through the select so a deep queue
+                            // cannot monopolise the loop.
+                            let mut batched = 1usize;
+                            while batched < MAX_EGRESS_PER_TICK {
+                                match internals.outbound_rx.try_recv() {
+                                    Ok(more) => {
+                                        send_ip_h3(&mut conn, h3c, sid, &more, use_capsule);
+                                        batched += 1;
+                                    }
+                                    Err(_) => break,
+                                }
                             }
+                        } else {
+                            // No request stream (yet, or any more): the packet is
+                            // gone, and a drop nobody counts is the difference
+                            // between "tunnel up, pages never load" being
+                            // diagnosable and being folklore.
+                            note_dropped(
+                                "outbound ip (no connect-ip stream)",
+                                "the CONNECT-IP stream is not open",
+                            );
                         }
                     }
                     None => {
@@ -630,6 +703,8 @@ pub async fn run(
                 &inbound_tx,
                 &mut dataplane_ok,
                 &mut addr_assigned,
+                h3_ready,
+                &mut h3_body,
             )?;
         }
 
@@ -798,6 +873,31 @@ fn classify_status(stream_id: u64, req_stream: u64, status: &str) -> StatusActio
     }
 }
 
+/// What the CONNECT-IP *probe* does with a `:status` line.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeStatus {
+    /// Interim (103 Early Hints, 100 Continue) or off-stream: keep polling.
+    Wait,
+    /// Final 2xx: the control plane works, go prove the data plane.
+    Ready,
+    /// Refused, or not a status at all.
+    Failed(String),
+}
+
+/// The single mapping from [`classify_status`] onto the probe's decision.
+///
+/// `verify_masque` used to compare the raw header bytes against `b"200"` and
+/// call everything else fatal, while `run()` went through `classify_status` and
+/// waited for interim responses. One edge behaviour therefore meant a working
+/// tunnel in the session and a broken endpoint in the scan that ranked it.
+fn probe_decision(stream_id: u64, req_stream: u64, status: &str) -> ProbeStatus {
+    match classify_status(stream_id, req_stream, status) {
+        StatusAction::Ignore | StatusAction::Interim => ProbeStatus::Wait,
+        StatusAction::Ready => ProbeStatus::Ready,
+        StatusAction::Fatal => ProbeStatus::Failed(format!("status {status}")),
+    }
+}
+
 /// Returns true when CONNECT-IP response status is 200.
 #[allow(clippy::too_many_arguments)]
 fn poll_h3(
@@ -811,9 +911,14 @@ fn poll_h3(
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     dataplane_ok: &mut bool,
     addr_assigned: &mut bool,
+    // Only a stream that answered CONNECT-IP may mark the data plane up; a
+    // datagram that arrives before the final response proves reachability, not
+    // forwarding. Same argument as `drain_datagrams`' `watch_dataplane`.
+    watch_dataplane: bool,
+    // Owned by `run` so a 64 KB allocation is not paid on every wakeup of the
+    // tunnel loop (`poll_h3` runs once per select iteration).
+    body: &mut Vec<u8>,
 ) -> Result<()> {
-    let mut body = vec![0u8; 65535];
-
     loop {
         match h3c.poll(conn) {
             Ok((stream_id, h3::Event::Headers { list, .. })) => {
@@ -853,13 +958,21 @@ fn poll_h3(
                 if stream_id != req_stream {
                     continue;
                 }
-                while let Ok(n) = h3c.recv_body(conn, stream_id, &mut body) {
+                while let Ok(n) = h3c.recv_body(conn, stream_id, &mut body[..]) {
                     if n == 0 {
                         break;
                     }
                     capsules.push(&body[..n]);
                 }
-                drain_capsules(capsules, addr_tx, probe_src, inbound_tx, dataplane_ok, addr_assigned);
+                drain_capsules(
+                    capsules,
+                    addr_tx,
+                    probe_src,
+                    inbound_tx,
+                    dataplane_ok,
+                    addr_assigned,
+                    watch_dataplane,
+                );
             }
 
             Ok((stream_id, h3::Event::Finished)) if stream_id == req_stream => {
@@ -890,6 +1003,7 @@ fn drain_capsules(
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     dataplane_ok: &mut bool,
     addr_assigned: &mut bool,
+    watch_dataplane: bool,
 ) {
     loop {
         match capsules.next() {
@@ -1034,15 +1148,32 @@ async fn drain_datagrams(
                         }
                         *dataplane_ok = true;
                     }
-                    // Prefer try_send so QUIC recv keeps moving; await only under backpressure.
+                    // Bounded by try_send only. Awaiting the queue used to park
+                    // the whole tunnel loop on the netstack consumer — no recv, no
+                    // flush, no `on_timeout` — so one slow reader became a QUIC
+                    // idle-timeout kill for every flow on the connection.
+                    // `drain_capsules` already answers saturation by dropping and
+                    // counting; TCP retransmits, which is the recovery path this
+                    // stack is built around.
                     match inbound_tx.try_send(ip_packet) {
                         Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
-                            if inbound_tx.send(pkt).await.is_err() {
-                                return Ok(());
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            let n = crate::counters::bump(&crate::counters::INBOUND_DROPPED);
+                            if n == 1 || n.is_multiple_of(1000) {
+                                log::warn!(
+                                    "[h3] dropped inbound datagram (count {n}): queue saturated"
+                                );
                             }
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            // The receiver is gone, so every datagram pulled off
+                            // quiche from here on is consumed into a void. That is
+                            // fatal and has to say so — returning `Ok(())` used to
+                            // end inbound delivery with the tunnel still reporting
+                            // itself healthy.
+                            log::error!("[quic] inbound queue closed: the netstack is gone");
+                            return Err(AetherError::Other("inbound queue closed".into()));
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -1060,19 +1191,43 @@ async fn drain_datagrams(
     Ok(())
 }
 
+/// Hand every datagram quiche wants to send to the socket it was sent from.
 async fn flush(
     conn: &mut quiche::Connection,
     sockets: &HashMap<SocketAddr, Arc<UdpSocket>>,
+    out: &mut [u8; MAX_DATAGRAM_SIZE],
 ) -> Result<()> {
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
-
     loop {
-        match conn.send(&mut out) {
+        match conn.send(out) {
             Ok((write, send_info)) => {
-                if let Some(sock) = sockets.get(&send_info.from) {
-                    sock.send_to(&out[..write], send_info.to).await?;
-                } else if let Some((_, sock)) = sockets.iter().next() {
-                    sock.send_to(&out[..write], send_info.to).await?;
+                // `send_info.from` is the local endpoint quiche chose for this
+                // packet; after a migration it can be one this map no longer
+                // holds. The old fallback sent it from `sockets.iter().next()` —
+                // an arbitrary HashMap entry, so a v4 packet could leave a v6
+                // socket with the wrong source address, which the peer cannot
+                // associate with the connection at all. A dropped packet is
+                // counted and retransmitted; a misrouted one is silent corruption.
+                let Some(sock) = sockets.get(&send_info.from) else {
+                    let n = crate::counters::bump(&crate::counters::DATAGRAM_SEND_DROPPED);
+                    if n == 1 || n.is_multiple_of(1000) {
+                        log::warn!(
+                            "[quic] no socket bound to {} (count {n}); packet for {} dropped",
+                            send_info.from,
+                            send_info.to
+                        );
+                    }
+                    continue;
+                };
+                // A failed send used to propagate out of `run()` and close the
+                // tunnel. The common cause is transient — an ICMP-driven
+                // `WSAECONNRESET` on the path, or a full socket buffer — and
+                // quiche retransmits whatever went unacknowledged, so the
+                // connection has no reason to die over one datagram.
+                if let Err(e) = sock.send_to(&out[..write], send_info.to).await {
+                    let n = crate::counters::bump(&crate::counters::DATAGRAM_SEND_DROPPED);
+                    if n == 1 || n.is_multiple_of(1000) {
+                        log::warn!("[quic] send to {} failed (count {n}): {e}", send_info.to);
+                    }
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -1376,13 +1531,22 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     Ok((stream_id, h3::Event::Headers { list, .. })) if stream_id == sid => {
                         for h in &list {
                             if h.name() == b":status" {
+                                let status = String::from_utf8_lossy(h.value()).to_string();
                                 if trace {
-                                    h3_stage(
-                                        "connect_ip_status",
-                                        &format!("code={}", String::from_utf8_lossy(h.value())),
-                                    );
+                                    h3_stage("connect_ip_status", &format!("code={status}"));
                                 }
-                                if h.value() == b"200" {
+                                // One classifier for both CONNECT-IP paths.
+                                // `run()` already tolerates interim responses;
+                                // the probe compared the raw bytes against "200",
+                                // so an edge that sent `103 Early Hints` (or a
+                                // `100`) ahead of its final answer was scored
+                                // broken and struck from the cache.
+                                match probe_decision(stream_id, sid, &status) {
+                                    ProbeStatus::Wait => {}
+                                    ProbeStatus::Failed(reason) => {
+                                        return Err(AetherError::Other(reason))
+                                    }
+                                    ProbeStatus::Ready => {
                                     // Control-plane OK. Now verify data-plane:
                                     // send 1 DNS probe through the datagram channel.
                                     // Fast-path: 1 round-trip is enough during scan.
@@ -1399,6 +1563,9 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                     // Wait for data-plane reply (up to 3.5s).
                                     let dp_deadline = Instant::now() + Duration::from_millis(3500).min(remaining(deadline));
                                     let mut dp_successes: u32 = 0;
+                                    // Hoisted: this buffer was being reallocated
+                                    // for every received datagram inside the loop.
+                                    let mut dgram_buf = vec![0u8; 65535];
                                     loop {
                                         if Instant::now() >= dp_deadline {
                                             // Data-plane timeout — endpoint accepts control but drops traffic.
@@ -1413,17 +1580,25 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                     let info = quiche::RecvInfo { from, to: local };
                                                     let _ = conn.recv(&mut buf[..n], info);
                                                     // Check for a QUIC DATAGRAM reply.
-                                                    let mut dgram_buf = vec![0u8; 65535];
                                                     let mut got_reply = false;
                                                     loop {
                                                         match conn.dgram_recv(&mut dgram_buf) {
                                                             Ok(dn) => {
-                                                                if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..dn], sid) {
-                                                                    if trace {
-                                                                        h3_stage("inbound_datagram", "quic datagram confirmed");
+                                                                // The same predicate the tunnel applies before
+                                                                // marking its data plane up: an inner packet the
+                                                                // edge could not have forwarded — an ICMP error,
+                                                                // or our own probe echoed back — is not proof.
+                                                                if let Ok(Some(ip)) =
+                                                                    masque::decode_ip_datagram(&dgram_buf[..dn], sid)
+                                                                {
+                                                                    if is_forwardable_ip_packet(&ip) {
+                                                                        if trace {
+                                                                            h3_stage("inbound_datagram", "quic datagram confirmed");
+                                                                        }
+                                                                        got_reply = true;
+                                                                        break;
                                                                     }
-                                                                    got_reply = true;
-                                                                    break;
+                                                                    log::debug!("[h3] probe: ignoring a datagram that is not forwardable traffic");
                                                                 }
                                                             }
                                                             Err(quiche::Error::Done) => break,
@@ -1446,12 +1621,15 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                         }
                                                         loop {
                                                             match dp_capsules.next() {
-                                                                Ok(Some(masque::Capsule::Datagram(_))) => {
-                                                                    if trace {
-                                                                        h3_stage("inbound_datagram", "capsule datagram confirmed");
+                                                                Ok(Some(masque::Capsule::Datagram(pkt))) => {
+                                                                    if is_forwardable_ip_packet(&pkt) {
+                                                                        if trace {
+                                                                            h3_stage("inbound_datagram", "capsule datagram confirmed");
+                                                                        }
+                                                                        got_reply = true;
+                                                                        break;
                                                                     }
-                                                                    got_reply = true;
-                                                                    break;
+                                                                    log::debug!("[h3] probe: ignoring a capsule that is not forwardable traffic");
                                                                 }
                                                                 Ok(Some(_)) => {}
                                                                 Ok(None) | Err(_) => break,
@@ -1478,11 +1656,8 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                             return Err(AetherError::Other("closed during data-plane probe".into()));
                                         }
                                     }
+                                    }
                                 }
-                                return Err(AetherError::Other(format!(
-                                    "status {}",
-                                    String::from_utf8_lossy(h.value())
-                                )));
                             }
                         }
                     }
@@ -1569,7 +1744,9 @@ async fn flush_to(
     sock: &UdpSocket,
     peer: SocketAddr,
 ) -> Result<()> {
-    let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
+    // Fixed size, so the datagram buffer is a stack array rather than a
+    // per-call heap allocation on the probe path.
+    let mut out = [0u8; MAX_DATAGRAM_SIZE];
     loop {
         match conn.send(&mut out) {
             Ok((write, send_info)) => {
@@ -1635,6 +1812,38 @@ mod tests {
         assert_eq!(classify_status(0, 0, "400"), StatusAction::Fatal);
         assert_eq!(classify_status(0, 0, "500"), StatusAction::Fatal);
         assert_eq!(classify_status(0, 0, "garbage"), StatusAction::Fatal);
+    }
+
+    /// The scan probe and the tunnel have to read a `:status` line the same way.
+    /// `verify_masque` compared the raw header bytes against `b"200"` and called
+    /// everything else fatal, so an edge that sent `103 Early Hints` ahead of its
+    /// final answer — which `run()` waits straight through — was scored broken
+    /// and struck from the endpoint cache.
+    #[test]
+    fn the_probe_waits_through_interim_responses_like_the_tunnel() {
+        for interim in ["100", "101", "102", "103", "199"] {
+            assert!(
+                matches!(classify_status(0, 0, interim), StatusAction::Interim),
+                "classifier moved on: {interim}"
+            );
+            assert_eq!(
+                probe_decision(0, 0, interim),
+                ProbeStatus::Wait,
+                "the probe called interim {interim} fatal"
+            );
+        }
+        assert_eq!(probe_decision(0, 0, "200"), ProbeStatus::Ready);
+        assert_eq!(probe_decision(0, 0, "204"), ProbeStatus::Ready);
+        assert!(
+            matches!(probe_decision(0, 0, "403"), ProbeStatus::Failed(_)),
+            "a refusal must still be a refusal"
+        );
+        assert!(
+            matches!(probe_decision(0, 0, "nonsense"), ProbeStatus::Failed(_)),
+            "an unparseable status must not be read as success"
+        );
+        // Not our stream: neither ready nor fatal, just noise to wait past.
+        assert_eq!(probe_decision(8, 0, "200"), ProbeStatus::Wait);
     }
 
     #[test]

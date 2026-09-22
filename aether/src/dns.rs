@@ -40,7 +40,11 @@ async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
     let (qid, query) = build_query(host, RR_HTTPS);
     sock.send(&query).await?;
 
-    let mut buf = [0u8; 4096];
+    // A UDP datagram can carry up to 65535 bytes, and an HTTPS RR with an
+    // ECHConfigList regularly exceeds 4 KB. Read the whole frame: a buffer that
+    // is too small does not fail, it truncates, and `parse_https_ech` then
+    // reports "no ech svcparam" for a resolver that answered perfectly.
+    let mut buf = vec![0u8; 65535];
     let n = timeout(Duration::from_secs(3), sock.recv(&mut buf))
         .await
         .map_err(|_| AetherError::Ech("dns timeout".into()))??;
@@ -281,10 +285,13 @@ pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {
     pkt
 }
 
-/// Validate that an inbound IPv4 datagram is a UDP DNS reply from the given
-/// resolver on port 53. Currently exercised only by tests (the live data-plane
-/// path decodes QUIC DATAGRAMs), so it is compiled for tests only.
-#[cfg(test)]
+/// Validate that an inbound IPv4 datagram is a UDP DNS *reply* from the given
+/// resolver on port 53.
+///
+/// This is the predicate the data-plane readiness gates use: "a datagram came
+/// back" is not proof the tunnel forwards traffic, because the peer can echo our
+/// own probe. Source address, source port and the QR bit are what separate a
+/// reply from an echo or a spoofed fragment.
 pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
     if pkt.len() < 28 || pkt[0] >> 4 != 4 {
         return false;
@@ -296,7 +303,15 @@ pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
     if pkt[12..16] != resolver.octets() {
         return false;
     }
-    u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == 53
+    if u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) != 53 {
+        return false;
+    }
+    // DNS header: flags at offset 2, QR is the top bit. An echo of the probe we
+    // sent has QR clear, so it is not evidence of anything.
+    if pkt.len() < ihl + 12 {
+        return false;
+    }
+    pkt[ihl + 2] & 0x80 != 0
 }
 
 #[cfg(test)]

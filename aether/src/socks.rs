@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -31,6 +31,41 @@ const RELAY_BUF: usize = 256 * 1024;
 /// rather than being a silent drop of the accepted socket (T163).
 pub const MAX_CLIENTS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest name worth decoding or asking for: RFC 1035 §2.3.4's 255-octum wire
+/// limit, which is 253 characters once the root label and its lengths are
+/// accounted for. Shared by the decoder and the resolver's own check so the two
+/// cannot disagree about what a legal name is.
+const MAX_DNS_NAME_LEN: usize = 253;
+/// How long to sit out after a transient `accept()` failure before trying again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// Consecutive transient accept failures tolerated before the listener is called
+/// dead. Without a bound a genuinely broken listener would log-and-sleep forever
+/// and the tunnel would never learn its proxy had gone.
+const MAX_TRANSIENT_ACCEPTS: u32 = 32;
+
+/// Did this `accept()` error kill the *connection* or the *listener*?
+///
+/// `EMFILE`/`ENFILE`/`ENOBUFS` (out of descriptors or socket buffers, which
+/// clears as soon as some socket closes) and `ECONNABORTED` (the client vanished
+/// between the SYN and the accept) are per-connection: the listener is fine. They
+/// used to be returned from the accept loop, which took the whole listener down —
+/// and in the HTTP proxy's case that `Err` reaches `session.rs`'s "proxy exited"
+/// readiness arm, which tears down a perfectly healthy tunnel because one client
+/// raced its own connect.
+///
+/// On both platforms these arrive as `Uncategorized`, so the raw code is not
+/// checked: the streak bound in [`MAX_TRANSIENT_ACCEPTS`] is what keeps a
+/// non-transient failure from spinning here forever.
+fn is_transient_accept(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::Uncategorized
+    )
+}
 /// Hard ceiling on one accepted session, both proxies (T163).
 ///
 /// This is a *documented* limit, not an invisible one: when it fires the engine
@@ -178,8 +213,23 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     log::info!("socks5 listening on {listen}");
 
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    let mut transient = 0u32;
     loop {
-        let (sock, peer) = listener.accept().await?;
+        let (sock, peer) = match listener.accept().await {
+            Ok(v) => {
+                transient = 0;
+                v
+            }
+            Err(e) if is_transient_accept(&e) && transient < MAX_TRANSIENT_ACCEPTS => {
+                transient += 1;
+                log::warn!(
+                    "[socks5] accept failed ({e}); staying up ({transient}/{MAX_TRANSIENT_ACCEPTS})"
+                );
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let permit = match permits.clone().try_acquire_owned() {
             Ok(p) => p,
             // T163: at the limit the accepted socket used to be dropped unseen,
@@ -526,7 +576,7 @@ pub fn dns_servers_for_adapter(list: &[SocketAddr]) -> Vec<Ipv4Addr> {
 
 fn valid_dns_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 253
+        && name.len() <= MAX_DNS_NAME_LEN
         && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
 }
 
@@ -561,6 +611,16 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
     for server in configured_dns_servers() {
         for qtype in dns_prefer_order() {
+            // Drop anything the association is already holding before asking a
+            // new question. One socket carries every retry — A then AAAA, server
+            // after server — and a reply that lands after its own 3 s window
+            // closed stays queued at the head. The next attempt's `recv` takes
+            // *that* one, rejects it for the wrong transaction id, and its own
+            // answer is then consumed by the attempt after it: every remaining
+            // query in the loop inherits the desync, which is the repeated
+            // 3-second timeout and the "no record" for a host that resolves
+            // perfectly well.
+            while from_stack.try_recv().is_ok() {}
             let (qid, query) = build_dns_query(name, qtype)?;
             if let Err(e) = sender.send_to(server, query).await {
                 last_err = e;
@@ -712,6 +772,12 @@ fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
 
 /// Decode a DNS name starting at `pos`, following compression pointers (bounded).
 /// Returns the lowercase dotted name without a trailing dot.
+///
+/// The bounds are RFC 1035's, not inventions: 127 labels and 253 characters. The
+/// old 16-label cap refused to decode legitimate deep hostnames — a CDN name with
+/// a service prefix and several regional labels clears 16 easily — and the caller
+/// cannot tell "malformed" from "too long for this parser", so the practical
+/// result was a CONNECT refused for a host that resolves fine.
 fn decode_qname(buf: &[u8], mut pos: usize) -> Option<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut jumps = 0usize;
@@ -728,10 +794,13 @@ fn decode_qname(buf: &[u8], mut pos: usize) -> Option<String> {
             continue;
         }
         if len == 0 {
-            if labels.is_empty() || labels.len() > 16 {
+            if labels.is_empty() || labels.len() > 127 {
                 return None;
             }
             let mut s = labels.join(".");
+            if s.len() > MAX_DNS_NAME_LEN {
+                return None;
+            }
             s.make_ascii_lowercase();
             return Some(s);
         }
@@ -850,8 +919,41 @@ async fn handle_connect(
     Ok(())
 }
 
+/// The address a UDP relay should bind and advertise for this control
+/// connection.
+///
+/// RFC 1928 defines BND.ADDR as the address the client must send its datagrams
+/// to, so answering with the loopback address is only correct for a loopback
+/// listener. `check_listener_bind` permits a credentialed remote-facing bind,
+/// and for that client `127.0.0.1` is its own machine: SOCKS UDP could never
+/// work. A listener on the wildcard has no address of its own, so the routing
+/// stack is asked which source it would use toward the peer — a bound-but-never
+/// -written UDP socket answers that without sending anything.
+async fn relay_bind_addr(control: SocketAddr, peer: SocketAddr) -> Result<SocketAddr> {
+    let wildcard_ip: IpAddr = if peer.is_ipv6() {
+        Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        Ipv4Addr::UNSPECIFIED.into()
+    };
+    if !control.ip().is_unspecified() {
+        return Ok(SocketAddr::new(control.ip(), 0));
+    }
+    let probe = UdpSocket::bind(SocketAddr::new(wildcard_ip, 0)).await?;
+    if let Err(e) = probe.connect(peer).await {
+        log::debug!("[socks5] no route toward {peer} for BND.ADDR: {e}");
+        return Ok(SocketAddr::new(wildcard_ip, 0));
+    }
+    match probe.local_addr() {
+        Ok(a) if !a.ip().is_unspecified() => Ok(SocketAddr::new(a.ip(), 0)),
+        _ => Ok(SocketAddr::new(wildcard_ip, 0)),
+    }
+}
+
 async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
-    let relay = UdpSocket::bind("127.0.0.1:0").await?;
+    let control = sock.local_addr()?;
+    let peer = sock.peer_addr()?;
+    let bind_ip = relay_bind_addr(control, peer).await?;
+    let relay = UdpSocket::bind(bind_ip).await?;
     let relay_addr = relay.local_addr()?;
     reply_bound(&mut sock, relay_addr).await?;
 

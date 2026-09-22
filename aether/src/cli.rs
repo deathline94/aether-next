@@ -100,13 +100,37 @@ pub async fn run() -> Result<()> {
     result
 }
 
+/// The only thing that ends the control wait: an explicit `shutdown` token.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Control {
+    Shutdown,
+}
+
 async fn shutdown_request() {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let lines = BufReader::new(tokio::io::stdin()).lines();
+    // The value says which of the two ended the wait; this arm's completion is
+    // the signal, and it only ever happens on an explicit `shutdown`.
+    watch_control(lines).await;
+}
+
+/// Read control-channel lines until an explicit `shutdown`.
+///
+/// End-of-input is **not** a shutdown. The parent writes the key handoff on this
+/// same pipe and may close its write half the moment that is done — and the old
+/// `while let Ok(Some(line))` loop simply ended on `None`, which returned from
+/// `shutdown_request()`, won the `select!`, dropped the live session and exited 0.
+/// A tunnel that looked healthy to the parent had been killed by the parent
+/// finishing its own write. So EOF parks this arm forever and only the token
+/// retires it.
+async fn watch_control<R>(mut lines: tokio::io::Lines<R>) -> Control
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     while let Ok(Some(line)) = lines.next_line().await {
         match line.trim().to_ascii_lowercase().as_str() {
-            "shutdown" => return,
+            "shutdown" => return Control::Shutdown,
             // Cooperative cancel: let an in-flight scan finalise with its best
             // result (and persist it) instead of being dropped mid-work.
             "cancel" => crate::prober::request_scan_cancel(),
@@ -119,6 +143,8 @@ async fn shutdown_request() {
             }
         }
     }
+    log::info!("[control] stdin closed; keeping the session up (only `shutdown` retires it)");
+    std::future::pending::<Control>().await
 }
 
 /// Install the process panic hook.
@@ -173,7 +199,49 @@ fn is_netstack_panic(file: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_netstack_panic;
+    use super::{is_netstack_panic, watch_control, Control};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    fn lines(text: &'static [u8]) -> tokio::io::Lines<BufReader<&'static [u8]>> {
+        BufReader::new(text).lines()
+    }
+
+    /// The parent writes the key handoff on this pipe and is free to close its
+    /// write half as soon as that lands. Ending the wait there used to win the
+    /// `select!` in `run`, drop the live session and exit 0 — a silent tunnel
+    /// kill, with a success code.
+    #[tokio::test]
+    async fn eof_on_the_control_pipe_does_not_shut_the_session_down() {
+        let gone = tokio::time::timeout(Duration::from_millis(200), watch_control(lines(b"")))
+            .await
+            .is_ok();
+        assert!(!gone, "an empty control pipe was treated as a shutdown request");
+    }
+
+    /// A handoff line followed by EOF is the real sequence a parent performs.
+    #[tokio::test]
+    async fn a_handoff_line_then_eof_still_does_not_shut_it_down() {
+        let input: &[u8] = b"key a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2V5a2U=\n";
+        let gone = tokio::time::timeout(Duration::from_millis(200), watch_control(lines(input)))
+            .await
+            .is_ok();
+        assert!(
+            !gone,
+            "a token that is not `shutdown` ended the control wait"
+        );
+    }
+
+    /// ... and the token that *is* a shutdown still works, so this is a
+    /// distinction and not an unreachable arm.
+    #[tokio::test]
+    async fn only_shutdown_retires_the_control_wait() {
+        let input: &[u8] = b"nonsense-token\n  SHUTDOWN  \nnever-read\n";
+        let got = tokio::time::timeout(Duration::from_millis(200), watch_control(lines(input)))
+            .await
+            .expect("`shutdown` must end the wait");
+        assert_eq!(got, Control::Shutdown);
+    }
 
     #[test]
     fn netstack_panics_are_recognised_on_both_path_styles() {

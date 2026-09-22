@@ -165,6 +165,65 @@ pub fn usize_bounded(key: &str, default: usize, min: usize, max: usize) -> usize
     }
 }
 
+/// The knob that turns TLS key logging on. Named here because the transport
+/// reaches for it, and because a diagnostic whose output is session keys must not
+/// be enable-able by whatever the ambient environment happens to contain.
+pub const TLS_KEYLOG_FLAG: &str = "AETHER_TLS_KEYLOG";
+/// Optional file name inside the diagnostics directory.
+pub const TLS_KEYLOG_NAME: &str = "AETHER_TLS_KEYLOG_FILE";
+/// The diagnostics directory itself, already used for qlog.
+pub const DIAGNOSTICS_DIR: &str = "AETHER_QLOG_DIR";
+
+/// Where TLS client secrets may be written, if anywhere.
+///
+/// `SSLKEYLOGFILE` used to be read from the ambient environment by the transport:
+/// any process able to set one variable caused every session's traffic to be
+/// decryptable from a file on disk, at a path that process chose. Key material is
+/// written only when **both** hold:
+///
+/// * `AETHER_TLS_KEYLOG` is truthy — an explicit opt-in, not presence, and not
+///   inherited by accident; and
+/// * the destination is inside the diagnostics directory the operator already
+///   chose (`AETHER_QLOG_DIR`), so it cannot be pointed at a startup file, a
+///   device, or somebody else's tree. The file name is a single component: `..`
+///   and path separators are refused rather than sanitised.
+pub fn keylog_target() -> Option<std::path::PathBuf> {
+    use std::path::Path;
+    if !flag(TLS_KEYLOG_FLAG) {
+        return None;
+    }
+    let Some(dir) = var(DIAGNOSTICS_DIR).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    else {
+        log::warn!(
+            "[config] {TLS_KEYLOG_FLAG} is set but {DIAGNOSTICS_DIR} is not: no key log \
+             written. Keys only go inside the diagnostics directory."
+        );
+        return None;
+    };
+    let name = var(TLS_KEYLOG_NAME).unwrap_or_else(|| "tlskeys.log".into());
+    let name = name.trim();
+    let unsafe_name = name.is_empty()
+        || name.eq(".")
+        || name.eq("..")
+        || name.contains('/')
+        || name.contains('\\')
+        // Windows: `C:foo` is a drive-relative path and would escape the directory
+        // without containing a separator at all.
+        || name.contains(':')
+        || name.contains('\0');
+    if unsafe_name {
+        log::warn!("[config] ignoring {TLS_KEYLOG_NAME}={name:?}: must be one file name");
+        return None;
+    }
+    let path = Path::new(&dir).join(name);
+    // Belt and braces: the joined result must still sit under the directory.
+    if !path.starts_with(Path::new(&dir)) {
+        log::warn!("[config] refusing a key log path outside {dir:?}");
+        return None;
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +271,52 @@ mod tests {
         set("AETHER_SELFTEST_B", "99999");
         assert_eq!(usize_bounded("AETHER_SELFTEST_B", 10, 1, 100), 100);
         remove("AETHER_SELFTEST_B");
+    }
+
+    /// TLS client secrets are the material that makes every recorded session
+    /// readable. The transport used to write them wherever the ambient
+    /// `SSLKEYLOGFILE` pointed, so this helper has to be unenable-able by
+    /// accident and unable to leave the diagnostics directory.
+    #[test]
+    fn a_key_log_needs_both_the_opt_in_and_the_diagnostics_directory() {
+        remove(TLS_KEYLOG_FLAG);
+        remove(DIAGNOSTICS_DIR);
+        remove(TLS_KEYLOG_NAME);
+        assert_eq!(keylog_target(), None, "off by default");
+
+        // The directory alone is not consent.
+        set(DIAGNOSTICS_DIR, "/tmp/aether-diag");
+        assert_eq!(keylog_target(), None, "no opt-in, no key log");
+
+        // Opt-in without a directory must not invent one.
+        remove(DIAGNOSTICS_DIR);
+        set(TLS_KEYLOG_FLAG, "1");
+        assert_eq!(keylog_target(), None, "keys must stay inside the diagnostics dir");
+        set(TLS_KEYLOG_FLAG, "0");
+        assert_eq!(keylog_target(), None, "a zero-valued opt-in is not an opt-in");
+
+        // Both present: one file, under the directory the operator named.
+        set(TLS_KEYLOG_FLAG, "1");
+        set(DIAGNOSTICS_DIR, "/tmp/aether-diag");
+        let p = keylog_target().expect("opt-in with a directory writes a key log");
+        assert!(p.starts_with("/tmp/aether-diag"), "{p:?}");
+        assert_eq!(p.file_name().unwrap(), "tlskeys.log");
+
+        set(TLS_KEYLOG_NAME, "session-keys.log");
+        assert_eq!(
+            keylog_target().expect("named").file_name().unwrap(),
+            "session-keys.log"
+        );
+
+        // None of these may escape the directory, however they are spelled.
+        for hostile in ["../../windows/startup.sql", r"..\..\..\evil.log", "/etc/passwd", "..", "C:boot.ini", ""] {
+            set(TLS_KEYLOG_NAME, hostile);
+            assert_eq!(keylog_target(), None, "{hostile:?} must be refused outright");
+        }
+
+        remove(TLS_KEYLOG_FLAG);
+        remove(DIAGNOSTICS_DIR);
+        remove(TLS_KEYLOG_NAME);
     }
 
     #[test]

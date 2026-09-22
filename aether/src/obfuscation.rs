@@ -4,6 +4,7 @@
 //! transport obfuscators. Tags: `<b HEX>`, `<t>`, `<c>`, `<n>`, `<r N|MIN-MAX>`,
 //! `<rc N|MIN-MAX>`, `<rd N|MIN-MAX>`.
 use crate::aethernoize::AetherNoizeConfig;
+use crate::error::{AetherError, Result};
 use crate::noize::NoizeConfig;
 
 use rand::{Rng, RngCore};
@@ -13,6 +14,36 @@ use regex::Regex;
 pub enum Transport {
     Masque,
     WireGuard,
+}
+
+/// The names the shell's vocabulary accepts, kept next to `is_recognized` so the
+/// refusal can quote them back.
+pub const RECOGNIZED_PROFILES: &[&str] = &[
+    "off", "none", "light", "low", "medium", "balanced", "firewall", "default", "high", "gfw",
+    "max", "aggressive", "heavy", "custom",
+];
+
+/// Refuse a profile name the transports have no definition for.
+///
+/// `normalize` maps an unrecognised name to `default`, and both transports then
+/// built *some* profile from it — so a typo, or a name only one side of the
+/// project knows, became a working-looking connection on a profile nobody asked
+/// for. The session calls this before anything reads `AETHER_NOIZE`, so the
+/// fallback below is unreachable from a live connect rather than merely warned
+/// about once in a log the GUI does not show.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if is_recognized(trimmed) {
+        return Ok(());
+    }
+    Err(AetherError::Other(format!(
+        "unknown obfuscation profile {name:?}; refusing to substitute one nobody asked \
+         for. Recognised: {}",
+        RECOGNIZED_PROFILES.join(", ")
+    )))
 }
 
 /// Canonical profile name after alias resolution.
@@ -262,6 +293,50 @@ mod tests {
         assert_eq!(normalize("aggressive"), "max");
         assert_eq!(normalize("gfw"), "high");
         assert_eq!(normalize("balanced"), "medium");
+    }
+
+    /// The shell's vocabulary and the transport's used to be two different lists:
+    /// `medium`, `high`, `max` and `custom` were all valid names to the UI and all
+    /// silently built a `balanced()` profile in `aethernoize::from_profile`. Now
+    /// the only silent mapping left is one the tables state out loud, and a name
+    /// outside the vocabulary stops the session with the list in its message.
+    #[test]
+    fn an_unknown_profile_name_is_refused_not_downgraded() {
+        for good in RECOGNIZED_PROFILES {
+            assert!(validate_profile_name(good).is_ok(), "{good} is a real name");
+            assert!(is_recognized(good), "{good} is missing from is_recognized");
+        }
+        assert!(
+            validate_profile_name("  High  ").is_ok(),
+            "case and padding are not part of the name"
+        );
+        assert!(validate_profile_name("").is_ok(), "empty means the default");
+
+        for bad in ["turbo", "max1", "off-x", "medium-ish", "é", "11"] {
+            let err = validate_profile_name(bad)
+                .expect_err("{bad} must not silently become balanced()");
+            assert!(
+                err.to_string().contains(bad),
+                "the refusal must name what it rejected: {err}"
+            );
+            assert!(
+                err.to_string().contains("medium"),
+                "the refusal must list the names that do work: {err}"
+            );
+        }
+    }
+
+    /// Every recognised name resolves to a profile in both transports, so the
+    /// refusal above cannot be hiding a hole where a real name has no definition.
+    #[test]
+    fn every_recognized_name_has_a_profile_in_both_transports() {
+        for name in RECOGNIZED_PROFILES {
+            let wg = aethernoize_from_name(name);
+            let mq = noize_from_name(name);
+            let off = name.eq_ignore_ascii_case("off") || name.eq_ignore_ascii_case("none");
+            assert_eq!(wg.is_enabled(), !off, "wireguard profile for {name}");
+            assert_eq!(mq.is_enabled(), !off, "masque profile for {name}");
+        }
     }
 
     #[test]

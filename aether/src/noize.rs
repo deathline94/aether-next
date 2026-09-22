@@ -7,6 +7,15 @@ use tokio::net::UdpSocket;
 
 use crate::obfuscation::parse_cps;
 
+/// Gap between the intro packets of one profile.
+///
+/// Both shipped profiles used to set `junk_interval: ZERO`, so every `if
+/// !cfg.junk_interval.is_zero()` sleep in `pre_handshake` was dead and the junk
+/// burst left the host as one clump — the periodicity the pacing exists to remove.
+/// `off` keeps `ZERO`: no packets, no pacing.
+const JUNK_INTERVAL_FIREWALL: Duration = Duration::from_millis(12);
+const JUNK_INTERVAL_GFW: Duration = Duration::from_millis(16);
+
 #[derive(Debug, Clone)]
 pub struct NoizeConfig {
     pub jc_before_hs: usize,
@@ -39,7 +48,7 @@ impl NoizeConfig {
             jmax: 128,
             i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
             i2: Some("<r 48>".to_string()),
-            junk_interval: Duration::ZERO,
+            junk_interval: JUNK_INTERVAL_FIREWALL,
         }
     }
 
@@ -51,7 +60,7 @@ impl NoizeConfig {
             jmax: 128,
             i1: Some("<b 0d0a0d0a><t><r 24>".to_string()),
             i2: Some("<r 32>".to_string()),
-            junk_interval: Duration::ZERO,
+            junk_interval: JUNK_INTERVAL_GFW,
         }
     }
 
@@ -136,13 +145,19 @@ mod tests {
         assert_eq!(fw.jc_before_hs, 5);
         assert_eq!(fw.jmin, 50);
         assert_eq!(fw.jmax, 128);
-        assert!(fw.junk_interval.is_zero());
+        assert!(!fw.junk_interval.is_zero(), "a zero interval makes the pacing dead code");
 
         let gfw = NoizeConfig::gfw();
         assert_eq!(gfw.jc_before_hs, 5);
         assert_eq!(gfw.jmin, 50);
         assert_eq!(gfw.jmax, 128);
-        assert!(gfw.junk_interval.is_zero());
+        assert!(!gfw.junk_interval.is_zero(), "a zero interval makes the pacing dead code");
+    }
+
+    #[test]
+    fn the_off_profile_does_not_pace_nothing() {
+        assert!(NoizeConfig::off().junk_interval.is_zero());
+        assert!(!NoizeConfig::off().is_enabled());
     }
 
     #[test]

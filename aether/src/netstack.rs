@@ -20,6 +20,13 @@ use crate::error::{AetherError, Result};
 const UDP_BUF: usize = 128 * 1024;
 const UDP_META: usize = 128;
 const APP_QUEUE: usize = 256;
+/// Inbound frames copied out of the tunnel channel per wakeup.
+///
+/// This bounds the *handoff* from `inbound_rx` into `device.rx`; the ring itself
+/// is separately capped at [`RX_RING`] frames / 8 MB by `push_ingress`, so the
+/// channel can never be drained into an unbounded queue. It is deliberately
+/// larger than [`MAX_INGRESS_PER_TICK`]: the two are different knobs, and the
+/// one that matters for latency is the smaller.
 const MAX_INGEST_PER_TICK: usize = 256;
 const MAX_CMDS_PER_TICK: usize = 64;
 /// App-side writes per pass. Higher than the command budget because one flow
@@ -188,6 +195,13 @@ impl SocketClass {
 }
 
 /// Ingress frames serviced per loop iteration before egress gets a pass.
+///
+/// This is the bound behind the "bounded ingress" claim in `c151591`: it caps
+/// how many frames smoltcp will *process* per tick, and therefore how long one
+/// tick can hold `poll_egress`, the socket services and `flush_tx` off. The
+/// channel-to-ring handoff above (`MAX_INGEST_PER_TICK`) is a different, looser
+/// limit — moving a `Vec<u8>` between two queues costs far less than running it
+/// through the TCP state machine, which is why one is 256 and this is 32.
 const MAX_INGRESS_PER_TICK: usize = 32;
 /// Floor for the "nothing to wait for" case while frames are still queued.
 const MIN_POLL_DELAY: std::time::Duration = std::time::Duration::from_micros(250);
@@ -937,37 +951,33 @@ fn alloc_unique_port(s: &NetStack) -> Option<u16> {
 pub fn forbidden_destination(ip: IpAddr) -> Option<&'static str> {
     let blocked_lan = crate::runtime_env::flag("AETHER_BLOCK_LAN_TARGETS");
     match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            if v4.is_loopback() {
-                Some("loopback")
-            } else if o[0] == 0 {
-                // 0.0.0.0/8: "this host", which routes to the local machine.
-                Some("unspecified/this-network")
-            } else if v4.is_link_local() || (o[0] == 169 && o[1] == 254) {
-                Some("link-local (instance metadata)")
-            } else if o[0] == 100 && o[1] >= 64 && o[1] <= 127 {
-                Some("carrier-grade NAT (100.64.0.0/10)")
-            } else if v4.is_multicast() {
-                Some("multicast")
-            } else if blocked_lan
-                && (o[0] == 10
-                    || (o[0] == 172 && (16..=31).contains(&o[1]))
-                    || (o[0] == 192 && o[1] == 168))
-            {
-                Some("private (AETHER_BLOCK_LAN_TARGETS)")
-            } else {
-                None
-            }
-        }
+        IpAddr::V4(v4) => forbidden_v4(v4, blocked_lan),
         IpAddr::V6(v6) => {
-            let f = v6.segments();
             if v6.is_loopback() {
-                Some("loopback (::1)")
-            } else if f[0] & 0xfe00 == 0xfc00 {
+                return Some("loopback (::1)");
+            }
+            if v6.is_unspecified() {
+                return Some("unspecified (::)");
+            }
+            // A v6 literal can carry a v4 destination inside it. Routing sends
+            // those to the same hosts, so every IPv4 rule has to be applied to
+            // the embedded address: before this, `::ffff:169.254.169.254` read
+            // the instance metadata service through the one check that claims
+            // to be un-walk-aroundable.
+            if let Some(inner) = embedded_ipv4(v6) {
+                return forbidden_v4(inner, blocked_lan);
+            }
+            let f = v6.segments();
+            if f[0] & 0xfe00 == 0xfc00 {
                 Some("unique local (fc00::/7)")
             } else if f[0] & 0xffc0 == 0xfe80 {
                 Some("link-local (fe80::/10)")
+            } else if f[0] == 0x2001 && f[1] == 0 {
+                // Teredo is a v4-relayed tunnel: every route through it ends at
+                // an IPv4 literal embedded in the address, which is exactly what
+                // the rules above exist to police. The server field straddles a
+                // word boundary, so the prefix is refused whole.
+                Some("teredo (2001:0::/32)")
             } else if f[0] == 0xff02 || v6.is_multicast() {
                 Some("multicast")
             } else {
@@ -975,6 +985,57 @@ pub fn forbidden_destination(ip: IpAddr) -> Option<&'static str> {
             }
         }
     }
+}
+
+/// The IPv4 checks, shared by both families. See [`forbidden_destination`].
+fn forbidden_v4(v4: Ipv4Addr, blocked_lan: bool) -> Option<&'static str> {
+    let o = v4.octets();
+    if v4.is_loopback() {
+        Some("loopback")
+    } else if o[0] == 0 {
+        // 0.0.0.0/8: "this host", which routes to the local machine.
+        Some("unspecified/this-network")
+    } else if v4.is_link_local() || (o[0] == 169 && o[1] == 254) {
+        Some("link-local (instance metadata)")
+    } else if o[0] == 100 && o[1] >= 64 && o[1] <= 127 {
+        Some("carrier-grade NAT (100.64.0.0/10)")
+    } else if v4.is_multicast() {
+        Some("multicast")
+    } else if blocked_lan
+        && (o[0] == 10
+            || (o[0] == 172 && (16..=31).contains(&o[1]))
+            || (o[0] == 192 && o[1] == 168))
+    {
+        Some("private (AETHER_BLOCK_LAN_TARGETS)")
+    } else {
+        None
+    }
+}
+
+/// The IPv4 address a v6 literal is really addressed to, if it is one.
+///
+/// Covers the forms a resolver or a hand-written URL can legitimately produce:
+/// IPv4-mapped (`::ffff:a.b.c.d`, what a dual-stack stack hands back for a v4
+/// peer), the deprecated v4-compatible form (`::a.b.c.d`) and 6to4
+/// (`2002:<v4>::/32`). `::` and `::1` are answered by the caller first, so
+/// neither is mislabelled as a v4 address here.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let f = v6.segments();
+    let from_words = |a: u16, b: u16| {
+        Ipv4Addr::new((a >> 8) as u8, (a & 0xff) as u8, (b >> 8) as u8, (b & 0xff) as u8)
+    };
+    if f[..4].iter().all(|&w| w == 0) && (f[4] | f[5]) == 0 && (f[6] | f[7]) != 0 {
+        // `::a.b.c.d` (deprecated v4-compatible) and `::ffff:a.b.c.d` (mapped).
+        return Some(from_words(f[6], f[7]));
+    }
+    if f[0] == 0x2002 {
+        // 6to4: 2002:<v4>::/32 carries the destination's own IPv4 in words 1-2.
+        return Some(from_words(f[1], f[2]));
+    }
+    None
 }
 
 /// One reading of the stack's clock.
@@ -1065,10 +1126,13 @@ async fn run(
             .iface
             .poll_delay(stack_now(clock_base), &s.sockets)
             .map(|d| std::time::Duration::from_micros(d.total_micros()));
-        if delay.is_none() && !s.device.rx.is_empty() {
-            // smoltcp says "act now" because a frame is queued; we just handed
-            // that work its bounded share, so wait long enough for the select to
-            // mean something instead of spinning at 0.
+        if delay.is_none() && (!s.device.rx.is_empty() || !s.device.tx.is_empty()) {
+            // smoltcp says "act now" because a frame is queued on either side; we
+            // just handed that work its bounded share, so wait long enough for
+            // the select to mean something instead of spinning at 0. `tx` has to
+            // be in this test: `flush_tx` returns early on a full tunnel queue
+            // with no timer armed, and parking on `pending()` there meant queued
+            // egress — including TCP ACKs — was never retried.
             delay = Some(MIN_POLL_DELAY);
         }
 
@@ -1454,6 +1518,39 @@ fn retire_tcp(s: &mut NetStack, id: usize, reason: Option<&str>) {
     }
 }
 
+/// What one egress attempt did with a flow's queued bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Egress {
+    /// The socket took `n` bytes; the remainder waits for the next poll.
+    Accepted(usize),
+    /// The socket cannot take data in its current state, so nothing it still
+    /// holds is ever going to leave.
+    Dead,
+}
+
+/// Tear down a flow whose app-side half is gone.
+///
+/// `close()` on its own is not enough: from `Established` it only moves the
+/// socket to `FinWait1`, which is reclaimed once the *peer* answers — against a
+/// dead or silent peer the flow then sat there holding its buffer pair (up to
+/// 1.3 MB) and a proxy slot for the full 75 s idle timeout, which is the exact
+/// failure this function exists to remove. The socket is dropped in the same
+/// breath as the app-side entry, so no handle is orphaned in the `SocketSet`
+/// and no inbound segment can find it afterwards.
+fn abandon_tcp(s: &mut NetStack, id: usize, handle: SocketHandle, established: bool) {
+    with_tcp(&mut s.sockets, handle, |sock| sock.abort());
+    remove_socket(&mut s.sockets, handle);
+    // An established flow's caller already has its `TcpConn`; one that never
+    // finished handshaking still has a `connect` waiting, and it must be
+    // answered rather than left to hang.
+    let reason = if established {
+        None
+    } else {
+        Some("connection abandoned before it completed")
+    };
+    retire_tcp(s, id, reason);
+}
+
 fn service_tcp(s: &mut NetStack) {
     let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
 
@@ -1472,6 +1569,10 @@ fn service_tcp(s: &mut NetStack) {
         };
         let data_in_tx = s.data_in_tx.clone();
 
+        // Set on the connect -> Established edge when the accepted flow has
+        // nowhere to go: the caller stopped waiting (aborted tab, client cancel)
+        // between the SYN and the handshake completing.
+        let mut orphaned = false;
         if !was_established && state == tcp::State::Established {
             with_tcp(&mut s.sockets, handle, arm_idle_keepalive);
             if let Some(st) = s.tcp_conns.get_mut(&id) {
@@ -1483,9 +1584,13 @@ fn service_tcp(s: &mut NetStack) {
                         from_stack: rx,
                         data_in: data_in_tx.clone(),
                     };
-                    let _ = resp.send(Ok(conn));
+                    orphaned = resp.send(Ok(conn)).is_err();
                 }
             }
+        }
+        if orphaned {
+            abandon_tcp(s, id, handle, true);
+            continue;
         }
 
         if !was_established && matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
@@ -1497,20 +1602,30 @@ fn service_tcp(s: &mut NetStack) {
         if let Some(st) = s.tcp_conns.get_mut(&id) {
             if !st.pending.is_empty() {
                 let pending = std::mem::take(&mut st.pending);
-                let sent = with_tcp(&mut s.sockets, handle, |sock| {
-                    if sock.can_send() {
-                        sock.send_slice(&pending).unwrap_or(0)
-                    } else {
-                        0
+                // `send_slice` reports two very different things as the same `0`:
+                // a full transmit buffer (retry next poll, nothing is lost) and a
+                // socket that cannot accept data in its current state (these bytes
+                // can never leave). The old `.unwrap_or(0)` conflated them, so a
+                // half-closed flow re-queued its backlog every tick until the
+                // pending cap killed it — after holding 512 KB of it for free.
+                let outcome = with_tcp(&mut s.sockets, handle, |sock| {
+                    match sock.send_slice(&pending) {
+                        Ok(n) => Egress::Accepted(n),
+                        Err(tcp::SendError::InvalidState) => Egress::Dead,
                     }
                 })
-                .unwrap_or(0);
-                let mut pending = pending;
-                if sent > 0 {
-                    pending.drain(0..sent);
-                }
-                if !pending.is_empty() {
-                    st.pending = pending;
+                .unwrap_or(Egress::Dead);
+                match outcome {
+                    Egress::Accepted(n) if n > 0 => st.pending.extend_from_slice(&pending[n..]),
+                    Egress::Accepted(_) => st.pending = pending,
+                    Egress::Dead => {
+                        log::debug!(
+                            "netstack TCP {id}: socket cannot accept {} queued byte(s)",
+                            pending.len()
+                        );
+                        st.half_closed = true;
+                        st.dead.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -1531,7 +1646,20 @@ fn service_tcp(s: &mut NetStack) {
             Some(st) => st.to_app.clone(),
             None => continue,
         };
+        let established = s
+            .tcp_conns
+            .get(&id)
+            .map(|st| st.established)
+            .unwrap_or(false);
         if to_app.capacity() == 0 {
+            // A full channel means "the reader is slow", and the bytes stay in
+            // smoltcp; a *closed* one means nobody will ever read again. The
+            // unqualified `continue` skipped the closed check below, so an
+            // abandoned flow stayed open — holding its buffer pair and a proxy
+            // slot — until the 75 s idle timeout.
+            if to_app.is_closed() {
+                abandon_tcp(s, id, handle, established);
+            }
             continue;
         }
         let app_gone = with_tcp(&mut s.sockets, handle, |socket| {
@@ -1560,18 +1688,14 @@ fn service_tcp(s: &mut NetStack) {
         })
         .unwrap_or(false);
         if app_gone {
-            with_tcp(&mut s.sockets, handle, |sock| sock.close());
+            abandon_tcp(s, id, handle, established);
+            continue;
         }
 
         let st_state = with_tcp(&mut s.sockets, handle, |sock| sock.state()).unwrap_or(tcp::State::Closed);
         if matches!(st_state, tcp::State::CloseWait) {
             with_tcp(&mut s.sockets, handle, |sock| sock.close());
         }
-        let established = s
-            .tcp_conns
-            .get(&id)
-            .map(|st| st.established)
-            .unwrap_or(false);
         if matches!(st_state, tcp::State::Closed) && established {
             remove_socket(&mut s.sockets, handle);
             retire_tcp(s, id, None);
@@ -1660,6 +1784,68 @@ mod tests {
         for addr in [v4(93, 184, 216, 34), v4(10, 0, 0, 5), IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1))] {
             assert_eq!(forbidden_destination(addr), None, "{addr} must be reachable");
         }
+    }
+
+    /// The same destination written in IPv6 form must be refused for the same
+    /// reason. `::ffff:x` is what a dual-stack resolver returns for an IPv4
+    /// record, so an un-de-mapped v6 check is not a narrower rule — it is a
+    /// bypass of the whole function, and this is the choke point a DNS rebinding
+    /// cannot walk around.
+    #[test]
+    fn ipv4_targets_in_ipv6_form_are_refused_too() {
+        let mapped = |a, b, c, d| {
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, (a << 8 | b) as u16, (c << 8 | d) as u16))
+        };
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        for (a, b, c, d, why) in [
+            (127, 0, 0, 1, "loopback"),
+            (169, 254, 169, 254, "link-local (instance metadata)"),
+            (100, 64, 0, 1, "carrier-grade NAT (100.64.0.0/10)"),
+            (224, 0, 0, 1, "multicast"),
+            (0, 0, 0, 0, "unspecified/this-network"),
+        ] {
+            assert_eq!(
+                forbidden_destination(v4(a, b, c, d)),
+                Some(why),
+                "v4 spelling of {a}.{b}.{c}.{d}"
+            );
+            assert_eq!(
+                forbidden_destination(mapped(a, b, c, d)),
+                Some(why),
+                "v4-mapped spelling of {a}.{b}.{c}.{d} walked through the choke point"
+            );
+        }
+
+        // Deprecated v4-compatible form, and a routable host in both spellings.
+        assert_eq!(
+            forbidden_destination(IpAddr::V6(Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe
+            ))),
+            Some("link-local (instance metadata)"),
+            "::169.254.169.254"
+        );
+        assert_eq!(
+            forbidden_destination(IpAddr::V6(Ipv6Addr::new(
+                0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
+            ))),
+            Some("link-local (instance metadata)"),
+            "6to4 2002:169.254.169.254"
+        );
+        assert_eq!(
+            forbidden_destination(IpAddr::V6(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1))),
+            Some("teredo (2001:0::/32)")
+        );
+        assert_eq!(
+            forbidden_destination(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some("unspecified (::)")
+        );
+        assert_eq!(
+            forbidden_destination(IpAddr::V6(Ipv6Addr::new(
+                0x2606, 0x4700, 0, 0, 0, 0xffff, 0x5db8, 0xd822
+            ))),
+            None,
+            "a mapped *routable* v6 address must still work"
+        );
     }
 
     use tokio::sync::mpsc::error::TryRecvError;

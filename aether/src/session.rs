@@ -31,18 +31,45 @@ use crate::wireguard;
 
 // ─── MTU helpers ────────────────────────────────────────────────────────────
 
-fn tunnel_mtu() -> usize {
-    mtu::current()
+/// How often a tunnel supervision loop says "still here". Must stay comfortably
+/// below `session_event::HEARTBEAT_INTERVAL`, which is the window the pulse is
+/// measured over.
+const SUPERVISE_TICK: Duration = Duration::from_secs(2);
+
+/// The inner MTU for a given outer tunnel MTU.
+///
+/// The M12 floor was `v.max(1152.min(tm - 80))` — with a tunnel MTU of 1240 that
+/// returns 1152 where the encapsulation budget is `1240 - 120 = 1120`, i.e. the
+/// floor *was* the overflow the comment called impossible. A floor may never
+/// exceed the budget, so 1152 is a preference here and not an override: below an
+/// outer MTU of 1272 the answer is simply the budget.
+fn inner_mtu_for(tunnel_mtu: usize) -> usize {
+    let budget = tunnel_mtu.saturating_sub(120);
+    budget.max(1152.min(budget))
 }
 
-fn inner_mtu() -> usize {
-    // M12 fix: the old `.max(1200)` could push the inner MTU *above* the safe
-    // budget (e.g. outer MTU 1280 -> inner 1200 > 1280-120=1160), causing
-    // double-encapsulation overflow drops. The floor can never exceed
-    // tunnel_mtu - 80 now.
-    let tm = tunnel_mtu();
-    let v = tm.saturating_sub(120);
-    v.max(1152.min(tm.saturating_sub(80)))
+/// MTU for a WireGuard-leg stack (plain WARP and the gool outer leg).
+///
+/// `mtu::resolve_mtu`'s `protocol` argument only steers the *first* probe: the
+/// answer is cached in one process-wide slot shared with MASQUE, so a WireGuard
+/// session that follows an H2 MASQUE connect is handed 1400 regardless of what it
+/// asked for. `mtu.rs`'s own stated rule is that only MASQUE-over-TCP may use 1400
+/// because "WireGuard outer packets add ~60B", so the rule is re-applied here
+/// rather than giving a WG stack an MTU its encapsulation cannot carry. The root
+/// fix is a per-protocol cache in `mtu.rs`.
+async fn wireguard_mtu(ipv6_configured: bool) -> usize {
+    /// WireGuard's own encap is 60-80 B, and the value `mtu.rs` calls "conservative
+    /// (<=1280)" for this transport.
+    const WIREGUARD_MAX_INNER_MTU: usize = 1280;
+    let resolved = crate::mtu::resolve_mtu("wireguard", ipv6_configured).await;
+    let capped = resolved.min(WIREGUARD_MAX_INNER_MTU);
+    if capped != resolved {
+        log::info!(
+            "[+] WireGuard MTU capped to {capped} (was {resolved}): the value on record \
+             was probed for a different transport"
+        );
+    }
+    crate::mtu::clamp_for_ip_families(capped, ipv6_configured)
 }
 
 /// Detached-task guard (M12 fix): aborts its task on drop so leaked tunnels stop
@@ -52,6 +79,16 @@ struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+impl<T> AbortOnDrop<T> {
+    /// Resolve when the wrapped task does, without consuming the guard — the
+    /// supervision select needs to await it while every other exit path still has
+    /// to abort it. A guard whose task nobody can wait on is how a dead inner
+    /// tunnel turned into a hung session.
+    async fn done(&mut self) -> std::result::Result<T, tokio::task::JoinError> {
+        (&mut self.0).await
     }
 }
 
@@ -160,6 +197,14 @@ impl Protocol {
 
 /// Product session entry — CLI is a thin adapter; GUI spawns this binary.
 pub async fn run_session(cfg: EngineConfig) -> Result<()> {
+    // Two things the rest of the session cannot recover from being wrong, checked
+    // before any network call: the witness that authenticates the peer, and the
+    // obfuscation profile the operator asked for. Both used to degrade silently —
+    // an unreadable pin file left the transports with no pins at all and a later
+    // connection error, and an unrecognised profile name quietly became `balanced`.
+    crate::trust::require_valid_masque_pins()?;
+    obfuscation::validate_profile_name(&cfg.noize)?;
+
     // Apply resolved config into a thread-safe, in-process store (S3 fix).
     // Downstream helpers read these via runtime_env::var, which falls back to
     // the real process environment. This avoids std::env::set_var, which is a
@@ -269,15 +314,37 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             }
             session_event::set_phase(session_event::Phase::Handshake);
             let ech = resolve_ech().await;
-            let result = run_masque_tunnel(identity.clone(), peer, ech.clone(), listen, http_listen).await;
-            // ECH fallback: if the tunnel failed and ECH was active, the network
-            // may be blocking ECH ClientHellos. Retry once without ECH.
-            let result = if result.is_err() && ech.is_some() {
-                log::warn!("[-] tunnel failed with ECH active; retrying without ECH (network may block ECH)");
-                run_masque_tunnel(identity, peer, None, listen, http_listen).await
-            } else {
-                result
-            };
+            let mut result =
+                run_masque_tunnel(identity.clone(), peer, ech.clone(), listen, http_listen).await;
+            // An ECH-specific failure used to retry the whole tunnel with ECH
+            // *removed* on a single warning — for any error at all. A middlebox
+            // that drops ECH ClientHellos therefore turned an opt-in privacy
+            // control into cleartext SNI on every connect, permanently and
+            // silently. The retry is now gated on an explicit decision.
+            if let Err(e) = &result {
+                if ech.is_some() && ech_related(e) {
+                    if runtime_env::flag("AETHER_ECH_ALLOW_DOWNGRADE") {
+                        log::warn!(
+                            "[-] ECH-specific failure ({e}); downgrading to no-ECH because \
+                             AETHER_ECH_ALLOW_DOWNGRADE is set — the SNI is visible on the wire"
+                        );
+                        result =
+                            run_masque_tunnel(identity.clone(), peer, None, listen, http_listen)
+                                .await;
+                    } else {
+                        // Not retried, and the message is what the user sees:
+                        // `cli::run` turns a failed session into the terminal
+                        // `SessionEvent::Error`, so this string *is* the event and
+                        // naming the knob there is what makes the decision theirs.
+                        return Err(AetherError::Ech(format!(
+                            "the connect failed in a way that involves ECH ({e}). Refusing to \
+                             retry with ECH stripped, which would send the SNI in cleartext. \
+                             Set AETHER_ECH_ALLOW_DOWNGRADE=1 to accept that fallback, or \
+                             AETHER_ECH=0 to stop using ECH deliberately."
+                        )));
+                    }
+                }
+            }
             // Feed the real connect outcome into the trust cache so endpoint
             // ranking learns from actual connections, not just scan reachability.
             let mutation = if result.is_ok() {
@@ -742,6 +809,28 @@ async fn quick_verify_masque(
     quic::verify_masque(&vp).await
 }
 
+/// Does this failure say something about ECH, as opposed to "the connect did not
+/// work"?
+///
+/// The whole point of the distinction: an unrelated failure (blocked UDP, a dead
+/// gateway, an expired pin) used to take the same path as an ECH problem and strip
+/// ECH from the retry. Token comparison rather than a substring test because
+/// "reachable" and "which" both contain the letters.
+fn ech_related(err: &AetherError) -> bool {
+    if matches!(err, AetherError::Ech(_)) {
+        return true;
+    }
+    err.to_string()
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| {
+            matches!(
+                tok,
+                "ech" | "echconfig" | "echconfiglist" | "encrypted_client_hello"
+            )
+        })
+}
+
 async fn resolve_ech() -> Option<Vec<u8>> {
     match crate::runtime_env::var("AETHER_ECH") {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") => {
@@ -916,6 +1005,18 @@ async fn run_masque_tunnel(
                     http: http_listen.to_string(),
                 });
             }
+            // The only place the MASQUE tunnel is actually up. `Phase::Tunnel` had
+            // no assignment anywhere, so the phase the pulse reported could not be
+            // "carrying traffic" — and the supervision loop below, which is where
+            // a connected session spends the rest of its life, was unlabelled.
+            session_event::set_phase(session_event::Phase::Tunnel);
+            session_event::emit(SessionEvent::TunnelReady {
+                transport: if masque_h2::enabled() {
+                    "masque-h2".into()
+                } else {
+                    "masque-h3".into()
+                },
+            });
             session_event::emit(SessionEvent::Connected {
                 detail: if stack.is_some() {
                     "masque proxies ready".into()
@@ -959,14 +1060,23 @@ async fn run_masque_tunnel(
     // and return so the caller's reconnect loop regains control. Awaiting only the
     // tunnel (as before) let a dead SOCKS listener sit undetected behind a live
     // tunnel, and vice-versa — the "connected but no traffic" silent hang.
+    //
+    // The interval arm is the session's heartbeat anchor. `session_event`'s pulse
+    // is gated on progress, so this loop — the one place the tunnel phase spends
+    // its life — has to say "I am still here and my transport task has not exited"
+    // or a healthy tunnel would look stalled.
     let mut tunnel_handle = tunnel_handle;
-    let tunnel_result: Result<()> = tokio::select! {
-        r = &mut tunnel_handle => match r {
-            Ok(inner) => inner,
-            Err(e) => Err(AetherError::Other(format!("tunnel task: {e}"))),
-        },
-        _ = await_opt(&mut socks_task) => Err(AetherError::Other("socks5 server exited".into())),
-        _ = await_opt(&mut http_task) => Err(AetherError::Other("http proxy exited".into())),
+    let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+    let tunnel_result: Result<()> = loop {
+        tokio::select! {
+            r = &mut tunnel_handle => break match r {
+                Ok(inner) => inner,
+                Err(e) => Err(AetherError::Other(format!("tunnel task: {e}"))),
+            },
+            _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
+            _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+            _ = supervise.tick().await => session_event::mark_progress(),
+        }
     };
 
     // Tear everything down. abort() on the tunnel is a no-op if it already ended.
@@ -1106,7 +1216,7 @@ async fn run_wireguard_tunnel(
     // left SOCKS up on a fresh unestablished tunnel → CONNECT hangs forever.
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
-    let mtu = crate::mtu::resolve_mtu("wireguard", !identity.ipv6.trim().is_empty()).await;
+    let mtu = wireguard_mtu(!identity.ipv6.trim().is_empty()).await;
     log::info!("[+] using MTU={mtu} for wireguard session");
 
     let cfg = wireguard::WgConfig {
@@ -1146,7 +1256,7 @@ async fn run_wireguard_tunnel(
     )
     .await?;
 
-    let (socks_task, http_task) = if let Some(stack) = stack {
+    let (mut socks_task, mut http_task) = if let Some(stack) = stack {
         let socks_listener = socks::bind(listen).await?;
         let http_listener = http_proxy::bind(http_listen).await?;
         let socks_stack = stack.clone();
@@ -1163,6 +1273,7 @@ async fn run_wireguard_tunnel(
     } else {
         (None, None)
     };
+    session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
         detail: if socks_task.is_some() {
             "wireguard proxies up".into()
@@ -1171,12 +1282,33 @@ async fn run_wireguard_tunnel(
         },
     });
 
-    let tunnel_result = wg_tunnel.run(tints.outbound_rx).await;
-    if let Some(task) = &socks_task {
+    // Supervised exactly like the MASQUE path: the tunnel and both proxy listeners
+    // are awaited together, and whichever of them finishes first ends the session.
+    // Awaiting only the tunnel meant a dead SOCKS or HTTP listener went unnoticed
+    // behind a live WireGuard session, and its socket was never confirmed released
+    // before the next connect rebound the same port — the "Address already in use"
+    // reconnect failure. The interval arm is the progress the heartbeat needs.
+    let mut tunnel_fut = std::pin::pin!(wg_tunnel.run(tints.outbound_rx));
+    let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+    let tunnel_result = loop {
+        tokio::select! {
+            r = &mut tunnel_fut => break r,
+            _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
+            _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+            _ = supervise.tick().await => session_event::mark_progress(),
+        }
+    };
+
+    // Drop the tunnel future first (it owns the socket), then abort AND await the
+    // proxies so their listen sockets are gone before a reconnect rebinds.
+    drop(tunnel_fut);
+    if let Some(task) = socks_task.take() {
         task.abort();
+        let _ = task.await;
     }
-    if let Some(task) = &http_task {
+    if let Some(task) = http_task.take() {
         task.abort();
+        let _ = task.await;
     }
 
     match tunnel_result {
@@ -1303,10 +1435,10 @@ async fn run_warp_in_warp(
     listen: SocketAddr,
     http_listen: SocketAddr,
 ) -> Result<()> {
-    let _ = mtu::resolve_mtu("wireguard", !primary.ipv6.trim().is_empty()).await;
+    let outer_mtu = wireguard_mtu(!primary.ipv6.trim().is_empty()).await;
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
-    let (outer_stack, _outer_guard) =
-        establish_wg(&primary, peer, tunnel_mtu(), true, 5, "outer").await?;
+    let (outer_stack, mut outer_task) =
+        establish_wg(&primary, peer, outer_mtu, true, 5, "outer").await?;
 
     // M12 fix: active data-plane gate instead of a fixed 1.5s hope-the-handshake-
     // finished sleep. Slow links used to start the inner tunnel against an outer
@@ -1317,8 +1449,9 @@ async fn run_warp_in_warp(
     log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
 
     log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
-    let (inner_stack, _inner_guard) =
-        establish_wg(&secondary, forwarder, inner_mtu(), false, 20, "inner").await?;
+    let inner_mtu = inner_mtu_for(outer_mtu);
+    let (inner_stack, mut inner_task) =
+        establish_wg(&secondary, forwarder, inner_mtu, false, 20, "inner").await?;
     // Same gate for the inner leg before proxies accept traffic.
     wait_stack_alive(&inner_stack, "inner WARP").await?;
 
@@ -1336,11 +1469,34 @@ async fn run_warp_in_warp(
     session_event::emit(SessionEvent::TunnelReady {
         transport: "gool".into(),
     });
+    session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
         detail: "warp-in-warp ready".into(),
     });
-    let result = socks::serve_listener(socks_listener, inner_stack).await;
-    http_task.abort();
+
+    // Both WARP legs are supervised alongside the two proxy listeners, like the
+    // MASQUE path. Previously only the SOCKS listener was awaited: an outer or
+    // inner tunnel that died logged its error from inside its own task and left
+    // the proxies accepting connections that nothing would ever answer, and the
+    // HTTP task was aborted without being awaited so its port could still be held
+    // when the next connect rebound it.
+    let mut http_task = Some(http_task);
+    let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
+    let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+    let result = loop {
+        tokio::select! {
+            r = &mut socks_fut => break r,
+            _ = outer_task.done() => break Err(AetherError::Other("outer WARP tunnel exited".into())),
+            _ = inner_task.done() => break Err(AetherError::Other("inner WARP tunnel exited".into())),
+            _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+            _ = supervise.tick().await => session_event::mark_progress(),
+        }
+    };
+    drop(socks_fut);
+    if let Some(task) = http_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     result
 }
 

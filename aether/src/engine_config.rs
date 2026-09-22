@@ -93,12 +93,19 @@ impl EngineConfig {
     }
 }
 
+/// A boolean knob. Delegates to the one truth table in the process
+/// (`runtime_env::truthy`), so every boolean answers the same question the same
+/// way.
+///
+/// The list used to carry `"h2"` as well — a *transport* token accepted as a
+/// *truth* value by the helper that also decides `AETHER_TUN`. Neither the desktop
+/// nor the Android runner ever writes `h2` (both write `1`/`0`), so it could only
+/// arrive from a hand-set or copied-out environment, and `AETHER_TUN=h2` then
+/// raised a Wintun adapter and rewrote host routes. Value vocabularies do not get
+/// to overlap like that.
 fn env_truthy(name: &str) -> bool {
     match crate::runtime_env::var(name) {
-        Some(v) => {
-            let v = v.trim().to_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on" || v == "h2"
-        }
+        Some(v) => crate::runtime_env::truthy(&v),
         None => false,
     }
 }
@@ -139,5 +146,29 @@ mod tests {
         let c = EngineConfig::default();
         assert_ne!(c.socks.port(), c.http.port());
         assert!(c.socks.port() >= 1024);
+    }
+
+    /// `AETHER_TUN` and `AETHER_MASQUE_HTTP2` are answered by the same helper, and
+    /// that helper used to treat the transport token `h2` as "true" — so a value
+    /// copied from one knob enabled the other, including the one that raises a
+    /// network adapter and rewrites host routes.
+    #[test]
+    fn boolean_knobs_accept_only_truth_values() {
+        const KEY: &str = "AETHER_SELFTEST_BOOL";
+        for not_true in [
+            "h2", "h3", "wg", "masque", "0", "false", "no", "off", "", "  ", "maybe",
+        ] {
+            crate::runtime_env::set(KEY, not_true);
+            assert!(
+                !env_truthy(KEY),
+                "{not_true:?} must not enable a boolean knob"
+            );
+        }
+        for is_true in ["1", "true", "TRUE", "yes", "on", " on "] {
+            crate::runtime_env::set(KEY, is_true);
+            assert!(env_truthy(KEY), "{is_true:?} should be true");
+        }
+        crate::runtime_env::remove(KEY);
+        assert!(!env_truthy(KEY), "absent is false");
     }
 }

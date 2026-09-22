@@ -11,6 +11,14 @@
 //! erases another's. That second part is what a missing or advisory-but-ignored lock
 //! breaks first, because each writer rewrites the entire document.
 //!
+//! The first half of that sentence is a contract about `Mutation`, not about the
+//! lock: `Applied` used to be returned whenever the *in-memory* document had been
+//! changed, with a failed persist swallowed into `log::warn!`. Under that
+//! implementation the count below could not match the file, and the assertion that
+//! now pins it lives beside the writer (`cache::tests::
+//! a_mutation_that_could_not_be_persisted_is_not_applied`), because forcing an io
+//! failure needs a broken filesystem rather than a second process.
+//!
 //! Runs the real thing across two OS processes: an in-process thread pair would
 //! share the same `File` descriptors and prove nothing about `fs2`'s advisory lock.
 

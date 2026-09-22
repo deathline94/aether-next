@@ -177,3 +177,102 @@ fn a_pin_set_only_covers_the_host_it_is_recorded_under() {
         "an absent pin set must not mean an unverified connection"
     );
 }
+
+// ─── the `require_chain` arm, driven through a real handshake ───────────────
+//
+// Every fixture above calls `accept_pinned_leaf` directly, which is the pin half
+// of the callback. The other half — `if require_chain && !(ok && ctx.verify_cert())`
+// — only ever runs inside a BoringSSL handshake, and until now no test in this
+// file built a pin set with `require_chain: true`, so the branch that decides
+// whether the shipped trust file means anything has never executed.
+
+use aether::trust::PinSet;
+use boring::ssl::{Ssl, SslContextBuilder, SslMethod, SslVerifyMode};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+fn pin_set(cert: &X509, require_chain: bool) -> PinSet {
+    let spki = spki_sha256(cert);
+    PinSet {
+        host: HOST.into(),
+        pins: vec![aether::trust::Pin {
+            spki_sha256: spki.iter().map(|b| format!("{b:02x}")).collect(),
+            expires_unix: now() + 86_400,
+            cert_sha256: None,
+        }],
+        require_hostname: false,
+        require_chain,
+    }
+}
+
+/// Run one real loopback TLS handshake with `install_pin_verification` on the
+/// client, and report whether it completed.
+fn handshake(leaf: &X509, leaf_key: &PKey<Private>, sets: &[PinSet]) -> Result<(), String> {
+    const TIMEOUT: Duration = Duration::from_secs(15);
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+    let server_leaf = leaf.clone();
+    let server_key = leaf_key.clone();
+    let server = std::thread::spawn(move || -> Result<(), String> {
+        let mut b = SslContextBuilder::new(SslMethod::tls()).map_err(|e| e.to_string())?;
+        b.set_certificate(&server_leaf).map_err(|e| e.to_string())?;
+        b.set_private_key(&server_key).map_err(|e| e.to_string())?;
+        b.set_verify(SslVerifyMode::NONE);
+        let ctx = b.build();
+        let (sock, _) = listener.accept().map_err(|e| e.to_string())?;
+        let _ = sock.set_read_timeout(Some(TIMEOUT));
+        let _ = sock.set_write_timeout(Some(TIMEOUT));
+        let stream = Ssl::new(&ctx)
+            .map_err(|e| e.to_string())?
+            .accept(sock)
+            .map_err(|e| format!("server side: {e}"))?;
+        drop(stream);
+        Ok(())
+    });
+
+    let mut b = SslContextBuilder::new(SslMethod::tls()).map_err(|e| e.to_string())?;
+    aether::tls::install_pin_verification(&mut b, sets, HOST)
+        .map_err(|e| format!("pin installation: {e}"))?;
+    let ctx = b.build();
+
+    let sock = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let _ = sock.set_read_timeout(Some(TIMEOUT));
+    let _ = sock.set_write_timeout(Some(TIMEOUT));
+    let connected = Ssl::new(&ctx)
+        .map_err(|e| e.to_string())?
+        .connect(sock)
+        .map(|_| ())
+        .map_err(|e| format!("client side: {e}"));
+
+    let _ = server.join();
+    connected
+}
+
+/// A self-signed leaf is exactly the case `require_chain` exists to refuse: it is
+/// in no root store, so BoringSSL's own verdict is "fail", and only a
+/// `require_chain=false` file lets the pinned digest carry the connection alone.
+#[test]
+fn require_chain_honours_boringssls_verdict_and_false_pins_only() {
+    let key = key();
+    let cert = leaf(&key, -1, 365);
+
+    // The shipped configuration, restated as a fixture: pin matches, no chain.
+    handshake(&cert, &key, std::slice::from_ref(&pin_set(&cert, false)))
+        .expect("pins-only must accept the leaf it pins");
+
+    // The branch no earlier test in this file reached.
+    let err = handshake(&cert, &key, std::slice::from_ref(&pin_set(&cert, true)))
+        .expect_err("require_chain must not accept a leaf with no chain to validate");
+    assert!(
+        err.contains("client side"),
+        "the handshake must fail on the client's verification, not somewhere else: {err}"
+    );
+}
+
+// The positive half of `require_chain` — a leaf whose chain *does* validate — is
+// not asserted here on purpose: it needs a fixture CA written to a trust store,
+// and the only witness that really answers the question is a live WE1-issued
+// edge. That is the measured pass `masque-pins.json` records as still pending,
+// so `require_chain` is false in the shipped file today.

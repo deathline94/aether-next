@@ -4,19 +4,48 @@
 //! packets, replies or cache entries vanish. Every such path gets a number
 //! BEFORE the path itself is argued about, so "did this guard ever fire?" has an
 //! answer instead of a guess. `snapshot()` is what the diagnostics export prints.
+//!
+//! The counter, its snapshot key and the exported table all come from the one
+//! `counters!` invocation below. Declaring a counter anywhere else is a compile
+//! error, and forgetting its key is a failing test — a list of names repeated
+//! under the `json!` macro can never disagree with it, so it can never fail
+//! either.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Inbound IP packets dropped because the netstack queue was full or closed.
-pub static INBOUND_DROPPED: AtomicU64 = AtomicU64::new(0);
-/// Outbound packets dropped on a full datagram queue or a closed stream.
-pub static DATAGRAM_SEND_DROPPED: AtomicU64 = AtomicU64::new(0);
-/// Engine events that arrived as `AETHER_EVENT` but did not parse.
-pub static MALFORMED_EVENTS: AtomicU64 = AtomicU64::new(0);
-/// Cache entries rejected by `sanitise` (bogus RTT, malformed address, …).
-pub static CACHE_ENTRIES_REJECTED: AtomicU64 = AtomicU64::new(0);
-/// H3 responses ignored because they did not belong to the request stream.
-pub static IGNORED_OFFSTREAM_STATUS: AtomicU64 = AtomicU64::new(0);
+macro_rules! counters {
+    ($( #[doc = $doc:literal] $name:ident => $key:literal, )*) => {
+        $(
+            #[doc = $doc]
+            pub static $name: AtomicU64 = AtomicU64::new(0);
+        )*
+
+        /// Every counter, in a stable order, for logs and the diagnostics export.
+        pub fn snapshot() -> serde_json::Value {
+            serde_json::json!({
+                $( $key: peek(&$name), )*
+            })
+        }
+
+        /// `(snapshot key, counter)` for every counter that exists.
+        pub const ALL: &[(&'static str, &'static AtomicU64)] = &[
+            $( ( $key, &$name ), )*
+        ];
+    };
+}
+
+counters! {
+    /// Inbound IP packets dropped because the netstack queue was full or closed.
+    INBOUND_DROPPED => "inbound_dropped",
+    /// Outbound packets dropped on a full datagram queue or a closed stream.
+    DATAGRAM_SEND_DROPPED => "datagram_send_dropped",
+    /// Engine events that arrived as `AETHER_EVENT` but did not parse.
+    MALFORMED_EVENTS => "malformed_events",
+    /// Cache entries rejected by `sanitise` (bogus RTT, malformed address, …).
+    CACHE_ENTRIES_REJECTED => "cache_entries_rejected",
+    /// H3 responses ignored because they did not belong to the request stream.
+    IGNORED_OFFSTREAM_STATUS => "ignored_offstream_status",
+}
 
 fn peek(c: &AtomicU64) -> u64 {
     c.load(Ordering::Relaxed)
@@ -31,17 +60,6 @@ pub fn bump(c: &AtomicU64) -> u64 {
 /// Bump by a batch count — for a routine that rejects several records per call.
 pub fn bump_by(c: &AtomicU64, n: u64) -> u64 {
     c.fetch_add(n, Ordering::Relaxed) + n
-}
-
-/// Every counter, in a stable order, for logs and the diagnostics export.
-pub fn snapshot() -> serde_json::Value {
-    serde_json::json!({
-        "inbound_dropped": peek(&INBOUND_DROPPED),
-        "datagram_send_dropped": peek(&DATAGRAM_SEND_DROPPED),
-        "malformed_events": peek(&MALFORMED_EVENTS),
-        "cache_entries_rejected": peek(&CACHE_ENTRIES_REJECTED),
-        "ignored_offstream_status": peek(&IGNORED_OFFSTREAM_STATUS),
-    })
 }
 
 #[cfg(test)]
@@ -67,14 +85,33 @@ mod tests {
     #[test]
     fn every_counter_has_a_name_the_snapshot_reports() {
         let snap = snapshot();
-        for key in [
-            "inbound_dropped",
-            "datagram_send_dropped",
-            "malformed_events",
-            "cache_entries_rejected",
-            "ignored_offstream_status",
-        ] {
-            assert!(snap.get(key).is_some(), "{key} missing from snapshot()");
+        assert!(!ALL.is_empty(), "no counter is declared at all");
+        for (key, counter) in ALL {
+            assert_eq!(
+                snap.get(*key).and_then(|v| v.as_u64()),
+                Some(peek(*counter)),
+                "{key} is declared but snapshot() does not report it"
+            );
         }
+        // The table has to be complete in the other direction too: a key in the
+        // export that no counter owns is a number nobody can move.
+        assert_eq!(
+            snap.as_object().map(|m| m.len()),
+            Some(ALL.len()),
+            "snapshot() and the counter table disagree on how many counters exist"
+        );
+    }
+
+    /// The point of `ALL` being a `(key, &AtomicU64)` pair rather than a list of
+    /// names: bumping through the table has to be visible in the export.
+    #[test]
+    fn a_counter_reached_through_the_table_is_reported() {
+        let (key, counter) = *ALL
+            .iter()
+            .find(|(k, _)| *k == "cache_entries_rejected")
+            .expect("cache_entries_rejected is in the table");
+        let before = peek(counter);
+        assert_eq!(bump(counter), before + 1);
+        assert_eq!(snapshot()[key].as_u64(), Some(before + 1));
     }
 }

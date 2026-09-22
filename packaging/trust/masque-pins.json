@@ -13,29 +13,45 @@
     "so the split is left as an explicitly measured task: observe the leaf each",
     "SNI actually presents, then narrow. require_hostname stays false for the",
     "same reason - the peer is dialled by IP, so tightening it needs a live",
-    "verification pass first (T065/T067)."
+    "verification pass first (T065/T067).",
+    "",
+    "require_chain IS NOT OPTIONAL. The field lost its serde default because an",
+    "omitted key decoded to false, which silently discarded BoringSSL's chain",
+    "verdict on every live connection while the file appeared to declare a",
+    "policy. Every host below therefore states it.",
+    "",
+    "Why both still say false, and what has to happen first: each host pins the",
+    "self-signed masque leaf AND the WE1-issued cloudflareaccess.com leaf. The",
+    "self-signed one has no chain to validate, so setting require_chain=true on",
+    "either host rejects whichever edge presents it - a guaranteed outage rather",
+    "than a tightening. require_chain=true belongs on the host once the measured",
+    "split above has moved the self-signed digest off it, leaving a host whose",
+    "pins are all chain-issued. That edit is a data change to this file, which is",
+    "the point of making the field required."
   ],
   "version": 1,
   "hosts": [
     {
       "host": "consumer-masque.cloudflareclient.com",
       "require_hostname": false,
+      "require_chain": false,
       "pins": [
         {
           "spki_sha256": "eb591b36ab26ba617e98371918c10bcdeae3742db6e76543f94be524dce1d555",
           "expires_unix": 1805500800,
-          "note": "masque.cloudflareclient.com leaf, self-signed by Cloudflare"
+          "note": "masque.cloudflareclient.com leaf, self-signed by Cloudflare - no chain exists to validate, which is why require_chain is still false for this host"
         },
         {
           "spki_sha256": "3fbb1d7452d32b3881eb4b5d48421445b6b9d8f5225959f033532d502637b040",
           "expires_unix": 1805500800,
-          "note": "cloudflareaccess.com leaf, issued by Google Trust Services WE1"
+          "note": "cloudflareaccess.com leaf, issued by Google Trust Services WE1 - the pin whose host can take require_chain=true once the leaves are measured and split"
         }
       ]
     },
     {
       "host": "consumer-masque-proxy.cloudflareclient.com",
       "require_hostname": false,
+      "require_chain": false,
       "pins": [
         {
           "spki_sha256": "eb591b36ab26ba617e98371918c10bcdeae3742db6e76543f94be524dce1d555",

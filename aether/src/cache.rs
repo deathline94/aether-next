@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -103,17 +103,21 @@ impl Rejected {
     }
 }
 
-fn address_is_plausible(addr: SocketAddr) -> bool {
-    let ip = addr.ip();
-    // A learned-endpoint cache must never hand the tunnel a loopback,
-    // link-local, multicast or "this host" address: those are the targets a
-    // hostile local writer would plant to make the engine connect to something
-    // it was never shown by a scan.
-    let v4_link_local = match ip {
-        IpAddr::V4(v4) => v4.is_link_local(),
-        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
-    };
-    !(ip.is_loopback() || ip.is_unspecified() || v4_link_local || ip.is_multicast())
+/// Is this address safe to steer a tunnel connection at?
+///
+/// Delegates to the netstack's own choke point rather than keeping a second list
+/// of ranges: a cache-file writer plants `::ffff:169.254.169.254` or `fc00::1` as
+/// a "great" gateway and every later connect goes to the instance metadata
+/// service or the local network. The previous private copy of this rule tested
+/// `Ipv6Addr::is_loopback` (which only matches `::1`) and read `segments()[0]`
+/// for link-local, so every IPv4-hostile-in-IPv6-dressing address passed — and it
+/// never covered `fc00::/7`, `100.64.0.0/10` or `0.0.0.0/8` at all.
+///
+/// `netstack::forbidden_destination` already unwraps embedded IPv4 (mapped,
+/// v4-compatible and 6to4) and covers the whole set, so sharing it also keeps the
+/// two checks from drifting apart again.
+pub fn address_is_plausible(addr: SocketAddr) -> bool {
+    crate::netstack::forbidden_destination(addr.ip()).is_none()
 }
 
 /// Validate untrusted on-disk entries before anything scores or connects with
@@ -509,8 +513,8 @@ pub fn provision_lock(base_config: &str) -> Result<ProvisionGuard> {
     ProvisionGuard::try_acquire(&PathBuf::from(p), PROVISION_LOCK_WAIT)
 }
 
-/// Write `data` to `path` atomically (temp file + rename) so a crash or a
-/// concurrent reader never observes a half-written / truncated file.
+/// Write `data` to `path` atomically (exclusively created temp file + rename) so
+/// a crash or a concurrent reader never observes a half-written / truncated file.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -523,15 +527,52 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     // Per-process, per-call unique temp name. A shared "<file>.tmp" made two engine
     // processes (scan + connect) collide on the same temp and fail the rename with
     // ERROR_ACCESS_DENIED on Windows; a unique name removes that collision.
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(format!(".{}.{}.tmp", std::process::id(), seq));
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    //
+    // The name also carries entropy and is created *exclusively*: `{pid}.{seq}`
+    // alone is guessable by any local user, and `File::create` follows a symlink
+    // they planted at that name, which turns "the cache is learned state" into
+    // "any local user can have a file written through this process".
+    const NAME_ATTEMPTS: u32 = 8;
+    let mut created: Option<(PathBuf, std::fs::File)> = None;
+    let mut collision = None;
+    for _ in 0..NAME_ATTEMPTS {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let rand: u32 = rand::random();
+        let mut name = path.as_os_str().to_os_string();
+        name.push(format!(".{}.{}.{}.tmp", std::process::id(), seq, rand));
+        let candidate = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                created = Some((candidate, f));
+                break;
+            }
+            Err(e) => {
+                // A repeated `AlreadyExists` on a 32-bit-random suffix means the
+                // directory is being pre-filled by someone, not that we are unlucky;
+                // any other error is final.
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                collision = Some(e);
+            }
+        }
     }
+    let (tmp, mut f) = match created {
+        Some(v) => v,
+        None => {
+            return Err(collision
+                .unwrap_or_else(|| std::io::Error::other("could not name a cache temp file")))
+        }
+    };
+    if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
     // std::fs::rename replaces an existing destination on both Unix and Windows.
     // Windows can still transiently return ERROR_ACCESS_DENIED when the destination
     // is briefly held (AV/indexer, or a racing writer), so retry with backoff.
@@ -549,14 +590,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     last
 }
 
-/// Run `f` under the cross-process lock: acquire, load (pruning stale), mutate,
-/// then persist atomically. The single entry point for every mutation.
 /// Whether a mutation actually reached the file.
 ///
 /// `with_cache` deliberately **skips** rather than writing unlocked when another
-/// process holds the lock, so "we updated the cache" was a claim nobody could
-/// check: the caller could not retry, the log could not say which endpoint stayed
-/// stale, and a test could not tell a lost update apart from an intentional skip.
+/// process holds the lock, so "we updated the cache" has to be a claim that can
+/// be checked: `Applied` now means the document was persisted, and anything that
+/// did not land — a contended lock *or* an io failure — is `Skipped`. Collapsing
+/// the two made a lost update indistinguishable from an intentional skip, so the
+/// caller could neither retry nor say which endpoint stayed stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutation {
     Applied,
@@ -569,10 +610,11 @@ impl Mutation {
     }
 }
 
+/// Run `f` under the cross-process lock: acquire, load (pruning stale), mutate,
+/// then persist atomically. The single entry point for every mutation.
 fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) -> Mutation {
     with_cache_locked(base_config, f, LOCK_WAIT)
 }
-
 /// As `with_cache`, but never blocks: a contended lock means the update is
 /// skipped and logged, not that an async worker sleeps for it.
 fn with_cache_nowait<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) -> Mutation {
@@ -595,8 +637,17 @@ fn with_cache_locked<F: FnOnce(&mut EndpointsCache)>(
     f(&mut cache);
     cache.version = CACHE_VERSION;
     cache.written_at = now_secs();
-    save_endpoints(base_config, &cache);
-    Mutation::Applied
+    // A mutation that never reached the file did not happen. Reporting `Applied`
+    // with the io error funnelled into `log::warn!` made every caller's
+    // "the cache is updated" claim a lie, and made a lost update
+    // indistinguishable from an intentional skip.
+    match save_endpoints(base_config, &cache) {
+        Ok(()) => Mutation::Applied,
+        Err(e) => {
+            log::error!("[cache] update not persisted: {e}");
+            Mutation::Skipped
+        }
+    }
 }
 
 /// Read the cache. Never writes, never renames: a read that destroyed evidence
@@ -623,16 +674,14 @@ pub fn load_endpoints(base_config: &str) -> EndpointsCache {
     cache
 }
 
-pub fn save_endpoints(base_config: &str, cache: &EndpointsCache) {
+/// Persist the cache atomically. `Err` means the document on disk is *not* this
+/// document, so every caller that reports an update must handle it.
+pub fn save_endpoints(base_config: &str, cache: &EndpointsCache) -> Result<()> {
     let path = cache_path(base_config);
-    match serde_json::to_string_pretty(cache) {
-        Ok(data) => {
-            if let Err(e) = write_atomic(&path, data.as_bytes()) {
-                log::warn!("[cache] failed to persist {}: {e}", path.display());
-            }
-        }
-        Err(e) => log::warn!("[cache] failed to encode endpoints: {e}"),
-    }
+    let data = serde_json::to_string_pretty(cache)
+        .map_err(|e| AetherError::Other(format!("encode {}: {e}", path.display())))?;
+    write_atomic(&path, data.as_bytes())
+        .map_err(|e| AetherError::Other(format!("persist {}: {e}", path.display())))
 }
 
 /// Which act produced an RTT number.
@@ -661,7 +710,12 @@ fn upsert(
 ) {
     let now = now_secs();
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
-        // Preserve accumulated trust when re-adding a known endpoint.
+        // Preserve accumulated trust when re-adding a known endpoint — including
+        // the strike counter. Zeroing `consecutive_failures` here meant any scan
+        // that happened to reach a flapping endpoint laundered the record, so the
+        // 3-strike eviction never fired and a peer that had died was offered first
+        // on every reconnect forever. Only a connect that *succeeds*
+        // (`record_success_on`) earns a reset.
         let prev = list.iter().find(|e| e.addr == addr).cloned();
         list.retain(|e| e.addr != addr);
         list.insert(
@@ -672,7 +726,7 @@ fn upsert(
                 rtt_ms,
                 successes: prev.as_ref().map(|p| p.successes).unwrap_or(0),
                 failures: prev.as_ref().map(|p| p.failures).unwrap_or(0),
-                consecutive_failures: 0,
+                consecutive_failures: prev.as_ref().map(|p| p.consecutive_failures).unwrap_or(0),
                 transport,
                 measurement,
             },
@@ -958,6 +1012,114 @@ mod tests {
         assert_eq!(r.implausible_rtt, 1);
         assert_eq!(clamped[0].successes, MAX_SUCCESSES);
         assert_eq!(clamped[0].rtt_ms, 0, "an impossible rtt must not earn points");
+    }
+
+    /// The old private copy of this rule looked only at `is_loopback` (`::1`),
+    /// read `segments()[0]` for link-local and never covered `fc00::/7`,
+    /// `100.64.0.0/10` or `0.0.0.0/8` — so `::ffff:169.254.169.254` was a
+    /// "plausible" learned endpoint and steered every later connect.
+    #[test]
+    fn an_address_in_v6_dressing_is_still_the_address_it_embeds() {
+        let now = 1_800_000_000;
+        let rejected = [
+            "[::ffff:127.0.0.1]:443",
+            "[::ffff:169.254.169.254]:443",
+            "[::127.0.0.1]:443",
+            "[fd00::1]:443",
+            "[fe80::1]:443",
+            "[::]:443",
+            "100.64.0.1:443",
+            "100.127.255.255:443",
+            "0.0.0.1:443",
+            "169.254.169.254:443",
+            "224.0.0.5:443",
+        ];
+        let mut list: Vec<CachedEndpoint> = rejected.iter().map(|a| entry(a, now, 9, 1)).collect();
+        let kept = [
+            "162.159.193.1:443",
+            "198.51.100.7:443",
+            "[2606:4700::1]:443",
+        ];
+        list.extend(kept.iter().map(|a| entry(a, now, 9, 1)));
+
+        let r = sanitise(&mut list, now);
+        assert_eq!(r.implausible_address as usize, rejected.len(), "{r:?}");
+        let survivors: Vec<String> = list.iter().map(|e| e.addr.to_string()).collect();
+        assert_eq!(survivors.len(), kept.len(), "{survivors:?}");
+        for k in kept {
+            let want = k.parse::<SocketAddr>().unwrap().to_string();
+            assert!(survivors.contains(&want), "{k} must stay: {survivors:?}");
+        }
+    }
+
+    /// A scan hit is a reachability observation, not a successful tunnel. It must
+    /// not wipe the strike counter that evicts a dead endpoint.
+    #[test]
+    fn a_scan_hit_does_not_launder_the_strike_counter() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_strikes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let gw: SocketAddr = "162.159.193.1:443".parse().unwrap();
+
+        record_success_quic(&base, gw);
+        record_failure_quic(&base, gw);
+        record_failure_quic(&base, gw);
+        // The scanner reaches it (an unanswered probe can still answer a scan),
+        // then two real connects fail: three strikes, so it must be evicted. The
+        // upsert is called directly so the assertion is about the cache and not
+        // about the ambient `AETHER_MASQUE_HTTP2` value another test left set.
+        with_cache(&base, |cache| {
+            upsert(
+                &mut cache.masque,
+                vec![(gw, 30)],
+                TransportKind::Quic,
+                Measurement::HandshakeProbe,
+            )
+        });
+        with_cache(&base, |cache| {
+            let e = cache
+                .masque
+                .iter()
+                .find(|e| e.addr == gw)
+                .expect("entry survives the scan hit");
+            assert_eq!(
+                e.consecutive_failures, 2,
+                "a scan hit reset the strikes the eviction counter depends on"
+            );
+        });
+        record_failure_quic(&base, gw);
+        assert!(
+            get_masque_sorted_for(&base, TransportKind::Quic).is_empty(),
+            "the third strike never landed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Applied` is a promise about the file, not about the in-memory mutation.
+    #[test]
+    fn a_mutation_that_could_not_be_persisted_is_not_applied() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_nowrite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        // A *directory* where the cache document belongs: the temp file is created
+        // and written, and only the final rename fails — exactly the case the old
+        // `log::warn!` swallowed while still answering "Applied".
+        std::fs::create_dir_all(cache_path(&base)).expect("block the cache path");
+
+        let mutation = record_success(&base, "162.159.193.9:443".parse().unwrap(), true);
+        assert_eq!(mutation, Mutation::Skipped, "a lost update is not Applied");
+        assert!(mutation.was_skipped());
+        // Nothing may be left behind either.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

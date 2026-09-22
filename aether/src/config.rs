@@ -152,6 +152,28 @@ pub enum KeySource {
     None,
 }
 
+/// Consumed once, by the one `load()` that needs it, to admit a pre-envelope
+/// plaintext config. Nothing else may: whoever can write `aether.toml` chooses
+/// the `wg_private_key` and `device_id` the tunnel authenticates with, so
+/// plaintext is a migration the operator has to ask for and not a state the
+/// engine settles into.
+pub const MIGRATE_PLAINTEXT_SIGNAL: &str = "AETHER_MIGRATE_PLAINTEXT_CONFIG";
+
+/// Read *and consume* the migration signal. Removing it makes the admission
+/// one-shot within the process: a second `load()` after the re-seal cannot
+/// quietly accept plaintext again because a stray write landed meanwhile.
+fn migration_requested() -> bool {
+    let requested = crate::runtime_env::flag(MIGRATE_PLAINTEXT_SIGNAL);
+    if requested {
+        crate::runtime_env::remove(MIGRATE_PLAINTEXT_SIGNAL);
+        log::warn!(
+            "[config] {MIGRATE_PLAINTEXT_SIGNAL} consumed: this load accepts an \
+             unencrypted identity file and re-seals it immediately"
+        );
+    }
+    requested
+}
+
 pub fn key_source() -> KeySource {
     match crate::runtime_env::var("AETHER_CONFIG_KEY") {
         Some(v) if !v.trim().is_empty() => KeySource::Injected,
@@ -345,10 +367,13 @@ fn temp_name(path: &str) -> String {
 /// tickets). The temp file is created empty and exclusively, its ACL is
 /// restricted **before** any secret byte hits disk, and the final file is
 /// re-restricted after the rename.
+///
+/// Every byte goes through the one handle that `create_new` returned. Reopening
+/// the temp file *by name* after the ACL step was the hole: anyone with write
+/// access to the directory could delete the name and plant a symlink in the gap,
+/// and the secret payload then landed at whatever target they chose.
 pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    create_parent(path)?;
     let tmp = temp_name(path);
     {
         use std::io::Write as _;
@@ -364,19 +389,12 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
         })?;
         #[cfg(windows)]
         {
-            // Nothing has been written yet: restrict first, then write.
-            drop(f);
+            // Nothing has been written yet: restrict the name first, then write
+            // through the handle we already hold — never re-open the name.
             if let Err(e) = restrict_windows_acl(&tmp) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
-            f = match std::fs::OpenOptions::new().append(true).open(&tmp) {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(e.into());
-                }
-            };
         }
         if let Err(e) = f.write_all(data).and_then(|()| f.sync_all()) {
             let _ = std::fs::remove_file(&tmp);
@@ -425,16 +443,34 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
             return Err(e.into());
         }
         if let Err(e) = restrict_windows_acl(path) {
-            let _ = e;
-            // The bytes are already in place and ACL-restricted from the temp
-            // phase; failing the second pass must not lose the config.
-            log::warn!("[config] could not re-restrict ACL on {path}");
+            // Propagated, not warned: a final file whose DACL was inherited from
+            // the directory is exactly the exposure the whole writer exists to
+            // avoid, and reporting success would hide it. The bytes stay in
+            // place — the next `load()` still authenticates them — but the
+            // caller must know they are not locked down.
+            return Err(AetherError::Other(format!(
+                "identity written to {path} but its access control could not be \
+                 restricted; it stays in place, fix the directory ACL: {e}"
+            )));
         }
     }
     #[cfg(not(windows))]
     {
         std::fs::rename(&tmp, path)?;
         sync_dir(Path::new(path).parent().unwrap_or_else(|| Path::new(".")));
+    }
+    Ok(())
+}
+
+/// Create the directory a config path lives in, *before* anything seals against
+/// it. `path_aad` canonicalises the parent, and canonicalisation only succeeds
+/// once it exists — so sealing first would bind the envelope to the literal
+/// fallback path and every later `load()` would authenticate a different one.
+fn create_parent(path: &str) -> Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     Ok(())
 }
@@ -452,20 +488,28 @@ fn sync_dir(dir: &Path) {
 /// It used to be the recovery source: whatever landed at `<path>.bak` was
 /// copied over the live config with the error ignored, so any local write of
 /// that one filename replaced the identity the tunnel authenticates with.
+///
+/// Each move lands under its own name, and a failed move leaves the backup
+/// where it is. The fixed `<path>.quarantined` target plus `remove_file` on
+/// collision destroyed the *first* quarantine artefact — the evidence an audit
+/// of a compromise depends on — and did it silently.
 fn quarantine_backup(path: &str) {
     let bak = format!("{path}.bak");
     if !Path::new(&bak).exists() {
         return;
     }
-    let doomed = format!("{path}.quarantined");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let doomed = format!("{path}.quarantined.{}.{}", std::process::id(), seq);
     match std::fs::rename(&bak, &doomed) {
         Ok(()) => log::error!(
             "[config] ignored and quarantined unauthenticated backup {bak} -> {doomed}"
         ),
-        Err(e) => {
-            log::error!("[config] could not quarantine {bak}: {e}; removing instead");
-            let _ = std::fs::remove_file(&bak);
-        }
+        Err(e) => log::error!(
+            "[config] could not move {bak} to {doomed}: {e}; leaving it in place. \
+             It is never read, and deleting it would destroy evidence a previous \
+             attempt preserved"
+        ),
     }
 }
 
@@ -474,36 +518,61 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
     if !Path::new(path).exists() {
         return Ok(None);
     }
-    let identity = read_identity(path)?;
+    // Asked for here and consumed, so exactly this one read may see plaintext.
+    let allow_plaintext = migration_requested();
+    let identity = match read_identity(path, allow_plaintext)? {
+        Loaded::Sealed(identity) => return Ok(Some(identity)),
+        Loaded::Plaintext(identity) => identity,
+    };
 
     // A config that is not in the current envelope is rewritten immediately and
     // then read back through the same code path, so "migrated" is something the
     // process proved rather than something it hoped for.
-    let raw = std::fs::read(path)?;
-    if !raw.starts_with(MAGIC_V2) {
-        if key()?.is_none() {
-            return Err(AetherError::Other(
-                "config is stored unencrypted and no key is available to seal it: refusing to keep \
-                 identity material in plaintext. Launch through the Aether app or set \
-                 AETHER_CONFIG_KEY."
-                    .into(),
-            ));
-        }
-        save(path, &identity)?;
-        let after = read_identity(path)?;
-        if after.device_id != identity.device_id || after.ipv4 != identity.ipv4 {
-            return Err(AetherError::Other(
-                "config migration read back a different identity".into(),
-            ));
-        }
-        log::info!("[config] migrated {path} into the v2 envelope");
+    if key()?.is_none() {
+        return Err(AetherError::Other(
+            "config is stored unencrypted and no key is available to seal it: refusing to keep \
+             identity material in plaintext. Launch through the Aether app or set \
+             AETHER_CONFIG_KEY."
+                .into(),
+        ));
     }
+    save(path, &identity)?;
+    match read_identity(path, false)? {
+        Loaded::Sealed(after) => {
+            if after.device_id != identity.device_id || after.ipv4 != identity.ipv4 {
+                return Err(AetherError::Other(
+                    "config migration read back a different identity".into(),
+                ));
+            }
+        }
+        Loaded::Plaintext(_) => {
+            return Err(AetherError::Other(
+                "config migration did not produce a sealed envelope".into(),
+            ))
+        }
+    }
+    log::info!("[config] migrated {path} into the v2 envelope");
 
     Ok(Some(identity))
 }
 
+/// What `read_identity` found behind the file name.
+enum Loaded {
+    /// Authenticated under the v2 (or legacy v1) envelope.
+    Sealed(Identity),
+    /// Valid identity bytes with no envelope at all — only ever produced when the
+    /// caller passed an explicit migration signal.
+    Plaintext(Identity),
+}
+
 /// Read, authenticate and validate the identity at `path`.
-fn read_identity(path: &str) -> Result<Identity> {
+///
+/// `allow_plaintext` is the one-shot migration admission from
+/// [`MIGRATE_PLAINTEXT_SIGNAL`]; it is a parameter rather than a fall-through so
+/// that refusing is the default at every call site. Whoever can write this file
+/// picks the `wg_private_key` and `device_id` the tunnel authenticates with, so
+/// an unenveloped file is never silently re-sealed as authoritative.
+fn read_identity(path: &str, allow_plaintext: bool) -> Result<Loaded> {
     let meta = std::fs::metadata(path)?;
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(AetherError::Other(format!(
@@ -512,30 +581,58 @@ fn read_identity(path: &str) -> Result<Identity> {
         )));
     }
     let raw = std::fs::read(path)?;
-    let encrypted = raw.starts_with(MAGIC_V2) || raw.starts_with(MAGIC_V1);
-    let plain = match key()? {
-        Some(k) => match open(path, &raw, &k)? {
-            Some(bytes) => bytes,
-            None => raw,
-        },
-        None if encrypted => {
+    let sealed = raw.starts_with(MAGIC_V2) || raw.starts_with(MAGIC_V1);
+    let opened = match key()? {
+        Some(k) => Some(open(path, &raw, &k)?),
+        None if sealed => {
             return Err(AetherError::Other(
                 "config is encrypted but no key is available for this process".into(),
             ))
         }
-        None => raw,
+        None => None,
+    };
+    let plain: Vec<u8> = match opened {
+        // An envelope, and it authenticated.
+        Some(Some(bytes)) => bytes,
+        // A key was present and the bytes are not an envelope at all.
+        Some(None) if allow_plaintext => raw,
+        Some(None) => return Err(plaintext_refused()),
+        // No key was available, so nothing authenticated them.
+        None if allow_plaintext => raw,
+        None => return Err(plaintext_refused()),
     };
     let text =
         String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))?;
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
-    Identity::try_from(persisted)
+    let identity = Identity::try_from(persisted)?;
+    Ok(if sealed {
+        Loaded::Sealed(identity)
+    } else {
+        Loaded::Plaintext(identity)
+    })
+}
+
+/// Why an unenveloped config was not adopted. Both ways out are named, and
+/// neither is "write it again and hope".
+fn plaintext_refused() -> AetherError {
+    AetherError::Other(format!(
+        "config is stored unencrypted; refusing to adopt plaintext identity material. \
+         Launch through the Aether app or set AETHER_CONFIG_KEY, then re-run once with \
+         {MIGRATE_PLAINTEXT_SIGNAL}=1 to move the file into the v2 envelope."
+    ))
 }
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
     let text =
         toml::to_string_pretty(&persisted).map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
+    // The parent must exist *before* sealing: `path_aad` canonicalises it, and on
+    // a first write into a new directory canonicalisation fails there and falls
+    // back to the literal path. `write_private_file` then created the directory,
+    // so every later `load()` authenticated a different one and reported
+    // "config authentication failed" on a file this same process had written.
+    create_parent(path)?;
     let data = seal(path, text.as_bytes())?;
     write_private_file(path, &data)
 }
@@ -599,6 +696,148 @@ mod tests {
         let same = path_aad("/var/lib/aether/aether.toml");
         assert_ne!(a, b, "two configs in one directory must not share a bind");
         assert_eq!(a, same);
+    }
+
+    static KEY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn sample_identity(device: &str) -> Identity {
+        Identity {
+            device_id: device.into(),
+            access_token: "tok".into(),
+            cert_pem: vec![],
+            key_pem: vec![],
+            ipv4: "172.16.0.2".into(),
+            ipv6: "2606:4700:110:8751:19d6:4fd1:d894:21dc".into(),
+            wg_private_key: [9u8; 32],
+            wg_peer_public_key: [10u8; 32],
+            client_id: [1, 2, 3],
+            masque_endpoint: None,
+        }
+    }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("aether_cfg_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn with_key<T>(f: impl FnOnce() -> T) -> T {
+        let _g = KEY_LOCK.lock();
+        crate::runtime_env::set(
+            "AETHER_CONFIG_KEY",
+            &base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        );
+        crate::runtime_env::remove(MIGRATE_PLAINTEXT_SIGNAL);
+        let out = f();
+        crate::runtime_env::remove("AETHER_CONFIG_KEY");
+        out
+    }
+
+    /// The first write into a directory that does not exist yet is the case that
+    /// used to seal against one path and open against another: `path_aad`
+    /// canonicalises the parent, which only succeeds once it is there, so every
+    /// later load reported "config authentication failed" on a file this same
+    /// process had just written.
+    #[test]
+    fn a_first_write_into_a_missing_directory_reads_back() {
+        with_key(|| {
+            let root = TempDir::new("firstwrite");
+            let nested = root.0.join("fresh").join("deep");
+            let path = nested.join("aether.toml").to_string_lossy().to_string();
+            assert!(!nested.exists(), "the parent must be absent to start");
+
+            save(&path, &sample_identity("first-dev")).expect("first save");
+            let back = load(&path)
+                .expect("load after the first write")
+                .expect("an identity");
+            assert_eq!(
+                back.device_id, "first-dev",
+                "seal and open must bind the same path"
+            );
+
+            // And again on the now-existing directory, i.e. the steady state.
+            save(&path, &sample_identity("second-dev")).expect("second save");
+            let again = load(&path)
+                .expect("load after the second write")
+                .expect("an identity");
+            assert_eq!(again.device_id, "second-dev");
+        });
+    }
+
+    /// A file that is not an envelope is only ever adopted for one load, and only
+    /// when the caller asked for that by name. Without the signal the identity the
+    /// tunnel would authenticate with is whatever the last writer of
+    /// `aether.toml` chose.
+    #[test]
+    fn plaintext_needs_the_signal_and_the_signal_is_consumed() {
+        with_key(|| {
+            let dir = TempDir::new("plaintext");
+            let path = dir.0.join("aether.toml").to_string_lossy().to_string();
+            let plain = format!(
+                "device_id = \"{}\"\naccess_token = \"tok\"\nipv4 = \"172.16.0.2\"\n\
+                 ipv6 = \"2606::1\"\nwg_private_key = \"{}\"\nwg_peer_public_key = \"{}\"\n",
+                "planted",
+                base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+                base64::engine::general_purpose::STANDARD.encode([10u8; 32]),
+            );
+            std::fs::write(&path, &plain).expect("plant plaintext");
+
+            let err = load(&path).expect_err("plaintext must not be adopted silently");
+            assert!(
+                err.to_string().contains(MIGRATE_PLAINTEXT_SIGNAL),
+                "the error must name the way out: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("reread"),
+                plain,
+                "a refused load must not rewrite the file either"
+            );
+
+            // Ask for it once: the load migrates, and the signal is gone.
+            crate::runtime_env::set(MIGRATE_PLAINTEXT_SIGNAL, "1");
+            let id = load(&path).expect("migration load").expect("an identity");
+            assert_eq!(id.device_id, "planted");
+            assert!(std::fs::read(&path).unwrap().starts_with(MAGIC_V2));
+            assert_eq!(
+                crate::runtime_env::var(MIGRATE_PLAINTEXT_SIGNAL),
+                None,
+                "the admission must be one-shot, not a mode"
+            );
+
+            // A second plaintext file is refused again in the same process.
+            std::fs::write(&path, &plain).expect("replant");
+            assert!(load(&path).is_err(), "the signal was already consumed");
+        });
+    }
+
+    /// `load()` used to `std::fs::read` the file a second time for its magic-byte
+    /// check, outside the `MAX_CONFIG_BYTES` bound that `read_identity` applies.
+    #[test]
+    fn an_oversized_config_is_refused_without_a_second_read() {
+        with_key(|| {
+            let dir = TempDir::new("oversize");
+            let path = dir.0.join("aether.toml").to_string_lossy().to_string();
+            let mut blob = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 8);
+            blob.extend_from_slice(MAGIC_V2);
+            blob.resize(MAX_CONFIG_BYTES as usize + 8, b'x');
+            std::fs::write(&path, &blob).expect("write");
+
+            let err = load(&path).expect_err("an over-long file must be refused");
+            assert!(
+                err.to_string().contains("too large"),
+                "expected the size refusal, got {err}"
+            );
+        });
     }
 
     #[test]

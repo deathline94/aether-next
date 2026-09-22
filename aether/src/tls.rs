@@ -97,6 +97,18 @@ pub fn install_pin_verification(
         )));
     }
     let require_chain = set.require_chain;
+    if !require_chain {
+        // Loud, once, per process: "chain validation is off for this host" is a
+        // property of the shipped trust file that a reader has to be able to see
+        // from a log, and the `require_chain` default that made it silent is gone.
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if WARNED.set(()).is_ok() {
+            log::warn!(
+                "[tls] {host:?}: SPKI pins are the only trust decision for this host \
+                 (require_chain=false in packaging/trust/masque-pins.json)"
+            );
+        }
+    }
     let host_owned = host.to_string();
     builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| {
         let host = host_owned.as_str();

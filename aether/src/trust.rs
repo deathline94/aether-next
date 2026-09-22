@@ -75,11 +75,12 @@ pub struct PinSet {
     pub require_hostname: bool,
     /// Build and validate the full chain against the system/embedded roots.
     ///
-    /// `false` is deliberate for Cloudflare's consumer MASQUE edge, which
-    /// presents a self-signed leaf: no chain exists to validate, so SPKI
-    /// pinning *is* the trust mechanism there. Enabling it for a host whose
-    /// leaf is properly issued (WE1) is the intended tightening path.
-    #[serde(default)]
+    /// **There is no default, on purpose.** `#[serde(default)]` here meant that
+    /// omitting the key in the shipped JSON silently turned chain validation off
+    /// for that host, and BoringSSL's precomputed `ok` was then discarded by the
+    /// verify callback — pins-only on every live connection. A pin file that does
+    /// not say what it means is now a load error, which makes the decision a
+    /// reviewed line in the file rather than an absence.
     pub require_chain: bool,
     pub pins: Vec<Pin>,
 }
@@ -112,6 +113,13 @@ pub const MASQUE_PINS_JSON: &str = include_str!("../../packaging/trust/masque-pi
 /// Loaded from the committed file rather than a byte literal in `consts.rs` so
 /// a rotation is a reviewable one-line diff, and so "empty pins" can never be
 /// mistaken for "trust everyone" — see [`active_pins`].
+///
+/// A load failure yields an empty set rather than a panic, which fails closed at
+/// the one place that matters (`tls::install_pin_verification` refuses a host with
+/// no pin set). It is *not* a loud startup signal, so a session must call
+/// [`require_valid_masque_pins`] first: that is what turns a bad
+/// `masque-pins.json` into a refusal to start instead of a connection error
+/// several steps later.
 pub fn masque_pin_sets() -> &'static [PinSet] {
     static SETS: OnceLock<Vec<PinSet>> = OnceLock::new();
     SETS.get_or_init(|| {
@@ -120,6 +128,23 @@ pub fn masque_pin_sets() -> &'static [PinSet] {
             Vec::new()
         })
     })
+}
+
+/// Refuse to run a session on an unusable pin file. Called once at session start
+/// so the operator sees which witness is broken and why.
+pub fn require_valid_masque_pins() -> Result<()> {
+    let sets = masque_pin_sets();
+    if sets.is_empty() {
+        return Err(AetherError::Tls(
+            "packaging/trust/masque-pins.json did not load: refusing to start a session \
+             that could not pin its peer"
+                .into(),
+        ));
+    }
+    // Re-check expiry against the *current* clock: the cached set was validated
+    // the first time it was loaded, and a long-lived process must not run past
+    // the rotation deadline it printed at startup.
+    active_pins(sets, now_unix())
 }
 
 /// On-disk shape of `packaging/trust/masque-pins.json`.
@@ -237,16 +262,6 @@ pub fn active_pins(sets: &[PinSet], now_unix: u64) -> Result<()> {
     Ok(())
 }
 
-/// Does this leaf's SPKI digest appear in the (unexpired) pins for `host`?
-pub fn pin_matches(sets: &[PinSet], host: &str, spki_sha256_hex: &str, now_unix: u64) -> bool {
-    sets.iter()
-        .filter(|s| s.host.eq_ignore_ascii_case(host))
-        .flat_map(|s| s.pins.iter())
-        .any(|p| {
-            p.expires_unix > now_unix && p.spki_sha256.eq_ignore_ascii_case(spki_sha256_hex)
-        })
-}
-
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -261,6 +276,11 @@ pub fn is_hex_sha256(s: &str) -> bool {
 }
 
 /// How a connection shall be verified. Passed explicitly; never ambient.
+///
+/// There is deliberately no predicate here for "is the chain still validated":
+/// the single `match` in `tls::build_config` is the whole policy, and a second
+/// function reporting on it (which the previous `requires_chain_validation` was)
+/// has no caller and therefore no way to be wrong loudly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyPolicy<'a> {
     /// Full chain verification against `anchors` **plus** an SPKI pin match.
@@ -273,17 +293,6 @@ pub enum VerifyPolicy<'a> {
     /// release binary, so no environment variable can reach it either.
     #[cfg(debug_assertions)]
     Insecure { reason: &'static str },
-}
-
-impl VerifyPolicy<'_> {
-    /// True when the peer certificate chain must still be validated normally.
-    pub fn requires_chain_validation(&self) -> bool {
-        match self {
-            VerifyPolicy::Pinned(_) | VerifyPolicy::ReadOnlyProbe => true,
-            #[cfg(debug_assertions)]
-            VerifyPolicy::Insecure { .. } => false,
-        }
-    }
 }
 
 /// SHA-256 of a file, lowercase hex. Used for both digest and trust checks.
@@ -338,32 +347,44 @@ mod tests {
         assert!(load_anchors(json).is_err());
     }
 
+    /// `active_pins` is the loader gate; host scoping of the digests themselves is
+    /// enforced where a connection is built, by `tls::install_pin_verification`
+    /// refusing a host with no pin set — see `tests/tls_pin_chain.rs`, which runs
+    /// against real certificates.
     #[test]
-    fn pins_are_bound_to_their_host() {
-        let sets = vec![PinSet {
-            host: "edge.example".into(),
-            require_hostname: true,
-            require_chain: false,
-            pins: vec![pin(A, u64::MAX / 2), pin(B, u64::MAX / 2)],
-        }];
-        assert!(pin_matches(&sets, "edge.example", A, 1));
-        // The defect this replaces: one global pin set authenticating any peer.
-        assert!(!pin_matches(&sets, "evil.example", A, 1));
-    }
-
-    #[test]
-    fn expired_pin_never_matches() {
+    fn an_expired_pin_set_is_a_hard_error_not_a_fallback() {
         let sets = vec![PinSet {
             host: "edge.example".into(),
             require_hostname: true,
             require_chain: false,
             pins: vec![pin(A, 100), pin(B, 100)],
         }];
-        assert!(!pin_matches(&sets, "edge.example", A, 1_000));
         assert!(
             active_pins(&sets, 1_000).is_err(),
             "an all-expired set must be a hard error, not a fallback"
         );
+    }
+
+    /// The exact shape of the shipped file that used to be silent: an omitted
+    /// `require_chain` decoded to `false`, which discarded BoringSSL's chain
+    /// verdict on every live connection. It is a load error now.
+    #[test]
+    fn a_pin_host_that_does_not_say_whether_to_validate_the_chain_is_rejected() {
+        let silent = r#"{"version":1,"hosts":[{"host":"edge.example","require_hostname":false,
+            "pins":[{"spki_sha256":"1111111111111111111111111111111111111111111111111111111111111111","expires_unix":1805500800},
+                    {"spki_sha256":"2222222222222222222222222222222222222222222222222222222222222222","expires_unix":1805500800}]}]}"#;
+        let err = load_pins(silent, 1).expect_err("an absent require_chain must not default");
+        assert!(
+            err.to_string().contains("require_chain"),
+            "the error must name the missing field: {err}"
+        );
+
+        let spoken = silent.replace(
+            "\"require_hostname\":false,",
+            "\"require_hostname\":false,\"require_chain\":true,",
+        );
+        let sets = load_pins(&spoken, 1).expect("the same file with the field present");
+        assert!(sets[0].require_chain);
     }
 
     #[test]
@@ -398,13 +419,5 @@ mod tests {
         assert!(is_hex_sha256(A));
         assert!(!is_hex_sha256(&A[..63]));
         assert!(!is_hex_sha256("zz"));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn insecure_policy_still_reports_chain_validation_as_off() {
-        let p = VerifyPolicy::Insecure { reason: "test" };
-        assert!(!p.requires_chain_validation());
-        assert!(VerifyPolicy::Pinned(&[]).requires_chain_validation());
     }
 }
