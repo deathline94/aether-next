@@ -552,6 +552,21 @@
   releases, so a future change that stops a terminal state from reaching the UI goes red.
   10 desktop UI tests pass.
 - [ ] T175 [US6] Scope scan events by `run_id` end to end (on T020's typed pipeline): mint in `startScan`, echo through the shell, drop non-matching in both layers, and make the synthetic terminal event a typed `scan_failed { run_id }` instead of `{"type":"scan_done","addr":"","rtt":""}` at `apps/desktop/src-tauri/src/lib.rs:1736-1741`, which today reports "no working endpoints found" after a scan that found dozens and can deactivate a live scan.
+  **Landed (the synthetic terminal event, both platforms).** Desktop: `scan_terminal_event(terminal_sent, hits)`
+  is now a pure function the shell calls after both pipes drain — `None` when the engine already reported
+  its own ending (the old code emitted a second terminal event regardless), otherwise `scan_failed` naming
+  how many endpoints were already found and kept. Android: the same rule in `scanExitEvent`, wired to a
+  `scanTerminalSent` flag set at every terminal production point and cleared when a new scan starts; the
+  duplicate emit in the *connect* branch of `handleExit` is gone, since a scan cannot be in flight while
+  connecting (`scan()` stops the tunnel and connect stops the scan) — it was announcing a terminal event
+  for a run that never happened. Both UIs already had a live `scan_failed` arm that keeps `endpoints`
+  and sets `phase: "Failed"`, so the fix needed no frontend change and T177's dead arm is now reachable.
+  Falsified: restoring the empty `scan_done` reddens all 3 new shell tests; 43 shell tests + clippy at
+  pinned 1.88, 43 Android JVM tests, and all 13 gates pass.
+  **Still open (the `run_id` half).** `grep run_id aether/src` matches nothing: the engine mints no scan
+  identifier and echoes none, so neither layer can drop a late event from a previous run. That needs
+  T020's typed event pipeline on the engine side first, which cannot be compiled on this machine (see
+  the toolchain note), so it stays open rather than being half-implemented in the shells.
 - [ ] T176 [US6] Clear `endpoints`, counters and `bestRtt` unconditionally in `apps/desktop/src/hooks/useScanner.ts:startScan` and key rows on `addr + protocol` (fixes T166).
 - [ ] T177 [US6] Delete `apps/desktop/src/types.ts:111-112`'s `scan_failed`/`scan_done.working` **or** emit them — with the generated type as arbiter (fixes the dead arm at `useScanner.ts:88-91`) — and carry `best_rtt_ms: Option<u32>` so completion stops logging `best: 1.1.1.1:443 ()` (`aether/src/session.rs:187,203,254,261,297` emit `rtt: String::new()`).
 - [ ] T178 [US6] Add `saveSeqRef` ordering to `apps/desktop/src/hooks/useRuntime.ts:123-135` so a slow older write cannot land last and flip "Synchronized" for the wrong payload; serialise persistence through one owner.

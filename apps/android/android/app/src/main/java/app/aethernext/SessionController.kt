@@ -30,15 +30,13 @@ class SessionController(
     private val vpnStarted = AtomicBoolean(false)
     private val vpnEstablished = AtomicBoolean(false)
     private val tearingDown = AtomicBoolean(false)
+    /// Whether the running scan has already produced a terminal event of its own.
+    private val scanTerminalSent = AtomicBoolean(false)
     private var settings = store.load()
 
     private fun handleExit(code: Int?, isScan: Boolean) {
         if (isScan) {
-            // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
-            emit(
-                "scan://event",
-                JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
-            )
+            scanExitEvent(scanTerminalSent.get())?.let { emit("scan://event", it) }
             if (runtime.status != "connected") {
                 setRuntime("disconnected", "Ready", null, null)
             }
@@ -58,11 +56,6 @@ class SessionController(
             else "Engine exited ($code)",
             null,
             null,
-        )
-        // Ensure the scanner UI never sticks "active" if the engine exits mid-scan.
-        emit(
-            "scan://event",
-            JSONObject().put("type", "scan_done").put("addr", "").put("rtt", "").put("protocol", ""),
         )
         context.stopService(Intent(context, EngineService::class.java))
         stopVpnService()
@@ -189,19 +182,23 @@ class SessionController(
             if (!runner.stopAndWait(3000)) {
                 val err = "Previous engine process is still terminating; scan aborted"
                 emitLog("scan error: $err")
+                scanTerminalSent.set(true)
                 emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
                 return err
             }
             if (runner.isRunning()) {
                 val err = "Engine could not be stopped for scan"
                 emitLog("scan error: $err")
+                scanTerminalSent.set(true)
                 emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
                 return err
             }
         }
+        scanTerminalSent.set(false)
         val err = runner.startScan(protocol, ipVersion, concurrency, timeoutMs, noize)
         if (err != null) {
             emitLog("scan error: $err")
+            scanTerminalSent.set(true)
             emit("scan://event", JSONObject().put("type", "scan_failed").put("message", err))
             return err
         }
@@ -292,13 +289,18 @@ class SessionController(
                         if (!runner.isScanMode()) {
                             rollbackStartup(msg)
                         } else {
+                            scanTerminalSent.set(true)
                             emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
                         }
                     }
                     // Forward structured scan telemetry to the webview (scan://event),
                     // mirroring the desktop Tauri bridge. The UI consumes these instead
                     // of regex-parsing log lines.
-                    "scan_start", "scan_progress", "scan_hit", "scan_done" -> emitScanEvent(json)
+                    "scan_done" -> {
+                        scanTerminalSent.set(true)
+                        emitScanEvent(json)
+                    }
+                    "scan_start", "scan_progress", "scan_hit" -> emitScanEvent(json)
                 }
             } catch (_: Exception) {
             }
@@ -308,6 +310,7 @@ class SessionController(
             if (!runner.isScanMode()) {
                 rollbackStartup(msg)
             } else {
+                scanTerminalSent.set(true)
                 emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
             }
         }

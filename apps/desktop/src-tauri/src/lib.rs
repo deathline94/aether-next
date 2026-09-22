@@ -2361,12 +2361,13 @@ fn scan(
     // Stop killed the process and stdout finally closed. One thread per stream
     // keeps both live.
     let terminal_sent = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
     if let Some(o) = stdout {
-        handles.push(pump_scan_stream(app.clone(), Box::new(o), terminal_sent.clone()));
+        handles.push(pump_scan_stream(app.clone(), Box::new(o), terminal_sent.clone(), hits.clone()));
     }
     if let Some(e) = stderr {
-        handles.push(pump_scan_stream(app.clone(), Box::new(e), terminal_sent.clone()));
+        handles.push(pump_scan_stream(app.clone(), Box::new(e), terminal_sent.clone(), hits.clone()));
     }
     let app_done = app.clone();
     std::thread::spawn(move || {
@@ -2375,17 +2376,39 @@ fn scan(
         }
         // Terminal scan_done only if the engine didn't already send one, so a crash
         // still unsticks the UI but a normal finish doesn't double-log.
-        if !terminal_sent.load(Ordering::SeqCst) {
-            let _ = app_done.emit("scan://event", serde_json::json!({
-                "type": "scan_done",
-                "addr": "",
-                "rtt": "",
-                "protocol": "",
-            }));
+        if let Some(event) = scan_terminal_event(
+            terminal_sent.load(Ordering::SeqCst),
+            hits.load(Ordering::SeqCst),
+        ) {
+            let _ = app_done.emit("scan://event", event);
         }
     });
 
     Ok(())
+}
+
+/// The synthetic terminal event for a scan whose process ended without saying so.
+///
+/// This used to be a `scan_done` with empty `addr`/`rtt`, which the UI read as
+/// "finished, nothing found": a scan that had already surfaced a dozen working
+/// endpoints was reported as having found none, and on the desktop a `scan_done`
+/// also ends the run — so the one message that could not be trusted was the one
+/// that decided the outcome. `None` means the engine already reported its own
+/// terminal event and nothing should be invented here.
+pub fn scan_terminal_event(terminal_sent: bool, hits: u64) -> Option<serde_json::Value> {
+    if terminal_sent {
+        return None;
+    }
+    let message = if hits == 0 {
+        "the scan process ended without reporting a result, and no working endpoint had been found"
+            .to_string()
+    } else {
+        format!(
+            "the scan process ended without reporting a result; {hits} working endpoint(s) were \
+             already found and are kept"
+        )
+    };
+    Some(serde_json::json!({ "type": "scan_failed", "message": message }))
 }
 
 /// Read one scan output pipe on its own thread, forwarding AETHER_EVENT lines as
@@ -2395,6 +2418,7 @@ fn pump_scan_stream(
     app: AppHandle,
     reader: Box<dyn std::io::Read + Send>,
     terminal_sent: Arc<AtomicBool>,
+    hits: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
@@ -2419,6 +2443,7 @@ fn pump_scan_stream(
                             }));
                         }
                         "scan_hit" => {
+                            hits.fetch_add(1, Ordering::SeqCst);
                             let _ = app.emit("scan://event", serde_json::json!({
                                 "type": "scan_hit",
                                 "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
