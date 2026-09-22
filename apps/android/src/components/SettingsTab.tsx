@@ -381,11 +381,24 @@ export function SettingsTab({
             disabled={settingsLocked}
             aria-label="Routing mode"
             className="tactical-select"
-            value={settings.routingMode === "system-proxy" ? "tun" : settings.routingMode}
+            value={settings.routingMode}
             onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
           >
             <option value="tun">Full VPN (Android VpnService)</option>
             <option value="proxy-only">Proxy Only (Local Listeners)</option>
+            {/* A config written on desktop can carry `system-proxy`, which Android
+                cannot do (no API to set the OS proxy from an app without
+                WRITE_SECURE_SETTINGS). The select used to *render* it as "Full
+                VPN" by coercion, so the stored mode and the label disagreed, and
+                the chip beside it — correctly reading the stored value as not
+                `tun` — said "LOCAL PROXY" on the same row. Showing the stored
+                value honestly, and naming it unsupported, keeps the three
+                widgets telling one story. */}
+            {settings.routingMode === "system-proxy" && (
+              <option value="system-proxy" disabled>
+                System Proxy — stored, not available on Android
+              </option>
+            )}
           </select>
         </div>
       </section>

@@ -11,6 +11,40 @@ import type { TestOutcome } from "../hooks/useRuntime";
 import { noiseIsInert } from "../../../../packages/ui/src";
 
 /**
+ * Carrier and transport wording, exhaustive by construction.
+ *
+ * Both tiles used two ternary arms, so anything that was not `masque` fell to
+ * "WIREGUARD" — a Gool session whose own headline says WARP-in-WARP advertised a
+ * carrier it is not, on the same card. A Record keyed on the protocol union makes
+ * a new protocol a compile error instead of a wrong label.
+ */
+const CARRIER_CHIP: Record<
+  Settings["protocol"],
+  { chip: (t: Settings["transport"]) => string; transport: (t: Settings["transport"]) => string }
+> = {
+  masque: {
+    chip: (t) => (t === "h3" ? "QUIC/UDP" : "H2/TLS"),
+    transport: (t) => (t === "h3" ? "HTTP/3" : "HTTP/2"),
+  },
+  gool: {
+    chip: () => "QUIC/UDP x2",
+    transport: () => "WireGuard in WireGuard",
+  },
+  wireguard: {
+    chip: () => "WIREGUARD",
+    transport: () => "UDP WireGuard",
+  },
+};
+
+export function carrierChip(settings: Settings): string {
+  return CARRIER_CHIP[settings.protocol].chip(settings.transport);
+}
+
+export function transportName(settings: Settings): string {
+  return CARRIER_CHIP[settings.protocol].transport(settings.transport);
+}
+
+/**
  * Nothing here may claim a property the app has not observed: the engine reports
  * no early-data result, so the previous badge asserted a resumed handshake that
  * nobody measured, and "Route Open"/"Traffic Secure" were shown while disconnected
@@ -308,15 +342,13 @@ export function ConnectionTab({
                 </strong>
               </div>
             </div>
-            <span className="bento-chip-cyan">
-              {settings.protocol === "masque" ? (settings.transport === "h3" ? "QUIC/UDP" : "H2/TLS") : "WIREGUARD"}
-            </span>
+            <span className="bento-chip-cyan">{carrierChip(settings)}</span>
           </div>
 
           <div className="cipher-specs-grid">
             <div className="spec-badge">
               <span>TRANSPORT</span>
-              <strong>{settings.protocol === "masque" ? (settings.transport === "h3" ? "HTTP/3" : "HTTP/2") : "UDP WireGuard"}</strong>
+              <strong>{transportName(settings)}</strong>
             </div>
             <div className="spec-badge">
               <span>OBFUSCATION</span>
