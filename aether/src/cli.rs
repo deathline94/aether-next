@@ -70,6 +70,7 @@ pub async fn run() -> Result<()> {
     };
 
     if let Err(ref e) = result {
+        let retryable = e.is_retryable();
         let message = match e {
             crate::error::AetherError::NoCleanEndpoint => {
                 "No working gateway found. Try HTTP/2, another scan mode, or a different network."
@@ -77,7 +78,15 @@ pub async fn run() -> Result<()> {
             }
             other => other.to_string(),
         };
-        log::error!("[-] session failed: {message}");
+        // The code travels with the text so a failure can be identified without
+        // matching a sentence, and the exit status separates "try again" from
+        // "something is wrong with this configuration" — both used to be 1, which
+        // left the supervising shell unable to tell a transient edge loss from a
+        // bad identity no retry will ever fix.
+        //
+        // The `[-] session failed:` prefix stays byte-identical and keeps its
+        // colon: src-tauri's log mirror matches and splits on exactly that string.
+        log::error!("[-] session failed: {message} [{}]", e.code());
         crate::session_event::emit(SessionEvent::Error { message });
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -85,7 +94,7 @@ pub async fn run() -> Result<()> {
         // Give the parent shell a moment to read the terminal event before the
         // process disappears, otherwise the GUI sees a bare exit with no reason.
         tokio::time::sleep(Duration::from_millis(80)).await;
-        std::process::exit(1);
+        std::process::exit(if retryable { 4 } else { 1 });
     }
 
     // Scan-only sessions finish on their own, but the control-stdin reader parks a
