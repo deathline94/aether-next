@@ -24,6 +24,7 @@ import type {
 } from "../../../packages/ui/src/enums";
 import { parseRuntimeCore } from "../../../packages/ui/src";
 import type { RuntimeStatus } from "../../../packages/ui/src";
+import type { LogLevel } from "../../../packages/ui/src/enums";
 
 export type { IpFamily, NoizeProfile, RoutingMode, ScanMode, TunnelProtocol, Transport };
 
@@ -136,7 +137,7 @@ export function parseRuntimeState(payload: unknown): RuntimeState | null {
 
 export type LogEntry = {
   id: number;
-  level: "info" | "warn" | "error";
+  level: LogLevel;
   message: string;
   /**
    * Epoch milliseconds, kept machine-readable for the buffer export. The console

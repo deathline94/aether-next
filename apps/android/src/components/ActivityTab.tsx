@@ -10,7 +10,6 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { nextOptionIndex } from "../../../../packages/ui/src";
 import { RENDER_CAP } from "../hooks/useLogs";
-import { formatLogTime } from "../types";
 import type { LogEntry, LogFilter, ScanState } from "../types";
 
 interface ActivityTabProps {
@@ -313,7 +312,7 @@ export function ActivityTab({
                     <span className="gutter-dot" aria-hidden="true" />
                   </span>
                   <time className="tabular-nums font-mono" dateTime={new Date(entry.ts).toISOString()}>
-                    {formatLogTime(entry.ts)}
+                    {entry.time}
                   </time>
                   <span className={`log-level-badge ${category} font-mono`}>
                     [{label}]

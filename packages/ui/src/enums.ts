@@ -108,3 +108,11 @@ export function oneOf<T extends string>(
     ? (value as T)
     : fallback;
 }
+
+/**
+ * Severities the engine's lines and the console's badges speak with. Both apps
+ * spelled this union inline, which is how a fourth level added on one surface
+ * would be `undefined` on the other.
+ */
+export const LOG_LEVELS = ["info", "warn", "error"] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];

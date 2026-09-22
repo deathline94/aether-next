@@ -1,5 +1,6 @@
 import { parseRuntimeCore } from "../../../packages/ui/src";
 import type { RuntimeStatus } from "../../../packages/ui/src";
+import type { LogLevel } from "../../../packages/ui/src/enums";
 
 export type View = "home" | "scanner" | "settings" | "logs";
 /** The four statuses the shell has copy, colours and a beacon for — one list, in `packages/ui`. */
@@ -82,11 +83,33 @@ export function parseRuntimeState(payload: unknown): RuntimeState | null {
 
 export type LogEntry = {
   id: number;
-  level: "info" | "warn" | "error";
+  level: LogLevel;
   message: string;
-  /** Epoch milliseconds — formatted at render time so exports keep the date. */
+  /**
+   * Epoch milliseconds, kept machine-readable for the buffer export and for
+   * `dateTime`. The row prints `time` instead: formatting here on every render
+   * multiplied a `toLocaleTimeString` call by the visible rows on every appended
+   * line, which is the scan-time freeze on the slower surface.
+   */
   ts: number;
+  /** `ts` already rendered as HH:MM:SS, computed once when the line was appended. */
+  time: string;
+  /**
+   * Set when this line *is* a hit rather than a line that mentions one: the
+   * address the structured event named, verbatim. `appendToStore` dedupes on it,
+   * so a hit is counted per endpoint and nothing has to guess at the engine's
+   * wording. See `packages/ui/src/logs.ts`.
+   */
+  hitKey?: string;
 };
+
+/**
+ * What a caller hands to `appendLog`: an entry without the store's own id and
+ * timestamp. `hitKey` is optional - pass it when the line is a fact about one
+ * endpoint (a structured scan event) rather than leaving the log to recognise it
+ * from prose.
+ */
+export type LogInput = Pick<LogEntry, "level" | "message"> & { hitKey?: string };
 
 export function formatLogTime(ts: number): string {
   // `hour12: false`, matching the desktop console: the rows sit on a 64 px time

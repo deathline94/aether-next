@@ -11,7 +11,7 @@ import type {
   ScanState,
 } from "../types";
 import { errorMessage } from "../ipcError";
-import { hitAddressKey } from "./useLogs";
+import { hitAddressKey } from "../../../../packages/ui/src/logs";
 import {
   SCAN_MAX_CONCURRENCY,
   SCAN_MIN_CONCURRENCY,

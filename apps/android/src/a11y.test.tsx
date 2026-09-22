@@ -40,6 +40,7 @@ const LOGS: LogEntry[] = Array.from({ length: 5 }, (_, i) => ({
   level: i % 3 === 0 ? "error" : i % 3 === 1 ? "warn" : "info",
   message: `engine line ${i}`,
   ts: TS + i * 1000,
+  time: "14:15:33",
 }));
 
 async function expectAccessible(label: string, ui: React.ReactElement) {

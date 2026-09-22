@@ -3,15 +3,16 @@ import { invoke, listen } from "../bridge";
 import { initialScanState, effectiveScanTimeout } from "../types";
 import { errorMessage } from "../ipcError";
 import { scanVerdict } from "../../../../packages/ui/src";
-import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
+import { hitAddressKey } from "../../../../packages/ui/src/logs";
+import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
 
 /**
  * Owns standalone-scanner state. Progress/hits arrive as structured
- * `scan://event` messages forwarded by the native bridge — no log-string
+ * `scan://event` messages forwarded by the native bridge - no log-string
  * parsing. `running` lets us disconnect an active tunnel before scanning.
  */
 export function useScanner(
-  appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
+  appendLog: (entry: LogInput) => void,
   running: boolean,
   clearLogs?: () => void,
 ) {
@@ -66,6 +67,16 @@ export function useScanner(
           setScanState((prev) => ({ ...prev, scanned: ev.scanned, total: ev.total, working: ev.working }));
           break;
         case "scan_hit": {
+          // The log reads this key rather than recognising the hit from prose, so
+          // the scanner's count and the Activity tab agree by construction and
+          // survive an engine that rewords its own lines. This case used to log
+          // nothing at all, so "Hits" on the phone showed only whatever prose the
+          // engine happened to emit rather than the endpoints that answered.
+          appendLog({
+            level: "info",
+            message: `Working endpoint ${ev.addr}${ev.protocol ? ` (${ev.protocol})` : ""}`,
+            hitKey: hitAddressKey(ev.addr),
+          });
           const current = endpointsRef.current;
           // Keyed on addr + protocol: one address answers the h2 and the h3 handshake
           // and keying on the address alone threw the second one away.

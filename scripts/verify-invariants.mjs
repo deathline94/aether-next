@@ -1412,18 +1412,18 @@ const GATES = [
        */
       const BASELINE = new Map([
         ['App.tsx', 66],
-        ['components/ActivityTab.tsx', 87],
+        ['components/ActivityTab.tsx', 88],
         ['components/ConnectionTab.tsx', 71],
         ['components/ErrorBoundary.tsx', 100],
         ['components/ScannerTab.tsx', 80],
         ['components/SettingsTab.tsx', 72],
         ['components/ui.tsx', 100],
-        ['hooks/useLogs.ts', 29],
+        ['hooks/useLogs.ts', 100],
         ['hooks/useRuntime.ts', 60],
-        ['hooks/useScanner.ts', 53],
+        ['hooks/useScanner.ts', 56],
         ['ipcError.ts', 63],
         ['main.tsx', 67],
-        ['types.ts', 50],
+        ['types.ts', 52],
         // Test plumbing, not shipped surface: `packages/ui` deliberately carries
         // no stubs (see the header of either copy), so this pair stays copied -
         // and 100 here means the two copies' code may never diverge.
@@ -1454,6 +1454,9 @@ const GATES = [
           v.push(`${twin}: newly forked from apps/desktop/src/${relPath} with ${identity}% shared code - share it through packages/ui, or record the pair deliberately in this gate's baseline`);
         } else if (identity < floor) {
           v.push(`${relPath}: the two frontends now share ${identity}% of their code lines, down from the ${floor}% baseline - sync the change into both apps, or move the rule into packages/ui`);
+        }
+        if (process.env.VERIFY_FORK_REPORT) {
+          console.log(`   fork ${String(identity).padStart(3)}% (floor ${floor ?? "-"})  ${relPath}`);
         }
       }
       if (compared < BASELINE.size) {
