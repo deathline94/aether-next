@@ -35,8 +35,16 @@ fn is_hex64(v: &str) -> bool {
     v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Reads the anchor and returns `(name, digest)` pairs, or stops the build.
-fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
+/// Reads the anchor and returns `(name, file_digest, cert_digest)` triples, or
+/// stops the build.
+///
+/// `cert_digest` is `cert_sha256`: sha256 over the signing leaf's DER, as
+/// defined by the anchor's own `$comment`. It was read by nobody, so "verify the
+/// publisher" reduced to a substring test on a subject string an attacker picks
+/// themselves. The field is optional in the JSON only for the sake of an
+/// anchor written before it existed; the runtime treats absent as unpinned and,
+/// in a release build, refuses.
+fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String, Option<String>)>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(ANCHOR_REL)
         .canonicalize()
@@ -66,7 +74,7 @@ fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
         .and_then(|f| f.as_array())
         .unwrap_or_else(|| die(&format!("{} has no `files` array", path.display()), ""));
 
-    let mut entries: Vec<(String, String)> = Vec::with_capacity(files.len());
+    let mut entries: Vec<(String, String, Option<String>)> = Vec::with_capacity(files.len());
     for entry in files {
         let name = entry
             .get("name")
@@ -101,11 +109,26 @@ fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String)>) {
                 "want exactly 64 hexadecimal characters",
             );
         }
-        entries.push((name.to_ascii_lowercase(), digest.to_ascii_lowercase()));
+        let cert = entry
+            .get("cert_sha256")
+            .and_then(|d| d.as_str())
+            .map(|c| c.to_ascii_lowercase());
+        if let Some(ref cert) = cert {
+            if !is_hex64(cert) {
+                die(
+                    &format!(
+                        "{}: entry `{name}` has cert_sha256 `{cert}`",
+                        path.display()
+                    ),
+                    "want exactly 64 hexadecimal characters, or the field omitted",
+                );
+            }
+        }
+        entries.push((name.to_ascii_lowercase(), digest.to_ascii_lowercase(), cert));
     }
 
     for want in ARTIFACTS {
-        if !entries.iter().any(|(n, _)| n == want) {
+        if !entries.iter().any(|(n, _, _)| n == want) {
             die(
                 &format!("{} has no entry for `{want}`", path.display()),
                 "an absent entry must not be allowed to mean \"nothing to check\": the runtime \
@@ -131,7 +154,7 @@ fn main() {
     #[cfg(windows)]
     println!("cargo:rustc-link-search=native={out_dir}");
 
-    let has_placeholder = entries.iter().any(|(_, d)| d == PLACEHOLDER_SHA256);
+    let has_placeholder = entries.iter().any(|(_, d, _)| d == PLACEHOLDER_SHA256);
     if has_placeholder {
         println!(
             "cargo:warning=engine-trust.json still carries a placeholder digest, so release \
@@ -142,8 +165,7 @@ fn main() {
         // `cargo build --release` path produced exactly that. Fail here, where the
         // reason is legible, unless this is a deliberately unwitnessed dev build.
         let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
-        let allow_unwitnessed =
-            matches!(std::env::var("AETHER_ALLOW_UNWITNESSED").as_deref(), Ok(v) if !v.trim().is_empty());
+        let allow_unwitnessed = matches!(std::env::var("AETHER_ALLOW_UNWITNESSED").as_deref(), Ok(v) if !v.trim().is_empty());
         if profile == "release" && !allow_unwitnessed {
             die(
                 "engine-trust.json still carries a placeholder digest, so this release shell \
@@ -172,8 +194,20 @@ fn main() {
          /// comparison unable to fail.\n",
     );
     code.push_str("pub static EMBEDDED_RELEASE_HASHES: &[(&str, &str)] = &[\n");
-    for (name, digest) in &entries {
+    for (name, digest, _) in &entries {
         code.push_str(&format!("    ({name:?}, {digest:?}),\n"));
+    }
+    code.push_str("];\n");
+    code.push_str(
+        "/// sha256 over each artifact's signing leaf (DER), from the same anchor. The \
+         runtime compares the certificate it authenticates against this, so a subject \
+         string the signer chose is no longer the check.\n\
+         pub static EMBEDDED_ISSUER_CERTS: &[(&str, &str)] = &[\n",
+    );
+    for (name, _, cert) in &entries {
+        if let Some(cert) = cert {
+            code.push_str(&format!("    ({name:?}, {cert:?}),\n"));
+        }
     }
     code.push_str("];\n");
     code.push_str(&format!(

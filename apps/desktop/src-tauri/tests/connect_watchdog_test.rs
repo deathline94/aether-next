@@ -12,10 +12,15 @@
 #[link(name = "resource", kind = "static")]
 extern "C" {}
 
-use aether_desktop_lib::{connect_watchdog_action, WatchdogAction, CONNECT_WATCHDOG_TIMEOUT};
+use aether_desktop_lib::{
+    connect_watchdog_action, heartbeat_stall_action, WatchdogAction, CONNECT_WATCHDOG_TIMEOUT,
+    HEARTBEAT_INTERVAL, HEARTBEAT_MISS_LIMIT,
+};
 use std::time::Duration;
 
 const TIMEOUT: Duration = CONNECT_WATCHDOG_TIMEOUT;
+const INTERVAL: Duration = HEARTBEAT_INTERVAL;
+const MISS_LIMIT: u32 = HEARTBEAT_MISS_LIMIT;
 
 fn under() -> Duration {
     TIMEOUT - Duration::from_millis(1)
@@ -82,5 +87,76 @@ fn the_connecting_check_does_not_care_about_case() {
     assert_eq!(
         connect_watchdog_action(Some((4, TIMEOUT)), 4, "Connecting", TIMEOUT),
         WatchdogAction::TimedOut
+    );
+}
+
+/// The "no pulse has ever arrived" branch.
+///
+/// It existed in the source but could not run: its only caller invoked
+/// `heartbeat_stall_action` inside `if let Some(beat) = ...`, so the `None` case
+/// was structurally excluded, and an engine that produced *no* event at all — the
+/// worst case, not the ordinary one — looked identical to a healthy session.
+#[test]
+fn a_session_that_has_never_pulsed_becomes_a_stall_on_a_clock() {
+    assert_eq!(
+        heartbeat_stall_action(
+            None,
+            true,
+            MISS_LIMIT,
+            INTERVAL,
+            Some(INTERVAL * (MISS_LIMIT + 1))
+        ),
+        Some("no progress event received".to_string())
+    );
+    // Inside the budget there is nothing to conclude yet...
+    assert_eq!(
+        heartbeat_stall_action(
+            None,
+            true,
+            MISS_LIMIT,
+            INTERVAL,
+            Some(Duration::from_secs(1))
+        ),
+        None
+    );
+    // ...and with no session age at all the function must not invent one.
+    assert_eq!(
+        heartbeat_stall_action(None, true, MISS_LIMIT, INTERVAL, None),
+        None
+    );
+    // Not armed: never a stall, whatever the clocks say.
+    assert_eq!(
+        heartbeat_stall_action(
+            None,
+            false,
+            MISS_LIMIT,
+            INTERVAL,
+            Some(INTERVAL * (MISS_LIMIT + 5))
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_recent_pulse_wins_over_the_age_of_the_session() {
+    assert_eq!(
+        heartbeat_stall_action(
+            Some(("probing", INTERVAL * (MISS_LIMIT - 1))),
+            true,
+            MISS_LIMIT,
+            INTERVAL,
+            Some(INTERVAL * 100)
+        ),
+        None
+    );
+    assert_eq!(
+        heartbeat_stall_action(
+            Some(("tuning", INTERVAL * (MISS_LIMIT + 1))),
+            true,
+            MISS_LIMIT,
+            INTERVAL,
+            None
+        ),
+        Some("tuning (20 s since the last pulse)".to_string())
     );
 }

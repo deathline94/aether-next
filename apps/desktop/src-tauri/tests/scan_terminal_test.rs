@@ -46,3 +46,52 @@ fn an_abandoned_scan_that_found_nothing_says_so() {
         "got {event}"
     );
 }
+
+/// The activity log's level, decided without a running engine.
+///
+/// The prose fallback asked whether the lowercased line *contained* "error", so a
+/// progress line reading "0 errors" arrived as an error and a healthy session's
+/// log went red.
+#[test]
+fn a_benign_mention_of_errors_is_not_an_error_line() {
+    assert_eq!(
+        aether_desktop_lib::log_level_for("probed 12 endpoints, 0 errors"),
+        "info"
+    );
+    assert_eq!(
+        aether_desktop_lib::log_level_for("error budget still intact"),
+        "info"
+    );
+}
+
+#[test]
+fn a_real_failure_still_classifies_as_error() {
+    assert_eq!(
+        aether_desktop_lib::log_level_for("[07:11:02 ERROR aether::session] handshake error: rst"),
+        "error"
+    );
+    assert_eq!(
+        aether_desktop_lib::log_level_for("engine error: connection refused"),
+        "error"
+    );
+    assert_eq!(
+        aether_desktop_lib::log_level_for("cannot bind 127.0.0.1:1820"),
+        "error"
+    );
+}
+
+#[test]
+fn the_env_logger_token_beats_the_prose_heuristics() {
+    assert_eq!(
+        aether_desktop_lib::log_level_for("[07:11:02  WARN aether] retry after failed probe"),
+        "warn"
+    );
+    assert_eq!(
+        aether_desktop_lib::log_level_for("[-] degraded path"),
+        "warn"
+    );
+    assert_eq!(
+        aether_desktop_lib::log_level_for("data-plane verified"),
+        "info"
+    );
+}

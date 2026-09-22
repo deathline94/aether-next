@@ -137,3 +137,83 @@ fn legacy_spellings_load_and_unknown_ones_fall_back_instead_of_failing() {
     assert_eq!(IpVersion::Dual.as_str(), "both");
     assert_eq!(ScanMode::parse("thorogh"), None);
 }
+
+/// A damaged file used to decode into `Settings::default()`, and the page's
+/// debounced autosave then wrote those defaults back over the user's real
+/// protocol / ports / obfuscation. The load has to fail for the persist effect to
+/// have anything to gate on.
+#[test]
+fn a_damaged_settings_file_is_refused_rather_than_replaced_by_defaults() {
+    let err =
+        aether_desktop_lib::decode_settings_text(r#"{"protocol":"masque","httpPort":"18a20"}"#)
+            .expect_err("a field that is not the type it claims must not decode");
+    let json = serde_json::to_value(&err).expect("errors carry their code over IPC");
+    assert_eq!(json["code"], "settings_corrupt");
+    assert_eq!(json["field"], "settings");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refusing to overwrite"),
+        "the message has to say what will not be done: {json}"
+    );
+}
+
+#[test]
+fn an_empty_or_truncated_file_is_corruption_but_an_absent_one_is_not() {
+    assert!(aether_desktop_lib::decode_settings_text("").is_err());
+    assert!(aether_desktop_lib::decode_settings_text("{").is_err());
+    // A whole, valid document — including one that relies on the container default
+    // for every field — still loads.
+    assert!(aether_desktop_lib::decode_settings_text("{}").is_ok());
+}
+
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "aether-{tag}-{}-{nanos}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+/// The writers used to share one hardcoded name — `settings.json.tmp`,
+/// `proxy-recovery.json.tmp` — with `fs::write` and no flush. Any second writer
+/// (an autosave during a connect) overwrote the first one's temp, and the rename
+/// then published whichever bytes happened to be there.
+#[test]
+fn an_atomic_write_leaves_a_foreign_temporary_file_beside_its_target_alone() {
+    let dir = scratch_dir("atomic");
+    let target = dir.join("settings.json");
+    let foreign = dir.join("settings.json.tmp");
+    std::fs::write(&foreign, b"someone else's bytes").expect("seed temp");
+    std::fs::write(&target, b"original").expect("seed target");
+
+    aether_desktop_lib::write_atomic(&target, b"replacement").expect("atomic write");
+
+    assert_eq!(
+        std::fs::read(&target).unwrap().as_slice(),
+        b"replacement".as_slice()
+    );
+    assert_eq!(
+        std::fs::read(&foreign).unwrap().as_slice(),
+        b"someone else's bytes".as_slice(),
+        "the old code wrote here and renamed it over the target"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_atomic_write_that_fails_leaves_no_temporary_behind() {
+    let dir = scratch_dir("atomic-fail");
+    let target = dir.join("missing-subdir").join("proxy-recovery.json");
+    assert!(aether_desktop_lib::write_atomic(&target, b"x").is_err());
+    assert!(!dir.join("missing-subdir").exists(), "no temp may survive");
+    let _ = std::fs::remove_dir_all(&dir);
+}

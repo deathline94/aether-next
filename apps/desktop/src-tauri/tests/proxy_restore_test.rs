@@ -367,3 +367,58 @@ fn the_applied_expectation_is_what_the_writer_writes() {
         Ok(())
     );
 }
+
+/// The token that goes into the Windows `ProxyOverride` list, which is
+/// semicolon-separated and parsed by WinINet — so the character class is the
+/// injection boundary, and a mangling rule that also breaks real addresses is a
+/// correctness bug in its own right.
+#[test]
+fn a_portless_ipv6_endpoint_keeps_its_address() {
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("2001:db8::1").as_deref(),
+        Some("2001:db8::1"),
+        "splitting an unbracketed IPv6 on its last colon used to yield `2001:db8:`"
+    );
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("[2001:db8::1]:1820").as_deref(),
+        Some("2001:db8::1")
+    );
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("[::1]").as_deref(),
+        Some("::1")
+    );
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("127.0.0.1:1820").as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("example.com:443").as_deref(),
+        Some("example.com")
+    );
+    assert_eq!(
+        aether_desktop_lib::sanitize_proxy_bypass_host("localhost").as_deref(),
+        Some("localhost")
+    );
+}
+
+#[test]
+fn a_token_that_cannot_be_a_host_is_refused() {
+    for bad in [
+        "1.2.3.4;Block",
+        "a<b",
+        "http://x:80",
+        "",
+        "   ",
+        ":::;",
+        "host:",
+        "[::1",
+        "[::1]x",
+        "[::1]:abc",
+    ] {
+        assert_eq!(
+            aether_desktop_lib::sanitize_proxy_bypass_host(bad),
+            None,
+            "{bad:?} must not reach the registry"
+        );
+    }
+}

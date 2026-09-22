@@ -159,38 +159,132 @@ use tauri::{
 };
 use zeroize::Zeroize;
 
+/// Absolute path to a binary under `%SystemRoot%\\System32`.
+///
+/// `Command::new("icacls")` resolves through the standard Windows search order,
+/// which tries the *application directory* first. The portable package ships the
+/// GUI into a folder that `allowed_binary_roots` also trusts, so a dropped
+/// `icacls.exe`/`powershell.exe` beside the exe runs with the shell's token: the
+/// interactive user, and Administrator on the documented elevated TUN path.
+/// System utilities are therefore always addressed by full path, and a missing
+/// `%SystemRoot%` fails closed instead of falling back to the bare name.
+#[cfg(windows)]
+fn system32(program: &str) -> Result<PathBuf, CommandError> {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| {
+            CommandError::new(
+                "internal",
+                format!("cannot locate %SystemRoot%\\System32\\{program}"),
+            )
+        })?;
+    Ok(root.join("System32").join(program))
+}
+
+/// SDDL string (`S-1-5-21-...`) for the user SID of *this* process token.
+///
+/// Built from `GetTokenInformation(TokenUser)` rather than `ConvertSidToStringSidW`
+/// so no ambient environment value takes part in an access decision.
+#[cfg(windows)]
+fn current_user_sid_string() -> Result<String, CommandError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid,
+        TokenUser, PSID, SID, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(CommandError::new("internal", "cannot open process token"));
+        }
+        // First call fails with ERROR_INSUFFICIENT_BUFFER and reports the size.
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed < std::mem::size_of::<TOKEN_USER>() as u32 {
+            CloseHandle(token);
+            return Err(CommandError::new("internal", "cannot read token user SID"));
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut _,
+            needed,
+            &mut needed,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(CommandError::new("internal", "cannot read token user SID"));
+        }
+        let user: TOKEN_USER = std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_USER);
+        let sid: PSID = user.User.Sid;
+        if sid.is_null() || IsValidSid(sid) == 0 || GetLengthSid(sid) == 0 {
+            return Err(CommandError::new("internal", "malformed token user SID"));
+        }
+        let sid_ref = &*(sid as *const SID);
+        let count_ptr = GetSidSubAuthorityCount(sid);
+        if sid_ref.Revision != 1 || count_ptr.is_null() {
+            return Err(CommandError::new("internal", "malformed token user SID"));
+        }
+        let mut identifier_authority: u64 = 0;
+        for byte in sid_ref.IdentifierAuthority.Value.iter() {
+            identifier_authority = (identifier_authority << 8) | u64::from(*byte);
+        }
+        let mut out = format!("S-{}-{}", sid_ref.Revision, identifier_authority);
+        for index in 0..u32::from(*count_ptr) {
+            let sub = GetSidSubAuthority(sid, index);
+            if sub.is_null() {
+                return Err(CommandError::new("internal", "malformed token user SID"));
+            }
+            out.push('-');
+            out.push_str(&(*sub).to_string());
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(windows)]
 pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
     // Fail closed. The previous `if let Ok(user)` skipped the whole ACL whenever
-    // `%USERNAME%` was unavailable, so the file that gates every other secret
-    // kept whatever the directory handed out. A SID-derived principal is the
-    // follow-up (the engine already does this); the name is unambiguous for the
-    // non-elevated case that reads these files.
-    #[allow(clippy::disallowed_methods)]
-    let user = std::env::var("USERNAME").map_err(|e| {
-        CommandError::new("internal", format!("cannot determine ACL principal: {e}"))
-    })?;
+    // the principal was unavailable, so the file that gates every other secret
+    // kept whatever the directory handed out.
+    //
+    // The principal comes from the token's user SID, never from `%USERNAME%`: on
+    // the documented elevated path ("Run as administrator" with a different
+    // admin credential) the env var names the *elevator's* account, so one
+    // elevated run re-granted the secrets to the admin and locked the ordinary
+    // user out of settings.json / config_key.dpapi / aether.toml - and made the
+    // DPAPI master key undecryptable for the account that owns it.
+    let sid = current_user_sid_string()?;
+    let icacls = system32("icacls.exe")?;
     {
         let is_dir = path.is_dir();
-        let user_perm = if is_dir {
-            format!("{user}:(OI)(CI)F")
-        } else {
-            format!("{user}:F")
-        };
-        let sys_perm = if is_dir {
-            "SYSTEM:(OI)(CI)F"
-        } else {
-            "SYSTEM:F"
-        };
-        let output = std::process::Command::new("icacls")
+        let scope = if is_dir { "(OI)(CI)" } else { "" };
+        let user_perm = format!("*{sid}:{scope}F");
+        let sys_perm = format!("SYSTEM:{scope}F");
+        let output = Command::new(&icacls)
             .arg(path.as_os_str())
-            .arg("/inheritance:r")
+            // Grant only. `/inheritance:r` revoked every inherited ACE, which is
+            // how an elevated run could delete the owning user's inherited
+            // access; `/grant:r` replaces just the explicit ACE for each named
+            // principal and leaves inheritance (and the owner's grant coming
+            // through it) untouched.
             .arg("/grant:r")
             .arg(&user_perm)
             .arg("/grant:r")
             .arg(sys_perm)
             .output()
-            .map_err(|e| format!("failed to execute icacls on {}: {e}", path.display()))?;
+            .map_err(|e| {
+                format!(
+                    "failed to execute {} on {}: {e}",
+                    icacls.display(),
+                    path.display()
+                )
+            })?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -453,7 +547,15 @@ pub mod dpapi {
             return Err(format!("cannot rename to {}: {e}", key_file.display()).into());
         }
 
-        let _ = super::restrict_directory_acl(&key_file);
+        // The temp file's DACL travels with the rename, so this repeats a
+        // restriction that is normally already in place — and repeating it while
+        // *discarding* the result (`let _ =`) was the defect: where the directory
+        // re-inherits over the file's own DACL, a failure here was silently the
+        // difference between "this user can read the master key" and "everyone
+        // can", against a comment that says fail closed. Report it, but leave the
+        // file in place: deleting a DPAPI master key the user may already have
+        // identities wrapped under is a worse loss than a loud failure.
+        super::restrict_directory_acl(&key_file)?;
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(raw_key);
         raw_key.zeroize();
@@ -713,6 +815,12 @@ struct AppState {
     proxy_applied: Mutex<Option<windows_proxy::ProxySnapshot>>,
     connected_once: AtomicBool,
     connecting: AtomicBool,
+    /// Set for the whole of a teardown's child wait. `disconnect` must not hold
+    /// `operation` across that wait (the output pumps take it per line, so the
+    /// pipes would stop being drained), which reopens the window the old comment
+    /// called M7: a connect slipping in mid-teardown. This flag is what closes it
+    /// again without the lock.
+    tearing_down: AtomicBool,
     generation: AtomicU64,
     /// `(generation, when)` for the session currently in `connecting`. The
     /// watchdog in `watch_child` fires only while the generation still matches,
@@ -813,6 +921,7 @@ impl Default for AppState {
             proxy_applied: Mutex::new(None),
             connected_once: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
+            tearing_down: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             connect_since: Mutex::new(None),
             last_beat: Mutex::new(None),
@@ -842,31 +951,101 @@ fn repair_proxy_requested() -> bool {
     std::env::args().any(|a| a == "--repair-proxy")
 }
 
+/// `--minimized`, the flag `autostart::set(true)` writes into the HKCU\Run value.
+/// Without it the launch-at-login path only ever consulted `start_minimized` from
+/// settings.json, so enabling autostart dropped a full window on the desktop at
+/// every logon.
+fn start_minimized_requested() -> bool {
+    std::env::args().any(|a| a == "--minimized")
+}
+
 fn proxy_recovery_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
     Ok(config_dir(app)?.join("proxy-recovery.json"))
 }
 
-fn load_settings_file(app: &AppHandle) -> Settings {
-    let Ok(path) = settings_path(app) else {
-        return Settings::default();
-    };
-    if !path.exists() {
-        return Settings::default();
-    }
+/// Decode the contents of `settings.json`, distinguishing "absent" from
+/// "damaged". Public so the corruption path is unit-testable without an app.
+pub fn decode_settings_text(text: &str) -> Result<Settings, CommandError> {
+    serde_json::from_str::<Settings>(text).map_err(|e| CommandError {
+        code: "settings_corrupt",
+        message: format!("settings.json is not readable ({e}); refusing to overwrite it"),
+        field: Some("settings"),
+    })
+}
+
+/// Read the persisted settings.
+///
+/// A malformed file used to be folded into `Settings::default()` here, and the
+/// frontend's autosave (debounced at ~400 ms) then wrote those defaults back
+/// over the user's real protocol / ports / obfuscation settings. Absent is a
+/// first run and still yields defaults; *damaged* is now an error the UI can
+/// show and, crucially, gate its persist effect on.
+fn load_settings_file(app: &AppHandle) -> Result<Settings, CommandError> {
+    let path = settings_path(app)?;
     match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<Settings>(&text) {
-            Ok(s) => s,
-            Err(e) => {
-                // Corrupt settings: keep file, use defaults, surface in log via stderr.
-                eprintln!("settings.json invalid ({e}); using defaults");
-                Settings::default()
-            }
-        },
-        Err(e) => {
-            eprintln!("settings.json unreadable ({e}); using defaults");
-            Settings::default()
-        }
+        Ok(text) => decode_settings_text(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(CommandError::new(
+            "settings_unreadable",
+            format!("cannot read {}: {e}", path.display()),
+        )),
     }
+}
+
+/// For readers that only *launch* something and never write the file back: a
+/// damaged settings.json must not disable the route sweep or the diagnostics
+/// export, but the reason has to be in the log rather than silent.
+fn load_settings_or_defaults(app: &AppHandle) -> Settings {
+    load_settings_file(app).unwrap_or_else(|e| {
+        eprintln!("settings unusable ({e}); continuing with defaults for this read");
+        Settings::default()
+    })
+}
+
+/// Write `bytes` to `path` by way of an exclusively-created, uniquely named
+/// temporary file that is flushed before it is renamed into place.
+///
+/// The settings file and the proxy-recovery journal used to share a fixed
+/// `*.json.tmp` name written with `fs::write` and no `sync_all`: two writers (an
+/// autosave and a connect, or two shells over the same profile) interleaved into
+/// one temp file, and a rename could publish bytes that were still in the cache
+/// across a power loss — for `proxy-recovery.json` that is the only record of
+/// what the machine's proxy was before Aether touched it. Same discipline as the
+/// DPAPI envelope write. Public so the temp-file discipline is testable.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let inner = || -> std::io::Result<()> {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Owner-only from the first byte: these files are written next to the
+            // DPAPI key where `restrict_directory_acl` is a no-op.
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    let result = inner();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), CommandError> {
@@ -874,10 +1053,8 @@ fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), Comman
     let parent = path.parent().ok_or("invalid config path")?;
     fs::create_dir_all(parent).map_err(CommandError::from)?;
     restrict_directory_acl(parent)?;
-    let json = serde_json::to_string_pretty(settings).map_err(CommandError::from)?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json).map_err(CommandError::from)?;
-    fs::rename(&tmp, &path).map_err(CommandError::from)
+    let json = serde_json::to_vec_pretty(settings).map_err(CommandError::from)?;
+    write_atomic(&path, &json).map_err(CommandError::from)
 }
 
 fn emit_state(
@@ -953,10 +1130,7 @@ fn validated_noize(noize: Option<&str>) -> Result<&'static str, CommandError> {
         .ok_or_else(|| {
             CommandError::validation(
                 "noize",
-                format!(
-                    "noize must be one of: {}",
-                    NOIZE_VOCABULARY.join(", ")
-                ),
+                format!("noize must be one of: {}", NOIZE_VOCABULARY.join(", ")),
             )
         })
 }
@@ -1230,6 +1404,13 @@ fn handle_engine_line(
     }
 
     // Legacy log markers — only strong readiness signals (not CONNECT/handshake alone).
+    //
+    // A `[-] session failed:` line is *prose*: the engine writes it for a probe
+    // that failed inside a session that is still healthy. Tearing the host down
+    // here meant one transient line from a chatty scan dropped the job-object
+    // handle and restored the system proxy under a live tunnel. Teardown belongs
+    // to the structured `Error` event above and to `watch_child`'s exit path, both
+    // of which know whether the session actually ended.
     if line.contains("[-] session failed:") {
         let msg = line
             .split("[-] session failed:")
@@ -1237,11 +1418,12 @@ fn handle_engine_line(
             .map(|s| s.trim())
             .unwrap_or("Connection failed");
         let state = app.state::<AppState>();
-        if !state.runtime.lock().status.eq_ignore_ascii_case("error") {
+        let status = state.runtime.lock().status.clone();
+        if status.eq_ignore_ascii_case("connected") {
+            // Keep the tunnel; say what was seen.
+            emit_log(app, format!("engine reported a failed session ({msg})"));
+        } else if !status.eq_ignore_ascii_case("error") {
             emit_state(app, &state, "error", msg, None, None);
-            state.generation.fetch_add(1, Ordering::SeqCst);
-            state.connecting.store(false, Ordering::SeqCst);
-            cleanup_routing(app, &state);
         }
     }
     if line.contains("socks5 listening on")
@@ -1280,27 +1462,57 @@ fn handle_engine_line(
     }
 }
 
-fn emit_log(app: &AppHandle, line: String) {
-    // Engine stderr lines come from env_logger with an uppercase level token
-    // ("[ts LEVEL target] msg") — prefer that exact signal before falling back
-    // to the fuzzy substring heuristics, which misclassified benign lines
-    // containing the word "error" (e.g. "0 errors").
-    let upper_error = line.contains(" ERROR ") || line.starts_with("ERROR ");
-    let upper_warn = line.contains(" WARN ") || line.starts_with("WARN ");
-    let level = if upper_error {
-        "error"
-    } else if upper_warn {
-        "warn"
+/// The env_logger level token, when the line carries one.
+///
+/// Engine stderr lines come from env_logger as `[ts LEVEL target] msg`, so the
+/// uppercase token is the only *authoritative* signal available; everything after
+/// it is a guess about prose.
+fn env_logger_level(line: &str) -> Option<&'static str> {
+    if line.contains(" ERROR ")
+        || line.starts_with("ERROR ")
+        || line.contains(" FATAL ")
+        || line.starts_with("FATAL ")
+    {
+        Some("error")
+    } else if line.contains(" WARN ") || line.starts_with("WARN ") {
+        Some("warn")
     } else {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("error") || lower.contains("failed") {
-            "error"
-        } else if lower.contains("warn") || lower.contains("[-]") {
-            "warn"
-        } else {
-            "info"
-        }
-    };
+        None
+    }
+}
+
+/// Classify one engine line for the activity log. Public so the heuristics are
+/// testable without a running engine.
+///
+/// The fallback used to ask whether the lowercased line *contained* "error", which
+/// made a benign progress line ("0 errors so far", "error budget") arrive as an
+/// error and turned the log into a wall of red on a healthy session. A prose line
+/// now has to carry a failure *marker*, not the word.
+pub fn log_level_for(line: &str) -> &'static str {
+    if let Some(level) = env_logger_level(line) {
+        return level;
+    }
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("error:")
+        || lower.contains(": error")
+        || lower.contains("errors occurred")
+        || lower.contains("failed")
+        || lower.contains("failure")
+        || lower.contains("fatal")
+        || lower.contains("panic")
+        || lower.contains("cannot")
+        || lower.contains("refused")
+    {
+        return "error";
+    }
+    if lower.contains("warn") || lower.contains("[-]") || lower.contains("retrying") {
+        return "warn";
+    }
+    "info"
+}
+
+fn emit_log(app: &AppHandle, line: String) {
+    let level = log_level_for(&line);
     let _ = app.emit(
         "session://log",
         LogEvent {
@@ -1319,7 +1531,11 @@ fn resolve_resource(app: &AppHandle, name: &str) -> Option<PathBuf> {
 
 /// TUN runs elevated: only load regular files under the app install / portable root.
 pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), CommandError> {
-    let meta = fs::metadata(path).map_err(|e| format!("{label}: {e}"))?;
+    // `symlink_metadata`, not `metadata`: `fs::metadata` *follows* reparse points,
+    // so the `FILE_ATTRIBUTE_REPARSE_POINT` test below could only ever observe the
+    // target's attributes. A link planted inside the install directory pointing at
+    // any PE on the machine satisfied "regular file, not a reparse point".
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("{label}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{label} is not a regular file").into());
     }
@@ -1346,7 +1562,19 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), Comman
     let app_root = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+    // The root test runs on the *canonical* path or not at all. Falling back to the
+    // raw path on a failed canonicalize meant `…\Aether\..\..\evil\aether.exe` was
+    // compared as a string against `…\Aether` and passed — a `..` walk out of the
+    // trusted root, straight into the elevated TUN launch.
+    let canon = path.canonicalize().map_err(|e| {
+        CommandError::new(
+            "validation",
+            format!(
+                "{label} rejected: its final path cannot be resolved ({e}), so it cannot be \
+                 shown to live under a trusted root"
+            ),
+        )
+    })?;
     let roots = allowed_binary_roots(app_root.as_deref());
     for root in &roots {
         if canon.starts_with(root) {
@@ -1355,29 +1583,55 @@ pub fn validate_trusted_binary(path: &PathBuf, label: &str) -> Result<(), Comman
     }
     Err(format!(
         "{label} rejected: must live under the app install directory (got {})",
-        path.display()
+        canon.display()
     )
     .into())
 }
 
 /// Only allow safe host tokens into Windows ProxyOverride (no `;` injection).
-fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
-    let host = endpoint
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(endpoint)
-        .trim_matches(['[', ']', ' ', '\t']);
-    if host.is_empty() || host.len() > 253 {
+pub fn sanitize_proxy_bypass_host(endpoint: &str) -> Option<String> {
+    let trimmed = endpoint.trim();
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]` or `[::1]:8080`. The port lives *outside* the
+        // brackets, so the plain `rsplit_once(':')` below would have cut the
+        // address itself in half.
+        let (addr, suffix) = rest.split_once(']')?;
+        let port_is_well_formed = suffix.is_empty()
+            || (suffix.len() > 1
+                && suffix.starts_with(':')
+                && suffix[1..].bytes().all(|b| b.is_ascii_digit()));
+        if !port_is_well_formed {
+            return None;
+        }
+        addr
+    } else {
+        match trimmed.rsplit_once(':') {
+            // `host:port` — but only when the head holds no colon of its own.
+            // A bare, unbracketed IPv6 address (`2001:db8::1`, no port at all)
+            // used to come back as `2001:db8:`, i.e. a wrong host written into
+            // the system bypass list.
+            Some((head, port))
+                if !head.is_empty()
+                    && !head.contains(':')
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                head
+            }
+            _ => trimmed,
+        }
+    };
+    let host = host.trim();
+    if host.is_empty() || host.len() > 253 || host.ends_with(':') {
         return None;
     }
-    // IPv4 / hostname / simple IPv6 without zone or separators that break registry lists.
-    let ok = host
+    // This character class *is* the filter. `;`, `<` and `>` — and every other
+    // delimiter ProxyOverride could mis-parse — are not in it, so they need no
+    // separate (and unreachable) `contains` checks beside it.
+    let allowed = host
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
-        && !host.contains(';')
-        && !host.contains('<')
-        && !host.contains('>');
-    ok.then(|| host.to_string())
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'));
+    allowed.then(|| host.to_string())
 }
 
 /// The only directories an engine binary may live in.
@@ -1566,10 +1820,84 @@ impl std::fmt::Display for BinaryTrustError {
 
 impl std::error::Error for BinaryTrustError {}
 
+/// The pinned signing-certificate digest the anchor holds for `filename`, or
+/// `None` when the anchor carries no entry or only the all-zero placeholder.
+pub fn embedded_cert_pin(filename: &str) -> Option<&'static str> {
+    EMBEDDED_ISSUER_CERTS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(filename))
+        .map(|(_, digest)| *digest)
+        .filter(|digest| *digest != PLACEHOLDER_SHA256)
+}
+
+/// Does this X.500 subject name `expected_cn` as a whole CN RDN value?
+///
+/// `subject.contains("CN=deathline94")` matched `CN=deathline94.example.com`, and
+/// the looser `eq_ignore_ascii_case` fallback matched a subject with no `CN=` at
+/// all — so any certificate whose common name merely *starts* with the expected
+/// text passed "published by deathline94". Distinguished names are compared per
+/// RDN instead: `CN=deathline94` matches, `CN=deathline94.example.com` and
+/// `O=CN=deathline94` do not.
+pub fn subject_names_common_name(subject: &str, expected_cn: &str) -> bool {
+    let expected = expected_cn.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    let bytes = subject.as_bytes();
+    let mut start = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut matched = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'"' => quoted = !quoted,
+            b',' | b';' if !quoted => {
+                matched |= cn_rdn_matches(&subject[start..index], expected);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    matched || cn_rdn_matches(&subject[start..], expected)
+}
+
+fn cn_rdn_matches(rdn: &str, expected: &str) -> bool {
+    let Some((name, value)) = rdn.split_once('=') else {
+        return false;
+    };
+    if !name.trim().eq_ignore_ascii_case("CN") {
+        return false;
+    }
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    // Undo the `\,` / `\"` escaping a DN uses inside quoted values.
+    let mut unescaped = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(next) => unescaped.push(next),
+                None => unescaped.push(c),
+            },
+            other => unescaped.push(other),
+        }
+    }
+    unescaped.trim().eq_ignore_ascii_case(expected)
+}
+
 #[cfg(windows)]
 pub fn verify_authenticode_signature(
     path: &Path,
     expected_cn: &str,
+    expected_cert_sha256: Option<&str>,
 ) -> Result<(), BinaryTrustError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Security::WinTrust::{
@@ -1635,12 +1963,23 @@ pub fn verify_authenticode_signature(
         ));
     }
 
-    if !expected_cn.is_empty() {
+    if !expected_cn.is_empty() || expected_cert_sha256.is_some() {
+        // Full path: `powershell.exe` resolved through the search order that puts
+        // the application directory first.
+        let shell = crate::system32("WindowsPowerShell\\v1.0\\powershell.exe")
+            .map_err(|e| BinaryTrustError::Validation(e.message))?;
+        let quoted = path.to_string_lossy().replace('\'', "''");
+        // The leaf's own digest, sha256 over its DER — which is what the anchor's
+        // `cert_sha256` field is defined as, and *not* the SHA-1 store thumbprint
+        // `Get-AuthenticodeSignature` exposes as `Thumbprint`.
         let ps_cmd = format!(
-            "(Get-AuthenticodeSignature -LiteralPath '{}').SignerCertificate.Subject",
-            path.to_string_lossy().replace('\'', "''")
+            "$c = (Get-AuthenticodeSignature -LiteralPath '{quoted}').SignerCertificate; \
+             if ($null -eq $c) {{ exit 3 }}; \
+             $sha = [System.BitConverter]::ToString( \
+             [System.Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData) \
+             ) -replace '-',''; Write-Output $sha; Write-Output $c.Subject"
         );
-        let out = Command::new("powershell")
+        let out = Command::new(&shell)
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .output()
             .map_err(|e| {
@@ -1654,9 +1993,23 @@ pub fn verify_authenticode_signature(
             )));
         }
 
-        let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let expected_needle = format!("CN={expected_cn}");
-        if !subject.contains(&expected_needle) && !subject.eq_ignore_ascii_case(expected_cn) {
+        let text = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        let mut lines = text.trim().splitn(2, '\n');
+        let found_hash = lines.next().unwrap_or("").trim().to_ascii_lowercase();
+        let subject = lines.next().unwrap_or("").trim().to_string();
+
+        // The certificate itself, not what it says it is called. A subject the
+        // signer writes is free; the leaf digest is only obtainable from whoever
+        // holds the private key that the release job recorded.
+        if let Some(pinned) = expected_cert_sha256 {
+            if found_hash != pinned.to_ascii_lowercase() {
+                return Err(BinaryTrustError::PublisherMismatch {
+                    expected: format!("{expected_cn} (leaf sha256 {pinned})"),
+                    found: format!("{subject} (leaf sha256 {found_hash})"),
+                });
+            }
+        }
+        if !expected_cn.is_empty() && !subject_names_common_name(&subject, expected_cn) {
             return Err(BinaryTrustError::PublisherMismatch {
                 expected: expected_cn.to_string(),
                 found: subject,
@@ -1671,6 +2024,7 @@ pub fn verify_authenticode_signature(
 pub fn verify_authenticode_signature(
     _path: &Path,
     _expected_cn: &str,
+    _expected_cert_sha256: Option<&str>,
 ) -> Result<(), BinaryTrustError> {
     Ok(())
 }
@@ -1694,10 +2048,21 @@ pub fn verify_elevated_binary(
     let path_buf = path.to_path_buf();
     validate_trusted_binary(&path_buf, label)
         .map_err(|e| BinaryTrustError::Validation(e.message))?;
+    // Hash and authenticate the *final* path. The two checks used to open whatever
+    // name the caller passed while the root test resolved it separately, so the
+    // bytes witnessed here and the file later launched were not guaranteed to be
+    // the same object.
+    let verified_path = path.canonicalize().map_err(|e| {
+        BinaryTrustError::Validation(format!(
+            "{}: cannot resolve a final path for verification ({e})",
+            path.display()
+        ))
+    })?;
 
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or(label);
 
-    let actual_hash = file_sha256_hex(path).map_err(|e| BinaryTrustError::Validation(e.message))?;
+    let actual_hash =
+        file_sha256_hex(&verified_path).map_err(|e| BinaryTrustError::Validation(e.message))?;
 
     let mut found_hash = false;
     for &(expected_name, expected_hash) in policy.embedded_hashes {
@@ -1735,7 +2100,18 @@ pub fn verify_elevated_binary(
 
     #[cfg(windows)]
     {
-        let auth_res = verify_authenticode_signature(path, policy.expected_publisher_cn);
+        // sha256 of the signing leaf, straight from the same anchor the file
+        // digests come from. Absent (or the all-zero placeholder) means nothing is
+        // pinned, which a release build may not treat as a pass for the same
+        // reason it does not treat an absent file digest as one.
+        let pinned = embedded_cert_pin(filename).or_else(|| embedded_cert_pin(label));
+        if pinned.is_none() && policy.enforce_hash_match {
+            return Err(BinaryTrustError::AnchorNotPublished {
+                filename: filename.to_string(),
+            });
+        }
+        let auth_res =
+            verify_authenticode_signature(&verified_path, policy.expected_publisher_cn, pinned);
         match auth_res {
             Ok(()) => {}
             Err(e) => {
@@ -1983,7 +2359,29 @@ fn stream_output<R: std::io::Read + Send + 'static>(
     generation: u64,
 ) {
     std::thread::spawn(move || {
-        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            let line = match lines.next() {
+                Some(Ok(line)) => line,
+                // Clean EOF: the engine closed this pipe, which is the normal end
+                // of a stream.
+                None => break,
+                // A read error is *not* EOF. `.map_while(Result::ok)` used to end
+                // the loop here with no message and no state change, so the UI kept
+                // reporting a live session off a dead pipe: every later readiness,
+                // error and heartbeat event — including the teardown ones — went
+                // unread while the engine carried on running.
+                Some(Err(e)) => {
+                    emit_log(&app, format!("ERROR engine output pipe failed ({e})"));
+                    let state = app.state::<AppState>();
+                    let mut rt = state.runtime.lock();
+                    rt.detail = format!("{} · engine log stream lost", rt.detail);
+                    let snapshot = rt.clone();
+                    drop(rt);
+                    let _ = app.emit("session://state", snapshot);
+                    break;
+                }
+            };
             let state = app.state::<AppState>();
             // Hold operation only for generation check + dispatch, not forever.
             {
@@ -2058,19 +2456,32 @@ pub const HEARTBEAT_MISS_LIMIT: u32 = 3;
 
 /// The stall window, as a pure function of the last pulse so it can be reasoned
 /// about without a running engine.
+///
+/// `since_session_start` is what makes the "no pulse ever arrived" case
+/// expressible. It used to have no clock to be judged against and its only caller
+/// invoked this inside `if let Some(beat)`, so the branch could never run: an
+/// engine that produced no event at all — killed before startup, or whose stdout
+/// is not reaching us — looked identical to one that had not needed a pulse yet.
 pub fn heartbeat_stall_action(
     last_beat: Option<(&str, std::time::Duration)>,
     armed: bool,
     miss_limit: u32,
     interval: std::time::Duration,
+    since_session_start: Option<std::time::Duration>,
 ) -> Option<String> {
     if !armed {
         return None;
     }
-    let Some((phase, elapsed)) = last_beat else {
-        // Connecting with no pulse ever seen: the engine is pre-startup or its
-        // events are not reaching us.
-        return Some("no progress event received".to_string());
+    let (phase, elapsed) = match last_beat {
+        Some((phase, elapsed)) => (phase, elapsed),
+        None => {
+            return match since_session_start {
+                Some(age) if age >= interval * miss_limit => {
+                    Some("no progress event received".to_string())
+                }
+                _ => None,
+            }
+        }
     };
     if elapsed >= interval * miss_limit {
         Some(format!(
@@ -2155,30 +2566,79 @@ fn watch_child(app: AppHandle) {
                 }
             }
         }
-        // Heartbeat stall: a connecting session whose engine stopped pulsing is
-        // wedged inside one phase, which the 90 s connect timeout would otherwise
-        // report as a plain timeout with no idea where it went. Warn once per gap
-        // by clearing the stamp, so the next pulse re-arms it.
+        // Heartbeat stall: a session whose engine stopped pulsing is wedged inside
+        // one phase. During a connect this is a diagnostic the 90 s timeout then
+        // enforces; once *connected* it is the only liveness signal this process
+        // has, because a running-but-stopped-responding engine satisfies every
+        // "does the process exist" check in the file. Warn once per gap by clearing
+        // the stamp, so the next pulse re-arms it.
         {
-            let armed = state.connecting.load(Ordering::SeqCst);
+            let status = state.runtime.lock().status.clone();
+            let armed = state.connecting.load(Ordering::SeqCst)
+                || status.eq_ignore_ascii_case("connecting")
+                || status.eq_ignore_ascii_case("connected");
             let beat = state.last_beat.lock().take();
-            if let Some((phase, at)) = beat {
-                let since = at.elapsed();
-                let stalled = heartbeat_stall_action(
-                    Some((&phase, since)),
-                    armed,
-                    HEARTBEAT_MISS_LIMIT,
-                    HEARTBEAT_INTERVAL,
-                );
-                match stalled {
-                    Some(detail) => {
-                        emit_log(
-                            &app,
-                            format!("Engine stopped reporting while connecting: {detail}"),
-                        );
+            let session_age = (*state.connect_since.lock()).map(|(_, started)| started.elapsed());
+            let stalled = heartbeat_stall_action(
+                beat.as_ref()
+                    .map(|(phase, at)| (phase.as_str(), at.elapsed())),
+                armed,
+                HEARTBEAT_MISS_LIMIT,
+                HEARTBEAT_INTERVAL,
+                session_age,
+            );
+            match stalled {
+                // Teardown only on evidence: a session that has pulsed before and
+                // went silent. A *connected* session that has never pulsed at all
+                // gets the same log line but is not stopped from here, because
+                // "this engine build does not pulse while connected" would otherwise
+                // read as a wedge and kill working tunnels.
+                Some(detail) if status.eq_ignore_ascii_case("connected") && beat.is_some() => {
+                    emit_log(
+                        &app,
+                        format!(
+                            "Engine stopped reporting on a connected session: {detail}. Stopping \
+                             it rather than leaving Windows routed through a tunnel nobody is \
+                             serving"
+                        ),
+                    );
+                    state.generation.fetch_add(1, Ordering::SeqCst);
+                    state.connecting.store(false, Ordering::SeqCst);
+                    *state.connect_since.lock() = None;
+                    if let Some(mut child) = state.child.lock().take() {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(b"shutdown\n");
+                            let _ = stdin.flush();
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
                     }
-                    // Not stalled: put the pulse back for the next tick.
-                    None => *state.last_beat.lock() = Some((phase, at)),
+                    let endpoint = state.runtime.lock().endpoint.clone();
+                    let problems = cleanup_routing(&app, &state);
+                    for problem in &problems {
+                        eprintln!("[aether] {problem}");
+                    }
+                    let detail = if problems.is_empty() {
+                        format!("Tunnel stopped: the engine stopped reporting ({detail})")
+                    } else {
+                        format!(
+                            "Tunnel stopped: the engine stopped reporting ({detail}) · {}",
+                            problems.join(" · ")
+                        )
+                    };
+                    emit_state(&app, &state, "error", &detail, None, endpoint);
+                }
+                Some(detail) => {
+                    emit_log(
+                        &app,
+                        format!("Engine stopped reporting while connecting: {detail}"),
+                    );
+                }
+                // Not stalled: put the pulse back for the next tick.
+                None => {
+                    if let Some((phase, at)) = beat {
+                        *state.last_beat.lock() = Some((phase, at));
+                    }
                 }
             }
         }
@@ -2298,13 +2758,42 @@ fn watch_child(app: AppHandle) {
     });
 }
 
+/// Run a command body that blocks on the filesystem, a child process or the
+/// network on Tauri's blocking pool.
+///
+/// A non-`async` `#[tauri::command]` is resolved on the main (UI) thread, so the
+/// icacls runs, DPAPI calls, multi-megabyte SHA-256s and the 15-second child
+/// waits below froze the window mid-drag and made WebView2 miss its paint
+/// callbacks. Only the boundary changes: the bodies stay synchronous, because
+/// they park on locks and pipes rather than awaiting anything.
+async fn command_blocking<T: Send + 'static>(
+    name: &'static str,
+    task: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
+) -> Result<T, CommandError> {
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|e| CommandError::new("internal", format!("{name} task did not run: {e}")))
+}
+
 #[tauri::command]
-fn get_settings(app: AppHandle) -> Settings {
+fn get_settings(app: AppHandle) -> Result<Settings, CommandError> {
+    // `Err` rather than `Settings::default()` on a damaged file: the frontend
+    // autosaves whatever it was handed, so the silent default *was* the data
+    // loss. A rejected promise is what lets the persist effect gate itself.
     load_settings_file(&app)
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+    command_blocking("save_settings", move || {
+        save_settings_blocking(app, settings)
+    })
+    .await
+}
+
+/// `save_settings`'s body: it runs `icacls` on the config directory and writes the
+/// registry Run key, both of which are child-process waits.
+fn save_settings_blocking(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
     validate_settings(&settings)?;
     save_settings_file(&app, &settings)?;
     #[cfg(windows)]
@@ -2330,12 +2819,23 @@ fn is_admin() -> bool {
 }
 
 #[tauri::command]
-fn connect(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    settings: Settings,
-) -> Result<(), CommandError> {
+async fn connect(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+    command_blocking("connect", move || connect_blocking(app, settings)).await
+}
+
+/// `connect`'s body: icacls, DPAPI, a multi-megabyte SHA-256, a signed-binary
+/// PowerShell query and the engine spawn. Always runs off the UI thread — via
+/// [`command_blocking`] for the IPC path, and on a dedicated thread for the tray
+/// menu item.
+fn connect_blocking(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+    let state = app.state::<AppState>();
     let _operation = state.operation.lock();
+    if state.tearing_down.load(Ordering::SeqCst) {
+        // M7 (see `disconnect`): a connect that lands inside another session's
+        // teardown window ends up having its system-proxy state torn down by that
+        // teardown, and its UI status overwritten with "disconnected".
+        return Err("Aether is still finishing the previous disconnect; try again".into());
+    }
     if state
         .connecting
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -2496,10 +2996,46 @@ fn connect(
             command.creation_flags(0x08000000);
         }
 
+        // M8: the engine is meant to run inside a kill-on-close job so it can
+        // never outlive us. Build the job *before* the spawn and refuse to launch
+        // without it: `eprintln!` is not a user-visible failure in a
+        // `windows_subsystem = "windows"` binary, and an engine that does outlive
+        // the shell keeps ports 1819/1820 bound and the system-proxy registry
+        // pointed at a tunnel nobody can close — the state every later launch
+        // fails against.
+        #[cfg(windows)]
+        let job = engine_job::Job::create().map_err(|error| {
+            CommandError::new(
+                "job_unavailable",
+                format!(
+                    "Cannot start the engine: the kill-on-close job object could not be created \
+                     ({error}); refusing to launch a process that could survive this window with \
+                     the tunnel's ports and the Windows proxy still set"
+                ),
+            )
+        })?;
+
         let mut child = command.spawn().map_err(|e| {
             dpapi_key.zeroize();
             format!("Could not start aether.exe: {e}")
         })?;
+        #[cfg(windows)]
+        if let Err(error) = job.assign_child(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            dpapi_key.zeroize();
+            return Err(CommandError::new(
+                "job_unavailable",
+                format!(
+                    "Cannot start the engine: the spawned process could not be placed in the \
+                     kill-on-close job object ({error}); it has been terminated"
+                ),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            *state.job.lock() = Some(job);
+        }
         // The key travels on stdin, then is wiped: the child never holds it in
         // its environment and neither does this process for longer than a call.
         if let Err(e) = handoff_preamble(&mut child, &dpapi_key, wintun_for_handoff.as_deref()) {
@@ -2510,20 +3046,6 @@ fn connect(
         }
         dpapi_key.zeroize();
         let pid = child.id();
-        // M8: put the engine into a kill-on-close job so it can never outlive us.
-        #[cfg(windows)]
-        match engine_job::Job::create().and_then(|j| {
-            let assigned = j.assign_child(&child);
-            if assigned.is_ok() {
-                *state.job.lock() = Some(j);
-            }
-            assigned
-        }) {
-            Ok(()) => {}
-            Err(error) => {
-                eprintln!("engine job object unavailable ({error}); orphan protection disabled")
-            }
-        }
         let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let socks_seen = Arc::new(AtomicBool::new(false));
         let tunnel_seen = Arc::new(AtomicBool::new(false));
@@ -2562,8 +3084,10 @@ fn connect(
             );
         }
         if let Some(stderr) = stderr {
+            // `app.clone()`, not `app`: `state` above borrows `app`, and the
+            // `connecting` reset after this block still needs it.
             stream_output(
-                app,
+                app.clone(),
                 stderr,
                 settings,
                 socks_seen,
@@ -2579,62 +3103,85 @@ fn connect(
 }
 
 #[tauri::command]
-fn disconnect(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandError> {
-    // M7 fix: hold the operation lock across the WHOLE teardown. The old code
-    // released it while waiting on the child, letting a concurrent connect slip
-    // in — after which cleanup_routing tore down the NEW session's system-proxy
-    // state and clobbered its UI status with "disconnected". Holding is safe:
-    // stream threads acquire the lock per-line only and observe the bumped
-    // generation as soon as we release.
-    let _operation = state.operation.lock();
-    state.generation.fetch_add(1, Ordering::SeqCst);
-    state.connecting.store(false, Ordering::SeqCst);
-    let mut child = state.child.lock().take();
-    let mut problems: Vec<String> = Vec::new();
-    if let Some(child) = child.as_mut() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(b"shutdown\n");
-            let _ = stdin.flush();
-        }
-        // Fifteen seconds, and never silently. The engine uses this window to
-        // close the tunnel, drop the routes it journaled and reset the adapter;
-        // five was routinely too short on a slow link, so the shell killed it
-        // mid-teardown and the machine kept routes to a dead adapter — with no
-        // log line saying a kill happened.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                _ => {
-                    eprintln!("[aether] engine outlived the 15s teardown grace; forcing exit");
-                    problems.push(
-                        "the engine had to be killed after the 15 s teardown grace; the routes it \
-                         journaled may still be installed"
-                            .to_string(),
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
+async fn disconnect(app: AppHandle) -> Result<(), CommandError> {
+    command_blocking("disconnect", move || disconnect_blocking(app)).await
+}
+
+fn disconnect_blocking(app: AppHandle) -> Result<(), CommandError> {
+    let state = app.state::<AppState>();
+    let outcome = (|| -> Result<(), CommandError> {
+        // Take the child and retire the generation under `operation`, then
+        // RELEASE it before waiting. M7 asked for the lock to span the whole
+        // teardown and it did — that was the bug: the output pumps acquire
+        // `operation` for every single line (`stream_output`), so holding it
+        // across the 15 s grace window meant nobody drained the pipes. A chatty
+        // engine filled its stdout buffer, blocked writing, never reached its own
+        // route-teardown path, and was force-killed at the end of the window —
+        // exactly the outcome that leaves journaled routes installed and the
+        // Windows proxy pointing at a dead port. The `tearing_down` gate is what
+        // keeps a concurrent connect out of this window, not the lock.
+        let mut child = {
+            let _operation = state.operation.lock();
+            state.generation.fetch_add(1, Ordering::SeqCst);
+            state.connecting.store(false, Ordering::SeqCst);
+            state.tearing_down.store(true, Ordering::SeqCst);
+            state.child.lock().take()
+        };
+        let mut problems: Vec<String> = Vec::new();
+        if let Some(child) = child.as_mut() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b"shutdown\n");
+                let _ = stdin.flush();
+            }
+            // Fifteen seconds, and never silently. The engine uses this window to
+            // close the tunnel, drop the routes it journaled and reset the adapter;
+            // five was routinely too short on a slow link, so the shell killed it
+            // mid-teardown and the machine kept routes to a dead adapter — with no
+            // log line saying a kill happened.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    _ => {
+                        eprintln!("[aether] engine outlived the 15s teardown grace; forcing exit");
+                        problems.push(
+                            "the engine had to be killed after the 15 s teardown grace; the routes it \
+                             journaled may still be installed"
+                                .to_string(),
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
                 }
             }
         }
-    }
-    problems.extend(cleanup_routing(&app, &state));
+        // `child` is dropped here, closing its handles; the job object is dropped
+        // by `cleanup_routing`, which is what kills anything still inside it.
+        problems.extend(cleanup_routing(&app, &state));
 
-    if problems.is_empty() {
-        emit_state(&app, &state, "disconnected", "Ready", None, None);
-        return Ok(());
+        if problems.is_empty() {
+            emit_state(&app, &state, "disconnected", "Ready", None, None);
+            return Ok(());
+        }
+        // Partial failure is reported as partial failure. The tunnel *is* down, so the
+        // status says so, but "Ready" would claim the host was put back together when
+        // the teardown path knows it was not.
+        let detail = problems.join(" · ");
+        eprintln!("[aether] disconnect incomplete: {detail}");
+        emit_state(&app, &state, "disconnected", &detail, None, None);
+        Err(CommandError::new("disconnect_incomplete", detail))
+    })();
+    {
+        // Under `operation`, so a connect either sees the gate and refuses, or
+        // starts after every byte of host state has been put back.
+        let _operation = state.operation.lock();
+        state.tearing_down.store(false, Ordering::SeqCst);
     }
-    // Partial failure is reported as partial failure. The tunnel *is* down, so the
-    // status says so, but "Ready" would claim the host was put back together when
-    // the teardown path knows it was not.
-    let detail = problems.join(" · ");
-    eprintln!("[aether] disconnect incomplete: {detail}");
-    emit_state(&app, &state, "disconnected", &detail, None, None);
-    Err(CommandError::new("disconnect_incomplete", detail))
+    outcome
 }
 
 #[tauri::command]
@@ -2656,7 +3203,7 @@ fn app_info() -> serde_json::Value {
 /// scrubbed — and does not wait for it.
 #[cfg(windows)]
 fn spawn_route_repair(app: &AppHandle) {
-    let settings = load_settings_file(app);
+    let settings = load_settings_or_defaults(app);
     let Ok(executable) = engine_path(app, &settings) else {
         return; // No resolvable engine yet; connect will report the real reason.
     };
@@ -2681,18 +3228,25 @@ fn spawn_route_repair(app: &AppHandle) {
 /// tunnel and never needs the config key, so no preamble and no key line go to
 /// the child. The binary is still verified first — a diagnostics run executes
 /// code just like a session does.
+/// How long `aether --diagnostics` may take before the shell gives up on it.
+/// The child writes a small JSON document and exits; anything past this is a
+/// hang, and `Command::output()` (what this replaced) waits forever on one.
+const DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[tauri::command]
-fn diagnostics(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, CommandError> {
+async fn diagnostics(app: AppHandle) -> Result<serde_json::Value, CommandError> {
+    command_blocking("diagnostics", move || diagnostics_blocking(app)).await
+}
+
+fn diagnostics_blocking(app: AppHandle) -> Result<serde_json::Value, CommandError> {
+    let state = app.state::<AppState>();
     if state.child.lock().is_some() || state.scan_child.lock().is_some() {
         return Err(CommandError::new(
             "busy",
             "Stop the running session or scan before exporting diagnostics.",
         ));
     }
-    let settings = load_settings_file(&app);
+    let settings = load_settings_or_defaults(&app);
     let executable = engine_path(&app, &settings)?;
     verify_engine_or_refuse(&executable)?;
 
@@ -2704,21 +3258,65 @@ fn diagnostics(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .map_err(|e| CommandError::new("spawn_failed", format!("Could not run the engine: {e}")))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
+    // Read both pipes on their own threads so a child that fills one of them
+    // cannot deadlock against the wait below, and give the wait a deadline: an
+    // engine that wedges inside `--diagnostics` used to hold this command — and,
+    // because it was synchronous, the UI thread — open indefinitely.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut handle) = stdout_handle {
+            let _ = std::io::Read::read_to_end(&mut handle, &mut bytes);
+        }
+        bytes
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut handle) = stderr_handle {
+            let _ = std::io::Read::read_to_end(&mut handle, &mut bytes);
+        }
+        bytes
+    });
+    let deadline = std::time::Instant::now() + DIAGNOSTICS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let detail = match other {
+                    Err(e) => format!("its exit status could not be read ({e})"),
+                    _ => format!("it did not exit within {} s", DIAGNOSTICS_TIMEOUT.as_secs()),
+                };
+                return Err(CommandError::new(
+                    "timeout",
+                    format!("Diagnostics were terminated: {detail}; the engine process was killed"),
+                ));
+            }
+        }
+    };
+    // The process is gone, so both write ends are closed and these joins cannot
+    // block on a live child.
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if !status.success() {
+        let err = String::from_utf8_lossy(&stderr);
         return Err(CommandError::new(
             "engine_failed",
             format!(
-                "Diagnostics exited {} — {}",
-                output.status,
+                "Diagnostics exited {status} — {}",
                 err.lines().last().unwrap_or("").trim()
             ),
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
     let value: serde_json::Value = serde_json::from_str(text.trim()).map_err(|e| {
         CommandError::new(
             "bad_output",
@@ -2729,7 +3327,16 @@ fn diagnostics(
 }
 
 #[tauri::command]
-fn test_connection(settings: Settings) -> Result<String, CommandError> {
+async fn test_connection(settings: Settings) -> Result<String, CommandError> {
+    command_blocking("test_connection", move || {
+        test_connection_blocking(settings)
+    })
+    .await
+}
+
+/// The probe itself. `ureq`'s agent is synchronous and its timeout is 12 s, so
+/// this has to run off the UI thread.
+fn test_connection_blocking(settings: Settings) -> Result<String, CommandError> {
     validate_settings(&settings)?;
     let url = "https://www.cloudflare.com/cdn-cgi/trace";
 
@@ -2767,11 +3374,9 @@ fn test_connection(settings: Settings) -> Result<String, CommandError> {
 #[tauri::command]
 // Tauri derives the JS-callable signature from these parameters, so grouping the
 // scan inputs into one struct would change the wire contract the frontend calls
-// with. The count is the cost of that; the values are validated below.
-#[allow(clippy::too_many_arguments)]
+// with. The count is the cost of that; the values are validated in `scan_blocking`.
 fn scan(
     app: AppHandle,
-    state: State<'_, AppState>,
     run_id: String,
     protocol: String,
     ip_version: IpVersion,
@@ -2779,6 +3384,34 @@ fn scan(
     timeout_ms: u32,
     noize: Option<String>,
 ) -> Result<(), CommandError> {
+    command_blocking("scan", move || {
+        scan_blocking(
+            app,
+            run_id,
+            protocol,
+            ip_version,
+            concurrency,
+            timeout_ms,
+            noize,
+        )
+    })
+    .await
+}
+
+/// `scan`'s body: it takes the operation lock, stops the running scan (up to the
+/// cancel grace window), runs `icacls`, unwraps the DPAPI key and hashes the
+/// engine, so it cannot run on the UI thread.
+#[allow(clippy::too_many_arguments)] // seven, all of them the frontend's own call shape
+fn scan_blocking(
+    app: AppHandle,
+    run_id: String,
+    protocol: String,
+    ip_version: IpVersion,
+    concurrency: u32,
+    timeout_ms: u32,
+    noize: Option<String>,
+) -> Result<(), CommandError> {
+    let state = app.state::<AppState>();
     // Before the lock and before the running scan is stopped: a parameter this
     // command refuses must not be able to take down the scan already in flight.
     let noize = validated_noize(noize.as_deref())?;
@@ -2798,7 +3431,7 @@ fn scan(
     // Gracefully stop any existing scan first (persist its best-so-far).
     stop_scan_child(&state.scan_child);
 
-    let settings = load_settings_file(&app);
+    let settings = load_settings_file(&app)?;
     let executable = engine_path(&app, &settings)?;
     let dir = config_dir(&app)?;
     fs::create_dir_all(&dir).map_err(CommandError::from)?;
@@ -2873,6 +3506,7 @@ fn scan(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let scan_pid = child.id();
     *state.scan_child.lock() = Some(child);
 
     // Stream scan output on a SEPARATE thread per pipe. The engine writes
@@ -2905,6 +3539,28 @@ fn scan(
     std::thread::spawn(move || {
         for h in handles {
             let _ = h.join();
+        }
+        // Reap the process. Both pipes closed, so the scan is over; until now the
+        // only things that ever cleared `scan_child` were `stop_scan` and the next
+        // `connect`, so a scan that finished on its own left the slot occupied for
+        // the rest of the program's life and `diagnostics` answered "Stop the
+        // running session or scan first" forever.
+        //
+        // `try_wait` only, and only for *this* run's pid: a scan that is still
+        // shutting down must not block this thread, and a newer scan must never be
+        // cleared by an older run's pump.
+        {
+            let state = app_done.state::<AppState>();
+            let mut slot = state.scan_child.lock();
+            if let Some(child) = slot.as_mut() {
+                if child.id() == scan_pid {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => *slot = None,
+                        // Still running: leave it for `stop_scan`.
+                        Ok(None) => {}
+                    }
+                }
+            }
         }
         // Terminal scan_done only if the engine didn't already send one, so a crash
         // still unsticks the UI but a normal finish doesn't double-log.
@@ -3103,7 +3759,14 @@ fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
 }
 
 #[tauri::command]
-fn stop_scan(state: State<'_, AppState>) -> Result<(), CommandError> {
+async fn stop_scan(app: AppHandle) -> Result<(), CommandError> {
+    command_blocking("stop_scan", move || stop_scan_blocking(app)).await
+}
+
+/// `stop_scan`'s body. `stop_scan_child` busy-waits up to the full cancel grace
+/// window, so this must not run on the UI thread.
+fn stop_scan_blocking(app: AppHandle) -> Result<(), CommandError> {
+    let state = app.state::<AppState>();
     // Serialize with connect/disconnect (QA-5) and cancel gracefully (QA-1).
     let _operation = state.operation.lock();
     stop_scan_child(&state.scan_child);
@@ -3158,11 +3821,25 @@ mod autostart {
             .map_err(CommandError::from)?;
         if enabled {
             let exe = env::current_exe().map_err(CommandError::from)?;
-            let cmd = format!("\"{}\"", exe.display());
+            // `--minimized`: the setting's own name promises a start that stays in
+            // the tray, and `setup` only ever consulted settings.json — which the
+            // shell being started *by* this key also has, but a launch-at-logon
+            // with no window is what "Launch at login" has always meant here.
+            let cmd = format!("\"{}\" --minimized", exe.display());
             key.set_value(VALUE, &cmd).map_err(CommandError::from)
         } else {
-            let _ = key.delete_value(VALUE);
-            Ok(())
+            // A failed delete used to be discarded and `Ok` returned, so the
+            // "Launch at login" toggle could display *off* while HKCU\Run still
+            // started the app at every logon. An absent value is the state that was
+            // asked for; anything else is a write that did not happen.
+            match key.delete_value(VALUE) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(CommandError::new(
+                    "autostart",
+                    format!("could not remove the `{VALUE}` Run entry: {e}"),
+                )),
+            }
         }
     }
 }
@@ -3321,10 +3998,13 @@ pub mod windows_proxy {
             }
             let json = serde_json::to_vec_pretty(&snapshot)
                 .map_err(|e| (format!("proxy recovery encode: {e}"), None))?;
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, json).map_err(|e| (format!("proxy recovery write: {e}"), None))?;
-            std::fs::rename(&tmp, path)
-                .map_err(|e| (format!("proxy recovery commit: {e}"), None))?;
+            // Exclusively-created temp + fsync before the rename: this file is the
+            // only record of what the proxy was before Aether touched it, and a
+            // fixed `proxy-recovery.json.tmp` name let a second writer (or a
+            // reconnect while the first session was still bringing the proxy up)
+            // interleave into it.
+            crate::write_atomic(path, &json)
+                .map_err(|e| (format!("proxy recovery write/commit: {e}"), None))?;
         }
         let applied = applied_expectation(port, endpoint);
         let result = (|| -> Result<(), CommandError> {
@@ -3640,15 +4320,24 @@ pub mod windows_proxy {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // Read argv *before any plugin is registered*. `--repair-proxy` is the entry
+    // point for a machine whose Windows proxy still points at an engine that died,
+    // and the single-instance plugin — registered ahead of `setup` — used to catch
+    // the invocation first, merely focus the tray app's window and exit, so the
+    // repair below was never reached by exactly the user who needs it. That flag
+    // now runs a real second instance instead.
+    let repair_only = repair_proxy_requested();
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    if !repair_only {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
                 let _ = window.unminimize();
             }
-        }))
+        }));
+    }
+    builder
         .manage(AppState::default())
         .setup(|app| {
             let dir = config_dir(app.handle())
@@ -3714,8 +4403,8 @@ pub fn run() {
                 std::process::exit(0);
             }
             watch_child(app.handle().clone());
-            let settings = load_settings_file(app.handle());
-            if settings.start_minimized {
+            let settings = load_settings_or_defaults(app.handle());
+            if settings.start_minimized || start_minimized_requested() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
@@ -3754,9 +4443,10 @@ pub fn run() {
                     "connect" => {
                         let app = app.clone();
                         std::thread::spawn(move || {
-                            let settings = load_settings_file(&app);
-                            let state = app.state::<AppState>();
-                            if let Err(e) = connect(app.clone(), state, settings) {
+                            let settings = load_settings_or_defaults(&app);
+                            // The blocking body, not the `async` command: this is
+                            // already off the UI thread and cannot await.
+                            if let Err(e) = connect_blocking(app.clone(), settings) {
                                 emit_log(&app, format!("tray connect: {e}"));
                             }
                         });
@@ -3764,15 +4454,13 @@ pub fn run() {
                     "disconnect" => {
                         let app = app.clone();
                         std::thread::spawn(move || {
-                            let state = app.state::<AppState>();
-                            let _ = disconnect(app.clone(), state);
+                            let _ = disconnect_blocking(app);
                         });
                     }
                     "quit" => {
                         let app = app.clone();
                         std::thread::spawn(move || {
-                            let state = app.state::<AppState>();
-                            let _ = disconnect(app.clone(), state);
+                            let _ = disconnect_blocking(app.clone());
                             app.exit(0);
                         });
                     }

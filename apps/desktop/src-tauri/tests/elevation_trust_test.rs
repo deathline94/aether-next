@@ -362,3 +362,54 @@ fn trusted_binary_roots_are_the_named_layout_directories_only() {
     );
     let _ = fs::remove_dir_all(&base);
 }
+
+/// The publisher test.
+///
+/// `subject.contains("CN=deathline94")` matched `CN=deathline94.example.com`, and
+/// the `eq_ignore_ascii_case(subject)` fallback matched a subject with no `CN=` at
+/// all, so a certificate whose *name* merely began with the publisher's text was
+/// accepted as published by them. A DN is compared one RDN at a time now.
+#[test]
+fn a_publisher_cn_must_be_the_whole_rdn() {
+    use aether_desktop_lib::subject_names_common_name as cn;
+
+    assert!(cn("CN=deathline94", "deathline94"));
+    assert!(cn("CN=deathline94, O=Someone", "deathline94"));
+    assert!(cn("OU=x, CN=\"deathline94\"", "deathline94"));
+    assert!(
+        cn("CN=DEATHLINE94", "deathline94"),
+        "DN names are case-insensitive"
+    );
+    assert!(cn("O=Example, CN=WireGuard LLC", "WireGuard LLC"));
+
+    assert!(!cn("CN=deathline94.example.com", "deathline94"));
+    assert!(!cn("CN=evil.example, O=CN=deathline94", "deathline94"));
+    assert!(!cn("deathline94", "deathline94"), "a bare name is not a DN");
+    assert!(!cn("CN=deathline94", ""));
+    assert!(!cn("", "deathline94"));
+    assert!(
+        !cn("CN=\"deathline94, OU=x, CN=evil\"", "deathline94"),
+        "a quoted comma must not split the value into a second RDN"
+    );
+}
+
+/// The anchor's `cert_sha256` — sha256 over the signing leaf's DER — was in the
+/// file and read by nothing.
+#[test]
+fn the_anchor_exposes_a_leaf_pin_only_when_one_is_published() {
+    // `wintun.dll` has a published leaf digest in packaging/trust/engine-trust.json.
+    let pinned = aether_desktop_lib::embedded_cert_pin("wintun.dll");
+    assert!(
+        pinned.is_some(),
+        "the anchor's cert_sha256 must reach the runtime"
+    );
+    assert_eq!(pinned, aether_desktop_lib::embedded_cert_pin("WINTUN.DLL"));
+    if let Some(digest) = pinned {
+        assert_eq!(digest.len(), 64, "a sha256, hex");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    // `aether.exe`'s entry is still the all-zero placeholder: that is "nothing is
+    // pinned", and a release build refuses rather than comparing against zeroes.
+    assert!(aether_desktop_lib::embedded_cert_pin("aether.exe").is_none());
+    assert!(aether_desktop_lib::embedded_cert_pin("not-in-the-anchor.dll").is_none());
+}
