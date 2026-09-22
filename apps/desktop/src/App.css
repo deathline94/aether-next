@@ -172,11 +172,7 @@ input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
 .version-tag,
 .badge,
 .rtt-badge,
-.status-chip,
-.metrics-grid strong,
-.activity-head-title small,
 .chip-count,
-.log-line time,
 .endpoint-row code,
 .discovered-info code,
 .scan-inline-stats,
@@ -1056,29 +1052,8 @@ code, kbd, pre {
   color: #ffffff;
 }
 
-.sparkline-bar-track {
-  display: flex;
-  align-items: flex-end;
-  gap: 5px;
-  height: 36px;
-  padding: 0 4px;
-}
-.sparkline-bar {
-  flex: 1;
-  border-radius: 2px;
-  background: rgba(255, 255, 255, 0.07);
-  transition: height 0.3s ease, background 0.3s;
-}
-.sparkline-bar.active {
-  background: linear-gradient(180deg, #00f08a 0%, #009957 100%);
-  box-shadow: 0 0 6px rgba(0, 240, 138, 0.35);
-  animation: sparkline-jitter 2.2s ease-in-out infinite alternate;
-}
-@keyframes sparkline-jitter {
-  0% { filter: brightness(0.9); }
-  50% { filter: brightness(1.28); }
-  100% { filter: brightness(0.95); }
-}
+/* The per-candidate sparkline was removed from the Connection view; its rules and
+   its `sparkline-jitter` keyframes stayed behind for a chart no markup renders. */
 
 .bento-footer {
   display: flex;
@@ -1328,8 +1303,7 @@ code, kbd, pre {
   font-family: var(--font-mono);
 }
 
-.profile-card span,
-.profile-hint {
+.profile-card span {
   display: block;
   font-size: 11px;
   color: var(--muted-light);
@@ -3024,8 +2998,8 @@ code, kbd, pre {
  * DISABLES motion. Previously that ordering was inverted for the spinners:
  * `spin` lived inside the query, so in the normal (no-preference) case the two
  * "working" indicators had no animation at all and a healthy engine read as
- * hung. The seven loops actually defined here are:
- *   beacon-pulse, ping-ring-pulse, breathing-glow, sparkline-jitter,
+ * hung. The loops actually defined here are:
+ *   beacon-pulse, ping-ring-pulse, breathing-glow,
  *   radar-sweep-spin, pulse, spin
  */
 @keyframes pulse { 50% { opacity: 0.4; } }
