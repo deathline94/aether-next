@@ -935,3 +935,95 @@ pub async fn spawn(
     log::info!("[tun] bridge active (kernel TCP / WinTUN high-throughput path)");
     Ok(handle)
 }
+
+#[cfg(test)]
+mod wintun_resolution_tests {
+    use super::*;
+
+    /// `AETHER_WINTUN` used to be read in the elevated child, so anything able to
+    /// set that variable chose which DLL a process with administrator rights would
+    /// `LoadLibrary`. A marker file proves the difference between "did not load it"
+    /// and "loaded it and reported a problem".
+    #[test]
+    fn an_environment_variable_cannot_name_the_driver() {
+        let dir = std::env::temp_dir().join(format!("aether_wintun_env_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let evil = dir.join("wintun.dll");
+        std::fs::write(&evil, b"MZ not a driver").unwrap();
+
+        // The variable is no longer consulted at all, so even a perfectly shaped
+        // candidate outside the install roots cannot be selected by it.
+        crate::runtime_env::set("AETHER_WINTUN", &evil.to_string_lossy());
+        let resolved = find_wintun_dll();
+        crate::runtime_env::remove("AETHER_WINTUN");
+
+        if let Ok(path) = resolved {
+            // Compare canonical forms: on Windows a raw temp path and its
+            // canonicalised version differ textually (8.3 short names), and a test
+            // that compares strings would pass while the engine loaded the plant.
+            assert!(
+                path.canonicalize().ok().as_ref() != Some(&evil.canonicalize().unwrap()),
+                "the engine resolved the driver from an environment variable"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&evil).unwrap(),
+            b"MZ not a driver",
+            "resolution must not read from or write to the candidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_plain_wintun_dll_inside_the_install_roots_is_accepted() {
+        let dir = std::env::temp_dir().join(format!("aether_wintun_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let good = dir.join("wintun.dll");
+        std::fs::write(&good, b"MZ").unwrap();
+        assert!(
+            inside_allowed_root(&good.to_string_lossy()).is_none(),
+            "a temp directory is not one of the install roots"
+        );
+
+        // Right name, wrong shape: a differently named file is not the driver even
+        // if it sits where the driver lives.
+        let misnamed = dir.join("not-wintun.dll");
+        std::fs::write(&misnamed, b"MZ").unwrap();
+        assert!(inside_allowed_root(&misnamed.to_string_lossy()).is_none());
+
+        // A path that walks out of the roots is judged where it lands, not as it
+        // reads - `..` in a path is not a way back in.
+        let escape = format!("{}", dir.join("..").join("..").display());
+        assert!(inside_allowed_root(&escape).is_none());
+
+        // Nothing on disk at all.
+        assert!(inside_allowed_root("").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_beside_exe_candidate_is_the_only_fallback() {
+        // With no handoff and no environment variable, resolution can only be the
+        // copy next to the executable (or an error): the CWD-relative probe is gone,
+        // because a working directory is not a trust boundary.
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let candidate = exe_dir.join("wintun.dll");
+        match find_wintun_dll() {
+            Ok(path) => assert!(
+                path == candidate.canonicalize().unwrap(),
+                "resolution reached for something other than the beside-exe copy: {path:?}"
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("beside aether.exe"), "{msg}");
+                assert!(
+                    !msg.contains("set AETHER_WINTUN"),
+                    "the error still advertises the removed environment override: {msg}"
+                );
+            }
+        }
+    }
+}

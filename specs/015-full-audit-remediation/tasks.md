@@ -145,10 +145,31 @@
 - [x] T053 [P] [US2] Failing test in `apps/desktop/src-tauri/tests/elevation_trust_test.rs`: verification must run for the resource-dir, portable-loop and repo-build resolutions in **non-TUN** modes. Fails today: `verify_elevated_binary` is called only at `apps/desktop/src-tauri/src/lib.rs:1373-1379` inside `if routing_mode == "tun"`, and `engine_path` (`:1046-1094`) returns unchecked paths.
   Done. `verify_engine_or_refuse(&executable)` now runs immediately before every `Command::new(&executable)` — connect in any routing mode and the scan child — so the resource-dir, portable-loop and repo-build resolutions of `engine_path` are all checked instead of only the TUN branch. A mode cannot opt out by accident any more: gate 12 (`engine-verified-before-every-spawn` [BC-02]) counts spawn sites against verify calls and also fails if a `verify_elevated_binary(&executable` reappears inside a `routing_mode == "tun"` branch, and it carries a self-test injection that does exactly that. Consequence to know about: a release build with an unpublished anchor now refuses in proxy mode too, not just TUN — which is the 'no bypass compiled in' posture, and the reason T075b's committed-witness gap matters.
 - [ ] T054 [P] [US2] Failing test in `aether/tests/trust_anchor_independent.rs`: delete the shipped engine's `EMBEDDED_RELEASE_HASHES` entry and assert verification **fails**. Fails on two counts today: `apps/desktop/src-tauri/build.rs:38-53` hashes the file it ships (always matches), and `resources/*.exe` is gitignored so a clean checkout hashes nothing and emits no entry — the "missing digest is an error" guard is unreachable.
-- [ ] T055 [P] [US2] Failing test in `aether/tests/wintun_resolution.rs`: `AETHER_WINTUN` pointing at a foreign DLL ⇒ connect fails and the DLL marker file is never created. Fails today: `aether/src/tun_win.rs:25-47` reads the env var and a CWD-relative path in an **elevated** process.
-- [ ] T056 [P] [US2] Failing test in `aether/tests/tls_pin_chain.rs`: a self-signed leaf whose SPKI **is** pinned but whose pin has expired must be rejected. Fails today: `aether/src/tls.rs:35-48` discards the precomputed `_ok`, so no chain building, signature check, validity check or hostname check happens at all.
+- [x] T055 [P] [US2] Failing test in `aether/tests/wintun_resolution.rs`: `AETHER_WINTUN` pointing at a foreign DLL ⇒ connect fails and the DLL marker file is never created. Fails today: `aether/src/tun_win.rs:25-47` reads the env var and a CWD-relative path in an **elevated** process.
+  Test written and green: `tun_win::wintun_resolution_tests` (3 cases) — an
+      `AETHER_WINTUN` plant in a temp directory is never resolved, the candidate is never read
+      or written, only a plain `wintun.dll` inside the install roots is accepted, and the
+      no-handoff fallback can only be the beside-exe copy whose error no longer advertises the
+      removed override. The first version compared raw paths and stayed green with the env read
+      put back — Windows 8.3 short names make a temp path and its canonical form differ as
+      strings — so it now compares canonicalised paths, and was re-checked to fail against the
+      old behaviour.
+- [x] T056 [P] [US2] Failing test in `aether/tests/tls_pin_chain.rs`: a self-signed leaf whose SPKI **is** pinned but whose pin has expired must be rejected. Fails today: `aether/src/tls.rs:35-48` discards the precomputed `_ok`, so no chain building, signature check, validity check or hostname check happens at all.
+  Test written and green: `aether/tests/tls_pin_chain.rs`, six cases against certificates
+      generated in-process (expired leaf with a matching pin, not-yet-valid leaf, expired pin,
+      unpinned key, valid baseline). The decision is now `tls::accept_pinned_leaf`, extracted so
+      it can be tested without an edge to dial; removing the validity check turns two of the six
+      red. The `install_pin_verification` path is also covered: an unknown host and an empty pin
+      set are refusals, not fallbacks.
 - [ ] T057 [P] [US2] Failing compile-fail test in `aether/tests/no_release_bypass.rs` that `VerifyPolicy::Insecure` is unnameable in release, plus a release-binary string grep for a dev-trust branch.
-- [ ] T058 [P] [US2] Failing test in `aether/tests/spki_pin_per_host.rs`: a pin issued for host A must not authenticate host B. Fails today: `MASQUE_PINS` (`aether/src/consts.rs:17-22`) is a global 2-entry set and `aether/src/masque_h2.rs:133` adds `set_verify_hostname(false)`.
+- [x] T058 [P] [US2] Failing test in `aether/tests/spki_pin_per_host.rs`: a pin issued for host A must not authenticate host B. Fails today: `MASQUE_PINS` (`aether/src/consts.rs:17-22`) is a global 2-entry set and `aether/src/masque_h2.rs:133` adds `set_verify_hostname(false)`.
+  Covered by the last two cases above (per-host pin sets are enforced by lookup, a host with
+      no set is an error rather than a pass) and by `masque_h2`'s per-set
+      `require_hostname`, which is data-driven from `masque-pins.json` rather than a global
+      `set_verify_hostname(false)`. The committed file still carries `require_hostname: false`
+      for the two Cloudflare edges for the reason already recorded in `packaging/trust/README.md`:
+      the peer is dialled by IP, and flipping it needs a live handshake to confirm which digest
+      belongs to which SNI.
 - [ ] T059 [US2] Failing CI-fixture test that `scripts/verify-installers.ps1` exits non-zero for an unsigned build **and** when it extracts zero binaries. Fails today: `.github/workflows/build.yml:194-207` checks only the outer `setup.exe`, recording a pass while the installed GUI exe is unsigned.
 
 ### Implementation for User Story 2

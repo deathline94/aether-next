@@ -115,29 +115,45 @@ pub fn install_pin_verification(
             log::error!("[tls] empty certificate chain for {host:?}");
             return false;
         };
-        if let Err(reason) = leaf_is_temporally_valid(leaf, now) {
-            log::error!("[tls] {host:?}: {reason}");
-            return false;
-        }
-        let Some(hash) = spki_sha256(leaf) else {
-            log::error!("[tls] {host:?}: cannot read leaf SPKI");
-            return false;
-        };
-        let matched = pins
-            .iter()
-            .any(|(pinned, expires)| *expires > now && pinned == &hash);
-        if !matched {
-            // Was `log::debug!`, i.e. invisible at the default filter: a key
-            // rotation looked like "network blocks QUIC" rather than what it was.
-            log::error!(
-                "[tls] SPKI pin mismatch for {host:?}: observed {} — rejecting. \
-                 If the edge key rotated, refresh packaging/trust/masque-pins.json.",
-                hex32(&hash)
-            );
-        }
-        matched
+        accept_pinned_leaf(leaf, &pins, now, host)
     });
     Ok(())
+}
+
+/// The pin and validity decision, separated from the handshake so it can be
+/// tested against real certificates.
+///
+/// The bug this guards is the one that made the callback a tautology: it discarded
+/// BoringSSL's precomputed result and checked only a hash, so a pinned SPKI kept
+/// authenticating a leaf for as long as it was copied around — expired, not yet
+/// valid, or both. A matching pin is therefore necessary, never sufficient.
+pub fn accept_pinned_leaf(
+    leaf: &boring::x509::X509Ref,
+    pins: &[([u8; 32], u64)],
+    now: u64,
+    host: &str,
+) -> bool {
+    if let Err(reason) = leaf_is_temporally_valid(leaf, now) {
+        log::error!("[tls] {host:?}: {reason}");
+        return false;
+    }
+    let Some(hash) = spki_sha256(leaf) else {
+        log::error!("[tls] {host:?}: cannot read leaf SPKI");
+        return false;
+    };
+    let matched = pins
+        .iter()
+        .any(|(pinned, expires)| *expires > now && pinned == &hash);
+    if !matched {
+        // Was `log::debug!`, i.e. invisible at the default filter: a key
+        // rotation looked like "network blocks QUIC" rather than what it was.
+        log::error!(
+            "[tls] SPKI pin mismatch for {host:?}: observed {} — rejecting. \
+             If the edge key rotated, refresh packaging/trust/masque-pins.json.",
+            hex32(&hash)
+        );
+    }
+    matched
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
