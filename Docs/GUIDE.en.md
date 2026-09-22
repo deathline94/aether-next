@@ -90,6 +90,72 @@ If you get a response, the proxy path is working.
 - Slow scan: use turbo.
 - Slow throughput: prefer MASQUE h2 or single WG over gool when the path allows it.
 
+## Verify a download
+
+Every Windows installer, portable zip and Android APK is attested by the CI run that
+built it, so provenance is checkable without trusting the file itself:
+
+```sh
+gh attestation verify AetherNext-windows-x64-setup.exe --repo deathline94/aether-next
+gh attestation verify AetherNext-android-arm64-v8a.apk  --repo deathline94/aether-next
+```
+
+A pass means these exact bytes were produced by this repository's build workflow at the
+recorded commit. On Windows, right-click → Properties → Digital Signatures must also show
+a valid signature; the shell refuses to launch an engine whose digest is not the one
+committed in `packaging/trust/engine-trust.json`, and that witness is cut by a separate
+reviewed step (`gh workflow run prepare-anchor.yml`), never by the build that uses it.
+
+## Repairing leftover state
+
+A crash or a killed process can leave host state behind: routes that still point at
+a tunnel that is gone, or a system proxy still set to the local port. Both are
+repairable without opening a tunnel:
+
+```sh
+aether --repair-routes          # drop routes this app installed and no longer owns
+AetherNext.exe --repair-proxy   # restore the system proxy integration
+```
+
+Repair is scoped to what the journal says this app created. Where ownership cannot be
+established it reports and changes nothing — deleting someone else's route is not a
+cleanup. If a proxy points at a port another program now holds, the repair says so
+instead of guessing at a value.
+
+## Rotating the engine trust anchor
+
+The desktop shell refuses to launch an engine whose bytes are not digested in
+`packaging/trust/engine-trust.json`. That witness is authored by a separate, reviewed
+step, so a release cannot vouch for whatever the runner happened to build:
+
+1. `gh workflow run prepare-anchor.yml` (it requires the literal `PUBLISH` confirmation).
+2. It builds and signs the engine, then opens a pull request with the one-line digest change.
+3. Merge it, then tag. A tag build that finds no committed witness for the engine it
+   staged fails, rather than rewriting its own anchor.
+
+If an engine change produces no anchor diff, the pipeline is broken: a release that
+silently reuses a stale witness is the failure this step exists to prevent.
+
+## Updates
+
+Aether Next tells you a newer version exists; it does not fetch and install one in
+the background. An updater that downloads a new engine is a second trust path, and
+the engine already has one that is auditable (the committed anchor above). Update by
+downloading and verifying per [Verify a download](#verify-a-download).
+
+## Invariants
+
+The mechanical gates live in `scripts/verify-invariants.mjs` and run in CI. Every
+gate ships a fixture that proves it can fail:
+
+```sh
+node scripts/verify-invariants.mjs                  # all gates must pass
+node scripts/verify-invariants.mjs --selftest-fail  # every gate must be able to fail
+```
+
+The governing rules are ratified in `.specify/memory/constitution.md`. A change with
+no check that would fail without it is not a fix.
+
 ## Build notes
 
 Windows desktop: Rust + Node, then `npm run tauri build` under `apps/desktop` after a release engine build.

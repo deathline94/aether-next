@@ -3,7 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <!--
+      Favicon (T200). The Vite scaffold's `/vite.svg` was an absolute path: on the
+      Android asset host the page is served from
+      https://appassets.androidplatform.net/assets/www/index.html and
+      MainActivity.shouldInterceptRequest only answers requests under that host's
+      /assets/ handler path for files that exist in assets/www, so the icon request
+      was answered 403 and logged "blocked untrusted WebView resource" on every
+      load. It is inlined here instead of shipped as a file: an inline data URI is
+      requested from no origin, so it cannot be blocked, and it survives a rebuild
+      (the packaged copy in android/app/src/main/assets/www points at the real
+      aether.svg that sync-www ships next to index.html).
+    -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Crect%20width='24'%20height='24'%20rx='5'%20fill='%230D1113'/%3E%3Cpath%20fill='%2366E3A4'%20d='M4%2021V11a8%208%200%200%201%2016%200v10h-4V11a4%204%200%200%200-8%200v10z'/%3E%3Cpath%20fill='%2366E3A4'%20d='M10%2015h3v-2l4.5%203.5L13%2020v-2h-3z'/%3E%3C/svg%3E" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0" />
     <title>Aether Next</title>
   </head>

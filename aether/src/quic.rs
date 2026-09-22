@@ -90,8 +90,7 @@ fn send_ip_h3(
 /// The counter exists because "the tunnel is healthy" and "we are throwing
 /// away TCP payload under load" were previously indistinguishable from outside.
 fn note_dropped(what: &str, e: impl std::fmt::Display) {
-    static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = crate::counters::bump(&crate::counters::DATAGRAM_SEND_DROPPED);
     if n == 1 || n.is_multiple_of(1000) {
         log::warn!("[quic] dropped {what} packet (count {n}): {e}");
     } else {
@@ -825,7 +824,9 @@ fn poll_h3(
                         h3_stage("connect_ip_status", &format!("code={status}"));
                         match classify_status(stream_id, req_stream, &status) {
                             StatusAction::Ignore => {
-                                log::debug!("[h3] ignoring :status {status} on stream {stream_id}");
+                                let n =
+                                    crate::counters::bump(&crate::counters::IGNORED_OFFSTREAM_STATUS);
+                                log::debug!("[h3] ignoring :status {status} on stream {stream_id} (count {n})");
                             }
                             StatusAction::Interim => {
                                 log::info!("[h3] interim {status} on the request stream; awaiting final");
@@ -925,7 +926,12 @@ fn drain_capsules(
                     h3_stage("first_inbound_datagram", "dataplane capsule received");
                 }
                 *dataplane_ok = true;
-                let _ = inbound_tx.try_send(payload);
+                if inbound_tx.try_send(payload).is_err() {
+                    let n = crate::counters::bump(&crate::counters::INBOUND_DROPPED);
+                    if n == 1 || n.is_multiple_of(1000) {
+                        log::warn!("[h3] dropped inbound capsule datagram (count {n}): queue saturated");
+                    }
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
@@ -1305,12 +1311,28 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
             ));
         }
 
-        let wait = match conn.timeout() {
+        let quic_timeout = conn.timeout();
+        let wait = match quic_timeout {
             Some(t) => t.min(remaining(deadline)),
             None => remaining(deadline),
         };
+        // `wait` may be the overall deadline rather than a QUIC timer. Calling
+        // `on_timeout()` when quiche did not ask for it would advance its PTO
+        // state on a probe that is merely out of time.
+        let timer_is_quic = quic_timeout.is_some_and(|t| wait <= t);
 
         tokio::select! {
+            biased;
+            // Timer first: with 8-16 probes in flight, a branch order that lets
+            // `recv_from` win whenever a datagram is pending delays
+            // `on_timeout()` — which drives PTO/retransmit — by whole round
+            // trips, and every concurrent probe pays for it. Same rule
+            // Cloudflare's quiche driver documents for its IO workers.
+            _ = tokio::time::sleep(wait) => {
+                if timer_is_quic {
+                    conn.on_timeout();
+                }
+            }
             r = sock.recv_from(&mut buf) => {
                 match r {
                     Ok((n, from)) => {
@@ -1328,9 +1350,6 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     }
                     Err(e) => return Err(AetherError::Io(e)),
                 }
-            }
-            _ = tokio::time::sleep(wait) => {
-                conn.on_timeout();
             }
         }
 

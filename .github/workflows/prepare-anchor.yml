@@ -1,0 +1,128 @@
+# Cut the engine trust witness for a release.
+#
+# Why this exists as its own job: `packaging/trust/engine-trust.json` is the
+# committed statement of which engine bytes the shell is allowed to run. A tag
+# build must not write it (that is the self-referential check this file
+# replaced), so the digest has to be published by a separate, reviewed step that
+# a human starts. This workflow never pushes to main — it opens a pull request
+# with a one-line diff, and the release job refuses to bundle until that PR is
+# merged. No PR merged, no tagged release. Manual trigger only, on purpose.
+name: Prepare engine anchor
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type PUBLISH to build a witness for this tree'
+        required: true
+        default: ''
+      ref:
+        description: 'Ref to build the engine from'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-anchor
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Build, sign and witness the engine
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      CONFIRM: ${{ github.event.inputs.confirm }}
+    steps:
+      - name: Refuse to run without confirmation
+        shell: pwsh
+        run: |
+          if ($env:CONFIRM -ne 'PUBLISH') { throw "confirm input must be exactly PUBLISH (got a value that is not)" }
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+      - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Build engine
+        working-directory: aether
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: cargo build --release
+
+      # Same ephemeral CI identity build.yml signs with, so the witnessed cert is
+      # the cert the bundled engine actually carries. Swapping in a different
+      # signer here would make the anchor describe bytes no release ever ships.
+      - name: Sign engine
+        shell: pwsh
+        run: |
+          $pfxPass = "ci-sign-$([Guid]::NewGuid().ToString('N').Substring(0,16))"
+          $configPath = Join-Path $env:RUNNER_TEMP "aether-anchor.cnf"
+          $keyPath = Join-Path $env:RUNNER_TEMP "aether-anchor.key"
+          $certPath = Join-Path $env:RUNNER_TEMP "aether-anchor.crt"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "aether-anchor.pfx"
+          "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = critical,digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = critical,CA:FALSE`nsubjectKeyIdentifier = hash" |
+            Set-Content -LiteralPath $configPath -NoNewline
+          & openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 1825 -nodes -config $configPath 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl req failed ($LASTEXITCODE)" }
+          & openssl pkcs12 -export -out $pfxPath -inkey $keyPath -in $certPath -passout "pass:$pfxPass" 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed ($LASTEXITCODE)" }
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" `
+            -Password (ConvertTo-SecureString $pfxPass -AsPlainText -Force) |
+            Where-Object HasPrivateKey | Select-Object -First 1
+          if (-not $cert) { throw "no importable signing certificate" }
+          $eng = "aether/target/release/aether.exe"
+          Set-AuthenticodeSignature -FilePath $eng -Certificate $cert -HashAlgorithm SHA256 `
+            -TimestampServer "http://timestamp.digicert.com" | Out-Null
+          $sig = Get-AuthenticodeSignature -FilePath $eng
+          if ($sig.Status -ne "Valid") { throw "refusing to witness an engine whose signature is not Valid: $($sig.StatusMessage)" }
+          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "publisher mismatch: $($sig.SignerCertificate.Subject)" }
+          $sha = (([Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
+          "ANCHOR_CERT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANCHOR_CN=$($sig.SignerCertificate.Subject)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Witness the staged engine
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources | Out-Null
+          Copy-Item -Force aether/target/release/aether.exe apps/desktop/src-tauri/resources/aether.exe
+          node scripts/publish-engine-trust.mjs --name aether.exe `
+            --file apps/desktop/src-tauri/resources/aether.exe `
+            --cert-sha $env:ANCHOR_CERT_SHA --cn $env:ANCHOR_CN
+          # Read it straight back: an anchor that does not describe the artifact
+          # it names is the exact failure this pipeline is built to prevent.
+          node scripts/publish-engine-trust.mjs --check --name aether.exe `
+            --file apps/desktop/src-tauri/resources/aether.exe
+
+      - name: Open the witness pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        shell: pwsh
+        run: |
+          $branch = "anchor/$(git rev-parse --short HEAD)-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b $branch
+          git add packaging/trust/engine-trust.json
+          if ((git diff --cached --quiet)) { throw "the anchor did not change - nothing to witness" }
+          git commit -m "chore(trust): witness engine bytes from $($env:GITHUB_SHA.Substring(0,7))"
+          git push -u origin $branch
+          gh pr create --base $env:DEFAULT_BASE --title "Trust anchor for engine $(git rev-parse --short HEAD)" `
+            --body "Automatically cut by \`.github/workflows/prepare-anchor.yml\` (run \`$env:RUN_ID\`).`n`nMerge this before tagging a release: a tag build refuses to bundle an engine whose bytes are not witnessed by the committed anchor.`n`nA rotation with no diff here is a pipeline bug, not a no-op."
+        env:
+          DEFAULT_BASE: ${{ github.event.inputs.ref }}

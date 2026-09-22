@@ -74,7 +74,7 @@ impl ScanMode {
     pub fn parse(s: &str) -> ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
-            "thorough" | "deep" | "pro" | "thorogh" => ScanMode::Thorough,
+            "thorough" | "deep" | "pro" => ScanMode::Thorough,
             "stealth" | "quiet" => ScanMode::Stealth,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,
@@ -250,11 +250,27 @@ impl CacheKind {
         &self,
         config_path: &str,
         endpoints: Vec<(SocketAddr, u32)>,
+        measurement: crate::cache::Measurement,
     ) -> crate::cache::Mutation {
         match self {
-            CacheKind::Masque => crate::cache::add_to_masque_with_rtt(config_path, endpoints),
-            CacheKind::WireGuard => crate::cache::add_to_wireguard_with_rtt(config_path, endpoints),
+            CacheKind::Masque => {
+                crate::cache::add_to_masque_with_rtt(config_path, endpoints, measurement)
+            }
+            CacheKind::WireGuard => {
+                crate::cache::add_to_wireguard_with_rtt(config_path, endpoints, measurement)
+            }
         }
+    }
+}
+
+/// Which measurement a cached RTT actually represents. Ironclad hits are a real
+/// HTTP round trip through a live tunnel; everything else is a handshake probe.
+/// The two are not comparable, and the cache ranks them apart.
+fn measured_as(ironclad: bool) -> crate::cache::Measurement {
+    if ironclad {
+        crate::cache::Measurement::HttpRoundTrip
+    } else {
+        crate::cache::Measurement::HandshakeProbe
     }
 }
 
@@ -328,6 +344,9 @@ pub async fn race_cached_endpoints(
                             .write_with_rtt(
                                 config_path,
                                 vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
+                                // Tier-0 is a bare handshake race: nothing here has
+                                // carried real HTTP through a tunnel.
+                                crate::cache::Measurement::HandshakeProbe,
                             )
                             .was_skipped()
                         {
@@ -732,8 +751,13 @@ pub async fn hunt_best(
                                     // 'static, so this cannot be spawned off. Cost is
                                     // bounded: drill-downs probe a small fixed
                                     // neighbor list at min(concurrency,16).
-                                    let hot_hits = drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency, cancel_token.clone()).await;
-                                    scanned += 1;
+                                    let (hot_hits, drill_examined) =
+                                        drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency, cancel_token.clone()).await;
+                                    // The drill-down examined a neighbour list, not
+                                    // one candidate — counting it as 1 made the
+                                    // progress bar claim fewer probes than ran and
+                                    // `scanned == total_candidates` never matched.
+                                    scanned += 1 + drill_examined;
                                     for h_pr in hot_hits {
                                         if !reported.insert((h_pr.ip, h_pr.port)) {
                                             continue;
@@ -751,7 +775,7 @@ pub async fn hunt_best(
                                 if st.early_exit_first {
                                     let final_best = best.unwrap_or(pr);
                                     let rtt_ms = final_best.rtt.as_millis() as u32;
-                                    config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(final_best.ip, final_best.port), rtt_ms)]);
+                                    config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(final_best.ip, final_best.port), rtt_ms)], measured_as(ironclad));
                                     return Ok(final_best);
                                 }
 
@@ -792,7 +816,7 @@ pub async fn hunt_best(
         Some(pr) => {
             log::info!("[+] best {} {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
             let rtt_ms = pr.rtt.as_millis() as u32;
-            config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)]);
+            config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)], measured_as(ironclad));
             Ok(pr)
         }
         None => {
@@ -849,7 +873,7 @@ async fn drill_down_hot_subnet(
     ironclad: bool,
     concurrency: usize,
     cancel_token: CancellationToken,
-) -> Vec<ProbeResult> {
+) -> (Vec<ProbeResult>, usize) {
     let mut neighbors = Vec::new();
     match ip {
         IpAddr::V4(v4) => {
@@ -877,8 +901,9 @@ async fn drill_down_hot_subnet(
         }
     }
 
+    let examined = neighbors.len();
     if neighbors.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let cancel_child = cancel_token.clone();
@@ -911,7 +936,7 @@ async fn drill_down_hot_subnet(
             }
         }
     }
-    results
+    (results, examined)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1943,5 +1968,34 @@ mod tier0_tests {
         )
         .await;
         assert!(matches!(out, Tier0Outcome::Cancelled), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod scan_mode_tests {
+    use super::ScanMode;
+
+    /// One string, one mode. The shell now ships a `ScanMode` enum, so the engine
+    /// must not keep a private vocabulary where a typo is a legal alias — that
+    /// was how `"thorogh"` became a value the Settings UI could select and the
+    /// validator could reject.
+    #[test]
+    fn every_label_parses_back_to_its_own_mode() {
+        for mode in [
+            ScanMode::Turbo,
+            ScanMode::Balanced,
+            ScanMode::Thorough,
+            ScanMode::Stealth,
+            ScanMode::Ironclad,
+        ] {
+            assert_eq!(ScanMode::parse(mode.label()), mode);
+        }
+    }
+
+    #[test]
+    fn a_misspelled_mode_is_not_a_mode() {
+        assert_eq!(ScanMode::parse("thorogh"), ScanMode::Balanced);
+        assert_eq!(ScanMode::parse("thoro"), ScanMode::Balanced);
+        assert_eq!(ScanMode::parse(""), ScanMode::Balanced);
     }
 }

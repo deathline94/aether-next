@@ -9,6 +9,21 @@ import type { IpcError } from "../ipcError";
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
 
+/**
+ * Engine-side diagnostics for the activity export: which binary ran, what the
+ * process settled on, and whether packets are being dropped. A failure comes
+ * back as text rather than an exception, so a diagnostics problem can never
+ * swallow the log the user was trying to send.
+ */
+export async function engineDiagnostics(): Promise<string> {
+  try {
+    const report = await invoke<Record<string, unknown>>("diagnostics");
+    return JSON.stringify(report, null, 2);
+  } catch (error) {
+    return `unavailable: ${ipcError(error).message}`;
+  }
+}
+
 export function useRuntime(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
 ) {
@@ -33,6 +48,9 @@ export function useRuntime(
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSaveRef = useRef<Settings | null>(null);
+  /// Monotonic save token: only the newest dispatch may report success, so a
+  /// slow write of an older payload cannot flip "Synchronized" for a newer one.
+  const saveSeqRef = useRef(0);
   // Mirrors the last settings object seen by the persist effect so hydration
   // does not trigger a redundant write-back to disk.
   const settingsRef = useRef(settings);
@@ -163,13 +181,16 @@ export function useRuntime(
       ) {
         return;
       }
+      const mine = ++saveSeqRef.current;
       try {
         await invoke("save_settings", { settings: toSave });
+        if (mine !== saveSeqRef.current) return; // superseded by a newer save
         setSaveError(null);
         setSaved(true);
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
       } catch (error) {
+        if (mine !== saveSeqRef.current) return;
         const err = ipcError(error);
         setSaveError(err);
         appendLog({ level: "error", message: err.message });
@@ -215,6 +236,7 @@ export function useRuntime(
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busy) return;
     setBusy(true);
+    const previous = settings;
     try {
       if (running) {
         await safeDisconnect();
@@ -228,6 +250,11 @@ export function useRuntime(
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
       const detail = errorMessage(error);
+      // Roll the optimistic commit back: this path wrote protocol/transport/
+      // peer through the settings effect as well as to the engine, so a failed
+      // attempt used to leave the user's carrier protocol permanently rewritten
+      // by a tunnel that never came up.
+      setSettings(previous);
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: `Direct connect error: ${detail}` });
     } finally {

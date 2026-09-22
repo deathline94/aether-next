@@ -2,11 +2,38 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { initialScanState } from "../types";
-import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
+import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
 import { errorMessage } from "../ipcError";
+import { hitAddressKey } from "./useLogs";
+
+/**
+ * A round-trip that can be shown: the engine's own text, or a measured number
+ * formatted. Anything empty or absent is `null`, so a caller keeps the previous
+ * value or says nothing rather than storing `""` and printing it.
+ */
+function rttLike(value: string | number | null | undefined): string | null {
+  if (typeof value === "number") return Number.isFinite(value) ? `${value} ms` : null;
+  const text = typeof value === "string" ? value.trim() : "";
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * The completion line, without the brackets that used to be empty.
+ *
+ * The engine's terminal event carries `rtt: ""` whenever it settled on a forced
+ * peer instead of a probe it timed, and `best: 1.1.1.1:443 ()` was the result —
+ * punctuation standing in for a number nobody measured. `bestRttMs` is the honest
+ * channel (absent, never a 0, when nothing was probed), so the order of preference
+ * is the engine's own text, then the measured number, then say nothing.
+ */
+export function scanCompletionMessage(addr: string, rtt: string, bestRttMs?: number | null): string {
+  if (!addr) return "Scan complete — no working endpoints found.";
+  const measured = rttLike(rtt) ?? rttLike(bestRttMs);
+  return measured ? `Scan complete — best: ${addr} (${measured})` : `Scan complete — best: ${addr}`;
+}
 
 export function useScanner(
-  appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
+  appendLog: (entry: LogInput) => void,
   running: boolean,
   clearLogs?: () => void,
 ) {
@@ -57,6 +84,14 @@ export function useScanner(
             working: prev.working + 1,
             bestRtt: ev.rtt || prev.bestRtt,
           }));
+          // The log's Hits filter reads this key rather than recognising the hit
+          // from prose, so the scanner's count and the Activity tab's agree by
+          // construction and survive an engine that rewords its own lines.
+          appendLog({
+            level: "info",
+            message: `Working endpoint ${ev.addr}${ev.protocol ? ` (${ev.protocol})` : ""}`,
+            hitKey: hitAddressKey(ev.addr),
+          });
           setEndpoints((prev) => {
             // One IP:port can answer on h2 and on h3; keyed on the address alone the
             // second protocol's hit was discarded as a duplicate of the first.
@@ -67,17 +102,20 @@ export function useScanner(
           });
           break;
         case "scan_done": {
-          const hasHits = (ev.working ?? 0) > 0 || Boolean(ev.addr);
+          // The engine's terminal event names the endpoint it settled on; how many
+          // answered is what the run's own counter says (`scan_progress` keeps it
+          // current), not a field on this event — the `working?` here was always
+          // undefined, so the "0 found" verdict rested on `addr` alone.
           setScanState((prev) => ({
             ...prev,
             active: false,
-            phase: hasHits ? "Verified" : "Completed (0 found)",
+            phase: prev.working > 0 || Boolean(ev.addr) ? "Verified" : "Completed (0 found)",
+            bestRtt: (rttLike(ev.rtt) ?? rttLike(ev.bestRttMs)) ?? prev.bestRtt,
           }));
-          if (ev.addr) {
-            appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
-          } else {
-            appendLog({ level: "info", message: "Scan complete — no working endpoints found." });
-          }
+          appendLog({
+            level: "info",
+            message: scanCompletionMessage(ev.addr, ev.rtt, ev.bestRttMs),
+          });
           break;
         }
         case "scan_failed":

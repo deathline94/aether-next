@@ -228,30 +228,67 @@ const GATES = [
   {
     name: 'css-banned-patterns',
     invariant: 'BC-11',
-    summary: 'no 100vh, transition:all, bare :hover, alpha hairlines, undefined vars',
+    summary: 'no 100vh, transition:all, unguarded :hover, alpha hairlines, nested keyframes, undefined vars',
     scan(api) {
       const v = [];
       const all = api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/));
       for (const f of all) {
-        const t = api.read(f);
+        const raw = api.read(f);
+        /*
+         * Comments legitimately quote the defects being removed ("was
+         * rgba(255,255,255,.05)", ".profile-card:hover"), so pattern scans run
+         * against a masked copy. Masking replaces comment bytes with spaces to
+         * keep every offset — and therefore every reported line number — intact.
+         */
+        const t = raw.replace(/\/\*[\s\S]*?\*\//g, (c) => c.replace(/[^\s]/g, ' '));
         const tests = [
           [/\b100vh\b/g, '100vh (use svh/dvh)'],
           [/transition\s*:\s*all\b/g, 'transition: all'],
-          [/:hover\b/g, 'hover rule (must sit inside @media (hover: hover))'],
-          [/border\s*:\s*1px solid rgba\(255,\s*255,\s*255,\s*\.?0?\.(?:0\d|1[01])\)/g, 'alpha hairline border'],
+          [/:hover\b/g, 'hover rule (must sit inside @media (hover: hover) and (pointer: fine))'],
+          // U-E1: any translucent-white border at all, not just the .0x tier —
+          // the previous pattern read `.0\d|1[01]` and waved through 0.12–0.28,
+          // which is how the hairlines survived the first pass at this gate.
+          [/border[^;{}]*rgba\(255,\s*255,\s*255,\s*0?\.\d+\)/g, 'alpha hairline border (use an opaque --edge token)'],
         ];
         for (const [re, label] of tests) {
           let m;
           while ((m = re.exec(t))) {
-            // Hover is allowed only inside a pointer-guarded media block.
+            // Hover is allowed only inside a pointer-guarded media block; a
+            // hover without (pointer: fine) latches on touch (T191 / U-F3).
             if (label.startsWith('hover')) {
               const before = t.slice(0, m.index);
               const openMedia = before.lastIndexOf('@media');
               const closeRule = Math.max(before.lastIndexOf('\n}', openMedia), -1);
-              if (openMedia > closeRule && /hover\s*:\s*hover/.test(before.slice(openMedia, m.index))) continue;
+              const cond = before.slice(openMedia, m.index);
+              if (openMedia > closeRule && /hover\s*:\s*hover/.test(cond) && /pointer\s*:\s*fine/.test(cond)) continue;
             }
             v.push(`${locate(f, t, m.index)} ${label}`);
           }
+        }
+        /*
+         * U-E4/U-E5: an @keyframes nested inside an @media block only exists
+         * when that query matches, so a spinner defined that way is frozen for
+         * everyone else. Keyframes are top-level; the reduced-motion block is
+         * only ever allowed to *remove* motion.
+         */
+        let depth = 0;
+        for (const m of t.matchAll(/@keyframes\s+[\w-]+|[{}]/g)) {
+          if (m[0] === '{') depth++;
+          else if (m[0] === '}') depth--;
+          else if (depth > 0) v.push(`${locate(f, t, m.index)} @keyframes sits inside an @media block — it stops animating outside it`);
+        }
+        const names = [...t.matchAll(/@keyframes\s+([\w-]+)/g)].map((x) => x[1]);
+        if (names.length) {
+          const rm = [...t.matchAll(/@media[^{]*prefers-reduced-motion[^{]*\{/g)];
+          // Blanket neutraliser: a `*` rule turning animation off, which covers
+          // every name above and any keyframe added later.
+          const blanket = rm.some((m) => {
+            const body = t.slice(m.index);
+            return /\*\s*(?:,\s*[^{}]*)?\{[^}]*animation(?:-name)?\s*:\s*none\s*!important/.test(body)
+              || /\*,\s*\*::before,/.test(body);
+          });
+          if (!rm.length) v.push(`${rel(f)}:0 defines ${names.length} animations but has no prefers-reduced-motion block`);
+          else if (!blanket) v.push(`${rel(f)}:0 reduced-motion block names selectors instead of neutralising all ${names.length} @keyframes (${names.join(', ')})`);
         }
         const defined = new Set([...t.matchAll(/(--[\w-]+)\s*:/g)].map((x) => x[1]));
         for (const m of t.matchAll(/var\((--[\w-]+)/g)) {
@@ -263,7 +300,13 @@ const GATES = [
     inject() {
       return {
         file: 'packages/ui/__selftest__.css',
-        content: '.a{height:100vh;transition:all .2s}\n.a:hover{color:red}\n.b{color:var(--nope-zz)}\n',
+        content:
+          '.a{height:100vh;transition:all .2s;border:1px solid rgba(255, 255, 255, 0.14)}\n'
+          + '.a:hover{color:red}\n'
+          + '@media (hover: hover){\n.b:hover{color:red}\n}\n'
+          + '@keyframes live{to{opacity:1}}\n'
+          + '@media (prefers-reduced-motion: reduce){@keyframes nested{to{opacity:0}}\n.c{transition:none}}\n'
+          + '.d{color:var(--nope-zz)}\n',
       };
     },
   },

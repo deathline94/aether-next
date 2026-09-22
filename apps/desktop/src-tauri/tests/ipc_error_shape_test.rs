@@ -52,31 +52,28 @@ fn a_rejected_setting_names_the_field_that_failed() {
         "the field has to be the name the frontend state uses, not the Rust one"
     );
 
-    let err = validate_settings(&settings_with(|s| s.scan_mode = "telepathic".into()))
-        .expect_err("an unknown scan mode must be refused");
+    let err = validate_settings(&settings_with(|s| s.noize = "volcano".into()))
+        .expect_err("an unknown obfuscation profile must be refused");
     assert_eq!(err.code, "validation");
-    assert_eq!(err.field, Some("scanMode"));
-
-    let err = validate_settings(&settings_with(|s| s.routing_mode = "bridge".into()))
-        .expect_err("an unknown routing mode must be refused");
-    assert_eq!(err.code, "validation");
-    assert_eq!(err.field, Some("routingMode"));
+    assert_eq!(err.field, Some("noize"));
 }
 
 /// Every error the shell can produce about a field has to name it: a `None`
 /// here would leave that branch of the form with the eternal spinner.
+///
+/// `protocol`, `transport`, `scanMode`, `ipVersion` and `routingMode` used to be
+/// in this list. They cannot be broken by construction any more — those values
+/// are `wire_enum!` types now, so a `Settings` holding `"teleport"` does not
+/// exist — which is the stronger version of the check: the rejection the form had
+/// to display is unreachable. Their wire contract is covered instead by
+/// `settings_compat_test.rs`.
 #[test]
 fn every_validation_failure_names_a_field() {
     let cases: Vec<(&str, Breaker)> = vec![
         ("httpPort", |s| s.http_port = 80),
         ("socksPort", |s| s.socks_port = 1),
         ("httpPort", |s| s.http_port = s.socks_port),
-        ("protocol", |s| s.protocol = "teleport".into()),
-        ("transport", |s| s.transport = "carrier-pigeon".into()),
-        ("scanMode", |s| s.scan_mode = "telepathic".into()),
-        ("ipVersion", |s| s.ip_version = "auto-detect".into()),
         ("noize", |s| s.noize = "volcano".into()),
-        ("routingMode", |s| s.routing_mode = "bridge".into()),
         ("enginePath", |s| s.engine_path = "C:\\definitely-not-here\\aether.exe".into()),
         ("noizeJmax", |s| {
             s.noize = "custom".into();

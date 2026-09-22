@@ -97,10 +97,13 @@ class FakeProcessLauncher(
 ) : ProcessLauncher {
     var lastCommand: List<String>? = null
     var lastEnv: Map<String, String>? = null
-    var launchCount = 0
+
+    /** Counted atomically: the concurrency tests read it from other threads. */
+    private val launches = AtomicInteger(0)
+    val launchCount: Int get() = launches.get()
 
     override fun launch(command: List<String>, env: Map<String, String>): Process {
-        launchCount++
+        launches.incrementAndGet()
         lastCommand = command
         lastEnv = env
         return nextProcess

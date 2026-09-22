@@ -51,54 +51,107 @@ class EngineRunnerTest {
         )
     }
 
+    /**
+     * T227: this case used to assert `SupervisorState.valueOf("IDLE") == IDLE`, i.e.
+     * that an enum's name round-trips — nothing in `EngineRunner` could ever have
+     * broken it. It now drives the runner and reads the state the runner reports.
+     */
     @Test
-    fun testSupervisorStateTransitions() {
-        assertEquals(SupervisorState.IDLE, SupervisorState.valueOf("IDLE"))
-        assertEquals(SupervisorState.SCANNING, SupervisorState.valueOf("SCANNING"))
-        assertEquals(SupervisorState.CONNECTING, SupervisorState.valueOf("CONNECTING"))
-        assertEquals(SupervisorState.CONNECTED, SupervisorState.valueOf("CONNECTED"))
-        assertEquals(SupervisorState.STOPPING, SupervisorState.valueOf("STOPPING"))
+    fun supervisorStateTracksTheRealLifecycle() {
+        val runner = TestableEngineRunner(
+            dummyContext, fakeBinary,
+            launcher = FakeProcessLauncher(nextProcess = FakeProcess(ProcessExitBehavior.UNKILLABLE)),
+        )
+
+        assertEquals(SupervisorState.IDLE, runner.getState())
+
+        assertNull(runner.start(Settings()))
+        assertEquals("a launched engine is connecting, not connected", SupervisorState.CONNECTING, runner.getState())
+
+        runner.setConnected()
+        assertEquals("only the session's word moves it on", SupervisorState.CONNECTED, runner.getState())
+
+        // A runner that never left IDLE must not be flung into CONNECTED by a stray
+        // `setConnected()` — that is how a green badge used to survive a dead tunnel.
+        val idle = TestableEngineRunner(
+            dummyContext, fakeBinary,
+            launcher = FakeProcessLauncher(nextProcess = FakeProcess(ProcessExitBehavior.UNKILLABLE)),
+        )
+        idle.setConnected()
+        assertEquals(SupervisorState.IDLE, idle.getState())
     }
 
     @Test
-    fun testGenerationTokenMonotonicIncrement() {
-        val generation = java.util.concurrent.atomic.AtomicLong(0)
-        assertEquals(0L, generation.get())
+    fun scanModeIsReportedByTheRunnerNotAssumed() {
+        // `configureScanEnvironment` (not overridden by the test runner) reads
+        // filesDir/cacheDir, so this needs the fake context rather than the bare
+        // ContextWrapper the rest of the file gets away with.
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "scan_${System.nanoTime()}").apply { mkdirs() }
+        val runner = TestableEngineRunner(
+            FakeSessionContext(tempDir), fakeBinary,
+            launcher = FakeProcessLauncher(nextProcess = FakeProcess(ProcessExitBehavior.UNKILLABLE)),
+        )
 
-        val g1 = generation.incrementAndGet()
-        val g2 = generation.incrementAndGet()
-        val g3 = generation.incrementAndGet()
+        assertFalse("an idle runner is not a scan", runner.isScanMode())
+        assertNull(runner.startScan("masque-h3", "v4", 64, 6000, "off"))
+        assertTrue(runner.isScanMode())
+        assertEquals("a scan reports SCANNING so connect() can interrupt it", SupervisorState.SCANNING, runner.getState())
 
-        assertEquals(1L, g1)
-        assertEquals(2L, g2)
-        assertEquals(3L, g3)
-        assertTrue(g3 > g2 && g2 > g1)
+        tempDir.deleteRecursively()
     }
 
+    /**
+     * T227: the generation token used to be a test-local `AtomicLong` the test
+     * incremented itself. Read it from the runner, which is what actually decides
+     * whether a finished reader thread may publish an exit.
+     */
     @Test
-    fun testSingleInstanceMutualExclusionUnderConcurrency() {
-        val running = java.util.concurrent.atomic.AtomicBoolean(false)
-        val successfulLaunches = AtomicInteger(0)
-        val collisions = AtomicInteger(0)
+    fun generationAdvancesWithRealStartsAndStops() {
+        val runner = TestableEngineRunner(
+            dummyContext, fakeBinary,
+            launcher = FakeProcessLauncher(nextProcess = FakeProcess(ProcessExitBehavior.GRACEFUL)),
+        )
+        val before = runner.getGeneration()
+
+        assertNull(runner.start(Settings()))
+        assertTrue("start() takes a generation", runner.getGeneration() > before)
+        val started = runner.getGeneration()
+
+        assertTrue(runner.stopAndWait(1000))
+        assertTrue("stop() takes another, so an in-flight reader can be recognised as stale",
+            runner.getGeneration() > started)
+    }
+
+    /**
+     * T227: was a local `AtomicBoolean` race between threads that shared nothing
+     * with the class under test. Now sixteen threads really do call `start()` and
+     * the launcher is what proves only one of them reached a `ProcessBuilder`.
+     */
+    @Test
+    fun singleInstanceMutualExclusionUnderConcurrency() {
+        val launcher = FakeProcessLauncher(nextProcess = FakeProcess(ProcessExitBehavior.UNKILLABLE))
+        val runner = TestableEngineRunner(dummyContext, fakeBinary, launcher = launcher)
         val threads = 16
-        val latch = CountDownLatch(threads)
+        val accepted = AtomicInteger(0)
+        val rejected = AtomicInteger(0)
+        val done = CountDownLatch(threads)
 
-        for (i in 0 until threads) {
+        repeat(threads) {
             Thread {
-                if (running.compareAndSet(false, true)) {
-                    successfulLaunches.incrementAndGet()
-                    Thread.sleep(20)
-                    running.set(false)
-                } else {
-                    collisions.incrementAndGet()
+                val err = try {
+                    runner.start(Settings())
+                } finally {
+                    done.countDown()
                 }
-                latch.countDown()
+                if (err == null) accepted.incrementAndGet() else rejected.incrementAndGet()
             }.start()
         }
+        assertTrue("the contenders deadlocked", done.await(10, TimeUnit.SECONDS))
 
-        assertTrue(latch.await(5, TimeUnit.SECONDS))
-        assertTrue("At least one launch succeeded", successfulLaunches.get() >= 1)
-        assertTrue("Collisions were caught and rejected", collisions.get() >= 1)
+        assertEquals("exactly one launch may reach the launcher", 1, launcher.launchCount)
+        assertEquals(1, accepted.get())
+        assertEquals(threads - 1, rejected.get())
+        assertEquals("Aether is already running", runner.start(Settings()))
     }
 
     @Test

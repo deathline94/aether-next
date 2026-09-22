@@ -1,18 +1,42 @@
 package app.aethernext
 
+import android.util.Log
 import android.webkit.JavascriptInterface
 import org.json.JSONException
 import org.json.JSONObject
 
 /**
  * WebView bridge exposing the same command surface as Tauri desktop invoke().
+ *
+ * [originTrusted] is the T219 gate. A `JavascriptInterface` is attached to the
+ * WebView, not to the page that was supposed to be in it: anything that can make
+ * this WebView show another document — a redirect, a failed load that fell back to
+ * the generated error page, a `data:`/`about:` navigation — inherits the object
+ * and with it `connect`, `disconnect`, `save_settings` and the engine's config.
+ * Every call therefore re-checks that the document actually loaded is one this APK
+ * shipped, using the URL captured on the UI thread in `onPageStarted`.
  */
 class AetherBridge(
     private val activity: MainActivity,
     private val session: SessionController,
+    private val originTrusted: () -> Boolean = { activity.isBridgeOriginTrusted() },
 ) {
     @JavascriptInterface
     fun invoke(cmd: String, argsJson: String): String {
+        val trusted = try {
+            originTrusted()
+        } catch (e: Exception) {
+            Log.w(TAG, "origin check threw, treating the caller as untrusted: ${e.message}")
+            false
+        }
+        if (!trusted) {
+            Log.e(TAG, "bridge call '$cmd' rejected: loaded page is not the packaged UI")
+            return bridgeErr(
+                "permission_denied",
+                "Bridge call '$cmd' rejected: the loaded page is not the packaged Aether UI.",
+                null,
+            )
+        }
         return try {
             val args = if (argsJson.isBlank()) JSONObject() else JSONObject(argsJson)
             val data: Any? = when (cmd) {
@@ -70,7 +94,11 @@ class AetherBridge(
     }
 
     internal fun handleDisconnect(): Any {
-        session.disconnect()
+        // T206: "I asked the tunnel to stop" is not "the tunnel stopped". The
+        // message says what is still up and what to do about it, and it travels as
+        // a coded rejection so the UI can show it instead of a green "Ready".
+        val err = session.disconnect()
+        if (err != null) throw BridgeError("stop_failed", err)
         return JSONObject.NULL
     }
 
@@ -111,4 +139,8 @@ class AetherBridge(
             .put("author", "deathline94")
             .put("engine", "deathline94/aether-next")
             .put("platform", "android")
+
+    companion object {
+        private const val TAG = "AetherBridge"
+    }
 }

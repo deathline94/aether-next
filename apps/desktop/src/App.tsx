@@ -6,7 +6,7 @@ import { ConnectionTab } from "./components/ConnectionTab";
 import { ScannerTab } from "./components/ScannerTab";
 import { SettingsTab } from "./components/SettingsTab";
 import { useLogs } from "./hooks/useLogs";
-import { useRuntime } from "./hooks/useRuntime";
+import { engineDiagnostics, useRuntime } from "./hooks/useRuntime";
 import { useScanner } from "./hooks/useScanner";
 import type { DiscoveredEndpoint, View } from "./types";
 
@@ -64,9 +64,14 @@ function App() {
 
   const exportLogs = useCallback(async (): Promise<boolean> => {
     if (logs.length === 0) return false;
-    const text = logs
-      .map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`)
-      .join("\n");
+    const diagnostics = await engineDiagnostics();
+    const text = [
+      logs
+        .map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`)
+        .join("\n"),
+      "# engine diagnostics",
+      diagnostics,
+    ].join("\n\n");
     try {
       await navigator.clipboard.writeText(text);
       return true;

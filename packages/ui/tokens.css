@@ -10,6 +10,9 @@
  */
 
 :root {
+  /* UA defaults the audit found absent (0 occurrences, contract U-D5). */
+  color-scheme: dark;
+
   /* Surfaces */
   --bg-app: #07090b;
   --panel: #0d1116;
@@ -23,10 +26,15 @@
    * separation does not, and is kept below that on purpose so it stays quiet.
    * Both are opaque composited colours rather than raw alpha over a surface,
    * because a 1px alpha hairline antialiases away at Windows 125%/150% scaling.
+   * Ratios below are measured (WCAG relative luminance) against every surface
+   * each token actually sits on — the darkest is --panel-2 #11161d, the
+   * lightest --panel-hover #161c24, and both tiers clear their floor there.
+   * Do not "fix" a low ratio by raising an rgba() alpha: still translucent,
+   * still antialiased (contract U-E1).
    */
-  --edge: #232b34;            /* decorative separation, >=1.6:1 vs --panel */
-  --edge-interactive: #4a5764; /* control boundary, >=3:1 vs --panel */
-  --edge-strong: #6b7b8a;
+  --edge: #3b4652;            /* decorative separation: 1.97:1 vs --panel, 1.89 vs --panel-2, 1.94 vs --panel-nested, 2.07 vs --bg-app, floor 1.78 vs --panel-hover — >=1.6 */
+  --edge-interactive: #606e7c; /* control boundary: 3.62:1 vs --panel, 3.48 vs --panel-2, 3.57 vs --panel-nested, 3.82 vs --bg-app, floor 3.28 vs --panel-hover — >=3 (WCAG 1.4.11) */
+  --edge-strong: #6b7b8a;     /* hover/emphasis step only: 4.35:1 vs --panel; never a resting state, so it cannot outrank --emerald (12.47:1) .active */
 
   /* Text */
   --text: #edf2f5;
@@ -47,6 +55,11 @@
   --violet: #a78bfa;
 
   /* Type */
+  /* Weight tiers are real steps (500/600/700), not 550/650/750: with the
+   * fallback stack (Segoe UI / system-ui) the odd tiers either snap to the
+   * same face or need synthesis, so `font-synthesis: none` is deliberately
+   * NOT set — synthetic emphasis is allowed rather than silently flattening
+   * half the scale to 400 (contract U-C2). */
   --font-sans: "Geist Variable", "Geist", system-ui, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono Variable", "Geist Mono", "JetBrains Mono", ui-monospace, Consolas, monospace;
   --text-micro: 11px;   /* floor: nothing legible-bearing renders smaller */
@@ -74,4 +87,22 @@
   --shadow-panel: 0 8px 28px rgba(0, 0, 0, 0.35);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   --duration-fast: 150ms;
+}
+
+/*
+ * UA defaults the audit found with zero occurrences in the whole codebase
+ * (contract U-D5): `option` inherited the light UA popup palette — #edf2f5 on
+ * #ffffff measures 1.13:1, i.e. invisible — and the UA selection highlight
+ * measured 1.24:1 (#d8e2ec on #accef7), so selected text disappeared.
+ */
+option {
+  padding: 8px 10px;
+  background: var(--panel-2); /* #edf2f5 on #11161d = 16.10:1 */
+  color: var(--text);
+}
+option:disabled { color: var(--muted); }
+
+::selection {
+  background: var(--blue);   /* #07090b on #5cc8ff = 10.60:1, was 1.24:1 */
+  color: var(--bg-app);
 }

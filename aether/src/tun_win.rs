@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 use wintun_bindings::{Adapter, Session, MAX_RING_CAPACITY};
 
 use crate::error::{AetherError, Result};
-use crate::route_repair::{RouteIntent, RouteJournal, ScopeKind};
+use crate::route_repair::{
+    self, powershell_script, ps_literal_is_safe, JournalOwner, Liveness, MutationVerdict,
+    OwnershipRecord, RouteIntent, RouteJournal,
+};
 
 const ADAPTER_NAME: &str = "Aether";
 const TUNNEL_TYPE: &str = "Aether";
@@ -107,16 +110,9 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
-/// Defense-in-depth: reject any interpolated value that could break out of a
-/// single-quoted PowerShell string literal (L1 fix). Inputs here are typed IPs
-/// and a constant adapter name, so this should never fire in practice; it guards
-/// against future call sites passing attacker-influenced strings into scripts.
-fn ps_literal_is_safe(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | ':'))
-}
+// Defense-in-depth for interpolated values now lives with the renderer that
+// consumes it (`route_repair::ps_literal_is_safe`), so a command string cannot
+// be built by one rule and checked by another.
 
 fn parse_v4(s: &str) -> Result<Ipv4Addr> {
     let ip = s.split('/').next().unwrap_or(s);
@@ -303,6 +299,10 @@ fn plan_journal(
         version: crate::route_repair::JOURNAL_VERSION,
         created_unix: crate::trust::now_unix(),
         creator_pid: std::process::id(),
+        // T036: the pid alone is not an owner — pids get reused, and a reused pid
+        // is how a fresh instance inherits a dead one's claim on the table. The
+        // boot id is what makes the pair meaningful.
+        boot_id: crate::route_repair::boot_id(),
         tun_alias: ADAPTER_NAME.into(),
         tun_if_index: tun_if,
         phys_if_index: phys_if,
@@ -310,10 +310,6 @@ fn plan_journal(
         tunnel_ipv4: ipv4.to_string(),
         peer_ipv4: peer_ip.to_string(),
         entries,
-        // Captured by configure_adapter_ip's caller on a future pass; the
-        // reset path today restores to Automatic/empty, which is the safe
-        // default for an adapter this process created.
-        before: None,
     }
 }
 
@@ -327,9 +323,10 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
         }
     };
     // One host mutation per moment, across processes. Two sessions each install
-    // the same split-default prefixes and each write their own journal for them,
-    // so the second journal silently describes routes the first still believes it
-    // owns — and whichever teardown runs last removes them.
+    // the same split-default prefixes, so the second must not be allowed to
+    // describe those prefixes as its own: the lock serialises the act of
+    // installing, and `refuse_if_another_instance_holds_a_journal` (T036) makes a
+    // live journal by another owner a refusal rather than a takeover.
     let _mutation = crate::host_lock::HostMutationGuard::acquire(crate::host_lock::ACQUIRE_TIMEOUT)?;
     let (physical_if_index, gw) = default_gateway()?;
     let if_index = interface_index(ADAPTER_NAME)?;
@@ -339,11 +336,36 @@ fn install_routes(peer: SocketAddr, ipv4: Ipv4Addr) -> Result<RouteJournal> {
 
     // Journal first, fail closed: an install we cannot record is an install we
     // cannot undo, and undoing is the whole point.
+    //
+    // T036 — before the journal is written, ask whether another instance already
+    // owns this interface's record. The single shared journal used to make a
+    // second engine overwrite the first one's, after which whichever teardown ran
+    // last deleted prefixes the *other* process still believed it held.
+    let me = route_repair::current_owner();
+    refuse_if_another_instance_holds_a_journal(if_index, &me)?;
     let mut journal = plan_journal(peer_ip, ipv4, gw, if_index, physical_if_index);
-    if let Some(path) = crate::route_repair::journal_path() {
-        crate::route_repair::write_journal(&path, &journal)
-            .map_err(|e| AetherError::Other(format!("refusing to mutate routes: {e}")))?;
-    }
+    let journal_path = route_repair::journal_path_for(&me).ok_or_else(|| {
+        AetherError::Other("refusing to mutate routes: no per-owner journal path".into())
+    })?;
+    route_repair::write_journal(&journal_path, &journal)
+        .map_err(|e| AetherError::Other(format!("refusing to mutate routes: {e}")))?;
+
+    // T044 — the backstop block, see `route_repair::ROUTE_BACKSTOP_LIFETIME`. It
+    // is applied inside its own `try`, so a host whose NetTCPIP cmdlets do not
+    // take a lifetime still gets its routes installed: the backstop degrades, the
+    // connection does not.
+    let backstop = route_repair::lifetime_refresh_commands(&journal);
+    let backstop_block = if backstop.is_empty() {
+        "Write-Output 'backstop=no-scoped-entries'".to_string()
+    } else {
+        let mut block = String::from("try {\n");
+        for command in &backstop {
+            block.push_str(command);
+            block.push('\n');
+        }
+        block.push_str("  Write-Output 'backstop=armed'\n} catch { Write-Output 'backstop=unsupported' }");
+        block
+    };
 
     // WireGuard-Windows style: on-link split default on tunnel IF (NextHop 0.0.0.0),
     // plus host route for edge peer via physical gateway. Prefer New-NetRoute.
@@ -386,6 +408,7 @@ try {{
     Select-Object -ExpandProperty DestinationPrefix)
   $peerOk = Get-NetRoute -DestinationPrefix $peer -InterfaceIndex $physIf -ErrorAction SilentlyContinue
   if ($v.Count -lt 2 -or -not $peerOk) {{ throw 'route verification failed' }}
+  {backstop_block}
   Write-Output ('ok tunIf=' + $tunIf + ' physIf=' + $physIf + ' routes=' + ($v -join ','))
 }} catch {{
   foreach ($r in $added) {{
@@ -413,7 +436,7 @@ try {{
                 "route",
                 &["add", &peer_s, "mask", "255.255.255.255", &gw_s, "metric", "1", "IF", &phys_s],
             ) {
-                clear_journal();
+                clear_journal_at(&journal_path);
                 return Err(AetherError::Other(format!(
                     "failed to install physical peer escape route: {err}"
                 )));
@@ -432,7 +455,7 @@ try {{
                         let _ = run_cmd("route", &["delete", installed, "mask", "128.0.0.0", "IF", &ifs]);
                     }
                     let _ = run_cmd("route", &["delete", &peer_s, "mask", "255.255.255.255", "IF", &phys_s]);
-                    clear_journal();
+                    clear_journal_at(&journal_path);
                     return Err(add_err);
                 }
                 installed_splits.push(dest);
@@ -446,17 +469,42 @@ try {{
                     entry.next_hop = via.clone();
                 }
             }
-            if let Some(path) = crate::route_repair::journal_path() {
-                if let Err(err) = crate::route_repair::write_journal(&path, &journal) {
-                    log::error!("[tun] installed routes but the journal is stale: {err}");
-                }
+            if let Err(err) = route_repair::write_journal(&journal_path, &journal) {
+                log::error!("[tun] installed routes but the journal is stale: {err}");
             }
+            // `route.exe` has no seconds-granularity lifetime (its `-age` is in
+            // minutes and only feeds the automatic-metric calculation), so a host
+            // that lands here has no T044 backstop: a killed process is cleaned by
+            // the journal replay at the next start instead.
+            log::warn!(
+                "[tun] route lifetime backstop not available on the route.exe path; \
+                 cleanup relies on the journal replay"
+            );
             log::info!(
                 "[tun] routes installed (route.exe): peer via {gw_s} IF={physical_if_index}, split-default {via} IF={if_index}"
             );
         }
     }
     Ok(journal)
+}
+
+/// T036 — another instance's journal blocks us, and that is the whole answer.
+fn refuse_if_another_instance_holds_a_journal(if_index: u32, me: &JournalOwner) -> Result<()> {
+    let records: Vec<OwnershipRecord> = route_repair::scan_journals(route_repair::boot_id(), process_liveness)
+        .into_iter()
+        .map(|stale| OwnershipRecord {
+            owner: route_repair::owner_of(&stale.journal),
+            tun_if_index: stale.journal.tun_if_index,
+            holder: stale.holder,
+        })
+        .collect();
+    match route_repair::decide_owner_exclusivity(&records, me, if_index) {
+        MutationVerdict::Proceed => Ok(()),
+        MutationVerdict::Refuse { why, owner } => Err(AetherError::Other(format!(
+            "{why} (pid {} from boot {:#x}); refusing to install routes a second instance would later delete",
+            owner.creator_pid, owner.boot_id
+        ))),
+    }
 }
 
 /// Remove exactly the routes the journal says we created, and nothing else.
@@ -493,108 +541,52 @@ fn remove_routes(journal: &RouteJournal) {
 ///
 /// Callers that already hold it (the stale-route replay) use this directly;
 /// anything else goes through [`remove_routes`], which takes the lock first. The
-/// split exists because the lock is not re-entrant across a process's own file
-/// descriptors, and a nested acquire would fail and silently skip the removal.
+/// split exists because the lock is not re-entrant, and a nested acquire would
+/// fail and silently skip the removal.
+///
+/// T032: the route deletions *and* the adapter reset are rendered into one
+/// script, so a teardown is a single `powershell.exe` cold start instead of two
+/// (previously three, with `route.exe` after them, which is why it overran the
+/// supervisor's grace window and never ran at all). Nothing here shells out per
+/// prefix.
 fn remove_routes_locked(journal: &RouteJournal) {
-    let plan = journal.removal_plan();
-    if plan.is_empty() {
-        log::warn!("[tun] no removal plan for this journal; leaving routes untouched");
+    let plan = route_repair::teardown_plan(journal, ADAPTER_NAME);
+    if plan.commands.is_empty() {
+        log::warn!("[tun] nothing removable in this journal and no safe adapter alias; leaving host state untouched");
         return;
     }
-    let mut script = String::from("$ErrorActionPreference = 'SilentlyContinue'\n");
-    let mut issued = 0usize;
-    let mut refused = 0usize;
-    for p in plan {
-        let Some(cidr) = crate::route_repair::as_cidr(&p.destination, &p.mask) else {
-            log::error!(
-                "[tun] cannot express {}/{:?} as a prefix; refusing this removal",
-                p.destination, p.mask
-            );
-            refused += 1;
-            continue;
-        };
-        match &p.scope {
-            ScopeKind::Interface { if_index } => {
-                script.push_str(&format!(
-                    "Get-NetRoute -DestinationPrefix '{cidr}' -InterfaceIndex {if_index} -ErrorAction SilentlyContinue |\n  Where-Object {{ $_.InterfaceIndex -eq {if_index} }} |\n  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n"
-                ));
-                issued += 1;
-            }
-            ScopeKind::NextHop { next_hop } if ps_literal_is_safe(next_hop) => {
-                script.push_str(&format!(
-                    "Get-NetRoute -DestinationPrefix '{cidr}' -ErrorAction SilentlyContinue |\n  Where-Object {{ $_.NextHop -eq '{next_hop}' }} |\n  Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n"
-                ));
-                issued += 1;
-            }
-            ScopeKind::NextHop { next_hop } => {
-                log::error!("[tun] refusing removal for {cidr}: rejected next-hop {next_hop:?}");
-                refused += 1;
-            }
-            ScopeKind::Refused { why } => {
-                log::error!("[tun] refusing to remove {cidr}: {why}");
-                refused += 1;
-            }
-        }
+    if plan.removals == 0 {
+        log::warn!(
+            "[tun] no scoped removal for this journal ({} refused); the adapter reset still runs",
+            plan.refused
+        );
     }
-    if issued > 0 {
-        // One shell spawn for the whole plan, not one per prefix: the teardown
-        // has to fit inside the supervisor's grace window or it never runs.
-        if let Err(e) = ps(&script) {
-            log::error!("[tun] route removal reported an error: {e}");
-        }
+    if let Err(e) = ps(&powershell_script(&plan.commands)) {
+        log::error!("[tun] teardown reported an error: {e}");
     }
     log::info!(
-        "[tun] route removal: {} scoped deletion(s) issued, {} refused",
-        issued,
-        refused
+        "[tun] teardown: {} scoped deletion(s) issued, {} refused, adapter reset folded in, one shell spawn",
+        plan.removals,
+        plan.refused
     );
 }
 
-/// M1 fix (continued): undo what configure_adapter_ip set on the tunnel NIC —
-/// pinned DNS servers (1.1.1.1/1.0.0.1) and InterfaceMetric=1 used to persist
-/// after disconnect/crash while the adapter lingered, degrading or breaking name
-/// resolution via a now-dead path. Called on drop and on stale-state recovery.
-fn reset_adapter_config(name: &str) {
-    if !ps_literal_is_safe(name) {
-        log::error!("[tun] refusing to reset adapter config for unsafe alias {name:?}");
-        return;
-    }
-    let script = format!(
-        r#"
-Set-DnsClientServerAddress -InterfaceAlias '{name}' -ResetServerAddresses -ErrorAction SilentlyContinue
-Set-NetIPInterface -InterfaceAlias '{name}' -AutomaticMetric Enabled -ErrorAction SilentlyContinue
-"#
-    );
-    // Teardown failures used to be discarded with `let _ =`, so a host left with
-    // a dead NIC's pinned resolver looked like a clean disconnect.
-    if let Err(e) = ps(&script) {
-        log::error!("[tun] adapter {name} reset failed: {e}");
-    }
-}
-
-fn clear_journal() {
-    if let Some(path) = crate::route_repair::journal_path() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::error!("[tun] could not clear journal {}: {e}", path.display());
-            }
-        }
-    }
+/// Unlink **this** owner's journal, plus the pre-journal state file.
+///
+/// T036: it takes a path. Clearing "the journal" without saying whose was how a
+/// second instance erased the record the first one needed to clean up after
+/// itself.
+fn clear_journal_at(path: &std::path::Path) {
+    route_repair::remove_journal_file(path);
     // The pre-journal file name, cleaned up so an upgrade cannot leave a second
     // stale record that a future reader might trust over the journal.
     if let Some(legacy) = legacy_state_path() {
-        let _ = std::fs::remove_file(legacy);
+        route_repair::remove_journal_file(&legacy);
     }
 }
 
 fn legacy_state_path() -> Option<PathBuf> {
-    // OS environment fact, not app configuration: `runtime_env` only owns
-    // `AETHER_*` keys, so routing this through it would return `None`.
-    #[allow(clippy::disallowed_methods)]
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
-    Some(dir.join("AetherNext").join("tun-routes.json"))
+    Some(route_repair::state_dir()?.join("tun-routes.json"))
 }
 
 /// Upgrade the pre-journal `tun-routes.json` into a journal.
@@ -636,6 +628,11 @@ fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
         version: crate::route_repair::JOURNAL_VERSION,
         created_unix: 0,
         creator_pid: u("pid"),
+        // A pre-journal file has no boot identity, so it can never be matched to
+        // "this process, this boot": `decide_replay` still needs a live-holder
+        // probe for it, and `decide_owner_exclusivity` treats it as a foreign
+        // owner rather than as ours.
+        boot_id: 0,
         tun_alias: ADAPTER_NAME.into(),
         tun_if_index: tun_if,
         phys_if_index: phys_if,
@@ -643,11 +640,17 @@ fn journal_from_legacy(state: &serde_json::Value) -> Option<RouteJournal> {
         tunnel_ipv4,
         peer_ipv4,
         entries,
-        before: None,
     })
 }
 
 /// Remove routes left by a crashed previous engine process.
+///
+/// T033: reachable from anywhere — the engine calls it at its own startup, before
+/// any session runs (`cli::run`), and `route_repair::repair_host_state_now` is the
+/// name a shell can call without entering TUN mode. It is safe to call at any
+/// moment because every journal it can act on has to pass
+/// [`route_repair::decide_replay`] first, which refuses to touch anything whose
+/// holder is alive or whose liveness could not be established.
 pub fn recover_stale_routes() {
     // The replay is a host mutation like any other. Holding the lock here also
     // means `remove_routes_locked` below is called with it already taken.
@@ -656,125 +659,213 @@ pub fn recover_stale_routes() {
         log::info!("[tun] another session owns host mutation; skipping the stale-route replay");
         return;
     };
-    let mut handled = false;
-    if let Some(path) = crate::route_repair::journal_path() {
-        match RouteJournal::load_opt(&path) {
-            Ok(Some(journal)) => {
-                let alive = journal.creator_pid != 0 && process_alive(journal.creator_pid);
-                if alive {
-                    log::info!(
-                        "[tun] routes owned by live pid {}; leaving them alone",
-                        journal.creator_pid
-                    );
-                    return;
-                }
-                if journal.creator_pid != 0 {
-                    log::warn!(
-                        "[tun] recovering stale routes from dead pid {}",
-                        journal.creator_pid
-                    );
-                    remove_routes_locked(&journal);
-                    reset_adapter_config(ADAPTER_NAME);
-                    handled = true;
-                }
-                let _ = std::fs::remove_file(&path);
-            }
-            Ok(None) => {}
-            Err(e) => log::error!("[tun] journal unreadable, cannot verify host state: {e}"),
-        }
+    // Every journal on disk — this one, every other owner's, and the legacy single
+    // file. `remove_routes_locked` already folds the adapter reset into the same
+    // script, so recovery needs no separate reset call.
+    let handled = route_repair::replay_abandoned_journals(process_liveness, &|journal: &RouteJournal| {
+        remove_routes_locked(journal);
+    });
+    if recover_legacy_state_file() {
+        log::info!("[tun] recovered routes recorded by a pre-journal build");
     }
-    // Pre-journal state file from an older build.
-    if let Some(legacy) = legacy_state_path() {
-        if let Ok(raw) = std::fs::read(&legacy) {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
-                if let Some(journal) = journal_from_legacy(&v) {
-                    if journal.is_abandoned(process_alive(journal.creator_pid)) {
-                        log::warn!(
-                            "[tun] recovering legacy routes from dead pid {}",
-                            journal.creator_pid
-                        );
-                        remove_routes_locked(&journal);
-                        reset_adapter_config(ADAPTER_NAME);
-                        handled = true;
-                    }
-                }
-            }
-            let _ = std::fs::remove_file(&legacy);
-        }
-    }
-    if handled {
-        log::info!("[tun] stale route recovery complete");
+    if handled > 0 {
+        log::info!("[tun] stale route recovery complete: {handled} journal(s) replayed");
     }
 }
 
-/// Is this pid ours, right now?
-///
-/// Exact field match. The shipped version asked `tasklist` for the pid and then
-/// substring-searched the whole output, so pid `4` matched the working-set and
-/// session columns of unrelated rows: a long-dead holder looked alive, stale
-/// routes were never cleaned, and the machine stayed black-holed.
-fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
+/// The `tun-routes.json` a build from before the journal left behind.
+fn recover_legacy_state_file() -> bool {
+    let Some(legacy) = legacy_state_path() else {
         return false;
+    };
+    let Ok(raw) = std::fs::read(&legacy) else {
+        return false;
+    };
+    let journal = serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| journal_from_legacy(&v));
+    let mut removed = false;
+    let mut keep_for_later = false;
+    if let Some(journal) = journal {
+        let holder = combine(process_liveness(journal.creator_pid), &journal);
+        match route_repair::decide_replay(&journal, holder, std::process::id()) {
+            route_repair::Replay::Remove => {
+                log::warn!(
+                    "[tun] recovering legacy routes from dead pid {}",
+                    journal.creator_pid
+                );
+                remove_routes_locked(&journal);
+                removed = true;
+            }
+            route_repair::Replay::LeaveAlone(why) => {
+                log::info!("[tun] leaving the pre-journal record alone: {why}");
+                // The holder may be live: the file is that session's only record,
+                // and deleting it would strand its routes with nothing to replay.
+                keep_for_later = journal.creator_pid != 0;
+            }
+        }
     }
+    if !keep_for_later {
+        // Unreadable as a journal, or already acted on: it has no further use, and
+        // leaving it would let a future build re-derive a journal from state it
+        // never verified.
+        route_repair::remove_journal_file(&legacy);
+    }
+    removed
+}
+
+/// Liveness folded with "was this written before the current boot".
+fn combine(probe: Liveness, journal: &RouteJournal) -> Liveness {
+    route_repair::combine_liveness(journal.created_unix, route_repair::boot_id(), probe)
+}
+
+/// Is this pid running?
+///
+/// T035. The shipped version substring-searched `tasklist`'s whole output, so pid
+/// `4` matched the working-set and session columns of unrelated rows: a long-dead
+/// holder looked alive forever and its routes were never cleaned. Two exact
+/// mechanisms replace it, and neither can guess:
+///
+/// 1. `OpenProcess` + `GetExitCodeProcess`, which identifies a process by handle,
+///    not by text; and
+/// 2. `tasklist /FI "PID eq <pid>" /FO CSV /NH`, parsed by
+///    [`route_repair::liveness_from_tasklist`] against the PID column only.
+///
+/// Access denied on the first is `Alive` (the process exists, it is someone
+/// else's); a probe that could not be performed at all is `Unknown`, which no
+/// caller may read as permission to delete.
+fn process_liveness(pid: u32) -> Liveness {
+    if pid == 0 {
+        return Liveness::Unknown;
+    }
+    match handle_liveness(pid) {
+        Liveness::Unknown => tasklist_liveness(pid),
+        decided => decided,
+    }
+}
+
+/// The kernel's own answer, for the common case where it has one.
+fn handle_liveness(pid: u32) -> Liveness {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // The exit code a running process reports; `windows-sys` does not export it.
+    const STILL_ACTIVE: u32 = 259;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Only "it exists but is not ours" is evidence of life. Anything else —
+        // including a privilege-restricted token that refuses the query — is not.
+        return if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+            Liveness::Alive
+        } else {
+            Liveness::Unknown
+        };
+    }
+    let mut code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) };
+    unsafe { CloseHandle(handle) };
+    if queried == 0 {
+        return Liveness::Unknown;
+    }
+    if code == STILL_ACTIVE {
+        Liveness::Alive
+    } else {
+        // A pid whose only remaining state is its exit code is not running.
+        Liveness::Dead
+    }
+}
+
+/// Fallback probe, for when the handle query cannot answer.
+fn tasklist_liveness(pid: u32) -> Liveness {
     use std::os::windows::process::CommandExt;
+    let filter = format!("PID eq {pid}");
     let exe = match crate::win_exec::system_exe("tasklist") {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("[tun] liveness probe for pid {pid} cannot be resolved ({e}); assuming dead");
-            return false;
+            log::warn!("[tun] liveness probe for pid {pid} cannot be resolved ({e}); unknown");
+            return Liveness::Unknown;
         }
     };
     let out = Command::new(exe)
-        .args([
-            "/FI",
-            &format!("PID eq {pid}"),
-            "/NH",
-            "/FO",
-            "CSV",
-        ])
+        .args(["/FI", &filter, "/NH", "/FO", "CSV"])
         .creation_flags(0x08000000)
         .output();
     let Ok(o) = out else {
-        log::warn!("[tun] liveness probe for pid {pid} failed to run; assuming dead");
-        return false;
+        log::warn!("[tun] liveness probe for pid {pid} failed to run; unknown");
+        return Liveness::Unknown;
     };
     if !o.status.success() {
         log::warn!(
-            "[tun] liveness probe for pid {pid} exited {}: assuming dead",
+            "[tun] liveness probe for pid {pid} exited {}; unknown",
             o.status.code().unwrap_or(-1)
         );
-        return false;
+        return Liveness::Unknown;
     }
-    for line in String::from_utf8_lossy(&o.stdout).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("INFO:") {
-            continue;
-        }
-        // CSV row: "image.exe","pid","session name",...
-        if let Some(field) = line.split(',').nth(1) {
-            if field.trim_matches('"').parse::<u32>() == Ok(pid) {
-                return true;
-            }
-        }
-    }
-    false
+    route_repair::liveness_from_tasklist(&String::from_utf8_lossy(&o.stdout), pid)
 }
 
+
+/// T044 — re-arm the route lifetime every [`route_repair::ROUTE_BACKSTOP_REFRESH_INTERVAL`]
+/// while this tunnel is up.
+///
+/// This is a backstop and nothing else. The primary teardown is `Drop`/journal
+/// replay; a live session re-arming a 90 s lifetime simply means the entry cannot
+/// outlive the process that made it when that process is killed hard. Skipping a
+/// round is not an error — one missed refresh still leaves 60 s of margin.
+fn spawn_route_lifetime_refresher(journal: RouteJournal) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(route_repair::ROUTE_BACKSTOP_REFRESH_INTERVAL).await;
+            let journal = journal.clone();
+            // The refresh launches a process; it must not run on an async thread.
+            if tokio::task::spawn_blocking(move || rearm_route_lifetime(&journal))
+                .await
+                .is_err()
+            {
+                log::warn!("[tun] route lifetime refresh could not run; the loop is done");
+                return;
+            }
+        }
+    })
+}
+
+fn rearm_route_lifetime(journal: &RouteJournal) {
+    let commands = route_repair::lifetime_refresh_commands(journal);
+    if commands.is_empty() {
+        return;
+    }
+    // A refresh is a host mutation like any other: if another session is
+    // mid-install, decline this round rather than race it.
+    let Ok(_mutation) =
+        crate::host_lock::HostMutationGuard::acquire(Duration::from_millis(500))
+    else {
+        log::debug!("[tun] host mutation is busy; skipping this lifetime refresh");
+        return;
+    };
+    if let Err(e) = ps(&powershell_script(&commands)) {
+        log::debug!("[tun] route lifetime refresh reported: {e}");
+    }
+}
 
 pub struct TunHandle {
     _adapter: Arc<Adapter>,
     session: Arc<Session>,
     journal: RouteJournal,
+    journal_path: PathBuf,
+    /// T044 — the refresh task that keeps the 90 s backstop armed. Aborted in
+    /// `Drop`, *before* the routes themselves are removed.
+    refresh: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for TunHandle {
     fn drop(&mut self) {
+        // Stop re-arming first, or a refresh could land after the deletion.
+        if let Some(task) = self.refresh.take() {
+            task.abort();
+        }
         remove_routes(&self.journal);
-        clear_journal();
-        // Restore adapter DNS + metric so the lingering NIC cannot keep
-        // hijacking name resolution after disconnect.
-        reset_adapter_config(ADAPTER_NAME);
+        clear_journal_at(&self.journal_path);
         let _ = self.session.shutdown();
         log::info!("[tun] cleaned routes, adapter config, and session");
     }
@@ -823,11 +914,24 @@ pub async fn spawn(
     };
 
     // Build handle first so Drop cleans routes/session if thread spawn fails.
+    let journal_path = route_repair::journal_path_for(&route_repair::owner_of(&journal))
+        .ok_or_else(|| {
+            let _ = session.shutdown();
+            AetherError::Other("no per-owner journal path for the routes just installed".into())
+        })?;
     let handle = TunHandle {
         _adapter: adapter,
         session: session.clone(),
         journal,
+        journal_path,
+        refresh: None,
     };
+    // T044 — keep the backstop armed for as long as this handle lives. See
+    // `route_repair::ROUTE_BACKSTOP_LIFETIME`: this is *not* the teardown path, it
+    // is what stops a killed process from black-holing the machine until the next
+    // start replays the journal.
+    let mut handle = handle;
+    handle.refresh = Some(spawn_route_lifetime_refresher(handle.journal.clone()));
 
     // High-throughput path: dedicated OS thread reads WinTUN ring (kernel packets)
     // and feeds the userspace tunnel encryptor. App TCP lives in the Windows stack.

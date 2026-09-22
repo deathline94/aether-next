@@ -1,0 +1,54 @@
+{
+  "$comment": [
+    "Provenance lock for the vendored hev-socks5-tunnel payloads under",
+    "apps/android/android/app/src/main/jniLibs/<abi>/libhev-socks5-tunnel.so.",
+    "",
+    "What this replaces: the release pipeline asserted `test -s <file>`, which",
+    "proves a file is non-empty. The claim being made was 'the native tunnel",
+    "library in this APK is the one we reviewed'. Non-empty is not that claim,",
+    "and no step compared the bytes to anything.",
+    "",
+    "HONEST LIMITATION, recorded rather than papered over: the upstream release",
+    "tag these three blobs were built from is NOT known. The repository carries",
+    "no build recipe, no upstream version string, and no note naming a tag, so",
+    "`upstream` below is null instead of a guessed version. What this lock CAN",
+    "do is detect substitution or drift of the committed blobs against every",
+    "consumer (CI, the APK gate, reviewers), which is the half of the problem",
+    "that is actually checkable today. Closing the other half means rebuilding",
+    "from a named tag in CI and replacing `source` with that recipe; until then",
+    "any statement that these blobs are provenance-complete would be false.",
+    "",
+    "Alignment is recorded because Google enforces a 16 KB page size for apps",
+    "targeting API 35+ from 2027-02-01: min_p_align is the smallest p_align",
+    "among the ELF PT_LOAD program headers, measured from the shipped file by",
+    "scripts/verify-hev-lock.mjs, not copied from a build log."
+  ],
+  "version": 1,
+  "source": {
+    "project": "hev-socks5-tunnel",
+    "upstream": null,
+    "tag": null,
+    "commit": null,
+    "recipe": null,
+    "note": "unverified provenance - see $comment"
+  },
+  "libraries": {
+    "libhev-socks5-tunnel.so": {
+      "arm64-v8a": {
+        "sha256": "848500218092cc7a3a84bb6d0e221b146566ce96af7d23e65f35c945878ffa67",
+        "bytes": 343816,
+        "min_p_align": 16384
+      },
+      "armeabi-v7a": {
+        "sha256": "c1e994e5c3301bb5e7dfaa547d5926256867c4b3b264cf17fdaa93cf804ad374",
+        "bytes": 234392,
+        "min_p_align": 16384
+      },
+      "x86_64": {
+        "sha256": "039d3cf6924eece31d2e4eab46742fa6df7748e07a0be461bf5968fbd32984e1",
+        "bytes": 344904,
+        "min_p_align": 16384
+      }
+    }
+  }
+}

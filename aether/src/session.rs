@@ -789,7 +789,7 @@ async fn run_masque_tunnel(
     listen: SocketAddr,
     http_listen: SocketAddr,
 ) -> Result<()> {
-    let mtu_val = mtu::resolve_mtu("masque").await;
+    let mtu_val = mtu::resolve_mtu("masque", !identity.ipv6.trim().is_empty()).await;
     // H3 CONNECT-IP carries inner IP packets as QUIC DATAGRAMs, whose size is bounded
     // by the QUIC path MTU minus framing. A higher netstack MTU silently drops full-size
     // TCP packets (tunnel_ready yet curl times out). Cap the H3 data-plane MTU so inner
@@ -1101,7 +1101,7 @@ async fn run_wireguard_tunnel(
     // left SOCKS up on a fresh unestablished tunnel → CONNECT hangs forever.
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
-    let mtu = crate::mtu::resolve_mtu("wireguard").await;
+    let mtu = crate::mtu::resolve_mtu("wireguard", !identity.ipv6.trim().is_empty()).await;
     log::info!("[+] using MTU={mtu} for wireguard session");
 
     let cfg = wireguard::WgConfig {
@@ -1298,7 +1298,7 @@ async fn run_warp_in_warp(
     listen: SocketAddr,
     http_listen: SocketAddr,
 ) -> Result<()> {
-    let _ = mtu::resolve_mtu("wireguard").await;
+    let _ = mtu::resolve_mtu("wireguard", !primary.ipv6.trim().is_empty()).await;
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let (outer_stack, _outer_guard) =
         establish_wg(&primary, peer, tunnel_mtu(), true, 5, "outer").await?;

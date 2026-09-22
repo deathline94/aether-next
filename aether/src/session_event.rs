@@ -65,18 +65,27 @@ pub enum SessionEvent {
 }
 
 pub fn emit(event: SessionEvent) {
-    if let Ok(json) = serde_json::to_string(&event) {
-        // Write structured events to STDOUT (one line, flushed immediately) rather
-        // than the stderr logger. GUI consumers read stdout for live progress; the
-        // desktop scan reader drains stdout first, so events on stderr only surfaced
-        // after the process exited (scanner looked frozen until Stop). stdout is a
-        // LineWriter behind a pipe, so an explicit flush guarantees each event ships
-        // the instant it is emitted.
-        use std::io::Write;
-        let out = std::io::stdout();
-        let mut lock = out.lock();
-        let _ = writeln!(lock, "AETHER_EVENT {json}");
-        let _ = lock.flush();
+    match serde_json::to_string(&event) {
+        Ok(json) => {
+            // Write structured events to STDOUT (one line, flushed immediately) rather
+            // than the stderr logger. GUI consumers read stdout for live progress; the
+            // desktop scan reader drains stdout first, so events on stderr only surfaced
+            // after the process exited (scanner looked frozen until Stop). stdout is a
+            // LineWriter behind a pipe, so an explicit flush guarantees each event ships
+            // the instant it is emitted.
+            use std::io::Write;
+            let out = std::io::stdout();
+            let mut lock = out.lock();
+            let _ = writeln!(lock, "AETHER_EVENT {json}");
+            let _ = lock.flush();
+        }
+        Err(e) => {
+            // An event that cannot be serialised never reaches the GUI, so the
+            // consumer's "did anything happen?" answer would be "nothing". Count
+            // it instead of dropping it silently.
+            let n = crate::counters::bump(&crate::counters::MALFORMED_EVENTS);
+            log::error!("[-] could not serialise a session event (count {n}): {e}");
+        }
     }
 }
 

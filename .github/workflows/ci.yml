@@ -6,6 +6,13 @@ on:
   push:
     branches: [main]
 
+# Default GITHUB_TOKEN scope is read/write on every API for every job, including
+# the PR-triggered ones that only need to read the repo. Declaring the narrow
+# permission at the workflow level means a compromised action in any job cannot
+# push, publish, or mint an attestation it has no business touching.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -90,6 +97,31 @@ jobs:
       - run: cargo clippy --manifest-path aether/Cargo.toml --all-targets --features test-hooks -- -D warnings
       - run: cargo test --manifest-path aether/Cargo.toml --features test-hooks
 
+  # Workflow linting is a supply-chain control, not a style check: a floating
+  # action ref, an over-broad permission, or a secret pasted into a `run:` block
+  # is how a release gets compromised without anyone editing the risky part.
+  # zizmor is expected to FIND the historical issues named below; if it reports
+  # clean because it stopped looking, the gate is worthless — so the job asserts
+  # both directions.
+  workflow-lint:
+    name: Workflow static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: actionlint (must be clean)
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+      - name: zizmor (must be clean after fixes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pipx install zizmor
+          zizmor --format=sarif . || {
+            echo "::error::zizmor reported findings; see the SARIF artifact"
+            exit 1
+          }
+
   installer-verifier:
     name: Installer verifier can fail
     runs-on: windows-latest
@@ -138,6 +170,13 @@ jobs:
               fi
             done
           done
+      - name: Vendored native payloads match their lock
+        # Digest + 16 KB PT_LOAD alignment, with a selftest that a substituted
+        # blob really does turn this red.
+        run: |
+          set -euo pipefail
+          node scripts/verify-hev-lock.mjs
+          node scripts/verify-hev-lock.mjs --selftest-fail
 
   android-unit-tests:
     name: Android unit tests

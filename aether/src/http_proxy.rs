@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -8,32 +9,126 @@ use crate::netstack::{StackHandle, TcpConn};
 use crate::socks;
 
 pub const MAX_HEADER: usize = 16 * 1024;
-const MAX_CLIENTS: usize = 256;
 const MAX_REQUEST_LINE: usize = 4096;
-const MAX_SESSION: std::time::Duration = std::time::Duration::from_secs(4 * 60 * 60);
 
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
-    // Centralised in `engine_config`: both listeners are validated together, so
-    // one knob decides whether a remote-facing proxy is allowed at all.
+    // Centralised in `engine_config` (one knob for whether a remote-facing proxy
+    // may bind at all) plus `socks::check_listener_bind`: a listener that *is*
+    // allowed to face outward must be able to authenticate its clients.
+    socks::check_listener_bind(listen)?;
     Ok(TcpListener::bind(listen).await?)
+}
+
+/// The answer a client gets when the proxy is at its session limit (T163).
+///
+/// Before this the accepted socket was dropped unseen, so the browser reported a
+/// network error and the user had no way to learn that a cap had been reached.
+pub fn over_capacity_reply() -> Vec<u8> {
+    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+fn auth_required_reply() -> Vec<u8> {
+    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+      Proxy-Authenticate: Basic realm=\"aether\"\r\n\
+      Connection: close\r\n\r\n"
+        .to_vec()
+}
+
+/// Value of a header, by case-insensitive name (RFC 9110).
+fn header_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// Decode a `Proxy-Authorization: Basic base64(user:pass)` value.
+fn basic_credentials(value: &str) -> Option<(String, String)> {
+    let (scheme, encoded) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    let (user, pass) = text.split_once(':')?;
+    Some((user.to_string(), pass.to_string()))
+}
+
+/// True when the request block carries proxy credentials that match.
+fn proxy_auth_ok(header_text: &str, want: &(String, String)) -> bool {
+    let Some(value) = header_value(header_text, "proxy-authorization") else {
+        return false;
+    };
+    match basic_credentials(value) {
+        Some((user, pass)) => {
+            let u = socks::secret_eq(user.as_bytes(), want.0.as_bytes());
+            // Both halves are compared unconditionally: a password is not
+            // guessable by watching where the check stops.
+            let p = socks::secret_eq(pass.as_bytes(), want.1.as_bytes());
+            u && p
+        }
+        None => false,
+    }
 }
 
 pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result<()> {
     let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(socks::MAX_CLIENTS));
     loop {
         let (socket, peer) = listener.accept().await?;
-        let permit = match permits.clone().try_acquire_owned() { Ok(p) => p, Err(_) => continue };
+        let permit = match permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            // T163: an explicit, protocol-level refusal instead of a dropped
+            // socket, answered off the accept loop so a slow client cannot stall it.
+            Err(_) => {
+                log::warn!(
+                    "http proxy at the {}-session limit; refusing {peer}",
+                    socks::MAX_CLIENTS
+                );
+                tokio::spawn(async move {
+                    let _ = refuse_over_capacity(socket).await;
+                });
+                continue;
+            }
+        };
         let _ = socket.set_nodelay(true);
         let stack = stack.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = tokio::time::timeout(MAX_SESSION, handle(socket, stack)).await
-                .map_err(|_| AetherError::Other("HTTP maximum session duration reached".into())).and_then(|r| r) {
+            let outcome = tokio::time::timeout(socks::MAX_SESSION, handle(socket, stack)).await;
+            let session = match outcome {
+                Ok(r) => r,
+                Err(_) => {
+                    let msg = socks::session_cap_message("http proxy", socks::MAX_SESSION);
+                    log::warn!("{msg} (peer {peer})");
+                    return Err(AetherError::Other(msg));
+                }
+            };
+            if let Err(error) = session {
                 log::debug!("http proxy client {peer} ended: {error}");
             }
+            Ok(())
         });
+    }
+}
+
+async fn refuse_over_capacity(mut client: TcpStream) -> Result<()> {
+    let wrote = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async move {
+            client.write_all(&over_capacity_reply()).await?;
+            client.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        },
+    )
+    .await;
+    match wrote {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(AetherError::Other(format!("http refusal write failed: {e}"))),
+        Err(_) => Err(AetherError::Other("http refusal write timed out".into())),
     }
 }
 
@@ -70,6 +165,15 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     assert_strict_crlf(&header[..header_end])?;
     let text = std::str::from_utf8(&header[..header_end])
         .map_err(|_| AetherError::Other("invalid HTTP header".into()))?;
+    // Credentials, if configured, are checked before a single byte is relayed:
+    // the listener may be reachable by others, and nothing here should be
+    // resolved or connected on their behalf (T157).
+    if let Some(want) = socks::proxy_credentials() {
+        if !proxy_auth_ok(text, &want) {
+            let _ = client.write_all(&auth_required_reply()).await;
+            return Err(AetherError::Other("http proxy authentication required".into()));
+        }
+    }
     let first = text
         .lines()
         .next()
@@ -342,7 +446,66 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_strict_crlf, find_header_end, rewrite_absolute_uri};
+    use super::{
+        assert_strict_crlf, basic_credentials, find_header_end, header_value, over_capacity_reply,
+        proxy_auth_ok, rewrite_absolute_uri, auth_required_reply,
+    };
+
+    /// The session-limit refusal has to be a real HTTP response (T163): the old
+    /// behaviour was to drop the accepted socket, which a browser reported as an
+    /// unreachable proxy with no hint that a cap had been hit.
+    #[test]
+    fn over_capacity_reply_is_a_well_formed_refusal() {
+        let reply = over_capacity_reply();
+        let text = String::from_utf8(reply.clone()).expect("ascii");
+        assert!(text.starts_with("HTTP/1.1 503 "), "{text}");
+        assert!(text.contains("Connection: close\r\n"), "must not be kept alive");
+        assert!(text.ends_with("\r\n\r\n"), "a header block ends at a blank line");
+        assert!(text.contains("Retry-After"), "and says when to try again");
+        let auth = String::from_utf8(auth_required_reply()).expect("ascii");
+        assert!(auth.starts_with("HTTP/1.1 407 "), "{auth}");
+        assert!(auth.contains("Proxy-Authenticate: Basic"), "{auth}");
+    }
+
+    #[test]
+    fn header_lookup_ignores_case_and_surrounding_space() {
+        let block = "GET http://a/ HTTP/1.1\r\nhost:  A.example \r\nAccept: */*\r\n\r\n";
+        assert_eq!(header_value(block, "host"), Some("A.example"));
+        assert_eq!(header_value(block, "accept"), Some("*/*"));
+        assert_eq!(header_value(block, "proxy-authorization"), None);
+    }
+
+    #[test]
+    fn basic_credentials_decode_and_are_matched_exactly() {
+        // base64("u:p") == "dTpw"
+        let ok = "GET http://a/ HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\r\n";
+        let want = ("u".to_string(), "p".to_string());
+        assert!(proxy_auth_ok(ok, &want));
+        assert!(!proxy_auth_ok(ok, &("u".to_string(), "q".to_string())));
+        assert!(!proxy_auth_ok(ok, &("v".to_string(), "p".to_string())));
+        // No header at all, and a header we cannot parse, both fail closed.
+        assert!(!proxy_auth_ok("GET http://a/ HTTP/1.1\r\n\r\n", &want));
+        assert!(!proxy_auth_ok(
+            "GET http://a/ HTTP/1.1\r\nProxy-Authorization: Bearer dTpw\r\n\r\n",
+            &want
+        ));
+        assert!(!proxy_auth_ok(
+            "GET http://a/ HTTP/1.1\r\nProxy-Authorization: Basic !!!not-base64\r\n\r\n",
+            &want
+        ));
+        // Scheme name is case-insensitive (RFC 7235); the credentials are not.
+        assert!(proxy_auth_ok(
+            "GET http://a/ HTTP/1.1\r\nproxy-authorization: basic dTpw\r\n\r\n",
+            &want
+        ));
+        let (user, pass) = basic_credentials("Basic dTpw").expect("decodes");
+        assert_eq!((user.as_str(), pass.as_str()), ("u", "p"));
+        // The split is on the *first* colon, so a password may contain one.
+        let (user, pass) = basic_credentials("Basic dTpwYXNzOndvcmQ=").expect("decodes");
+        assert_eq!((user.as_str(), pass.as_str()), ("u", "pass:word"));
+        assert!(basic_credentials("Basic").is_none());
+        assert!(basic_credentials("Digest dTpw").is_none());
+    }
 
     #[test]
     fn separates_pipelined_connect_payload() {

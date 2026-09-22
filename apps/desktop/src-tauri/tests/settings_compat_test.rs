@@ -5,7 +5,10 @@
 #[link(name = "resource", kind = "static")]
 extern "C" {}
 
-use aether_desktop_lib::Settings;
+use aether_desktop_lib::{
+    IpVersion, Protocol, RoutingMode, ScanMode, Settings, TransportKind,
+};
+use serde_json::Value;
 
 /// `Settings` gained fields over releases (`peer`, the QUIC fragmentation pair, the
 /// jitter bounds). Without a container-level default, a config written by an older
@@ -21,11 +24,11 @@ fn a_config_from_an_older_release_loads_and_keeps_what_it_declares() {
         "enginePath":""}"#;
     let settings: Settings =
         serde_json::from_str(older).expect("a pre-QUIC-frag config must still load");
-    assert_eq!(settings.protocol, "gool");
+    assert_eq!(settings.protocol, Protocol::Gool);
     assert_eq!(settings.http_port, 18080);
     assert!(settings.launch_at_login, "the flag the user set survives the upgrade");
     // The fields that file predates come from `Default`, not from nothing.
-    assert_eq!(settings.scan_mode, "stealth");
+    assert_eq!(settings.scan_mode, ScanMode::Stealth);
     assert_eq!(settings.noize_jmax, 128);
     let defaults = Settings::default();
     assert_eq!(
@@ -38,7 +41,7 @@ fn a_config_from_an_older_release_loads_and_keeps_what_it_declares() {
 #[test]
 fn a_full_round_trip_loses_nothing() {
     let original = Settings {
-        protocol: "masque".into(),
+        protocol: Protocol::Masque,
         http_port: 18081,
         quic_initial_frag: true,
         quic_initial_frag_size: 128,
@@ -62,4 +65,67 @@ fn a_field_of_the_wrong_type_is_still_an_error() {
     let bad = r#"{"protocol":"masque","httpPort":"not a port"}"#;
     serde_json::from_str::<Settings>(bad)
         .expect_err("a present-but-invalid value must not be replaced by a default");
+}
+
+/// The enums replaced string allow-lists, and the React app was not touched.
+/// That only holds if the strings on the wire are the ones it already sends, so
+/// pin them: a rename of a variant is a silent config-format break the type
+/// system cannot see.
+#[test]
+fn the_vocabulary_serialises_as_the_strings_the_ui_already_sends() {
+    let settings = Settings {
+        protocol: Protocol::Wireguard,
+        transport: TransportKind::H3,
+        scan_mode: ScanMode::Ironclad,
+        ip_version: IpVersion::Dual,
+        routing_mode: RoutingMode::ProxyOnly,
+        ..Settings::default()
+    };
+    let json: Value = serde_json::to_value(&settings).expect("serialise");
+    assert_eq!(json["protocol"], "wireguard");
+    assert_eq!(json["transport"], "h3");
+    assert_eq!(json["scanMode"], "ironclad");
+    // The Scanner's and the Settings row's own spelling for "probe both
+    // families" — the value the old allow-list rejected while the UI offered it.
+    assert_eq!(json["ipVersion"], "both");
+    assert_eq!(json["routingMode"], "proxy-only");
+}
+
+#[test]
+fn every_default_is_the_string_the_previous_allow_list_defaulted_to() {
+    let json: Value = serde_json::to_value(Settings::default()).expect("serialise");
+    assert_eq!(json["protocol"], "masque");
+    assert_eq!(json["transport"], "h2");
+    assert_eq!(json["scanMode"], "balanced");
+    assert_eq!(json["ipVersion"], "v4");
+    assert_eq!(json["routingMode"], "system-proxy");
+}
+
+/// A stale file is not a load error, and a legacy spelling is not a different
+/// choice: both go through the same parse the child's environment is built from,
+/// so "what the engine was told" and "what the row shows" cannot drift.
+#[test]
+fn legacy_spellings_load_and_unknown_ones_fall_back_instead_of_failing() {
+    let legacy = r#"{"ipVersion":"dual","scanMode":"DEEP ","protocol":"WARP","routingMode":"tun"}"#;
+    let settings: Settings = serde_json::from_str(legacy)
+        .expect("a legacy spelling must not turn the user's config into a load error");
+    assert_eq!(settings.ip_version, IpVersion::Dual);
+    assert_eq!(settings.scan_mode, ScanMode::Thorough, "trimmed and case-folded");
+    assert_eq!(settings.protocol, Protocol::Warp);
+    assert_eq!(settings.routing_mode, RoutingMode::Tun);
+
+    // `"thorogh"` was a legal value in the allow-list. Now it names nothing, so it
+    // reads as the default the `#[serde(default)]` path produced — not as a
+    // rejection of the whole file, and not as a mode that does not exist.
+    let typo = r#"{"scanMode":"thorogh","ipVersion":"auto-detect","protocol":"teleport"}"#;
+    let settings: Settings = serde_json::from_str(typo)
+        .expect("an unknown value is a stale file, not a corrupt one");
+    assert_eq!(settings.scan_mode, ScanMode::default());
+    assert_eq!(settings.ip_version, IpVersion::default());
+    assert_eq!(settings.protocol, Protocol::default());
+
+    // `"both"` reaches the engine as the string it parses, whatever the variant is
+    // called in Rust.
+    assert_eq!(IpVersion::Dual.as_str(), "both");
+    assert_eq!(ScanMode::parse("thorogh"), None);
 }

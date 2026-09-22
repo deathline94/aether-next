@@ -5,12 +5,12 @@ plugins {
 
 android {
     namespace = "app.aethernext"
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "app.aethernext"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 52
         versionName = "1.3.0"
     }
@@ -39,6 +39,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
+            // Shrinking is only meaningful next to minification, and it is what
+            // keeps the added monochrome drawable from carrying the whole resource
+            // table into the APK (T223).
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -59,7 +63,11 @@ android {
     }
     packaging {
         jniLibs {
-            useLegacyPackaging = true
+            // Legacy packaging extracts the .so at install time, which puts the
+            // loader in charge of page alignment and defeats the 16 KB page-size
+            // requirement for apps targeting 35+. Uncompressed + page-aligned in
+            // the APK is what Android 15 devices need.
+            useLegacyPackaging = false
         }
     }
     testOptions {
@@ -71,7 +79,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.webkit:webkit:1.11.0")
+    implementation("androidx.webkit:webkit:1.14.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("junit:junit:4.13.2")

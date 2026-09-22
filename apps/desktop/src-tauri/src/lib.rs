@@ -416,6 +416,155 @@ pub mod dpapi {
     }
 }
 
+/// A settings value drawn from a fixed vocabulary, with the wire format pinned.
+///
+/// Each of these used to be a `String` plus an allow-list in `validate_settings`,
+/// which is the worst of both: the list could hold a typo (`"thorogh"`) as a legal
+/// value, and it could disagree with what the UI offers — `ipVersion` accepted
+/// `v4/v6/ipv4/dual…` but *not* `"both"`, the exact string the Scanner's
+/// Dual-Stack option and the Settings row both send. The consequence was visible:
+/// a legitimate choice was rejected on save and hard-broke the Connect button
+/// while the identical label worked everywhere else.
+///
+/// Serialising always writes the canonical spelling, so the JSON on disk and in
+/// the IPC payloads is byte-for-byte what the React app already produces — no
+/// frontend change is needed. Deserialising accepts that spelling plus the legacy
+/// aliases that meant the same thing, and a value the vocabulary cannot name
+/// falls back to the variant `Settings::default()` would have produced rather
+/// than turning a stale config into a load error (a *non-string* is still a type
+/// error; `#[serde(default)]` is for absent keys, not for garbage).
+macro_rules! wire_enum {
+    (
+        $(#[$meta:meta])*
+        enum $name:ident {
+            $($variant:ident = $wire:literal $(| $alias:literal)* $(,)?)*
+        }
+        default $default:ident
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($variant),*
+        }
+
+        impl $name {
+            /// The one spelling on the wire and in the child's environment.
+            pub fn as_str(&self) -> &'static str {
+                match self { $( $name::$variant => $wire, )* }
+            }
+
+            /// Canonical spelling plus the aliases that have always meant it.
+            pub fn parse(raw: &str) -> Option<Self> {
+                let value = raw.trim().to_ascii_lowercase();
+                $(
+                    if value == $wire $(|| value == $alias)* {
+                        return Some($name::$variant);
+                    }
+                )*
+                None
+            }
+
+            /// Every value the type can hold, for error prose.
+            pub const ALL: &'static [$name] = &[$( $name::$variant ),*];
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name::$default
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = <String as serde::Deserialize>::deserialize(d)?;
+                let value = Self::parse(&raw).unwrap_or_default();
+                if Self::parse(&raw).is_none() && !raw.trim().is_empty() {
+                    eprintln!(
+                        "settings: {raw:?} is not a {} and was read as {:?}",
+                        stringify!($name),
+                        value,
+                    );
+                }
+                Ok(value)
+            }
+        }
+    };
+}
+
+wire_enum! {
+    /// Tunnel protocol the engine dials. `warp` is legacy but a shipped config can
+    /// hold it, so it stays representable rather than silently becoming `masque`.
+    enum Protocol {
+        Masque = "masque",
+        Wireguard = "wireguard",
+        Warp = "warp",
+        Gool = "gool",
+    }
+    default Masque
+}
+
+wire_enum! {
+    /// MASQUE inner transport. `auto` is the legacy "let the engine choose" value;
+    /// it is not the same statement as `h3`, so it keeps its own variant.
+    enum TransportKind {
+        H3 = "h3",
+        H2 = "h2",
+        Auto = "auto",
+    }
+    default H2
+}
+
+wire_enum! {
+    /// Probe velocity profile — "Probe Velocity Profile" in the Settings UI.
+    ///
+    /// The set is the engine's (`turbo/balanced/thorough/stealth/ironclad`), not
+    /// the allow-list's, which also carried `fast`/`deep` as aliases, `auto` as a
+    /// non-value and `"thorogh"` as a typo. Aliases below are the ones with a
+    /// single established meaning; a misspelling is not an alias of anything.
+    enum ScanMode {
+        Turbo = "turbo" | "fast",
+        Balanced = "balanced" | "auto",
+        Thorough = "thorough" | "deep",
+        Stealth = "stealth" | "quiet",
+        Ironclad = "ironclad" | "verify",
+    }
+    default Balanced
+}
+
+wire_enum! {
+    /// Address families to probe. `Dual` is the wire value `"both"` the UI has
+    /// always sent — `"dual"` and `"all"` are the engine's aliases for it.
+    enum IpVersion {
+        Auto = "auto",
+        V4 = "v4" | "4" | "ipv4",
+        V6 = "v6" | "6" | "ipv6",
+        Dual = "both" | "dual" | "all",
+    }
+    default V4
+}
+
+wire_enum! {
+    /// How the OS is pointed at the engine.
+    enum RoutingMode {
+        ProxyOnly = "proxy-only" | "proxy" | "none",
+        SystemProxy = "system-proxy" | "system",
+        Tun = "tun" | "wintun",
+    }
+    default SystemProxy
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 // A config written before a field existed must load with that field at its
@@ -425,10 +574,10 @@ pub mod dpapi {
 // this covers absent keys only.
 #[serde(default)]
 pub struct Settings {
-    pub protocol: String,
-    pub transport: String,
-    pub scan_mode: String,
-    pub ip_version: String,
+    pub protocol: Protocol,
+    pub transport: TransportKind,
+    pub scan_mode: ScanMode,
+    pub ip_version: IpVersion,
     pub noize: String,
     /// Custom obfuscation: junk packet count (when noize == custom).
     pub noize_jc: u32,
@@ -438,7 +587,7 @@ pub struct Settings {
     pub noize_jmax: u32,
     /// Custom obfuscation: interval between junk packets (ms).
     pub noize_interval_ms: u32,
-    pub routing_mode: String,
+    pub routing_mode: RoutingMode,
     pub socks_port: u16,
     pub http_port: u16,
     pub start_minimized: bool,
@@ -463,17 +612,17 @@ fn default_quic_frag_size() -> u32 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            protocol: "masque".into(),
-            transport: "h2".into(),
+            protocol: Protocol::Masque,
+            transport: TransportKind::H2,
             // Prefer balanced over turbo: better edge RTT → higher throughput.
-            scan_mode: "balanced".into(),
-            ip_version: "v4".into(),
+            scan_mode: ScanMode::Balanced,
+            ip_version: IpVersion::V4,
             noize: "off".into(),
             noize_jc: 5,
             noize_jmin: 50,
             noize_jmax: 128,
             noize_interval_ms: 0,
-            routing_mode: "system-proxy".into(),
+            routing_mode: RoutingMode::SystemProxy,
             socks_port: 1819,
             http_port: 1820,
             start_minimized: false,
@@ -520,6 +669,10 @@ struct AppState {
     /// watchdog in `watch_child` fires only while the generation still matches,
     /// so a session that reached any terminal state leaves the stamp inert.
     connect_since: Mutex<Option<(u64, std::time::Instant)>>,
+    /// `(phase, when)` from the engine's last `heartbeat` event. The engine used
+    /// to be silent for the whole multi-second endpoint hunt, which from the GUI
+    /// side is indistinguishable from a hang; absence of pulses now says so.
+    last_beat: Mutex<Option<(String, std::time::Instant)>>,
     operation: Mutex<()>,
     #[cfg(windows)]
     job: Mutex<Option<engine_job::Job>>,
@@ -609,6 +762,7 @@ impl Default for AppState {
             connecting: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             connect_since: Mutex::new(None),
+            last_beat: Mutex::new(None),
             operation: Mutex::new(()),
             #[cfg(windows)]
             job: Mutex::new(None),
@@ -727,9 +881,18 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             "HTTP and SOCKS5 ports must differ",
         ));
     }
+    // `protocol`, `transport`, `scanMode`, `ipVersion` and `routingMode` are not
+    // checked here any more: they are `wire_enum!` types, so a value outside the
+    // vocabulary cannot be built in the first place. That removes the drift this
+    // list was papering over — `ipVersion` allowed `auto/4/6/v4/v6/ipv4/ipv6/dual`
+    // but not `"both"`, which is the exact string the Scanner's Dual-Stack row and
+    // the Settings select both send. A valid choice was refused on save and
+    // hard-broke the Connect button while the same label worked everywhere else,
+    // and `"thorogh"` sat in the list as a legal scan mode.
+    //
     // The first argument is the `Settings` key in the name the frontend uses,
     // because that is what the form needs in order to mark the right input: a
-    // rejected `scanMode` otherwise has nowhere to go but the log, and the save
+    // rejected value otherwise has nowhere to go but the log, and the save
     // spinner never stops.
     let allow = |field: &'static str, val: &str, opts: &[&str]| -> Result<(), CommandError> {
         if opts.iter().any(|o| o.eq_ignore_ascii_case(val.trim())) {
@@ -741,32 +904,6 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             ))
         }
     };
-    allow(
-        "protocol",
-        &settings.protocol,
-        &["masque", "wireguard", "warp", "gool"],
-    )?;
-    allow("transport", &settings.transport, &["h3", "h2", "auto"])?;
-    allow(
-        "scanMode",
-        &settings.scan_mode,
-        &[
-            "turbo",
-            "balanced",
-            "thorough",
-            "stealth",
-            "fast",
-            "deep",
-            "thorogh",
-            "auto",
-            "ironclad",
-        ],
-    )?;
-    allow(
-        "ipVersion",
-        &settings.ip_version,
-        &["auto", "4", "6", "v4", "v6", "ipv4", "ipv6", "dual"],
-    )?;
     allow(
         "noize",
         &settings.noize,
@@ -818,11 +955,8 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             ));
         }
     }
-    allow(
-        "routingMode",
-        &settings.routing_mode,
-        &["proxy-only", "system-proxy", "tun"],
-    )?;
+    // `routingMode` is a `wire_enum!` type now, so the three values are the only
+    // ones that can reach here.
     // A custom engine path is checked for existence here rather than at connect,
     // where the allow-list would refuse it and the user would be left with a
     // "binary is not trusted" error for a path they typed themselves. It used to
@@ -849,7 +983,7 @@ fn handle_engine_line(
     tunnel_seen: &AtomicBool,
     tun_seen: &AtomicBool,
 ) {
-    let want_tun = settings.routing_mode == "tun";
+    let want_tun = settings.routing_mode == RoutingMode::Tun;
     if let Some(json) = line.split("AETHER_EVENT ").nth(1) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
             let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -863,6 +997,16 @@ fn handle_engine_line(
                         drop(rt);
                         let _ = app.emit("session://state", snap);
                     }
+                }
+                "heartbeat" => {
+                    // Only the phase is kept: a pulse resets the stall timer.
+                    let phase = v
+                        .get("phase")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let state = app.state::<AppState>();
+                    *state.last_beat.lock() = Some((phase, std::time::Instant::now()));
                 }
                 "proxy_ready" => {
                     socks_seen.store(true, Ordering::SeqCst);
@@ -1410,7 +1554,7 @@ pub fn verify_elevated_binary(
 
 /// Verify the engine binary this process is about to spawn, in **every** mode.
 ///
-/// The call used to live inside `if settings.routing_mode == "tun"`, so the
+/// The call used to live inside `if settings.routing_mode == RoutingMode::Tun`, so the
 /// unelevated proxy/socks paths started a binary whose signature and digest
 /// nobody had looked at: `engine_path` only proves "a PE under an allowed root",
 /// which a dropped-in file satisfies. Wrapping it in one named function keeps a
@@ -1499,7 +1643,7 @@ fn handoff_preamble(
 fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandError> {
     // TUN: never honor custom overrides (elevated risk).
     // Non-TUN: custom paths allowed only after full trust checks.
-    if settings.routing_mode != "tun" && !settings.engine_path.trim().is_empty() {
+    if settings.routing_mode != RoutingMode::Tun && !settings.engine_path.trim().is_empty() {
         let path = PathBuf::from(settings.engine_path.trim());
         if !path.exists() {
             return Err("Configured aether.exe was not found".into());
@@ -1537,7 +1681,7 @@ fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBuf, CommandE
             }
         }
     }
-    if settings.routing_mode == "tun" {
+    if settings.routing_mode == RoutingMode::Tun {
         return Err("aether.exe not found next to app; reinstall or use portable package".into());
     }
     let repo_build =
@@ -1568,7 +1712,7 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
         return;
     }
     let endpoint = state.runtime.lock().endpoint.clone();
-    if settings.routing_mode == "system-proxy" {
+    if settings.routing_mode == RoutingMode::SystemProxy {
         #[cfg(windows)]
         {
             let recovery_path = proxy_recovery_path(app).ok();
@@ -1613,10 +1757,10 @@ fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
         }
     }
     let pid = state.runtime.lock().pid;
-    let detail = match settings.routing_mode.as_str() {
-        "tun" => "TUN active (full system)",
-        "system-proxy" => "System proxy active",
-        _ => "Proxy only active",
+    let detail = match settings.routing_mode {
+        RoutingMode::Tun => "TUN active (full system)",
+        RoutingMode::SystemProxy => "System proxy active",
+        RoutingMode::ProxyOnly => "Proxy only active",
     };
     emit_state(app, state, "connected", detail, pid, endpoint);
 }
@@ -1705,6 +1849,35 @@ const PROXY_COHERENCE_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// whatever the window is doing.
 pub const CONNECT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// The engine pulses at most this often (see `session_event::HEARTBEAT_INTERVAL`).
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Three missed pulses is a stall. Two would fire on ordinary scheduling noise.
+pub const HEARTBEAT_MISS_LIMIT: u32 = 3;
+
+/// The stall window, as a pure function of the last pulse so it can be reasoned
+/// about without a running engine.
+pub fn heartbeat_stall_action(
+    last_beat: Option<(&str, std::time::Duration)>,
+    armed: bool,
+    miss_limit: u32,
+    interval: std::time::Duration,
+) -> Option<String> {
+    if !armed {
+        return None;
+    }
+    let Some((phase, elapsed)) = last_beat else {
+        // Connecting with no pulse ever seen: the engine is pre-startup or its
+        // events are not reaching us.
+        return Some("no progress event received".to_string());
+    };
+    if elapsed >= interval * miss_limit {
+        Some(format!("{phase} ({} s since the last pulse)", elapsed.as_secs()))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WatchdogAction {
     LeaveAlone,
@@ -1777,6 +1950,29 @@ fn watch_child(app: AppHandle) {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Heartbeat stall: a connecting session whose engine stopped pulsing is
+        // wedged inside one phase, which the 90 s connect timeout would otherwise
+        // report as a plain timeout with no idea where it went. Warn once per gap
+        // by clearing the stamp, so the next pulse re-arms it.
+        {
+            let armed = state.connecting.load(Ordering::SeqCst);
+            let beat = state.last_beat.lock().take();
+            if let Some((phase, at)) = beat {
+                let since = at.elapsed();
+                let stalled =
+                    heartbeat_stall_action(Some((&phase, since)), armed, HEARTBEAT_MISS_LIMIT, HEARTBEAT_INTERVAL);
+                match stalled {
+                    Some(detail) => {
+                        emit_log(
+                            &app,
+                            format!("Engine stopped reporting while connecting: {detail}"),
+                        );
+                    }
+                    // Not stalled: put the pulse back for the next tick.
+                    None => *state.last_beat.lock() = Some((phase, at)),
                 }
             }
         }
@@ -1954,7 +2150,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         #[cfg(windows)]
         autostart::set(settings.launch_at_login)?;
 
-        if settings.routing_mode == "tun" {
+        if settings.routing_mode == RoutingMode::Tun {
             #[cfg(windows)]
             {
                 // Prefer Admin session for TUN (Wintun + routes). No whole-GUI auto-relaunch.
@@ -1988,7 +2184,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         // precisely in the case that matters: the packaged DLL missing, silently
         // renamed, or shadowed by one the user dropped next to the exe.
         let mut wintun_for_handoff: Option<PathBuf> = None;
-        if settings.routing_mode == "tun" {
+        if settings.routing_mode == RoutingMode::Tun {
             let wintun = wintun_path(&app).ok_or_else(|| {
                 CommandError::new(
                     "not_found",
@@ -2027,9 +2223,9 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
         command
             .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
             .env("AETHER_CONFIG_KEY_STDIN", "1")
-            .env("AETHER_PROTOCOL", &settings.protocol)
-            .env("AETHER_SCAN", &settings.scan_mode)
-            .env("AETHER_IP", &settings.ip_version)
+            .env("AETHER_PROTOCOL", settings.protocol.as_str())
+            .env("AETHER_SCAN", settings.scan_mode.as_str())
+            .env("AETHER_IP", settings.ip_version.as_str())
             .env("AETHER_NOIZE", &settings.noize)
             .env("AETHER_SOCKS", format!("127.0.0.1:{}", settings.socks_port))
             .env("AETHER_HTTP", format!("127.0.0.1:{}", settings.http_port))
@@ -2040,7 +2236,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             // builds can still opt out by setting the env var themselves.
             .env(
                 "AETHER_MASQUE_HTTP2",
-                if settings.transport == "h2" { "1" } else { "0" },
+                if settings.transport == TransportKind::H2 { "1" } else { "0" },
             )
             .env(
                 "AETHER_QUIC_INITIAL_FRAG",
@@ -2052,7 +2248,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             )
             .env(
                 "AETHER_TUN",
-                if settings.routing_mode == "tun" {
+                if settings.routing_mode == RoutingMode::Tun {
                     "1"
                 } else {
                     "0"
@@ -2134,7 +2330,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             &app,
             &state,
             "connecting",
-            if settings.routing_mode == "tun" {
+            if settings.routing_mode == RoutingMode::Tun {
                 "Starting tunnel + full-system routing"
             } else {
                 "Scanning reachable routes"
@@ -2240,12 +2436,89 @@ fn app_info() -> serde_json::Value {
     })
 }
 
+/// Sweep routes a previous crash left behind, at GUI startup rather than only
+/// when someone opens TUN mode. Abandoned-route recovery used to be reachable
+/// exclusively from the TUN bring-up path, so a session that died in proxy mode
+/// left the machine pointed at a tunnel that no longer existed until the user
+/// happened to enable TUN again. The engine owns the journal and the deletion
+/// rules; the shell only launches it — verified, with the inherited environment
+/// scrubbed — and does not wait for it.
+#[cfg(windows)]
+fn spawn_route_repair(app: &AppHandle) {
+    let settings = load_settings_file(app);
+    let Ok(executable) = engine_path(app, &settings) else {
+        return; // No resolvable engine yet; connect will report the real reason.
+    };
+    if verify_engine_or_refuse(&executable).is_err() {
+        return;
+    }
+    let mut command = Command::new(&executable);
+    scrub_ambient_engine_env(&mut command);
+    command
+        .arg("--repair-routes")
+        .current_dir(executable.parent().unwrap_or(Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(e) = command.spawn() {
+        emit_log(app, format!("Could not start the route repair: {e}"));
+    }
+}
+
+/// Export what the engine actually resolved, for a bug report that can be
+/// checked. Read-only: it runs `aether --diagnostics`, which never opens a
+/// tunnel and never needs the config key, so no preamble and no key line go to
+/// the child. The binary is still verified first — a diagnostics run executes
+/// code just like a session does.
+#[tauri::command]
+fn diagnostics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, CommandError> {
+    if state.child.lock().is_some() || state.scan_child.lock().is_some() {
+        return Err(CommandError::new(
+            "busy",
+            "Stop the running session or scan before exporting diagnostics.",
+        ));
+    }
+    let settings = load_settings_file(&app);
+    let executable = engine_path(&app, &settings)?;
+    verify_engine_or_refuse(&executable)?;
+
+    let mut command = Command::new(&executable);
+    scrub_ambient_engine_env(&mut command);
+    command
+        .arg("--diagnostics")
+        .current_dir(executable.parent().unwrap_or(Path::new(".")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|e| CommandError::new("spawn_failed", format!("Could not run the engine: {e}")))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(CommandError::new(
+            "engine_failed",
+            format!(
+                "Diagnostics exited {} — {}",
+                output.status,
+                err.lines().last().unwrap_or("").trim()
+            ),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| CommandError::new("bad_output", format!("Engine diagnostics were not JSON: {e}")))?;
+    Ok(value)
+}
+
 #[tauri::command]
 fn test_connection(settings: Settings) -> Result<String, CommandError> {
     validate_settings(&settings)?;
     let url = "https://www.cloudflare.com/cdn-cgi/trace";
 
-    let (client, via_desc) = if settings.routing_mode == "tun" {
+    let (client, via_desc) = if settings.routing_mode == RoutingMode::Tun {
         let client = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(12))
             .build();
@@ -2281,7 +2554,7 @@ fn scan(
     app: AppHandle,
     state: State<'_, AppState>,
     protocol: String,
-    ip_version: String,
+    ip_version: IpVersion,
     concurrency: u32,
     timeout_ms: u32,
     noize: Option<String>,
@@ -2321,9 +2594,15 @@ fn scan(
         .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
         .env("AETHER_CONFIG_KEY_STDIN", "1")
         .env("AETHER_PROTOCOL", engine_protocol)
-        .env("AETHER_SCAN", "balanced")
+        // T161: the profile the user picked, not a hardcoded one. This used to
+        // read `"balanced"` whatever the Settings row said, so "Probe Velocity
+        // Profile" changed the banner (the engine echoes its own mode back in
+        // `scan_start`) and nothing else — the scan ran at the same rate either
+        // way. Same channel as every other setting here: the child's environment,
+        // which `engine_config::from_env` reads through `runtime_env`.
+        .env("AETHER_SCAN", settings.scan_mode.as_str())
         .env("AETHER_SCAN_EXHAUSTIVE", "1")
-        .env("AETHER_IP", &ip_version)
+        .env("AETHER_IP", ip_version.as_str())
         .env("AETHER_NOIZE", noize.as_deref().unwrap_or("off"))
         .env("AETHER_CONFIG", dir.join("aether.toml"))
         .env("AETHER_SCAN_ONLY", "1")
@@ -2474,7 +2753,19 @@ fn pump_scan_stream(
                         }
                         "scan_done" => {
                             terminal_sent.store(true, Ordering::SeqCst);
-                            let _ = app.emit("scan://event", v);
+                            // Re-keyed rather than forwarded raw like the other arms used to be
+                            // done to them: the engine's `best_rtt_ms` is snake_case while every
+                            // other field on this channel is camelCase, and an empty `rtt` used
+                            // to reach the UI as `best: 1.1.1.1:443 ()` — a pair of brackets
+                            // around nothing, which reads as a measurement of zero. Absent stays
+                            // absent (`null`), never a fabricated 0.
+                            let _ = app.emit("scan://event", serde_json::json!({
+                                "type": "scan_done",
+                                "addr": v.get("addr").and_then(|a| a.as_str()).unwrap_or(""),
+                                "rtt": v.get("rtt").and_then(|r| r.as_str()).unwrap_or(""),
+                                "protocol": v.get("protocol").and_then(|p| p.as_str()).unwrap_or(""),
+                                "bestRttMs": v.get("best_rtt_ms").and_then(|b| b.as_f64()),
+                            }));
                         }
                         _ => {}
                     }
@@ -3066,6 +3357,7 @@ pub fn run() {
             #[cfg(windows)]
             {
                 let _ = dpapi::get_or_create_dpapi_config_key(&dir);
+                spawn_route_repair(app.handle());
             }
             #[cfg(windows)]
             {
@@ -3216,6 +3508,7 @@ pub fn run() {
             disconnect,
             app_info,
             test_connection,
+            diagnostics,
             scan,
             stop_scan
         ])

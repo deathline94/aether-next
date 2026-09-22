@@ -15,12 +15,39 @@ const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 /// last sent to it. A QUIC connection migrates and idles; a NAT binding does
 /// not survive much past a couple of minutes, so keeping origins forever only
 /// widens the window in which an unsolicited source reaches the client.
-const UDP_ORIGIN_TTL: Duration = Duration::from_secs(120);
-const UDP_ORIGIN_MAX: usize = 2048;
+pub const UDP_ORIGIN_TTL: Duration = Duration::from_secs(120);
+pub const UDP_ORIGIN_MAX: usize = 2048;
+/// An association with no traffic in either direction for this long is closed
+/// (T136). Without it, a client that vanished mid-session kept its netstack
+/// socket, its buffers and its origin table until `MAX_SESSION` — four hours of
+/// holding a slot another client needed.
+pub const UDP_ASSOC_IDLE: Duration = Duration::from_secs(300);
+/// How often an idle UDP association is woken to expire origins and check
+/// `UDP_ASSOC_IDLE`. Coarse on purpose: this is a reaper, not a timer.
+pub const UDP_ASSOC_TICK: Duration = Duration::from_secs(15);
 const RELAY_BUF: usize = 256 * 1024;
-const MAX_CLIENTS: usize = 256;
+/// Concurrent accepted sessions per proxy. Exported so the refusal the proxy
+/// sends at the limit can be tested and so the number is visible to the UI
+/// rather than being a silent drop of the accepted socket (T163).
+pub const MAX_CLIENTS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+/// Hard ceiling on one accepted session, both proxies (T163).
+///
+/// This is a *documented* limit, not an invisible one: when it fires the engine
+/// logs `session_cap_message` at warn level and the client is disconnected with
+/// that explanation rather than being truncated mid-stream in silence. Long-lived
+/// SSH/database sessions belong on the TUN path, not behind a SOCKS session cap.
+pub const MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The user-visible explanation emitted when `MAX_SESSION` aborts a session.
+pub fn session_cap_message(kind: &str, limit: Duration) -> String {
+    format!(
+        "{kind} session ended: it reached the maximum session length of {}s ({}h). \
+         Reconnect to continue; long-lived sessions belong on the TUN adapter.",
+        limit.as_secs(),
+        limit.as_secs() / 3600,
+    )
+}
 
 struct DnsCache {
     /// `(address, first-seen, last-used)`. `last-used` is what eviction ranks
@@ -78,15 +105,71 @@ const REP_CMD_NOT_SUPPORTED: u8 = 0x02;
 const REP_ATYP_NOT_SUPPORTED: u8 = 0x07;
 const CMD_BIND: u8 = 0x02;
 
+/// RFC 1928 / RFC 1929 authentication identifiers.
+const AUTH_NONE: u8 = 0x00;
+/// Username/password, which is the only method offered once credentials are
+/// configured (`AETHER_PROXY_USER` / `AETHER_PROXY_PASS`).
+const AUTH_USERPASS: u8 = 0x02;
+/// "No acceptable methods": the protocol-level way of saying no, which clients
+/// report as an authentication failure rather than a broken connection.
+const AUTH_NO_ACCEPTABLE: u8 = 0xff;
+/// RFC 1929 subnegotiation version byte.
+const USERPASS_VER: u8 = 0x01;
+
 enum Target {
     Ip(IpAddr),
     Domain(String),
 }
 
+/// Credentials both proxies demand from a client, if any are configured.
+///
+/// One gate variable decides whether a *remote-facing* listener is allowed at all
+/// (`AETHER_ALLOW_REMOTE_PROXY`, checked centrally in `engine_config`); this is the
+/// second half of that decision — such a listener is only permitted when it can
+/// actually authenticate whoever connects, because a proxy that binds a routable
+/// port is an open relay for anyone on the network.
+///
+/// Returns `None` when either half is missing or empty, so a half-configured
+/// setup fails closed at bind time instead of silently shipping an unauthenticated
+/// remote listener.
+pub fn proxy_credentials() -> Option<(String, String)> {
+    let user = crate::runtime_env::var("AETHER_PROXY_USER")?;
+    let pass = crate::runtime_env::var("AETHER_PROXY_PASS")?;
+    if user.is_empty() || pass.is_empty() {
+        return None;
+    }
+    Some((user, pass))
+}
+
+/// Refuse to bind a proxy listener that would be reachable and unauthenticated.
+pub fn check_listener_bind(listen: SocketAddr) -> Result<()> {
+    if !listen.ip().is_loopback() && proxy_credentials().is_none() {
+        return Err(AetherError::Other(format!(
+            "{listen} is not a loopback address: a remote-facing proxy must set \
+             AETHER_PROXY_USER and AETHER_PROXY_PASS"
+        )));
+    }
+    Ok(())
+}
+
+/// Length-independent byte comparison, so a wrong password is not discoverable by
+/// timing how early the comparison bails out.
+pub fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
 pub async fn bind(listen: SocketAddr) -> Result<TcpListener> {
-    // Non-loopback binds are already rejected centrally in `engine_config`
-    // (one knob, checked for both listeners before anything binds); a second
-    // variable here was a second source of truth that could disagree with it.
+    // Non-loopback binds are rejected centrally in `engine_config` (one knob,
+    // checked for both listeners before anything binds); this is the other half:
+    // a listener that *is* allowed to face outward must have credentials.
+    check_listener_bind(listen)?;
     Ok(TcpListener::bind(listen).await?)
 }
 
@@ -97,17 +180,61 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
     loop {
         let (sock, peer) = listener.accept().await?;
-        let permit = match permits.clone().try_acquire_owned() { Ok(p) => p, Err(_) => continue };
+        let permit = match permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            // T163: at the limit the accepted socket used to be dropped unseen,
+            // which reaches the client as a bare RST with no SOCKS reply and no
+            // clue. Say no in protocol terms instead, off the accept loop so a
+            // slow client cannot stall it.
+            Err(_) => {
+                log::warn!("socks5 at the {MAX_CLIENTS}-session limit; refusing {peer}");
+                tokio::spawn(async move {
+                    let _ = refuse_over_capacity(sock).await;
+                });
+                continue;
+            }
+        };
         let _ = sock.set_nodelay(true);
         let stack = stack.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = tokio::time::timeout(MAX_SESSION, handle_client(sock, stack)).await
-                .map_err(|_| AetherError::Other("SOCKS maximum session duration reached".into()))
-                .and_then(|r| r) {
+            let outcome = tokio::time::timeout(MAX_SESSION, handle_client(sock, stack)).await;
+            let session = match outcome {
+                Ok(r) => r,
+                Err(_) => {
+                    let msg = session_cap_message("socks", MAX_SESSION);
+                    log::warn!("{msg} (peer {peer})");
+                    return Err(AetherError::Other(msg));
+                }
+            };
+            if let Err(e) = session {
                 log::debug!("socks client {peer} ended: {e}");
             }
+            Ok(())
         });
+    }
+}
+
+/// The greeting-level refusal a SOCKS5 client understands: no acceptable
+/// authentication method, which every client maps to "the proxy said no" instead
+/// of "the connection broke".
+pub const SOCKS_GREETING_REFUSAL: [u8; 2] = [VER, AUTH_NO_ACCEPTABLE];
+
+async fn refuse_over_capacity(mut sock: TcpStream) -> Result<()> {
+    // Bound the write: a client that never reads must not pin a task.
+    let wrote = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        async move {
+            sock.write_all(&SOCKS_GREETING_REFUSAL).await?;
+            sock.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        },
+    )
+    .await;
+    match wrote {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(AetherError::Other(format!("socks refusal write failed: {e}"))),
+        Err(_) => Err(AetherError::Other("socks refusal write timed out".into())),
     }
 }
 
@@ -138,6 +265,7 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
 }
 
 async fn handshake(sock: &mut TcpStream) -> Result<()> {
+    let creds = proxy_credentials();
     let mut prefix = [0u8; 2];
     sock.read_exact(&mut prefix).await?;
     if prefix[0] != VER {
@@ -146,21 +274,61 @@ async fn handshake(sock: &mut TcpStream) -> Result<()> {
     let nmethods = prefix[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    let method = select_auth_method(&methods);
+    let method = select_auth_method(&methods, creds.is_some());
     sock.write_all(&[VER, method]).await?;
-    if method == 0xff {
-        return Err(AetherError::Other(
+    match method {
+        AUTH_NONE => Ok(()),
+        AUTH_USERPASS => match creds {
+            Some(want) => authenticate_userpass(sock, &want).await,
+            None => Err(AetherError::Other("proxy credentials unavailable".into())),
+        },
+        _ => Err(AetherError::Other(
             "no supported socks authentication method".into(),
-        ));
+        )),
     }
-    Ok(())
 }
 
-fn select_auth_method(methods: &[u8]) -> u8 {
-    if methods.contains(&0x00) {
-        0x00
+/// Pick the method to answer with.
+///
+/// With credentials configured the *only* acceptable method is RFC 1929
+/// username/password: a remote-facing listener that negotiated `0x00` would be an
+/// open relay regardless of what the user thought `AETHER_ALLOW_REMOTE_PROXY` did.
+fn select_auth_method(methods: &[u8], creds_required: bool) -> u8 {
+    if creds_required {
+        if methods.contains(&AUTH_USERPASS) {
+            AUTH_USERPASS
+        } else {
+            AUTH_NO_ACCEPTABLE
+        }
+    } else if methods.contains(&AUTH_NONE) {
+        AUTH_NONE
     } else {
-        0xff
+        AUTH_NO_ACCEPTABLE
+    }
+}
+
+/// RFC 1929 subnegotiation, then the `0x01, 0x00` success / `0x01, 0x01` failure
+/// reply. The caller has already committed to this method in the greeting.
+async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) -> Result<()> {
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await?;
+    if head[0] != USERPASS_VER {
+        return Err(AetherError::Other("bad username/password version".into()));
+    }
+    let ulen = head[1] as usize;
+    let mut user = vec![0u8; ulen];
+    sock.read_exact(&mut user).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut pass).await?;
+
+    let ok = secret_eq(&user, want.0.as_bytes()) && secret_eq(&pass, want.1.as_bytes());
+    sock.write_all(&[USERPASS_VER, u8::from(ok)]).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(AetherError::Other("socks authentication failed".into()))
     }
 }
 
@@ -381,9 +549,13 @@ pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
     }
 
     // The UdpSender's Drop now closes the netstack socket (H1 fix), so every
-    // return path below frees the socket + buffers instead of leaking them
-    // until MAX_UDP_CONNECTIONS permanently broke resolution.
-    let udp = stack.open_udp().await?;
+    // return path below frees the socket + buffers instead of leaking them until
+    // the association pool permanently broke resolution.
+    //
+    // Resolver class, deliberately: a client that saturates its own UDP budget
+    // must not be able to take name resolution — and with it every domain
+    // `CONNECT` — down with it (T137).
+    let udp = stack.open_udp_resolver().await?;
     let (sender, mut from_stack) = udp.into_split();
 
     let mut last_err = AetherError::Other(format!("no DNS record for {name}"));
@@ -716,6 +888,9 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     let mut client: Option<SocketAddr> = None;
     let mut cbuf = vec![0u8; 65535];
     let mut ctrl = [0u8; 256];
+    // Reaper state (T136): an association whose client vanished used to hold a
+    // netstack socket, its buffers and its origin table until `MAX_SESSION`.
+    let mut last_activity = Instant::now();
 
     loop {
         tokio::select! {
@@ -735,6 +910,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                     }
                     Some(_) => continue, // reject any other source
                 }
+                last_activity = Instant::now();
                 let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) else { continue };
                 match dst {
                     Target::Ip(ip) => {
@@ -758,23 +934,13 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
 
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
+                last_activity = Instant::now();
                 // Reply filtering, not forwarding: a datagram from a peer the
-                // client never sent to is dropped. The previous `.or(client)`
-                // handed the client *anything* that arrived, labelled with the
-                // attacker-chosen source address.
+                // client never sent to is dropped, and so is one whose origin
+                // has aged out. There is deliberately no fallback to `client`.
                 let target_client = {
                     let mut map = routes.lock();
-                    match map.get_mut(&src) {
-                        Some((from, seen)) if seen.elapsed() < UDP_ORIGIN_TTL => {
-                            *seen = Instant::now();
-                            Some(*from)
-                        }
-                        Some(_) => {
-                            map.remove(&src);
-                            None
-                        }
-                        None => None,
-                    }
+                    origin_target(&mut map, src, Instant::now())
                 };
                 if target_client.is_none() {
                     log::debug!("socks udp: dropping unsolicited datagram from {src}");
@@ -786,7 +952,21 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
             }
 
             r = sock.read(&mut ctrl) => {
-                match r { Ok(0) | Err(_) => break, Ok(_) => {} }
+                match r { Ok(0) | Err(_) => break, Ok(_) => last_activity = Instant::now() }
+            }
+
+            // Tick: expire origins even while traffic is one-directional, and
+            // close the association once it has been silent both ways for
+            // `UDP_ASSOC_IDLE`.
+            _ = tokio::time::sleep(UDP_ASSOC_TICK) => {
+                let now = Instant::now();
+                routes.lock().retain(|_, (_, seen)| {
+                    now.saturating_duration_since(*seen) < UDP_ORIGIN_TTL
+                });
+                if association_expired(last_activity, now) {
+                    log::debug!("socks udp association for {relay_addr} idle past {UDP_ASSOC_IDLE:?}; closing");
+                    break;
+                }
             }
         }
     }
@@ -844,22 +1024,80 @@ fn parse_udp_request(buf: &[u8]) -> Option<(Target, (u16, Vec<u8>))> {
 /// Record that the client just talked to `dst`, so replies may come back, and
 /// keep the table bounded by age rather than by wiping every flow at once
 /// (`clear()` dropped thousands of live origins on a burst).
-fn note_origin(map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>, dst: SocketAddr, from: SocketAddr) {
-    let now = Instant::now();
+pub fn note_origin(map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>, dst: SocketAddr, from: SocketAddr) {
+    note_origin_at(map, dst, from, Instant::now());
+}
+
+/// [`note_origin`] with the clock supplied, so eviction is testable without
+/// sleeping for the TTL.
+pub fn note_origin_at(
+    map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>,
+    dst: SocketAddr,
+    from: SocketAddr,
+    now: Instant,
+) {
     map.insert(dst, (from, now));
-    if map.len() <= UDP_ORIGIN_MAX {
-        return;
-    }
-    map.retain(|_, (_, seen)| seen.elapsed() < UDP_ORIGIN_TTL);
     if map.len() > UDP_ORIGIN_MAX {
-        // Still over budget: the oldest half goes, newest conversations stay.
-        let mut by_age: Vec<(Instant, SocketAddr)> =
-            map.iter().map(|(k, (_, v))| (*v, *k)).collect();
-        by_age.sort_unstable_by_key(|(seen, _)| *seen);
-        for (_, key) in by_age.iter().take(by_age.len() - UDP_ORIGIN_MAX / 2) {
-            map.remove(key);
-        }
+        evict_origins(map, now);
     }
+}
+
+/// Age out dead origins, then evict the oldest half if still over budget.
+///
+/// Returns how many entries went. Per-association and LRU-ordered: the previous
+/// behaviour was `map.clear()` at the cap, which dropped *every* live origin at
+/// once so the next reply had nowhere to go and an attacker's unsolicited source
+/// was just as good as a real one.
+pub fn evict_origins(
+    map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>,
+    now: Instant,
+) -> usize {
+    let before = map.len();
+    map.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < UDP_ORIGIN_TTL);
+    if map.len() <= UDP_ORIGIN_MAX {
+        return before - map.len();
+    }
+    // Still over budget: the oldest excess goes, and every live conversation
+    // keeps its origin.
+    let excess = map.len() - UDP_ORIGIN_MAX;
+    let mut by_age: Vec<(Instant, SocketAddr)> =
+        map.iter().map(|(k, (_, seen))| (*seen, *k)).collect();
+    by_age.sort_unstable_by_key(|(seen, _)| *seen);
+    for (_, key) in by_age.iter().take(excess) {
+        map.remove(key);
+    }
+    before - map.len()
+}
+
+/// Which pinned client, if any, a datagram arriving from `src` may be delivered
+/// to.
+///
+/// Reply *filtering*, not forwarding: a source this association never contacted
+/// (or contacted only before the TTL) yields `None`, and the caller drops the
+/// datagram. The old `.or(client)` fallback handed the client anything that
+/// arrived, labelled with an attacker-chosen source address — which is how one
+/// client received another client's traffic once the map had been wiped.
+pub fn origin_target(
+    map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>,
+    src: SocketAddr,
+    now: Instant,
+) -> Option<SocketAddr> {
+    match map.get_mut(&src) {
+        Some((from, seen)) if now.saturating_duration_since(*seen) < UDP_ORIGIN_TTL => {
+            *seen = now;
+            Some(*from)
+        }
+        Some(_) => {
+            map.remove(&src);
+            None
+        }
+        None => None,
+    }
+}
+
+/// True once an association has been silent in both directions for too long.
+pub fn association_expired(last_activity: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_activity) >= UDP_ASSOC_IDLE
 }
 
 fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
@@ -882,8 +1120,11 @@ fn build_udp_reply(src: SocketAddr, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_dns_query, decode_qname, evict_lru, note_origin, parse_dns_answer_id, parse_domain_name,
-        parse_udp_request, select_auth_method, DnsCache, DNS_CACHE_MAX, UDP_ORIGIN_MAX,
+        association_expired, build_dns_query, check_listener_bind, decode_qname, evict_lru,
+        note_origin, parse_dns_answer_id, parse_domain_name, parse_udp_request, proxy_credentials,
+        secret_eq, select_auth_method, session_cap_message, DnsCache, AUTH_NONE,
+        AUTH_NO_ACCEPTABLE, AUTH_USERPASS, DNS_CACHE_MAX, MAX_SESSION,
+        SOCKS_GREETING_REFUSAL, UDP_ASSOC_IDLE, UDP_ASSOC_TICK, UDP_ORIGIN_MAX, VER,
     };
     use std::{
         collections::HashMap,
@@ -965,10 +1206,87 @@ mod tests {
         assert_eq!(default_servers[1], "1.0.0.1:53".parse().unwrap());
     }
 
+    /// With no credentials configured the proxy stays a no-auth loopback proxy;
+    /// once they are, `0x00` must not be negotiable any more — that is the
+    /// difference between a relay only the user can use and one anyone on the
+    /// network can use (T157).
     #[test]
-    fn rejects_clients_without_no_auth_method() {
-        assert_eq!(select_auth_method(&[0x02]), 0xff);
-        assert_eq!(select_auth_method(&[0x02, 0x00]), 0x00);
+    fn auth_method_selection_follows_the_credential_config() {
+        assert_eq!(select_auth_method(&[0x02], false), AUTH_NO_ACCEPTABLE);
+        assert_eq!(select_auth_method(&[0x02, 0x00], false), AUTH_NONE);
+        assert_eq!(select_auth_method(&[0x00], true), AUTH_NO_ACCEPTABLE);
+        assert_eq!(select_auth_method(&[0x00, 0x02], true), AUTH_USERPASS);
+        assert_eq!(select_auth_method(&[], true), AUTH_NO_ACCEPTABLE);
+    }
+
+    /// A wrong password must be rejected for the same reason over every prefix:
+    /// the comparison may not decide early.
+    #[test]
+    fn secret_comparison_is_complete_and_exact() {
+        assert!(secret_eq(b"correct horse", b"correct horse"));
+        assert!(!secret_eq(b"correct horse", b"correct horsf"));
+        assert!(!secret_eq(b"correct horse", b"correct hors"));
+        assert!(!secret_eq(b"", b"x"));
+        assert!(secret_eq(b"", b""));
+    }
+
+    /// `AETHER_ALLOW_REMOTE_PROXY` alone used to be enough to put an
+    /// unauthenticated relay on a routable address.
+    #[test]
+    fn remote_listener_without_credentials_is_refused() {
+        let public: SocketAddr = "0.0.0.0:1819".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:1819".parse().unwrap();
+        crate::runtime_env::remove("AETHER_PROXY_USER");
+        crate::runtime_env::remove("AETHER_PROXY_PASS");
+        assert!(proxy_credentials().is_none());
+        assert!(check_listener_bind(loopback).is_ok(), "loopback must stay usable");
+        let err = check_listener_bind(public)
+            .expect_err("a routable listener with no credentials must be refused");
+        assert!(
+            err.to_string().contains("AETHER_PROXY_USER"),
+            "the refusal must name the setting to set: {err}"
+        );
+        // Half a credential pair is not a credential pair.
+        crate::runtime_env::set("AETHER_PROXY_USER", "u");
+        assert!(proxy_credentials().is_none());
+        crate::runtime_env::set("AETHER_PROXY_PASS", "p");
+        assert_eq!(proxy_credentials(), Some(("u".into(), "p".into())));
+        assert!(check_listener_bind(public).is_ok());
+        crate::runtime_env::remove("AETHER_PROXY_USER");
+        crate::runtime_env::remove("AETHER_PROXY_PASS");
+    }
+
+    /// The caps have to be *legible*: `MAX_CLIENTS` used to surface as a bare RST
+    /// and `MAX_SESSION` as a silent mid-stream truncation (T163).
+    #[test]
+    fn session_caps_are_stated_in_the_message_the_user_sees() {
+        assert_eq!(SOCKS_GREETING_REFUSAL, [VER, AUTH_NO_ACCEPTABLE]);
+        let msg = session_cap_message("socks", MAX_SESSION);
+        assert!(msg.contains("maximum session length"), "{msg}");
+        assert!(msg.contains("4h"), "the limit must be stated in hours: {msg}");
+        assert!(msg.contains("Reconnect"), "and the remedy: {msg}");
+        assert!(msg.contains("socks"));
+    }
+
+    /// An association's reaper must be a checked predicate, not a sleep nobody
+    /// can verify (T136).
+    #[test]
+    fn idle_association_expires_and_live_one_does_not() {
+        let base = Instant::now();
+        assert!(!association_expired(base, base));
+        assert!(!association_expired(
+            base,
+            base + UDP_ASSOC_IDLE - Duration::from_millis(1)
+        ));
+        assert!(association_expired(base, base + UDP_ASSOC_IDLE));
+        assert!(
+            UDP_ASSOC_IDLE < MAX_SESSION,
+            "the association reaper must bite before the session cap"
+        );
+        assert!(
+            UDP_ASSOC_TICK < UDP_ASSOC_IDLE,
+            "with a tick longer than the idle limit the reaper can never fire in time"
+        );
     }
 
     #[test]

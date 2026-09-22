@@ -15,24 +15,62 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class SessionController(
     private val context: Context,
-    private var emit: (event: String, payload: JSONObject) -> Unit,
+    emitter: (event: String, payload: JSONObject) -> Unit,
     runnerFactory: ((onLine: (String) -> Unit, onExit: (Int?, Boolean) -> Unit) -> EngineRunner)? = null,
 ) {
+    /**
+     * The last published state. T215: this used to be one mutable `RuntimeState`
+     * that several threads wrote field-by-field, so `toJson()` could serialise
+     * `status="connected"` next to a previous session's `pid`, or a `connected`
+     * status with no tunnel behind it. Writes now build a whole new value under
+     * [stateLock] and publish it in one @Volatile store, and [getState] hands out
+     * that reference — which nobody can mutate afterwards, because `RuntimeState`
+     * is immutable once published.
+     */
+    @Volatile
+    private var runtime = RuntimeState()
+
+    private val stateLock = Any()
+
     fun setEmitter(fn: (event: String, payload: JSONObject) -> Unit) {
         emit = fn
     }
 
+    @Volatile
+    private var emit: (event: String, payload: JSONObject) -> Unit = emitter
+
     private val store = SettingsStore(context)
-    private val runtime = RuntimeState()
     private val connectedOnce = AtomicBoolean(false)
     private val socksSeen = AtomicBoolean(false)
     private val tunnelSeen = AtomicBoolean(false)
     private val vpnStarted = AtomicBoolean(false)
     private val vpnEstablished = AtomicBoolean(false)
     private val tearingDown = AtomicBoolean(false)
+    /// Set while a VPN teardown has been asked for but not yet acked by [AetherVpnService].
+    private val vpnStopPending = AtomicBoolean(false)
+    /// The engine's own `{"type":"connected"}` event — the only statement that can
+    /// claim a working data path on its own (T129's fail-closed replacement for
+    /// inferring it from log prose).
+    private val engineAssertedConnected = AtomicBoolean(false)
+    /// Malformed `AETHER_EVENT` lines this session, counted so the drop is visible
+    /// rather than silent (T129).
+    private val malformedEvents = java.util.concurrent.atomic.AtomicInteger(0)
+    /// Events with a valid shape but a `type` this shell does not model.
+    private val unknownEvents = java.util.concurrent.atomic.AtomicInteger(0)
     /// Whether the running scan has already produced a terminal event of its own.
     private val scanTerminalSent = AtomicBoolean(false)
+
+    @Volatile
     private var settings = store.load()
+
+    private fun resetSessionFlags() {
+        connectedOnce.set(false)
+        socksSeen.set(false)
+        tunnelSeen.set(false)
+        vpnStarted.set(false)
+        vpnEstablished.set(false)
+        engineAssertedConnected.set(false)
+    }
 
     private fun handleExit(code: Int?, isScan: Boolean) {
         if (isScan) {
@@ -43,22 +81,18 @@ class SessionController(
             return
         }
         val wasConnected = connectedOnce.get()
-        connectedOnce.set(false)
-        socksSeen.set(false)
-        tunnelSeen.set(false)
-        vpnStarted.set(false)
-        vpnEstablished.set(false)
+        resetSessionFlags()
         val isError = code != null && code != 0 && !wasConnected
+        val vpnErr = stopVpnService()
         setRuntime(
-            if (isError) "error" else "disconnected",
-            if (isError) "Could not find a working gateway"
+            if (vpnErr != null) "error" else if (isError) "error" else "disconnected",
+            vpnErr ?: if (isError) "Could not find a working gateway"
             else if (code == 0 || code == null) "Engine stopped"
             else "Engine exited ($code)",
             null,
             null,
         )
         context.stopService(Intent(context, EngineService::class.java))
-        stopVpnService()
     }
 
     internal val runner: EngineRunner = runnerFactory?.invoke(
@@ -78,7 +112,29 @@ class SessionController(
         settings = s
     }
 
-    fun getState(): RuntimeState = runtime
+    /**
+     * A snapshot of the published state. Never mutated after publication, and
+     * always read together with the tunnel's own view of itself, so a
+     * `status="connected"` can no longer be handed to the UI alongside a tunnel
+     * that does not exist (T215).
+     */
+    fun getState(): RuntimeState {
+        val snapshot = runtime
+        // Fail-closed reconciliation: in tun mode the service's own view of the fd
+        // is the ground truth. If it is gone, "connected" is a lie whatever this
+        // controller last believed, and the UI must not show a green badge over it.
+        if (snapshot.status == "connected" && settings.routingMode == "tun" && !VpnTunnel.up) {
+            return RuntimeState(
+                status = "connecting",
+                detail = "Waiting for the VPN tunnel",
+                pid = snapshot.pid,
+                endpoint = snapshot.endpoint,
+            )
+        }
+        return snapshot
+    }
+
+    internal fun malformedEventCount(): Int = malformedEvents.get()
 
     fun isVpnPrepared(): Boolean {
         return VpnService.prepare(context) == null
@@ -93,26 +149,22 @@ class SessionController(
         } catch (e: Exception) {
             Log.w(TAG, "Failed to stop EngineService during rollback: ${e.message}")
         }
-        stopVpnService()
+        val vpnErr = stopVpnService()
 
-        connectedOnce.set(false)
-        socksSeen.set(false)
-        tunnelSeen.set(false)
-        vpnStarted.set(false)
-        vpnEstablished.set(false)
+        resetSessionFlags()
 
         val stopped = runner.stopAndWait(3000)
         val stillRunning = runner.isRunning()
-        val finalReason = if (!stopped || stillRunning) {
+        val problems = mutableListOf<String>()
+        if (vpnErr != null) problems += vpnErr
+        if (!stopped || stillRunning) {
             val alivePid = runner.pid()
-            val warn = "$reason (Engine process pid=$alivePid still running after rollback timeout)"
+            val warn = "Engine process pid=$alivePid still running after rollback timeout"
             Log.e(TAG, warn)
             emitLog(warn)
-            warn
-        } else {
-            reason
+            problems += warn
         }
-
+        val finalReason = if (problems.isEmpty()) reason else "$reason — ${problems.joinToString("; ")}"
         setRuntime("error", finalReason, null, runtime.endpoint)
         return finalReason
     }
@@ -135,11 +187,18 @@ class SessionController(
         validate(s)
         store.save(s)
         settings = s
-        connectedOnce.set(false)
-        socksSeen.set(false)
-        tunnelSeen.set(false)
-        vpnStarted.set(false)
-        vpnEstablished.set(false)
+        resetSessionFlags()
+        malformedEvents.set(0)
+        // A tunnel left over from a previous attempt carries the *old* SOCKS port,
+        // and AetherVpnService will not re-establish while a tun exists: make the
+        // stale one go away and say so instead of quietly ignoring the new setting.
+        if (vpnStarted.get() || VpnTunnel.up) {
+            val stale = stopVpnService()
+            if (stale != null) {
+                setRuntime("error", stale, null, null)
+                return stale
+            }
+        }
 
         if (s.routingMode == "tun") {
             val prep = VpnService.prepare(context)
@@ -209,20 +268,41 @@ class SessionController(
         runner.stop()
     }
 
-    fun disconnect() {
-        if (!tearingDown.compareAndSet(false, true)) return
-        runner.stopAndWait(3000)
-        context.stopService(Intent(context, EngineService::class.java))
-        if (vpnStarted.get()) {
-            stopVpnService()
+    /**
+     * Tear the session down.
+     *
+     * @return `null` when everything that was up is now down, otherwise the
+     *   actionable reason the caller must show. The old version returned Unit and
+     *   then reported `disconnected`/"Ready" no matter what the VPN stop did
+     *   (T206), so a still-running tunnel was announced as gone.
+     */
+    fun disconnect(): String? {
+        if (!tearingDown.compareAndSet(false, true)) return null
+        // Fail-closed ordering (T216): a stale engine must not be left holding the
+        // SOCKS port the next connect() will ask the tunnel for.
+        val engineStopped = runner.stopAndWait(3000)
+        val engineStillUp = !engineStopped || runner.isRunning()
+        try {
+            context.stopService(Intent(context, EngineService::class.java))
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to stop EngineService during disconnect: ${e.message}")
         }
-        connectedOnce.set(false)
-        socksSeen.set(false)
-        tunnelSeen.set(false)
-        vpnStarted.set(false)
-        vpnEstablished.set(false)
-        setRuntime("disconnected", "Ready", null, null)
+        val vpnErr = stopVpnService()
+        resetSessionFlags()
+
+        val problems = mutableListOf<String>()
+        if (vpnErr != null) problems += vpnErr
+        if (engineStillUp) problems += "engine process pid=${runner.pid()} is still running"
         tearingDown.set(false)
+
+        if (problems.isNotEmpty()) {
+            val detail = "Could not fully stop Aether: ${problems.joinToString("; ")}"
+            Log.e(TAG, detail)
+            setRuntime("error", detail, null, runtime.endpoint)
+            return detail
+        }
+        setRuntime("disconnected", "Ready", null, null)
+        return null
     }
 
     fun testConnection(s: Settings): String {
@@ -255,131 +335,222 @@ class SessionController(
         validateSettings(s)
     }
 
+    /**
+     * One line of engine output.
+     *
+     * The lifecycle is driven exclusively by structured `AETHER_EVENT` JSON
+     * ([EngineEvent]) — see T129. The prose this replaces asked whether a log line
+     * contained "handshake successful", a sentence the engine has never printed, so
+     * a healthy tunnel stayed "connecting" forever while the real
+     * `{"type":"connected"}` event on the very same line was parsed, discarded and
+     * left unreported. Nothing here infers state from wording any more.
+     */
     private fun handleEngineLine(line: String) {
         emitLog(line)
-        val idx = line.indexOf("AETHER_EVENT ")
-        if (idx >= 0) {
-            try {
-                val json = JSONObject(line.substring(idx + "AETHER_EVENT ".length).trim())
-                when (json.optString("type")) {
-                    "endpoint_selected" -> {
-                        if (!runner.isScanMode()) {
-                            runtime.endpoint = json.optString("addr").ifEmpty { null }
-                            emitState()
-                            // The connect path emits no scan_done — close the live scan card
-                            // once a gateway is chosen so it does not linger during the tunnel.
-                            emit(
-                                "scan://event",
-                                JSONObject().put("type", "scan_done")
-                                    .put("addr", json.optString("addr")).put("rtt", "").put("protocol", ""),
-                            )
-                        }
-                    }
-                    "proxy_ready" -> {
-                        socksSeen.set(true)
-                        maybeStartVpn()
-                    }
-                    "tunnel_ready", "tun_ready", "connected" -> {
-                        tunnelSeen.set(true)
-                        maybeStartVpn()
-                    }
-                    "error" -> {
-                        val msg = json.optString("message", "Connection failed")
-                        emitLog("engine error: $msg")
-                        if (!runner.isScanMode()) {
-                            rollbackStartup(msg)
-                        } else {
-                            scanTerminalSent.set(true)
-                            emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
-                        }
-                    }
-                    // Forward structured scan telemetry to the webview (scan://event),
-                    // mirroring the desktop Tauri bridge. The UI consumes these instead
-                    // of regex-parsing log lines.
-                    "scan_done" -> {
-                        scanTerminalSent.set(true)
-                        emitScanEvent(json)
-                    }
-                    "scan_start", "scan_progress", "scan_hit" -> emitScanEvent(json)
-                }
-            } catch (_: Exception) {
+        val ev = EngineEvent.parse(line)
+        if (ev == null) {
+            // An endpoint may still arrive as log prose; it only ever labels the
+            // header, it never moves the state machine.
+            parseEndpoint(line)?.let { setEndpoint(it) }
+            return
+        }
+        when (ev) {
+            is EngineEvent.Malformed -> {
+                val count = malformedEvents.incrementAndGet()
+                // Counted and visible on the log stream: the contract between the
+                // engine and this shell is broken, and a dropped event used to be
+                // indistinguishable from an event that never happened.
+                reportStreamError(
+                    "engine event rejected (#$count this session): ${ev.reason} — ${ev.raw.take(200)}",
+                )
             }
-        }
-        if (line.contains("[-] session failed:")) {
-            val msg = line.substringAfter("[-] session failed:").trim()
-            if (!runner.isScanMode()) {
-                rollbackStartup(msg)
-            } else {
-                scanTerminalSent.set(true)
-                emit("scan://event", JSONObject().put("type", "scan_failed").put("message", msg))
-            }
-        }
-        if (line.contains("socks5 server listening") || line.contains("http proxy listening")) {
-            socksSeen.set(true)
-            maybeStartVpn()
-        }
-        if (
-            line.contains("connect-ip status: 200") ||
-            line.contains("handshake successful") ||
-            line.contains("[tun] bridge active") ||
-            line.contains("quic handshake established")
-        ) {
-            tunnelSeen.set(true)
-            maybeStartVpn()
-        }
-        parseEndpoint(line)?.let {
-            runtime.endpoint = it
-            emitState()
-        }
 
-        val ready = if (settings.protocol == "masque") {
-            socksSeen.get() && tunnelSeen.get()
-        } else {
-            socksSeen.get() || tunnelSeen.get()
+            is EngineEvent.Unrecognised -> {
+                val count = unknownEvents.incrementAndGet()
+                Log.w(TAG, "unhandled engine event '${ev.type}' (#$count)")
+                emit(
+                    "session://log",
+                    JSONObject().put("level", "warn")
+                        .put("message", "unhandled engine event '${ev.type}' (#$count)"),
+                )
+            }
+
+            is EngineEvent.Stage -> Unit
+
+            is EngineEvent.IdentityReady -> Unit
+
+            is EngineEvent.EndpointSelected -> {
+                if (!runner.isScanMode() && ev.addr.isNotEmpty()) {
+                    setEndpoint(ev.addr)
+                    // The connect path emits no scan_done — close the live scan card
+                    // once a gateway is chosen so it does not linger during the tunnel.
+                    emit(
+                        "scan://event",
+                        JSONObject().put("type", "scan_done")
+                            .put("addr", ev.addr).put("rtt", "").put("protocol", ev.protocol),
+                    )
+                }
+            }
+
+            is EngineEvent.ProxyReady -> {
+                socksSeen.set(true)
+                maybeStartVpn()
+            }
+
+            is EngineEvent.TunnelReady,
+            is EngineEvent.TunReady,
+            -> {
+                tunnelSeen.set(true)
+                maybeStartVpn()
+            }
+
+            is EngineEvent.Connected -> {
+                tunnelSeen.set(true)
+                engineAssertedConnected.set(true)
+                maybeStartVpn()
+            }
+
+            is EngineEvent.Failure -> {
+                emitLog("engine error: ${ev.message}")
+                if (!runner.isScanMode()) {
+                    rollbackStartup(ev.message)
+                } else {
+                    scanTerminalSent.set(true)
+                    emit("scan://event", JSONObject().put("type", "scan_failed").put("message", ev.message))
+                }
+            }
+
+            is EngineEvent.Scan -> {
+                if (ev.type == "scan_done") scanTerminalSent.set(true)
+                emitScanEvent(ev.payload)
+            }
         }
-        if (ready && (settings.routingMode != "tun" || vpnEstablished.get())) markConnected()
+        evaluateReadiness()
     }
+
+    /** A visible, counted error on the log stream (level "error" by construction). */
+    private fun reportStreamError(message: String) {
+        Log.e(TAG, message)
+        emit("session://log", JSONObject().put("level", "error").put("message", message))
+    }
+
+    /**
+     * Fail-closed readiness (T129): the path counts as up when the engine said so
+     * structurally, or when its local listeners are accepting *and* — for the
+     * MASQUE family, where `proxy_ready` precedes the tunnel — the tunnel itself
+     * reported ready. A full-device tunnel additionally waits for the tun.
+     */
+    private fun evaluateReadiness() {
+        val s = settings
+        val pathReady = when {
+            engineAssertedConnected.get() -> true
+            s.protocol.lowercase().startsWith("masque") -> socksSeen.get() && tunnelSeen.get()
+            else -> socksSeen.get()
+        }
+        if (!pathReady) return
+        if (s.routingMode == "tun" && !vpnEstablished.get()) return
+        markConnected()
+    }
+
+    /** MASQUE-family protocols carry the user's traffic inside the QUIC tunnel. */
+    private fun requiresTunnelPath(protocol: String): Boolean =
+        protocol.lowercase().startsWith("masque")
 
     private fun maybeStartVpn() {
         if (settings.routingMode != "tun") return
         if (!socksSeen.get()) return
         // Wait until the tunnel path is actually up so early SOCKS accepts
         // do not blackhole the first wave of DNS/TCP from other apps.
-        if (settings.protocol == "masque" && !tunnelSeen.get()) return
+        if (requiresTunnelPath(settings.protocol) && !tunnelSeen.get()) return
         if (!vpnStarted.compareAndSet(false, true)) return
+        val port = settings.socksPort
         try {
             val vpn = Intent(context, AetherVpnService::class.java).apply {
-                putExtra(AetherVpnService.EXTRA_SOCKS_PORT, settings.socksPort)
+                putExtra(AetherVpnService.EXTRA_SOCKS_PORT, port)
             }
             context.startForegroundService(vpn)
-            Log.i(TAG, "started AetherVpnService socks=${settings.socksPort}")
-            emitLog("VPN: starting tun2socks -> 127.0.0.1:${settings.socksPort}")
+            Log.i(TAG, "started AetherVpnService socks=$port")
+            emitLog("VPN: starting tun2socks -> 127.0.0.1:$port")
         } catch (e: Exception) {
             Log.e(TAG, "VPN start failed: ${e.message}", e)
+            vpnStarted.set(false)
             rollbackStartup("VPN start failed: ${e.message}")
         }
     }
 
-    private fun stopVpnService() {
+    /**
+     * Ask [AetherVpnService] to tear its tunnel down.
+     *
+     * @return `null` when the stop was accepted, otherwise an actionable message.
+     *   The swallow this replaces meant a background `startService` rejection —
+     *   which Android answers with `IllegalStateException` — left the tun up while
+     *   the session went on to report "disconnected"/"Ready" (T206).
+     */
+    internal fun stopVpnService(): String? {
+        var refused: Throwable? = null
         try {
             val stop = Intent(context, AetherVpnService::class.java).apply {
                 action = AetherVpnService.ACTION_STOP
             }
+            // The cooperative stop is what actually closes the fd; `stopService`
+            // alone can be answered by the system after the process is long gone.
             context.startService(stop)
-        } catch (_: Exception) {
+            vpnStopPending.set(true)
+        } catch (e: Exception) {
+            refused = e
+            Log.e(TAG, "VPN stop request failed: ${e.message}", e)
         }
-        context.stopService(Intent(context, AetherVpnService::class.java))
+        try {
+            context.stopService(Intent(context, AetherVpnService::class.java))
+        } catch (e: Exception) {
+            refused = refused ?: e
+            Log.e(TAG, "VPN stopService failed: ${e.message}", e)
+        }
+        if (refused == null) return null
+        vpnStopPending.set(false)
+        // Ask the service rather than assume: it owns the descriptor.
+        val stillUp = VpnTunnel.up || AetherVpnService.current?.isTunnelUp() == true
+        val evidence = if (stillUp) {
+            "the tunnel still reports itself up"
+        } else {
+            "whether the tunnel closed cannot be confirmed"
+        }
+        val detail = "VPN tunnel could not be stopped (${refused.message ?: refused.javaClass.simpleName}); " +
+            "$evidence, so it may still be carrying this device's traffic. Open system Settings > " +
+            "Network & internet > VPN and disconnect Aether Next, then force-stop the app."
+        reportStreamError(detail)
+        return detail
     }
 
     fun onVpnEstablished() {
         vpnEstablished.set(true)
+        VpnTunnel.established(true, settings.socksPort)
         emitLog("VPN: tun2socks established")
-        val ready = socksSeen.get() && (settings.protocol != "masque" || tunnelSeen.get())
-        if (ready) markConnected()
+        evaluateReadiness()
+    }
+
+    /** The service confirmed the tun is closed; only now may the session say "Ready". */
+    fun onVpnStopped() {
+        VpnTunnel.established(false, -1)
+        vpnEstablished.set(false)
+        if (!vpnStopPending.compareAndSet(true, false)) return
+        if (!runner.isRunning() && !tearingDown.get()) {
+            setRuntime("disconnected", "Ready", null, null)
+        }
     }
 
     fun onVpnFailed(message: String) {
         rollbackStartup("VPN failed: $message")
+    }
+
+    /**
+     * Publish a crash. Reached from [AetherApp]'s uncaught-exception forwarder,
+     * which is why it does not go through the WebView: the thread that crashed may
+     * have been the one owning it.
+     */
+    fun reportCrash(reason: String) {
+        resetSessionFlags()
+        setRuntime("error", "App crashed: $reason", null, runtime.endpoint)
     }
 
     private fun parseEndpoint(line: String): String? {
@@ -413,24 +584,34 @@ class SessionController(
         setRuntime("connected", detail, runner.pid(), runtime.endpoint)
     }
 
+    /** Publish a whole new snapshot; the old one is never touched again. */
     private fun setRuntime(
         status: String,
         detail: String,
         pid: Int?,
         endpoint: String?,
-    ) {
-        runtime.status = status
-        runtime.detail = detail
-        runtime.pid = pid
-        if (endpoint != null) runtime.endpoint = endpoint
-        if (status == "disconnected" || status == "error") {
-            if (status == "disconnected") runtime.endpoint = null
-        }
-        emitState()
+    ) = synchronized(stateLock) {
+        val previous = runtime
+        val next = RuntimeState(
+            status = status,
+            detail = detail,
+            pid = pid,
+            endpoint = when {
+                status == "disconnected" -> null
+                endpoint != null -> endpoint
+                status == "error" -> previous.endpoint
+                else -> previous.endpoint
+            },
+        )
+        runtime = next
+        emit("session://state", next.toJson())
     }
 
-    private fun emitState() {
-        emit("session://state", runtime.toJson())
+    /** Endpoint label only — it never changes [status]. */
+    private fun setEndpoint(endpoint: String) = synchronized(stateLock) {
+        val next = runtime.copy(endpoint = endpoint)
+        runtime = next
+        emit("session://state", next.toJson())
     }
 
     /**
@@ -547,5 +728,29 @@ class SessionController(
         }
 
         fun getOrNull(): SessionController? = instance
+    }
+}
+
+/**
+ * The process-wide answer to "is there a tun right now, and on which SOCKS port?".
+ *
+ * [AetherVpnService] owns the descriptor and publishes here when it opens or closes
+ * it; [SessionController] reads it so it can *check* a teardown instead of
+ * announcing one (T206), and so a published `connected` state can be reconciled
+ * against a tunnel that vanished underneath it (T215). `@Volatile` because the
+ * writer is the VPN worker thread and the readers are the main and bridge threads.
+ */
+internal object VpnTunnel {
+    @Volatile
+    var up: Boolean = false
+        private set
+
+    @Volatile
+    var socksPort: Int = -1
+        private set
+
+    fun established(isUp: Boolean, port: Int) {
+        socksPort = port
+        up = isUp
     }
 }

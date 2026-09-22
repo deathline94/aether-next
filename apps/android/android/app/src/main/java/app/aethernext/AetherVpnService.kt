@@ -31,21 +31,56 @@ import java.util.concurrent.Executors
  *
  * DNS uses hev mapdns (fake resolver at 198.18.0.2) so name lookups go through
  * SOCKS rather than raw UDP to public resolvers.
+ *
+ * Loop avoidance (`addDisallowedApplication`) is fail-closed and cannot be
+ * replaced by `protect()` — see [LoopAvoidance] for the reasoning (T208).
  */
 class AetherVpnService : VpnService() {
+    // T215: every field below is written from the main thread (onStartCommand,
+    // onRevoke, onDestroy) and from `worker`, sometimes while `lifecycleLock` is
+    // held and sometimes before it is taken. Plain fields gave the worker thread
+    // no guarantee of ever observing a new value, so `stopRequested` could be
+    // missed for the whole life of a doomed tunnel. They are @Volatile now, and
+    // every decision that combines two of them reads them inside the lock.
+    @Volatile
     private var tun: ParcelFileDescriptor? = null
+
+    @Volatile
     private var hevStarted = false
+
+    @Volatile
     private var stopRequested = false
+
     private val lifecycleLock = Any()
     private val vpnGeneration = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** The generation handed to the most recent start request, main thread only. */
+    @Volatile
+    private var latestStartGen = NO_LISTENER
+
+    @Volatile
     private var connectivityManager: ConnectivityManager? = null
+
+    @Volatile
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     internal fun getVpnGeneration(): Long = vpnGeneration.get()
 
+    /** Whether this service currently holds an open tun fd (T206's ground truth). */
+    internal fun isTunnelUp(): Boolean = synchronized(lifecycleLock) { tun != null }
+
+    override fun onCreate() {
+        super.onCreate()
+        current = this
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             vpnGeneration.incrementAndGet()
+            // Disarm failure reporting: no worker was started with generation -1, so
+            // a teardown that races an in-flight start cannot report an error the
+            // user did not ask about.
+            latestStartGen = NO_LISTENER
             stopRequested = true
             // Do not call startForeground on STOP — just tear down.
             worker.execute {
@@ -65,14 +100,15 @@ class AetherVpnService : VpnService() {
         if (tun == null) {
             val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, -1) ?: -1
             val currentGen = vpnGeneration.incrementAndGet()
+            latestStartGen = currentGen
             worker.execute {
                 try {
                     check(socksPort in 1024..65535) { "VPN start missing valid SOCKS port" }
                     check(nativeLoaded) { "hev-socks5-tunnel native library unavailable" }
                     val established = establishTun(socksPort, currentGen)
-                    if (established && currentGen == vpnGeneration.get() && !stopRequested) {
+                    if (established && ownsTunnel(currentGen)) {
                         mainHandler.post {
-                            if (currentGen == vpnGeneration.get() && !stopRequested) {
+                            if (ownsTunnel(currentGen)) {
                                 SessionController.getOrNull()?.onVpnEstablished()
                             }
                         }
@@ -81,7 +117,12 @@ class AetherVpnService : VpnService() {
                     Log.e(TAG, "VPN establish failed: ${e.message}", e)
                     stopTunnel()
                     mainHandler.post {
-                        if (currentGen == vpnGeneration.get()) {
+                        // `stopTunnel()` above has already bumped `vpnGeneration`, so
+                        // the token that proves "nobody superseded me" cannot be the
+                        // generation: gating the report on it dropped every establish
+                        // failure — including the loop-avoidance refusal — and left
+                        // the session waiting for a tunnel that never existed.
+                        if (reportsToUser(currentGen)) {
                             SessionController.getOrNull()?.onVpnFailed(e.message ?: "VPN establish failed")
                         }
                         stopSelf()
@@ -90,7 +131,7 @@ class AetherVpnService : VpnService() {
                     Log.e(TAG, "VPN native call failed: ${e.message}", e)
                     stopTunnel()
                     mainHandler.post {
-                        if (currentGen == vpnGeneration.get()) {
+                        if (reportsToUser(currentGen)) {
                             SessionController.getOrNull()?.onVpnFailed("VPN native library incompatible")
                         }
                         stopSelf()
@@ -100,6 +141,22 @@ class AetherVpnService : VpnService() {
         }
         return START_NOT_STICKY
     }
+
+    /**
+     * Whether the service the user last asked for is still the one started at
+     * [gen]. Distinct from [ownsTunnel] on purpose: see the comment in the catch
+     * blocks — a worker that failed has already invalidated its own token.
+     */
+    internal fun reportsToUser(gen: Long): Boolean = reportsToUser(gen, latestStartGen)
+
+    /**
+     * Whether the worker started at [gen] still owns the tunnel: no stop has been
+     * requested and no newer start has superseded it. The service published this
+     * rule inline twice (plus once per `mainHandler.post`) and the tests simulated
+     * it against a local counter instead of calling it (T227).
+     */
+    internal fun ownsTunnel(gen: Long): Boolean =
+        ownsTunnel(gen, vpnGeneration.get(), stopRequested)
 
     internal fun configureTunBuilder(): Builder {
         val builder = Builder()
@@ -126,14 +183,15 @@ class AetherVpnService : VpnService() {
                 Log.w(TAG, "setMetered failed: ${e.message}")
             }
         }
-
-        // Keep engine + hev sockets off the TUN (otherwise infinite loop).
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) {
-        }
         return builder
     }
+
+    /**
+     * Packages that must stay off the TUN. The engine child inherits this
+     * package's uid, so excluding the package excludes the child's sockets too
+     * (and is the only thing that can — see [LoopAvoidance]).
+     */
+    internal fun loopAvoidancePackages(): List<String> = listOf(packageName)
 
     internal fun registerUnderlyingNetworkCallbacks() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -198,14 +256,21 @@ class AetherVpnService : VpnService() {
             if (tun != null) return true
 
             val builder = configureTunBuilder()
-            val established = builder.establish()
-                ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
+            // T202/T208: loop avoidance runs *inside* TunEstablishment, before
+            // establish(), and a failure is thrown rather than swallowed — a tunnel
+            // that carries the engine's own traffic is a blackhole, not a fallback.
+            val established = TunEstablishment.establish(
+                exempt = TunEstablishment.builderFor(builder),
+                packages = loopAvoidancePackages(),
+                openTun = { builder.establish() },
+            )
 
             if (stopRequested || gen != vpnGeneration.get()) {
                 try { established.close() } catch (_: Exception) {}
                 return false
             }
             tun = established
+            VpnTunnel.established(true, socksPort)
 
             registerUnderlyingNetworkCallbacks()
 
@@ -272,7 +337,7 @@ class AetherVpnService : VpnService() {
         val n: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.notif_vpn))
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(open)
             .setOngoing(true)
             .build()
@@ -311,6 +376,7 @@ class AetherVpnService : VpnService() {
             } catch (_: Exception) {
             }
             tun = null
+            VpnTunnel.established(false, -1)
 
             try {
                 networkCallback?.let { cb ->
@@ -335,8 +401,13 @@ class AetherVpnService : VpnService() {
     override fun onDestroy() {
         val unexpected = !stopRequested && hevStarted
         stopTunnel()
+        if (current === this) current = null
         if (unexpected) {
             SessionController.getOrNull()?.onVpnFailed("VPN service stopped by system")
+        } else {
+            // The tunnel is closed and the fd released *now*: this is the ack the
+            // session waits on before it is allowed to say "Ready" (T206).
+            SessionController.getOrNull()?.onVpnStopped()
         }
         super.onDestroy()
     }
@@ -360,6 +431,28 @@ class AetherVpnService : VpnService() {
         private val mainHandler = Handler(Looper.getMainLooper())
         const val EXTRA_SOCKS_PORT = "socks_port"
         const val ACTION_STOP = "app.aethernext.VPN_STOP"
+
+        /** A generation no worker can have: nobody is listening for a report. */
+        private const val NO_LISTENER = -1L
+
+        /** The live service, if any. @Volatile because the session reads it from `worker`. */
+        @Volatile
+        internal var current: AetherVpnService? = null
+
+        /**
+         * The rule the service applies before publishing any worker result — kept as
+         * a pure function of the three values so it can be asserted directly
+         * instead of against a test-local counter (T227).
+         */
+        internal fun ownsTunnel(gen: Long, currentGen: Long, stopRequested: Boolean): Boolean =
+            !stopRequested && gen == currentGen
+
+        /**
+         * The failure-report rule. `NO_LISTENER` is what a STOP leaves behind, so a
+         * teardown in flight silences the workers it invalidates.
+         */
+        internal fun reportsToUser(gen: Long, latestStartGen: Long): Boolean =
+            gen != NO_LISTENER && gen == latestStartGen
 
         init {
             try {

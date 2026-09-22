@@ -5,4 +5,6 @@
     <string name="channel_vpn">Aether Next VPN</string>
     <string name="notif_running">Tunnel engine running</string>
     <string name="notif_vpn">VPN tunnel active</string>
+    <string name="channel_boot">Aether Next start-up</string>
+    <string name="notif_tap_to_start">Aether Next is ready. Tap to open and connect.</string>
 </resources>

@@ -8,6 +8,8 @@ pub mod aethernoize;
 pub mod cli;
 pub mod config;
 pub mod consts;
+pub mod counters;
+pub mod diagnostics;
 pub mod dns;
 pub mod engine_config;
 pub mod error;

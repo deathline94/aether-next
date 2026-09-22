@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::collections::VecDeque;
@@ -6,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::socket::{tcp, udp, AnySocket};
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address};
 use tokio::sync::{mpsc, oneshot};
 
@@ -23,9 +24,41 @@ const MAX_INGEST_PER_TICK: usize = 256;
 const MAX_CMDS_PER_TICK: usize = 64;
 const MAX_APPDATA_PER_TICK: usize = 64;
 const MAX_RECV_CHUNKS: usize = 64;
-const MAX_TCP_CONNECTIONS: usize = 512;
-const MAX_UDP_CONNECTIONS: usize = 128;
 const MAX_PENDING_PER_CONN: usize = 512 * 1024;
+
+// Per-class socket budgets (T137/T149).
+//
+// Proxy traffic and the engine's own DNS lookups used to share one 128-entry
+// pool, so a browser that opened every UDP association (trivial with WebRTC /
+// QUIC) starved the resolver — and because every domain `CONNECT` is resolved
+// through that same path, exhausting the UDP pool took down *all* proxying, not
+// just UDP. Splitting the budget means the worst a client can do to name
+// resolution is consume the proxy class, which the resolver cannot.
+//
+// The totals match the old single-pool caps, so per-flow memory is unchanged.
+// They are public because the budgets are user-visible limits: the UI and the
+// tests both need to say what "too many associations" means.
+pub const MAX_UDP_PROXY: usize = 96;
+pub const MAX_UDP_RESOLVER: usize = 32;
+pub const MAX_TCP_PROXY: usize = 480;
+pub const MAX_TCP_RESOLVER: usize = 32;
+
+/// TCP inactivity abort while still connecting (H2): a SYN into a black hole
+/// must not sit in `SynSent` forever holding 1 MB of buffers and a slot.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP inactivity abort once Established.
+///
+/// smoltcp's `timed_out` is `timestamp >= remote_last_ts + timeout`
+/// (`socket/tcp.rs:2118`), i.e. the *connect* timeout doubled as an idle killer
+/// and cut every quiet SSH / IMAP / long-poll / WebSocket / keep-alive session
+/// at 10 s. Widening alone would leave a dead peer unsupervised for minutes, so
+/// it is paired with a real keep-alive below: 75 s > 4 x 15 s means four probes
+/// go unanswered before a flow is reaped.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Idle interval after which smoltcp emits a 1-byte probe at `seq - 1`
+/// (`socket/tcp.rs:2449`); a live peer ACKs it, which refreshes
+/// `remote_last_ts` and keeps the flow alive indefinitely.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Upper bound on frames the device will queue for the tunnel.
 ///
@@ -45,8 +78,60 @@ const TX_RING: usize = 256;
 /// caused anyway once the socket buffer filled.
 const RX_RING: usize = 512;
 
+/// Extra room past `TX_RING` for the transmit token paired with an ingress
+/// frame.
+///
+/// `transmit()` refuses at `TX_RING` so bulk data cannot outrun the tunnel, but
+/// a TCP *reply* must not be dropped: `ack_reply` moves `remote_last_ack`
+/// forward eagerly and a lost ACK is not regenerated until new data or a window
+/// update arrives. So the token `receive()` hands back may go a bounded distance
+/// past the ring, which keeps the whole queue at `TX_RING + 32` frames maximum
+/// and makes "the ring is full" observable instead of a growing `VecDeque`.
+const TX_EGRESS_SLACK: usize = 32;
+
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
 type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
+
+/// Which socket budget a flow draws from. See `MAX_*_PROXY` / `MAX_*_RESOLVER`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketClass {
+    /// Client traffic relayed through the SOCKS / HTTP proxies.
+    Proxy,
+    /// The engine's own lookups, which must keep working while the proxy is at
+    /// its limit.
+    Resolver,
+}
+
+impl SocketClass {
+    fn for_resolver(resolver: bool) -> Self {
+        if resolver {
+            SocketClass::Resolver
+        } else {
+            SocketClass::Proxy
+        }
+    }
+
+    fn tcp_cap(self) -> usize {
+        match self {
+            SocketClass::Proxy => MAX_TCP_PROXY,
+            SocketClass::Resolver => MAX_TCP_RESOLVER,
+        }
+    }
+
+    fn udp_cap(self) -> usize {
+        match self {
+            SocketClass::Proxy => MAX_UDP_PROXY,
+            SocketClass::Resolver => MAX_UDP_RESOLVER,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SocketClass::Proxy => "proxy",
+            SocketClass::Resolver => "resolver",
+        }
+    }
+}
 
 pub struct StackDevice {
     rx: VecDeque<Vec<u8>>,
@@ -95,6 +180,10 @@ impl StackDevice {
 pub struct StackRxToken(Vec<u8>);
 pub struct StackTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
+    /// Hard ceiling for this token; `TX_RING` for bulk egress, `TX_RING +
+    /// TX_EGRESS_SLACK` for the reply token paired with an ingress frame.
+    cap: usize,
+    deferred: &'a mut u64,
 }
 
 impl RxToken for StackRxToken {
@@ -107,7 +196,17 @@ impl<'a> TxToken for StackTxToken<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        self.queue.push_back(buf);
+        // Past the cap the frame is dropped and *counted*. For bulk egress the
+        // cap equals `TX_RING`, which `transmit()` already refuses up front, so
+        // this arm is unreachable there; for the paired reply token it can only
+        // be reached after `TX_EGRESS_SLACK` ACKs queued on top of a full ring —
+        // a state where the tunnel is behind anyway and TCP recovers by
+        // retransmit. The alternative was an unbounded queue.
+        if self.queue.len() < self.cap {
+            self.queue.push_back(buf);
+        } else {
+            *self.deferred += 1;
+        }
         r
     }
 }
@@ -119,14 +218,18 @@ impl Device for StackDevice {
     fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.pop_front()?;
         self.rx_bytes = self.rx_bytes.saturating_sub(pkt.len());
-        // The token paired with an ingress packet is deliberately *not* capped:
-        // dropping an ACK is unsafe, because `ack_reply` updates remote_last_ack
-        // eagerly and a lost reply is not regenerated until new data or a window
-        // update arrives — whereas a refused egress segment is simply retried.
+        // The token paired with an ingress packet is deliberately *not* capped
+        // at TX_RING: dropping an ACK is unsafe, because `ack_reply` updates
+        // remote_last_ack eagerly and a lost reply is not regenerated until new
+        // data or a window update arrives — whereas a refused egress segment is
+        // simply retried. It is capped at TX_RING + TX_EGRESS_SLACK so a burst
+        // of replies still cannot grow the queue without limit.
         Some((
             StackRxToken(pkt),
             StackTxToken {
                 queue: &mut self.tx,
+                cap: TX_RING + TX_EGRESS_SLACK,
+                deferred: &mut self.tx_deferred,
             },
         ))
     }
@@ -138,6 +241,8 @@ impl Device for StackDevice {
         }
         Some(StackTxToken {
             queue: &mut self.tx,
+            cap: TX_RING,
+            deferred: &mut self.tx_deferred,
         })
     }
 
@@ -153,8 +258,19 @@ impl Device for StackDevice {
 }
 
 pub enum Cmd {
-    OpenTcp { dst: SocketAddr, resp: OpenTcpResp },
-    OpenUdp { resp: OpenUdpResp },
+    /// Open a TCP flow to `dst`.
+    ///
+    /// `resolver` selects the socket budget (see `SocketClass`): internal name
+    /// lookups must not compete with, and must not be starved by, client traffic.
+    OpenTcp {
+        dst: SocketAddr,
+        resp: OpenTcpResp,
+        resolver: bool,
+    },
+    OpenUdp {
+        resp: OpenUdpResp,
+        resolver: bool,
+    },
     SetAddrs {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
@@ -316,13 +432,32 @@ impl Drop for UdpSender {
 #[derive(Clone)]
 pub struct StackHandle {
     cmd_tx: mpsc::Sender<Cmd>,
+    /// The netstack *task* itself, kept so a supervisor can tell "one command
+    /// panicked and was contained" apart from "the task is gone". Only the
+    /// latter is a restart condition; restarting the stack for a contained panic
+    /// would kill every other flow on the tunnel (T148).
+    task: Arc<tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl StackHandle {
     pub async fn open_tcp(&self, dst: SocketAddr) -> Result<TcpConn> {
+        self.open_tcp_class(dst, SocketClass::Proxy).await
+    }
+
+    /// Open a TCP flow against the resolver budget: a name lookup or a health
+    /// probe must still get a socket when the proxy budget is full.
+    pub async fn open_tcp_resolver(&self, dst: SocketAddr) -> Result<TcpConn> {
+        self.open_tcp_class(dst, SocketClass::Resolver).await
+    }
+
+    async fn open_tcp_class(&self, dst: SocketAddr, class: SocketClass) -> Result<TcpConn> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::OpenTcp { dst, resp: resp_tx })
+            .send(Cmd::OpenTcp {
+                dst,
+                resp: resp_tx,
+                resolver: class == SocketClass::Resolver,
+            })
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))?;
         resp_rx
@@ -332,9 +467,23 @@ impl StackHandle {
     }
 
     pub async fn open_udp(&self) -> Result<UdpConn> {
+        self.open_udp_class(SocketClass::Proxy).await
+    }
+
+    /// Open a UDP association against the resolver budget (see
+    /// `open_tcp_resolver`): this is what keeps `dns_resolve` working when a
+    /// client has saturated its own association pool.
+    pub async fn open_udp_resolver(&self) -> Result<UdpConn> {
+        self.open_udp_class(SocketClass::Resolver).await
+    }
+
+    async fn open_udp_class(&self, class: SocketClass) -> Result<UdpConn> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(Cmd::OpenUdp { resp: resp_tx })
+            .send(Cmd::OpenUdp {
+                resp: resp_tx,
+                resolver: class == SocketClass::Resolver,
+            })
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))?;
         resp_rx
@@ -353,10 +502,19 @@ impl StackHandle {
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))
     }
+
+    /// False only once the netstack task has actually returned — a contained
+    /// panic inside `run` never finishes the task, so this cannot be used to
+    /// justify tearing down live flows.
+    pub fn task_alive(&self) -> bool {
+        !self.task.is_finished()
+    }
 }
 
 struct TcpState {
     handle: SocketHandle,
+    /// Budget this flow was admitted against; see `SocketClass`.
+    class: SocketClass,
     to_app: mpsc::Sender<Vec<u8>>,
     from_stack_rx: Option<mpsc::Receiver<Vec<u8>>>,
     connect_resp: Option<OpenTcpResp>,
@@ -373,6 +531,8 @@ struct TcpState {
 
 struct UdpState {
     handle: SocketHandle,
+    /// Budget this association was admitted against; see `SocketClass`.
+    class: SocketClass,
     to_app: mpsc::Sender<(SocketAddr, Vec<u8>)>,
 }
 
@@ -387,6 +547,70 @@ pub struct NetStack {
     /// Odd step used to walk the ephemeral band (see `alloc_port`).
     port_stride: u16,
     data_in_tx: mpsc::Sender<DataIn>,
+}
+
+/// Checked `tcp::Socket` access.
+///
+/// `SocketSet::get`/`get_mut` **panic** when a handle is stale or points at the
+/// other socket type (`iface/socket_set.rs:98-130`), and a stale handle is an
+/// ordinary outcome here: smoltcp retires sockets on its own timers while the
+/// app-side entry still has a queued write or a pending connect reply. Every
+/// access in this module therefore goes through these accessors and gets `None`,
+/// so no code path depends on `catch_unwind` to stay alive.
+fn with_tcp<'s, R>(
+    sockets: &mut SocketSet<'s>,
+    handle: SocketHandle,
+    f: impl FnOnce(&mut tcp::Socket<'s>) -> R,
+) -> Option<R> {
+    for (h, sock) in sockets.iter_mut() {
+        if h == handle {
+            return tcp::Socket::downcast_mut(sock).map(f);
+        }
+    }
+    None
+}
+
+/// Checked `udp::Socket` access; see [`with_tcp`].
+fn with_udp<'s, R>(
+    sockets: &mut SocketSet<'s>,
+    handle: SocketHandle,
+    f: impl FnOnce(&mut udp::Socket<'s>) -> R,
+) -> Option<R> {
+    for (h, sock) in sockets.iter_mut() {
+        if h == handle {
+            return udp::Socket::downcast_mut(sock).map(f);
+        }
+    }
+    None
+}
+
+/// Remove a socket from the set, reporting whether one was there.
+///
+/// `SocketSet::remove` panics on a stale handle, and the close paths below run
+/// from app-driven messages that can race smoltcp's own retirement of a socket.
+fn remove_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) -> bool {
+    if sockets.iter().any(|(h, _)| h == handle) {
+        let _ = sockets.remove(handle);
+        return true;
+    }
+    false
+}
+
+impl NetStack {
+    /// Live TCP flows in one budget class.
+    ///
+    /// Counted from the maps rather than kept in a counter: an admit/remove pair
+    /// that must stay balanced across five removal paths is exactly how the old
+    /// single pool leaked slots, and `count()` over at most 512 entries is noise
+    /// next to the 1 MB of buffers each admission allocates.
+    fn tcp_in_class(&self, class: SocketClass) -> usize {
+        self.tcp_conns.values().filter(|st| st.class == class).count()
+    }
+
+    /// Live UDP associations in one budget class; see [`Self::tcp_in_class`].
+    fn udp_in_class(&self, class: SocketClass) -> usize {
+        self.udp_conns.values().filter(|st| st.class == class).count()
+    }
 }
 
 fn strip_cidr(s: &str) -> &str {
@@ -506,8 +730,11 @@ pub fn spawn(
 ) -> Result<StackHandle> {
     let mut device = StackDevice::new(mtu);
 
+    // Monotonic clock for every timestamp handed to smoltcp; see `stack_now`.
+    let clock_base = std::time::Instant::now();
+
     let config = Config::new(HardwareAddress::Ip);
-    let mut iface = Interface::new(config, &mut device, Instant::now());
+    let mut iface = Interface::new(config, &mut device, stack_now(clock_base));
 
     let v4 = parse_v4(ipv4)?;
     let v6 = parse_v6(ipv6)?;
@@ -528,9 +755,19 @@ pub fn spawn(
         data_in_tx: data_in_tx.clone(),
     };
 
-    tokio::spawn(run(stack, cmd_rx, data_in_rx, inbound_rx, outbound_tx));
+    let task = tokio::spawn(run(
+        stack,
+        clock_base,
+        cmd_rx,
+        data_in_rx,
+        inbound_rx,
+        outbound_tx,
+    ));
 
-    Ok(StackHandle { cmd_tx })
+    Ok(StackHandle {
+        cmd_tx,
+        task: Arc::new(task),
+    })
 }
 
 /// Ephemeral band.
@@ -575,33 +812,47 @@ fn port_seed() -> (u16, u16) {
     *SEED.get_or_init(seed_port_cursor)
 }
 
+/// Every local port a live socket holds right now.
+///
+/// Read from the socket set in one pass instead of per candidate via
+/// `sockets.get::<T>(handle)`: that lookup panics on a stale handle, and it ran
+/// once per candidate port per live socket. A socket that is not bound yet has
+/// no port to reserve, so the snapshot cannot be raced by our own admission.
+fn live_local_ports(sockets: &SocketSet<'_>) -> HashSet<u16> {
+    let mut ports = HashSet::new();
+    for (_handle, sock) in sockets.iter() {
+        if let Some(tcp_sock) = tcp::Socket::downcast(sock) {
+            if let Some(ep) = tcp_sock.local_endpoint() {
+                ports.insert(ep.port);
+            }
+        } else if let Some(udp_sock) = udp::Socket::downcast(sock) {
+            let port = udp_sock.endpoint().port;
+            if port != 0 {
+                ports.insert(port);
+            }
+        }
+    }
+    ports
+}
+
+/// First port on the `start`/`stride` cycle that nothing is holding.
+fn pick_free_port(taken: &HashSet<u16>, start: u16, stride: u16) -> Option<u16> {
+    let mut cursor = start;
+    for _ in 0..EPHEMERAL_SPAN {
+        let cand = alloc_port(&mut cursor, stride);
+        if !taken.contains(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 /// L-fix: pick the next ephemeral port that no live TCP/UDP socket is bound to.
 /// The old wrap-around counter could hand a duplicate local port to a second
 /// socket once ~16k flows opened, silently breaking both flows (responses became
 /// ambiguous inside smoltcp).
 fn alloc_unique_port(s: &NetStack) -> Option<u16> {
-    let mut cursor = s.next_port;
-    for _ in 0..16000 {
-        let cand = alloc_port(&mut cursor, s.port_stride);
-        let tcp_taken = s.tcp_conns.values().any(|st| {
-            matches!(
-                s.sockets.get::<tcp::Socket>(st.handle).local_endpoint(),
-                Some(ep) if ep.port == cand
-            )
-        });
-        if tcp_taken {
-            continue;
-        }
-        let udp_taken = s
-            .udp_conns
-            .values()
-            .any(|st| s.sockets.get::<udp::Socket>(st.handle).endpoint().port == cand);
-        if udp_taken {
-            continue;
-        }
-        return Some(cand);
-    }
-    None
+    pick_free_port(&live_local_ports(&s.sockets), s.next_port, s.port_stride)
 }
 
 
@@ -658,27 +909,53 @@ pub fn forbidden_destination(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
+/// One reading of the stack's clock.
+///
+/// smoltcp's own `Instant::now()` is derived from `SystemTime` — a *wall* clock.
+/// Every socket timer in smoltcp is an absolute `Instant`, so an NTP correction
+/// or a manual date change shifted them all at once: a forward step aborted every
+/// idle connection simultaneously, a backward one froze retransmit and the
+/// keep-alive probes that detect a dead peer. `std::time::Instant` cannot go
+/// backwards, so all timestamps given to smoltcp are measured from the instant
+/// the stack task started instead. It is also what makes the socket state machine
+/// testable against a simulated clock.
+fn stack_now(base: std::time::Instant) -> Instant {
+    let elapsed = std::time::Instant::now().saturating_duration_since(base);
+    Instant::from_micros(i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+}
+
+/// Arm the timers an established, possibly-long-lived flow needs.
+///
+/// Called exactly once, on the connect -> Established edge: the connect timeout
+/// is also smoltcp's inactivity abort, so leaving it armed killed every session
+/// that went quiet for 10 s. `set_timeout(None)` was rejected — it leaves the
+/// stack unsupervised.
+fn arm_idle_keepalive(sock: &mut tcp::Socket<'_>) {
+    sock.set_timeout(Some(TCP_IDLE_TIMEOUT));
+    sock.set_keep_alive(Some(TCP_KEEPALIVE_INTERVAL));
+}
+
 async fn run(
     mut s: NetStack,
+    clock_base: std::time::Instant,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     mut data_in_rx: mpsc::Receiver<DataIn>,
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     loop {
-        let now = Instant::now();
+        let now = stack_now(clock_base);
         let poll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             s.iface.poll(now, &mut s.device, &mut s.sockets);
         }));
         if poll_outcome.is_err() {
-            // L4 fix: don't silently swallow a smoltcp poll panic; surface it so the
-            // recovery (dropping the in-flight rx/tx buffers) is visible in logs.
-            log::error!(
-                "[netstack] smoltcp poll panicked; dropping in-flight rx/tx buffers and continuing"
-            );
-            s.device.rx.clear();
-            s.device.rx_bytes = 0;
-            s.device.tx.clear();
+            // L4 fix: a smoltcp poll panic is surfaced, not swallowed. The
+            // in-flight rx/tx buffers are deliberately *not* discarded here:
+            // they hold packets the tunnel already paid to deliver, and
+            // throwing them away turned one bad flow into a retransmit storm on
+            // every other one. The ring caps and the checked socket accessors
+            // make the panic path a no-op instead of a state corruption.
+            log::error!("[netstack] smoltcp poll panicked; continuing with buffers retained");
         }
         for (name, svc) in [
             ("service_tcp", 0u8),
@@ -697,16 +974,13 @@ async fn run(
                 }
             }));
             if outcome.is_err() {
-                log::error!("[netstack] {name} panicked; dropping in-flight rx/tx buffers and continuing");
-                s.device.rx.clear();
-                s.device.rx_bytes = 0;
-                s.device.tx.clear();
+                log::error!("[netstack] {name} panicked; continuing with buffers retained");
             }
         }
 
         let delay = s
             .iface
-            .poll_delay(Instant::now(), &s.sockets)
+            .poll_delay(stack_now(clock_base), &s.sockets)
             .map(|d| std::time::Duration::from_micros(d.total_micros()));
 
         tokio::select! {
@@ -744,46 +1018,93 @@ async fn run(
     }
 }
 
+/// Which input a drain pass served next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainSrc {
+    Ingest,
+    Cmd,
+    Data,
+}
+
+/// Round-robin scheduler for one pass over the three input channels.
+///
+/// This is the command-starvation fix (T134). With `biased;` on the select, and
+/// with the ingest branch draining a whole batch before any command was looked
+/// at, a peer that kept frames arriving meant `Cmd::OpenTcp` waited behind
+/// `MAX_INGEST_PER_TICK` frames *per wakeup* — a new tab's connect queued behind
+/// the current download. Serving at most one item per source and then advancing
+/// the cursor means a concurrently-submitted command is reached on the *second*
+/// step of the first pass no matter how much ingress is pending, while the
+/// per-source caps still bound how long one pass can hold the loop.
+#[derive(Clone, Copy, Debug, Default)]
+struct DrainState {
+    served: [usize; 3],
+    cursor: usize,
+}
+
+impl DrainState {
+    const CAPS: [usize; 3] = [
+        MAX_INGEST_PER_TICK,
+        MAX_CMDS_PER_TICK,
+        MAX_APPDATA_PER_TICK,
+    ];
+
+    /// Pick the next source with work left, or `None` to end the pass.
+    fn next(&mut self, ready: [bool; 3]) -> Option<DrainSrc> {
+        for step in 0..3 {
+            let idx = (self.cursor + step) % 3;
+            if !ready[idx] || self.served[idx] >= Self::CAPS[idx] {
+                continue;
+            }
+            self.served[idx] += 1;
+            // Next pass starts after the source just served, so a source that is
+            // always ready cannot occupy the head of the rotation.
+            self.cursor = (idx + 1) % 3;
+            return match idx {
+                0 => Some(DrainSrc::Ingest),
+                1 => Some(DrainSrc::Cmd),
+                _ => Some(DrainSrc::Data),
+            };
+        }
+        None
+    }
+}
+
 /// Round-robin the channels' backlog after any wakeup.
 ///
-/// Each source is capped per pass and every pass restarts from the top, so a
-/// flood on one class (the peer pushing ingress at us, or a client blasting
-/// writes) cannot starve the other two. Without this, a `biased;` select let
-/// the always-ready inbound arm win every iteration: `open_tcp` from a new tab
-/// then waits out the browser connection storm instead of the ~ms it should.
+/// Each source is capped per pass and every step rotates, so a flood on one
+/// class (the peer pushing ingress at us, or a client blasting writes) cannot
+/// starve the other two.
 fn drain_backlog(
     s: &mut NetStack,
     cmd_rx: &mut mpsc::Receiver<Cmd>,
     data_in_rx: &mut mpsc::Receiver<DataIn>,
     inbound_rx: &mut mpsc::Receiver<Vec<u8>>,
 ) {
-    let (mut ing, mut cm, mut ad) = (0usize, 0usize, 0usize);
+    let mut state = DrainState::default();
     loop {
-        let mut progressed = false;
-
-        if ing < MAX_INGEST_PER_TICK {
-            if let Ok(pkt) = inbound_rx.try_recv() {
-                s.device.push_ingress(pkt);
-                ing += 1;
-                progressed = true;
+        let ready = [
+            !inbound_rx.is_empty(),
+            !cmd_rx.is_empty(),
+            !data_in_rx.is_empty(),
+        ];
+        match state.next(ready) {
+            None => return,
+            Some(DrainSrc::Ingest) => {
+                if let Ok(pkt) = inbound_rx.try_recv() {
+                    s.device.push_ingress(pkt);
+                }
             }
-        }
-        if cm < MAX_CMDS_PER_TICK {
-            if let Ok(cmd) = cmd_rx.try_recv() {
-                guard_cmd(s, cmd);
-                cm += 1;
-                progressed = true;
+            Some(DrainSrc::Cmd) => {
+                if let Ok(cmd) = cmd_rx.try_recv() {
+                    guard_cmd(s, cmd);
+                }
             }
-        }
-        if ad < MAX_APPDATA_PER_TICK {
-            if let Ok(d) = data_in_rx.try_recv() {
-                guard_data(s, d);
-                ad += 1;
-                progressed = true;
+            Some(DrainSrc::Data) => {
+                if let Ok(d) = data_in_rx.try_recv() {
+                    guard_data(s, d);
+                }
             }
-        }
-        if !progressed {
-            return;
         }
     }
 }
@@ -792,14 +1113,16 @@ fn drain_backlog(
 /// previously aborted the whole netstack task (and with it every tunnel)
 /// because only `iface.poll` was wrapped. A dropped responder is a clean
 /// `Err` at the caller, so containing here is strictly better than dying.
+///
+/// Recovery does *not* discard the rx/tx queues: those are packets the tunnel
+/// already paid to deliver, and the checked `with_tcp`/`with_udp` accessors mean
+/// a stale handle can no longer panic in the first place.
 fn guard_cmd(s: &mut NetStack, cmd: Cmd) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle_cmd(s, cmd);
     }));
     if outcome.is_err() {
-        log::error!("[netstack] handle_cmd panicked; dropping in-flight rx buffers and continuing");
-        s.device.rx.clear();
-        s.device.rx_bytes = 0;
+        log::error!("[netstack] handle_cmd panicked; command dropped, buffers retained");
     }
 }
 
@@ -808,9 +1131,7 @@ fn guard_data(s: &mut NetStack, d: DataIn) {
         handle_data(s, d);
     }));
     if outcome.is_err() {
-        log::error!("[netstack] handle_data panicked; dropping in-flight rx buffers and continuing");
-        s.device.rx.clear();
-        s.device.rx_bytes = 0;
+        log::error!("[netstack] handle_data panicked; write dropped, buffers retained");
     }
 }
 
@@ -823,13 +1144,22 @@ async fn sleep_opt(delay: Option<std::time::Duration>) {
 
 fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     match cmd {
-        Cmd::OpenTcp { dst, resp } => {
+        Cmd::OpenTcp { dst, resp, resolver } => {
+            let class = SocketClass::for_resolver(resolver);
+            // Post-resolution choke point (T157): `dst` is an address here, not a
+            // name, so this is the one check a DNS rebinding cannot walk around.
             if let Some(reason) = forbidden_destination(dst.ip()) {
                 let _ = resp.send(Err(format!("destination {dst} is not reachable through the tunnel: {reason}")));
                 return;
             }
-            if s.tcp_conns.len() >= MAX_TCP_CONNECTIONS {
-                let _ = resp.send(Err("too many TCP connections".into()));
+            if s.tcp_in_class(class) >= class.tcp_cap() {
+                // The class goes in *parentheses*: `session::local_stack_broken`
+                // matches the literal "too many TCP connections" to tell a local
+                // refusal apart from a refusal that came back through the tunnel,
+                // and rewording the prefix would silently turn that readiness
+                // gate back into a false positive.
+                let label = class.label();
+                let _ = resp.send(Err(format!("too many TCP connections ({label})")));
                 return;
             }
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
@@ -838,11 +1168,14 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             socket.set_nagle_enabled(false);
             // H2 fix: without a connect timeout a SYN to a black-holed address
             // sits in SynSent forever (smoltcp retransmits indefinitely), leaking
-            // 1MB of buffers + a connection slot per attempt until
-            // MAX_TCP_CONNECTIONS exhausts and the proxy dies permanently.
+            // 1MB of buffers + a connection slot per attempt until the TCP budget
+            // exhausts and the proxy dies permanently.
             // On expiry smoltcp aborts the socket -> State::Closed, which the
             // service loop already maps to "connection refused" for the caller.
-            socket.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
+            // This is only the *connect* budget: `service_tcp` re-arms a longer
+            // timeout plus a keep-alive on the Established edge, because smoltcp
+            // reads this same field as an inactivity abort (see T131).
+            socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
 
             let local_port = match alloc_unique_port(s) {
                 Some(p) => {
@@ -871,6 +1204,7 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 id,
                 TcpState {
                     handle,
+                    class,
                     to_app: to_app_tx,
                     from_stack_rx: Some(to_app_rx),
                     connect_resp: Some(resp),
@@ -881,9 +1215,11 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 },
             );
         }
-        Cmd::OpenUdp { resp } => {
-            if s.udp_conns.len() >= MAX_UDP_CONNECTIONS {
-                let _ = resp.send(Err("too many UDP associations".into()));
+        Cmd::OpenUdp { resp, resolver } => {
+            let class = SocketClass::for_resolver(resolver);
+            if s.udp_in_class(class) >= class.udp_cap() {
+                let label = class.label();
+                let _ = resp.send(Err(format!("too many UDP associations ({label})")));
                 return;
             }
             let rx_meta = vec![udp::PacketMetadata::EMPTY; UDP_META];
@@ -912,7 +1248,14 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             s.next_id += 1;
 
             let (to_app_tx, to_app_rx) = mpsc::channel(APP_QUEUE);
-            s.udp_conns.insert(id, UdpState { handle, to_app: to_app_tx });
+            s.udp_conns.insert(
+                id,
+                UdpState {
+                    handle,
+                    class,
+                    to_app: to_app_tx,
+                },
+            );
 
             let conn = UdpConn {
                 id,
@@ -951,16 +1294,38 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
                 log::debug!("netstack: dropped UDP to {dst} ({reason})");
                 return;
             }
-            if let Some(st) = s.udp_conns.get(&id) {
-                let sock = s.sockets.get_mut::<udp::Socket>(st.handle);
+            let Some(handle) = s.udp_conns.get(&id).map(|st| st.handle) else {
+                return;
+            };
+            // Checked access: a sender racing its own `UdpClose`, or an
+            // association retired by the pool, used to panic here.
+            with_udp(&mut s.sockets, handle, |sock| {
                 let _ = sock.send_slice(&data, to_ip_endpoint(dst));
-            }
+            });
         }
         DataIn::UdpClose(id) => {
             if let Some(st) = s.udp_conns.remove(&id) {
-                s.sockets.remove(st.handle);
+                remove_socket(&mut s.sockets, st.handle);
             }
         }
+    }
+}
+
+/// Retire the app-side state of a TCP flow, answering a connect that never
+/// completed with `reason` if one is pending.
+fn retire_tcp(s: &mut NetStack, id: usize, reason: Option<&str>) {
+    if let Some(st) = s.tcp_conns.get_mut(&id) {
+        if let Some(resp) = st.connect_resp.take() {
+            match reason {
+                Some(msg) => {
+                    let _ = resp.send(Err(msg.to_string()));
+                }
+                None => drop(resp),
+            }
+        }
+    }
+    if let Some(st) = s.tcp_conns.remove(&id) {
+        st.dead.store(true, Ordering::Relaxed);
     }
 }
 
@@ -968,32 +1333,27 @@ fn service_tcp(s: &mut NetStack) {
     let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
 
     for id in ids {
-        let handle = match s.tcp_conns.get(&id) {
-            Some(st) => st.handle,
-            None => continue,
+        let Some((handle, was_established)) = s.tcp_conns.get(&id).map(|st| (st.handle, st.established))
+        else {
+            continue;
         };
 
-        let state = s.sockets.get_mut::<tcp::Socket>(handle).state();
+        // Every access below goes through `with_tcp`: smoltcp's `get`/`get_mut`
+        // panic on a stale handle, and a socket can be retired while its
+        // app-side entry still has a queued write or an unanswered connect.
+        let Some(state) = with_tcp(&mut s.sockets, handle, |sock| sock.state()) else {
+            retire_tcp(s, id, Some("connection lost"));
+            continue;
+        };
         let data_in_tx = s.data_in_tx.clone();
 
-        if !s.tcp_conns[&id].established && state == tcp::State::Established {
-            // The 10 s timeout armed at connect is *also* smoltcp's inactivity
-            // abort (`timed_out` compares remote_last_ts + timeout), so leaving
-            // it armed killed every SSH / IMAP / long-poll / WebSocket / DB /
-            // HTTP keep-alive session that went quiet for 10 s. Widen the abort
-            // and start probing: a live idle peer's ACK refreshes
-            // remote_last_ts, a dead peer stops answering and is reaped ~75 s.
-            // `set_timeout(None)` was rejected — it leaves the stack unsupervised.
-            {
-                let sock = s.sockets.get_mut::<tcp::Socket>(handle);
-                sock.set_timeout(Some(smoltcp::time::Duration::from_secs(75)));
-                sock.set_keep_alive(Some(smoltcp::time::Duration::from_secs(15)));
-            }
+        if !was_established && state == tcp::State::Established {
+            with_tcp(&mut s.sockets, handle, arm_idle_keepalive);
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.established = true;
                 if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
                     let conn = TcpConn {
-                        dead: s.tcp_conns[&id].dead.clone(),
+                        dead: st.dead.clone(),
                         id,
                         from_stack: rx,
                         data_in: data_in_tx.clone(),
@@ -1003,54 +1363,55 @@ fn service_tcp(s: &mut NetStack) {
             }
         }
 
-        if !s.tcp_conns[&id].established
-            && matches!(state, tcp::State::Closed | tcp::State::TimeWait)
-        {
-            if let Some(st) = s.tcp_conns.get_mut(&id) {
-                if let Some(resp) = st.connect_resp.take() {
-                    let _ = resp.send(Err("connection refused".into()));
-                }
-            }
-            s.sockets.remove(handle);
-            if let Some(st) = s.tcp_conns.remove(&id) {
-                st.dead.store(true, Ordering::Relaxed);
-            }
+        if !was_established && matches!(state, tcp::State::Closed | tcp::State::TimeWait) {
+            retire_tcp(s, id, Some("connection refused"));
+            remove_socket(&mut s.sockets, handle);
             continue;
         }
 
-        {
-            if let Some(st) = s.tcp_conns.get_mut(&id) {
-                if !st.pending.is_empty() {
-                    let socket = s.sockets.get_mut::<tcp::Socket>(handle);
-                    if socket.can_send() {
-                        let sent = socket.send_slice(&st.pending).unwrap_or(0);
-                        if sent > 0 {
-                            st.pending.drain(0..sent);
-                        }
+        if let Some(st) = s.tcp_conns.get_mut(&id) {
+            if !st.pending.is_empty() {
+                let pending = std::mem::take(&mut st.pending);
+                let sent = with_tcp(&mut s.sockets, handle, |sock| {
+                    if sock.can_send() {
+                        sock.send_slice(&pending).unwrap_or(0)
+                    } else {
+                        0
                     }
+                })
+                .unwrap_or(0);
+                let mut pending = pending;
+                if sent > 0 {
+                    pending.drain(0..sent);
+                }
+                if !pending.is_empty() {
+                    st.pending = pending;
                 }
             }
         }
 
-        {
-            let pending_empty = s.tcp_conns[&id].pending.is_empty();
-            let half = s.tcp_conns[&id].half_closed;
-            if half && pending_empty {
-                s.sockets.get_mut::<tcp::Socket>(handle).close();
-            }
+        let close_now = s
+            .tcp_conns
+            .get(&id)
+            .map(|st| st.half_closed && st.pending.is_empty())
+            .unwrap_or(false);
+        if close_now {
+            with_tcp(&mut s.sockets, handle, |sock| sock.close());
         }
 
         // Critical: never `.await` on to_app here. Awaiting stalls the entire netstack
         // (including TCP ACK generation for other sockets) and kills download speed.
         // Leave unread bytes in smoltcp when the app channel is full — natural backpressure.
-        let to_app = s.tcp_conns[&id].to_app.clone();
+        let to_app = match s.tcp_conns.get(&id) {
+            Some(st) => st.to_app.clone(),
+            None => continue,
+        };
         if to_app.capacity() == 0 {
             continue;
         }
-        let mut app_gone = false;
-        {
-            let socket = s.sockets.get_mut::<tcp::Socket>(handle);
+        let app_gone = with_tcp(&mut s.sockets, handle, |socket| {
             let mut n = 0;
+            let mut gone = false;
             while socket.can_recv() && n < MAX_RECV_CHUNKS {
                 if to_app.capacity() == 0 {
                     break;
@@ -1063,27 +1424,32 @@ fn service_tcp(s: &mut NetStack) {
                         Ok(()) => n += 1,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            app_gone = true;
+                            gone = true;
                             break;
                         }
                     },
                     _ => break,
                 }
             }
-        }
+            gone
+        })
+        .unwrap_or(false);
         if app_gone {
-            s.sockets.get_mut::<tcp::Socket>(handle).close();
+            with_tcp(&mut s.sockets, handle, |sock| sock.close());
         }
 
-        let st_state = s.sockets.get_mut::<tcp::Socket>(handle).state();
+        let st_state = with_tcp(&mut s.sockets, handle, |sock| sock.state()).unwrap_or(tcp::State::Closed);
         if matches!(st_state, tcp::State::CloseWait) {
-            s.sockets.get_mut::<tcp::Socket>(handle).close();
+            with_tcp(&mut s.sockets, handle, |sock| sock.close());
         }
-        if matches!(st_state, tcp::State::Closed) && s.tcp_conns[&id].established {
-            s.sockets.remove(handle);
-            if let Some(st) = s.tcp_conns.remove(&id) {
-                st.dead.store(true, Ordering::Relaxed);
-            }
+        let established = s
+            .tcp_conns
+            .get(&id)
+            .map(|st| st.established)
+            .unwrap_or(false);
+        if matches!(st_state, tcp::State::Closed) && established {
+            remove_socket(&mut s.sockets, handle);
+            retire_tcp(s, id, None);
         }
     }
 }
@@ -1092,17 +1458,20 @@ fn service_udp(s: &mut NetStack) {
     let ids: Vec<usize> = s.udp_conns.keys().copied().collect();
 
     for id in ids {
-        let handle = match s.udp_conns.get(&id) {
-            Some(st) => st.handle,
-            None => continue,
+        let Some((handle, to_app)) = s
+            .udp_conns
+            .get(&id)
+            .map(|st| (st.handle, st.to_app.clone()))
+        else {
+            continue;
         };
-
-        let to_app = s.udp_conns[&id].to_app.clone();
         if to_app.capacity() == 0 {
             continue;
         }
-        {
-            let socket = s.sockets.get_mut::<udp::Socket>(handle);
+        // Checked access; see `with_tcp`. An association closed by its sender's
+        // `Drop` between the handle being read and the socket being polled was a
+        // panic here.
+        with_udp(&mut s.sockets, handle, |socket| {
             let mut n = 0;
             while socket.can_recv() && n < MAX_RECV_CHUNKS && to_app.capacity() > 0 {
                 match socket.recv() {
@@ -1116,7 +1485,7 @@ fn service_udp(s: &mut NetStack) {
                     Err(_) => break,
                 }
             }
-        }
+        });
     }
 }
 
@@ -1412,5 +1781,396 @@ mod tests {
         assert!(token.is_some());
         drop(token);
         assert!(device.push_ingress(vec![0u8; 64]));
+    }
+
+    /// An idle **Established** flow must survive 60 s of silence.
+    ///
+    /// The 10 s timeout armed at connect is *also* smoltcp's inactivity abort
+    /// (`timed_out` is `now >= remote_last_ts + timeout`), so the connect-timeout
+    /// fix silently became an idle killer for every SSH / IMAP / long-poll /
+    /// WebSocket / database session that went quiet.
+    ///
+    /// This drives the real smoltcp state machine: two interfaces cross-connected
+    /// through their `StackDevice`s, a **simulated** clock, and zero inbound
+    /// frames after the handshake. It asserts both halves of the requirement —
+    /// the flow is still `Established` after 60 s, *and* at least one egress
+    /// frame went out in that window, which is what distinguishes a quiet peer
+    /// from a dead one.
+    #[test]
+    fn idle_established_survives() {
+        let t0 = Instant::from_millis(1_000);
+        let mut dev_c = StackDevice::new(1500);
+        let mut dev_s = StackDevice::new(1500);
+        let mut if_c = Interface::new(Config::new(HardwareAddress::Ip), &mut dev_c, t0);
+        let mut if_s = Interface::new(Config::new(HardwareAddress::Ip), &mut dev_s, t0);
+        if_c.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(10, 0, 0, 2)), 24));
+        });
+        if_s.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Addr::new(10, 0, 0, 1)), 24));
+        });
+
+        let mut set_c: SocketSet<'static> = SocketSet::new(Vec::new());
+        let mut set_s: SocketSet<'static> = SocketSet::new(Vec::new());
+        let buf = || tcp::SocketBuffer::new(vec![0u8; 8192]);
+
+        let mut client = tcp::Socket::new(buf(), buf());
+        // The production connect policy, then the production Established policy.
+        client.set_timeout(Some(TCP_CONNECT_TIMEOUT));
+        let server_ep = IpEndpoint::new(IpAddress::Ipv4(Ipv4Addr::new(10, 0, 0, 1)), 443);
+        client
+            .connect(if_c.context(), server_ep, 40000u16)
+            .expect("connect accepted");
+        let ch = set_c.add(client);
+
+        let mut server = tcp::Socket::new(buf(), buf());
+        server.listen(443u16).expect("listen");
+        let sh = set_s.add(server);
+
+        for _ in 0..8 {
+            if_c.poll(t0, &mut dev_c, &mut set_c);
+            move_frames(&mut dev_c, &mut dev_s);
+            if_s.poll(t0, &mut dev_s, &mut set_s);
+            move_frames(&mut dev_s, &mut dev_c);
+            if with_tcp(&mut set_c, ch, |sock| sock.state()) == Some(tcp::State::Established) {
+                break;
+            }
+        }
+        assert_eq!(
+            with_tcp(&mut set_c, ch, |sock| sock.state()),
+            Some(tcp::State::Established),
+            "the mock handshake never completed, so this test would prove nothing"
+        );
+        assert_eq!(
+            with_tcp(&mut set_s, sh, |sock| sock.state()),
+            Some(tcp::State::Established),
+            "the listening half never came up"
+        );
+
+        with_tcp(&mut set_c, ch, arm_idle_keepalive);
+        dev_c.tx.clear();
+
+        let mut probes = 0usize;
+        let mut t = t0;
+        for step in 1..=12usize {
+            t = Instant::from_millis(t.total_millis() + 5_000);
+            assert!(dev_c.rx.is_empty(), "the peer was meant to stay silent");
+            if_c.poll(t, &mut dev_c, &mut set_c);
+            probes += dev_c.tx.len();
+            dev_c.tx.clear();
+            let quiet_for = step * 5;
+            assert_eq!(
+                with_tcp(&mut set_c, ch, |sock| sock.state()),
+                Some(tcp::State::Established),
+                "idle Established socket died after {quiet_for} s of silence"
+            );
+        }
+        assert!(
+            probes > 0,
+            "60 s of silence produced no keep-alive frame: a crashed peer would never be reaped"
+        );
+        // The other half of the bug: the connect timeout really is the short one,
+        // so a socket that never had its timers revised would have died here.
+        assert!(TCP_CONNECT_TIMEOUT < TCP_IDLE_TIMEOUT);
+        assert!(TCP_IDLE_TIMEOUT.total_millis() > 60_000);
+        assert!(TCP_IDLE_TIMEOUT.total_millis() > 4 * TCP_KEEPALIVE_INTERVAL.total_millis());
+    }
+
+    /// The tx ring must be bounded by the ring, not by available RAM (T133).
+    ///
+    /// `outbound_tx` saturation is the interesting case: smoltcp keeps polling
+    /// and keeps producing while nothing drains, and an unbounded queue there
+    /// ended in an allocator abort.
+    #[test]
+    fn tx_ring_is_bounded() {
+        let mut device = StackDevice::new(1500);
+        let t = Instant::from_millis(1);
+
+        // Bulk egress: the producer never stops, the drain never runs.
+        for _ in 0..TX_RING * 8 {
+            if let Some(tok) = device.transmit(t) {
+                tok.consume(1448, |b| b[0] = 0xAA);
+            }
+        }
+        assert_eq!(
+            device.tx.len(),
+            TX_RING,
+            "bulk egress grew past the ring while the tunnel was not draining"
+        );
+        assert!(
+            device.tx_deferred > 0,
+            "saturation must be counted, not silently dropped"
+        );
+        let deferred_at_ring = device.tx_deferred;
+
+        // The ACK path: the token paired with an ingress frame is allowed past
+        // the ring (a lost reply is not regenerated) but only by the documented
+        // slack, so the queue still cannot grow without limit.
+        for _ in 0..RX_RING * 4 {
+            let _ = device.push_ingress(vec![0u8; 64]);
+        }
+        for _ in 0..RX_RING * 4 {
+            match device.receive(t) {
+                Some((rx, tok)) => {
+                    rx.consume(|pkt| pkt.len());
+                    tok.consume(64, |_| ());
+                }
+                None => break,
+            }
+        }
+        assert!(
+            device.tx.len() <= TX_RING + TX_EGRESS_SLACK,
+            "reply frames grew the queue past TX_RING + TX_EGRESS_SLACK: {}",
+            device.tx.len()
+        );
+        assert!(
+            device.tx.len() > TX_RING,
+            "the reply token was capped at TX_RING, which is the ACK-loss bug"
+        );
+        assert!(device.tx_deferred > deferred_at_ring);
+    }
+
+    /// A command submitted while the peer is flooding us must be reached in a
+    /// bounded number of steps (T134).
+    #[test]
+    fn cmd_not_starved_by_inbound() {
+        // Five full ingest batches queued behind one `Cmd::OpenTcp`.
+        let mut queued_ingest = MAX_INGEST_PER_TICK * 5;
+        let mut queued_cmd = 1usize;
+        let mut state = DrainState::default();
+        let mut steps = 0usize;
+        while queued_cmd > 0 {
+            let ready = [queued_ingest > 0, queued_cmd > 0, false];
+            match state.next(ready) {
+                None => break,
+                Some(DrainSrc::Ingest) => queued_ingest -= 1,
+                Some(DrainSrc::Cmd) => queued_cmd -= 1,
+                Some(DrainSrc::Data) => {}
+            }
+            steps += 1;
+            assert!(steps <= 10, "a concurrently submitted command took {steps} drain steps");
+        }
+        assert_eq!(queued_cmd, 0, "OpenTcp was starved by the ingest backlog");
+        assert!(
+            queued_ingest > 0,
+            "the drain ran the ingest queue dry instead of rotating"
+        );
+
+        // One pass is still bounded, so a permanently-ready channel cannot make
+        // the loop spin forever without polling the stack.
+        let mut state = DrainState::default();
+        let mut ingested = 0usize;
+        for _ in 0..1_000 {
+            match state.next([true, false, false]) {
+                Some(DrainSrc::Ingest) => ingested += 1,
+                Some(_) => unreachable!("nothing else was ready"),
+                None => break,
+            }
+        }
+        assert_eq!(ingested, MAX_INGEST_PER_TICK, "one pass ignored the ingest cap");
+    }
+
+    /// Deliver every frame one device queued into the other's ingress ring.
+    fn move_frames(from: &mut StackDevice, to: &mut StackDevice) {
+        while let Some(pkt) = from.tx.pop_front() {
+            to.push_ingress(pkt);
+        }
+    }
+
+    /// An in-process stack with a routable address and no peer: the same
+    /// harness the FIFO tests build by hand, shared.
+    fn empty_stack() -> NetStack {
+        let mut device = StackDevice::new(1500);
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+        apply_addrs(&mut iface, Some((Ipv4Addr::new(10, 0, 0, 2), 24)), None);
+        let (data_in_tx, _data_in_rx) = mpsc::channel(1);
+        NetStack {
+            iface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            tcp_conns: HashMap::new(),
+            udp_conns: HashMap::new(),
+            next_id: 1,
+            next_port: port_seed().0,
+            port_stride: port_seed().1,
+            data_in_tx,
+        }
+    }
+
+    /// True when `Cmd::OpenUdp` was admitted, judged by the pool it joined.
+    fn admitted_udp(stack: &mut NetStack, resolver: bool) -> bool {
+        let before = stack.udp_conns.len();
+        let (tx, _rx) = oneshot::channel();
+        handle_cmd(stack, Cmd::OpenUdp { resp: tx, resolver });
+        stack.udp_conns.len() > before
+    }
+
+    /// True when `Cmd::OpenTcp` was admitted to a socket, judged the same way.
+    fn admitted_tcp(stack: &mut NetStack, dst: SocketAddr, resolver: bool) -> bool {
+        let before = stack.tcp_conns.len();
+        let (tx, _rx) = oneshot::channel();
+        handle_cmd(stack, Cmd::OpenTcp { dst, resp: tx, resolver });
+        stack.tcp_conns.len() > before
+    }
+
+    /// A handle that no longer names a socket must not take the netstack down
+    /// (T135/T148), and recovering from one must not throw away the packets
+    /// behind it.
+    #[test]
+    fn stale_handle_does_not_panic() {
+        let dst: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let mut stack = empty_stack();
+
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 1024]),
+            tcp::SocketBuffer::new(vec![0u8; 1024]),
+        );
+        sock.connect(stack.iface.context(), to_ip_endpoint(dst), 40001u16)
+            .expect("connect accepted");
+        let handle = stack.sockets.add(sock);
+        let (to_app, _to_app_rx) = mpsc::channel(4);
+        let dead = Arc::new(AtomicBool::new(false));
+        stack.tcp_conns.insert(
+            7,
+            TcpState {
+                handle,
+                class: SocketClass::Proxy,
+                to_app,
+                from_stack_rx: None,
+                connect_resp: None,
+                pending: Vec::new(),
+                established: true,
+                half_closed: false,
+                dead: dead.clone(),
+            },
+        );
+
+        let mut usock = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 512]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 512]),
+        );
+        usock.bind(40002u16).expect("bind");
+        let uhandle = stack.sockets.add(usock);
+        let (uto_app, _uto_app_rx) = mpsc::channel(4);
+        stack.udp_conns.insert(
+            9,
+            UdpState {
+                handle: uhandle,
+                class: SocketClass::Proxy,
+                to_app: uto_app,
+            },
+        );
+
+        // Both sockets disappear underneath the app-side entries — smoltcp
+        // retiring them on its own timers, or a close racing the service loop.
+        assert!(remove_socket(&mut stack.sockets, handle));
+        assert!(remove_socket(&mut stack.sockets, uhandle));
+        assert!(!remove_socket(&mut stack.sockets, uhandle), "double remove reported success");
+
+        // Buffered traffic that must survive.
+        stack.device.push_ingress(vec![0u8; 64]);
+        stack.device.tx.push_back(vec![9u8; 1448]);
+
+        guard_data(&mut stack, DataIn::Tcp(7, b"hi".to_vec()));
+        guard_data(&mut stack, DataIn::Udp(9, dst, b"ping".to_vec()));
+        guard_data(&mut stack, DataIn::UdpClose(9));
+        guard_data(&mut stack, DataIn::UdpClose(9));
+        service_udp(&mut stack);
+        service_tcp(&mut stack);
+
+        assert!(
+            stack.tcp_conns.is_empty(),
+            "the flow was not retired, so its slot and buffers leaked"
+        );
+        assert!(stack.udp_conns.is_empty());
+        assert!(
+            dead.load(Ordering::Relaxed),
+            "a retired flow still acknowledges writes as sent"
+        );
+        assert_eq!(
+            stack.device.rx.len(),
+            1,
+            "recovery discarded a good inbound packet"
+        );
+        assert_eq!(stack.device.rx_bytes, 64);
+        assert_eq!(
+            stack.device.tx.len(),
+            1,
+            "recovery discarded a good outbound frame"
+        );
+        assert!(!stack.sockets.iter().any(|(h, _)| h == handle));
+
+        // And the stack keeps admitting connections afterwards.
+        assert!(
+            admitted_tcp(&mut stack, dst, false),
+            "the next open_tcp did not succeed"
+        );
+    }
+
+    /// Proxy traffic must not be able to take name resolution down with it
+    /// (T137/T149).
+    #[test]
+    fn proxy_saturation_leaves_the_resolver_budget_intact() {
+        let dst: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let mut stack = empty_stack();
+
+        let mut proxy = 0usize;
+        while admitted_udp(&mut stack, false) {
+            proxy += 1;
+        }
+        assert_eq!(proxy, MAX_UDP_PROXY, "the proxy UDP budget moved");
+        assert_eq!(stack.udp_in_class(SocketClass::Proxy), MAX_UDP_PROXY);
+        assert_eq!(stack.udp_in_class(SocketClass::Resolver), 0);
+
+        let mut resolver = 0usize;
+        while admitted_udp(&mut stack, true) {
+            resolver += 1;
+        }
+        assert_eq!(
+            resolver, MAX_UDP_RESOLVER,
+            "DNS was starved by proxy associations instead of getting its own budget"
+        );
+
+        // The TCP classes are separate too (a saturated proxy must not be able
+        // to block the resolver's own connects), and the split preserves the old
+        // overall ceiling so per-flow memory is unchanged.
+        assert!(admitted_tcp(&mut stack, dst, false));
+        assert!(admitted_tcp(&mut stack, dst, true));
+        assert_eq!(stack.tcp_in_class(SocketClass::Proxy), 1);
+        assert_eq!(stack.tcp_in_class(SocketClass::Resolver), 1);
+        assert_eq!(
+            SocketClass::Proxy.tcp_cap() + SocketClass::Resolver.tcp_cap(),
+            512
+        );
+        assert_eq!(
+            SocketClass::Proxy.udp_cap() + SocketClass::Resolver.udp_cap(),
+            128
+        );
+    }
+
+    /// `forbidden_destination` is the single choke point every flow passes, and
+    /// a refusal is answered to the caller rather than dropped on the floor.
+    #[test]
+    fn loopback_and_metadata_targets_are_refused_at_admission() {
+        let mut stack = empty_stack();
+        let (tx, rx) = oneshot::channel();
+        handle_cmd(
+            &mut stack,
+            Cmd::OpenTcp {
+                dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1337),
+                resp: tx,
+                resolver: false,
+            },
+        );
+        let refusal = rx
+            .blocking_recv()
+            .expect("a refusal is replied to, not silently dropped");
+        let msg = match refusal {
+            Err(msg) => msg,
+            Ok(_) => panic!("loopback was admitted through the tunnel"),
+        };
+        assert!(msg.contains("loopback"), "unexpected refusal: {msg}");
+        assert!(stack.tcp_conns.is_empty(), "a refused connect took a slot");
     }
 }

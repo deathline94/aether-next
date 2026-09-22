@@ -144,6 +144,10 @@ pub fn sanitise(endpoints: &mut Vec<CachedEndpoint>, now: u64) -> Rejected {
         kept.push(e);
     }
     *endpoints = kept;
+    let rejected = (out.future_timestamp + out.implausible_address) as u64;
+    if rejected > 0 {
+        crate::counters::bump_by(&crate::counters::CACHE_ENTRIES_REJECTED, rejected);
+    }
     out
 }
 
@@ -169,6 +173,10 @@ pub struct CachedEndpoint {
     /// no field decodes as `Quic`, which is what every pre-v2 file meant.
     #[serde(default)]
     pub transport: TransportKind,
+    /// Which measurement produced `rtt_ms`. Legacy files decode as
+    /// `HandshakeProbe`, which is what every pre-existing writer did.
+    #[serde(default)]
+    pub measurement: Measurement,
 }
 
 impl CachedEndpoint {
@@ -176,17 +184,30 @@ impl CachedEndpoint {
     /// recent consecutive failures. Higher is better. Always finite (no NaN),
     /// so ordering by it is well-defined.
     pub fn trust_score(&self) -> f64 {
+        self.trust_score_for(self.measurement)
+    }
+
+    /// Trust score as seen by a consumer whose own numbers are of `expected`
+    /// kind. When the entry was measured differently, the RTT term is dropped
+    /// outright — not folded in, and not treated as a missing (zero) reading,
+    /// which would silently rank it with the "unknown latency" crowd.
+    pub fn trust_score_for(&self, expected: Measurement) -> f64 {
+        let comparable = self.measurement == expected;
         let total = self.successes + self.failures;
         let base = if total == 0 {
             // No history — neutral score based on RTT only.
-            if self.rtt_ms > 0 {
+            if !comparable {
+                30.0
+            } else if self.rtt_ms > 0 {
                 50.0 - (self.rtt_ms as f64 * 0.1).min(40.0)
             } else {
                 30.0
             }
         } else {
             let rate = self.successes as f64 / total as f64;
-            let rtt_penalty = if self.rtt_ms > 0 {
+            let rtt_penalty = if !comparable {
+                0.0
+            } else if self.rtt_ms > 0 {
                 (self.rtt_ms as f64 * 0.05).min(20.0)
             } else {
                 10.0
@@ -288,7 +309,11 @@ struct CacheGuard {
 }
 
 impl CacheGuard {
-    fn acquire(cache_file: &Path) -> Option<CacheGuard> {
+    /// `wait` is how long to keep retrying before giving up. Scan writers pass
+    /// `Duration::ZERO`: they run on async workers, and sleeping there to wait
+    /// for a lock another process holds stalls the very probes whose PTO the
+    /// wait is inflating.
+    fn acquire(cache_file: &Path, wait: Duration) -> Option<CacheGuard> {
         let path = {
             let mut s = cache_file.as_os_str().to_os_string();
             s.push(".lock");
@@ -312,7 +337,7 @@ impl CacheGuard {
                 return None;
             }
         };
-        let deadline = Instant::now() + LOCK_WAIT;
+        let deadline = Instant::now() + wait;
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Some(CacheGuard { file }),
@@ -545,8 +570,22 @@ impl Mutation {
 }
 
 fn with_cache<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) -> Mutation {
+    with_cache_locked(base_config, f, LOCK_WAIT)
+}
+
+/// As `with_cache`, but never blocks: a contended lock means the update is
+/// skipped and logged, not that an async worker sleeps for it.
+fn with_cache_nowait<F: FnOnce(&mut EndpointsCache)>(base_config: &str, f: F) -> Mutation {
+    with_cache_locked(base_config, f, Duration::ZERO)
+}
+
+fn with_cache_locked<F: FnOnce(&mut EndpointsCache)>(
+    base_config: &str,
+    f: F,
+    wait: Duration,
+) -> Mutation {
     let path = cache_path(base_config);
-    let Some(_guard) = CacheGuard::acquire(&path) else {
+    let Some(_guard) = CacheGuard::acquire(&path, wait) else {
         return Mutation::Skipped;
     };
     if !parses_as_cache(&path) {
@@ -596,10 +635,29 @@ pub fn save_endpoints(base_config: &str, cache: &EndpointsCache) {
     }
 }
 
+/// Which act produced an RTT number.
+///
+/// A handshake probe and a full Ironclad HTTP round trip are not the same
+/// measurement — the second includes a real request/response over the tunnel, so
+/// it is systematically larger, and ranking the two together let the cheaper
+/// number decide the order. Entries therefore say how they were measured, and a
+/// reader that is comparing against one kind ignores the RTT term of the other
+/// rather than treating it as absent (which `sanitise` already reads as unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Measurement {
+    /// QUIC/TLS handshake or WireGuard handshake probe — the cheap default.
+    #[default]
+    HandshakeProbe,
+    /// Real HTTP round trip through a live tunnel (Ironclad mode).
+    HttpRoundTrip,
+}
+
 fn upsert(
     list: &mut Vec<CachedEndpoint>,
     endpoints: Vec<(SocketAddr, u32)>,
     transport: TransportKind,
+    measurement: Measurement,
 ) {
     let now = now_secs();
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
@@ -616,16 +674,22 @@ fn upsert(
                 failures: prev.as_ref().map(|p| p.failures).unwrap_or(0),
                 consecutive_failures: 0,
                 transport,
+                measurement,
             },
         );
     }
     list.truncate(MAX_CACHED);
 }
 
-pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) -> Mutation {
+/// Scan hits, measured however `measurement` says.
+pub fn add_to_masque_with_rtt(
+    base_config: &str,
+    endpoints: Vec<(SocketAddr, u32)>,
+    measurement: Measurement,
+) -> Mutation {
     let transport = active_masque_transport();
-    with_cache(base_config, move |cache| {
-        upsert(&mut cache.masque, endpoints, transport)
+    with_cache_nowait(base_config, move |cache| {
+        upsert(&mut cache.masque, endpoints, transport, measurement)
     })
 }
 
@@ -633,7 +697,8 @@ pub fn add_to_masque_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32
 pub fn get_masque_sorted_for(base_config: &str, transport: TransportKind) -> Vec<(SocketAddr, u32)> {
     let mut eps = load_endpoints(base_config).masque;
     eps.retain(|e| e.transport == transport);
-    sorted(eps)
+    // The connect path compares against handshake numbers.
+    sorted(eps, Measurement::HandshakeProbe)
 }
 
 /// Cached masque endpoints for the transport the tunnel would use now.
@@ -641,20 +706,27 @@ pub fn get_masque_sorted(base_config: &str) -> Vec<(SocketAddr, u32)> {
     get_masque_sorted_for(base_config, active_masque_transport())
 }
 
-pub fn add_to_wireguard_with_rtt(base_config: &str, endpoints: Vec<(SocketAddr, u32)>) -> Mutation {
-    with_cache(base_config, |cache| {
-        upsert(&mut cache.wireguard, endpoints, TransportKind::default())
+pub fn add_to_wireguard_with_rtt(
+    base_config: &str,
+    endpoints: Vec<(SocketAddr, u32)>,
+    measurement: Measurement,
+) -> Mutation {
+    with_cache_nowait(base_config, move |cache| {
+        upsert(&mut cache.wireguard, endpoints, TransportKind::default(), measurement)
     })
 }
 
 /// Cached wireguard endpoints sorted by trust score (highest first).
 pub fn get_wireguard_sorted(base_config: &str) -> Vec<(SocketAddr, u32)> {
-    sorted(load_endpoints(base_config).wireguard)
+    sorted(load_endpoints(base_config).wireguard, Measurement::HandshakeProbe)
 }
 
-fn sorted(mut eps: Vec<CachedEndpoint>) -> Vec<(SocketAddr, u32)> {
+fn sorted(mut eps: Vec<CachedEndpoint>, expected: Measurement) -> Vec<(SocketAddr, u32)> {
     // total_cmp is NaN-safe; trust_score is finite regardless.
-    eps.sort_by(|a, b| b.trust_score().total_cmp(&a.trust_score()));
+    eps.sort_by(|a, b| {
+        b.trust_score_for(expected)
+            .total_cmp(&a.trust_score_for(expected))
+    });
     eps.into_iter().map(|e| (e.addr, e.rtt_ms)).collect()
 }
 
@@ -693,6 +765,9 @@ fn record_success_on(
                 failures: 0,
                 consecutive_failures: 0,
                 transport,
+                // A connect that succeeds proves reachability, not latency: the
+                // entry keeps whatever measurement it already carried, or none.
+                measurement: Measurement::default(),
             },
         );
         list.truncate(MAX_CACHED);
@@ -748,6 +823,7 @@ mod tests {
             failures: 0,
             consecutive_failures: 0,
             transport: TransportKind::default(),
+            measurement: Measurement::default(),
         }
     }
 
@@ -916,7 +992,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("aether.toml").to_string_lossy().to_string();
-        add_to_masque_with_rtt(&base, vec![("93.184.216.34:443".parse().unwrap(), 42)]);
+        add_to_masque_with_rtt(&base, vec![("93.184.216.34:443".parse().unwrap(), 42)], Measurement::default());
         let written = std::fs::read_to_string(cache_path(&base)).unwrap();
         let doc: EndpointsCache = serde_json::from_str(&written).unwrap();
         assert_eq!(doc.version, CACHE_VERSION, "a writer must stamp its schema");
@@ -934,7 +1010,40 @@ mod tests {
             failures,
             consecutive_failures: consec,
             transport: TransportKind::default(),
+            measurement: Measurement::HandshakeProbe,
         }
+    }
+
+    /// A handshake probe and a real HTTP round trip are different numbers. The
+    /// cheaper one must not win the ranking by being cheaper.
+    #[test]
+    fn an_incomparable_measurement_contributes_no_rtt_term() {
+        let fast_probe = ep("1.1.1.1:443", 3, 0, 0, 5);
+        let mut slow_http = ep("2.2.2.2:443", 3, 0, 0, 400);
+        slow_http.measurement = Measurement::HttpRoundTrip;
+
+        // Same kind: the 400 ms entry really is behind the 5 ms one.
+        assert!(
+            fast_probe.trust_score_for(Measurement::HandshakeProbe)
+                > slow_http.trust_score_for(Measurement::HandshakeProbe)
+        );
+        // Different kind: the RTT term is dropped, so history alone decides and
+        // the two tie rather than the probe pulling ahead on latency.
+        let probe_as_http = fast_probe.trust_score_for(Measurement::HttpRoundTrip);
+        let tied = slow_http.trust_score_for(Measurement::HttpRoundTrip);
+        assert!(
+            (probe_as_http - tied).abs() < f64::EPSILON,
+            "expected {probe_as_http} == {tied}"
+        );
+        // And a dropped term is not the same as a zero reading, which `sanitise`
+        // would otherwise treat as "latency unknown".
+        let mut unknown = ep("3.3.3.3:443", 3, 0, 0, 0);
+        unknown.measurement = Measurement::HttpRoundTrip;
+        assert!(
+            (probe_as_http - unknown.trust_score_for(Measurement::HttpRoundTrip)).abs()
+                > f64::EPSILON,
+            "an incomparable RTT must not be scored as an absent one"
+        );
     }
 
     #[test]
@@ -975,7 +1084,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let base = dir.join("aether.toml");
         let base = base.to_string_lossy().to_string();
-        add_to_masque_with_rtt(&base, vec![("1.1.1.1:443".parse().unwrap(), 42)]);
+        add_to_masque_with_rtt(&base, vec![("1.1.1.1:443".parse().unwrap(), 42)], Measurement::default());
         let got = get_masque_sorted(&base);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, 42);

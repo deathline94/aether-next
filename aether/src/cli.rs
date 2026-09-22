@@ -26,6 +26,13 @@ pub async fn run() -> Result<()> {
 
     install_panic_guard();
 
+    // Read-only export, before anything can touch the host. The support path had
+    // no machine-checkable answer to "what did the engine actually resolve?".
+    if std::env::args().any(|a| a == "--diagnostics") {
+        crate::diagnostics::print();
+        return Ok(());
+    }
+
     // Before the first spawned tool or loaded DLL, and before the route replay
     // below: pin the search order to `%WINDIR%\System32`.
     #[cfg(windows)]

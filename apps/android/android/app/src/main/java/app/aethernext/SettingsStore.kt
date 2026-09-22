@@ -71,11 +71,21 @@ data class Settings(
     }
 }
 
+/**
+ * What the shell believes about the running session.
+ *
+ * Every field is a `val` on purpose (T215): a published instance is a *snapshot*,
+ * handed straight to `getState()` and serialised on another thread. While these
+ * were `var`s the session controller mutated them field by field, so the UI could
+ * read `status="connected"` together with the previous session's `pid`, or half a
+ * transition. Updates go through `SessionController.setRuntime`, which builds a
+ * new value and publishes it in one volatile store.
+ */
 data class RuntimeState(
-    var status: String = "disconnected",
-    var detail: String = "Ready",
-    var pid: Int? = null,
-    var endpoint: String? = null,
+    val status: String = "disconnected",
+    val detail: String = "Ready",
+    val pid: Int? = null,
+    val endpoint: String? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("status", status)
