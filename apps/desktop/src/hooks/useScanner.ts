@@ -190,6 +190,13 @@ export function useScanner(
 
   const startScan = useCallback(async () => {
     if (busy || active) return;
+    // Mint the run id before anything is cleared or awaited. This used to happen
+    // after `await invoke("disconnect")`, so the outgoing run's terminal event —
+    // still stamped with the id the guard was matching — arrived onto the list
+    // that had just been cleared for the new run and wrote `active: false` and
+    // `phase: "Verified"` onto a scan that had not begun yet.
+    const runId = crypto.randomUUID();
+    runIdRef.current = runId;
     clearLogs?.();
     setBusy(true);
     // The counters and `bestRtt` restart with the run, so the list has to as well:
@@ -207,8 +214,6 @@ export function useScanner(
         await invoke("disconnect");
       }
       const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
-      const runId = crypto.randomUUID();
-      runIdRef.current = runId;
       await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
@@ -219,6 +224,9 @@ export function useScanner(
   }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
+    // Retire the run id with the run: without this, a stopped scan's stragglers
+    // still match and are merged into whichever scan starts next.
+    runIdRef.current = "";
     // Ask the engine first — only report "Stopped" once it actually is.
     try {
       await invoke("stop_scan");

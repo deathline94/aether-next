@@ -254,8 +254,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
                 protocol: "masque".into(),
-            });            ,
-            rtt_ms: selection.best_rtt_ms(),
+                rtt_ms: selection.best_rtt_ms(),
             });
             // Scan-only mode: report result and exit without tunnel.
             if scan_only() {
@@ -364,8 +363,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
                 protocol: "gool".into(),
-            });            ,
-            rtt_ms: selection.best_rtt_ms(),
+                rtt_ms: selection.best_rtt_ms(),
             });
             if scan_only() {
                 session_event::emit(SessionEvent::ScanDone {
@@ -621,8 +619,7 @@ async fn select_peer(
                             session_event::emit(SessionEvent::EndpointSelected {
                                 addr: peer_addr.to_string(),
                                 protocol: "masque".into(),
-                            });                            ,
-                            rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
+                                rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
                             });
                             return Ok(Selection {
                                 peer: peer_addr,
@@ -657,8 +654,7 @@ async fn select_peer(
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: "masque".into(),
-            });            ,
-            rtt_ms: Some(best.rtt.as_secs_f64() * 1000.0),
+                rtt_ms: Some(best.rtt.as_secs_f64() * 1000.0),
             });
             Ok(Selection { peer, rtt: Some(best.rtt) })
         }
@@ -1080,8 +1076,7 @@ async fn run_wireguard(
     session_event::emit(SessionEvent::EndpointSelected {
         addr: peer.to_string(),
         protocol: "wireguard".into(),
-    });    ,
-    rtt_ms: None,
+        rtt_ms: None,
     });
     // M2 fix: reuse the handshake the scanner already established for this peer
     // instead of performing a second one (Cloudflare edges punish double

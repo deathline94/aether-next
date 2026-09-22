@@ -98,6 +98,15 @@ const current = field(entry, "file_sha256");
 
 if (args.check) {
   if (current === PLACEHOLDER) {
+    // The same switch build.rs honours: an explicitly unwitnessed dev build may
+    // proceed, loudly. CI sets it only outside a tag, so a release always has to
+    // find a real witness here.
+    if ((process.env.AETHER_ALLOW_UNWITNESSED ?? "").trim() !== "") {
+      console.error(
+        `NOTICE: ${args.name} has no committed witness; this artifact is unwitnessed and must not be published.`,
+      );
+      process.exit(0);
+    }
     fail(
       `check mode refuses a placeholder witness for ${args.name}: publish it first ` +
         "(release builds would refuse to run this artifact)",

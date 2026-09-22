@@ -820,7 +820,7 @@ pub fn spawn(
         next_port: port_seed().0,
         port_stride: port_seed().1,
         mem_reserved: 0,
-        data_in_tx: data_in_tx.clone(),,
+        data_in_tx: data_in_tx.clone(),
     };
 
     let task = tokio::spawn(run(
@@ -2164,6 +2164,7 @@ mod tests {
             TcpState {
                 handle,
                 class: SocketClass::Proxy,
+                reserved: 0,
                 to_app,
                 from_stack_rx: None,
                 connect_resp: None,
@@ -2186,6 +2187,7 @@ mod tests {
             UdpState {
                 handle: uhandle,
                 class: SocketClass::Proxy,
+                reserved: 0,
                 to_app: uto_app,
             },
         );

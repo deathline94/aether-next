@@ -832,10 +832,12 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, CommandError> {
     Ok(config_dir(app)?.join("settings.json"))
 }
 
-#[cfg(windows)]
 /// `--repair-proxy`: recovery entry point for a user whose system proxy still
 /// points at an engine that died. The app restores the registry state and exits
-/// instead of opening a window they would have to fight with.
+/// instead of opening a window they would have to fight with. Reading argv is the
+/// same operation on every platform, so this is deliberately not `cfg`-gated:
+/// the call site in `setup` is not either, and gating it left the shell unable to
+/// compile for Linux and macOS, where CI never builds it.
 fn repair_proxy_requested() -> bool {
     std::env::args().any(|a| a == "--repair-proxy")
 }
@@ -918,6 +920,47 @@ fn parse_endpoint(line: &str) -> Option<String> {
     None
 }
 
+/// The obfuscation profile names the engine is willing to run. Shared by
+/// `validate_settings` (the Settings form) and the `scan` command: the scanner
+/// used to take `noize` straight from the webview into `AETHER_NOIZE`, so a
+/// profile could reach the engine's environment through a path that bypassed
+/// every rule this list encodes.
+pub const NOIZE_VOCABULARY: &[&str] = &[
+    "off",
+    "none",
+    "light",
+    "low",
+    "medium",
+    "balanced",
+    "firewall",
+    "default",
+    "high",
+    "gfw",
+    "max",
+    "aggressive",
+    "heavy",
+    "custom",
+];
+
+/// One reading of `noize` for a child environment: absent means "off", anything
+/// outside [`NOIZE_VOCABULARY`] is refused rather than forwarded.
+fn validated_noize(noize: Option<&str>) -> Result<&'static str, CommandError> {
+    let requested = noize.unwrap_or("off").trim();
+    NOIZE_VOCABULARY
+        .iter()
+        .find(|o| o.eq_ignore_ascii_case(requested))
+        .copied()
+        .ok_or_else(|| {
+            CommandError::validation(
+                "noize",
+                format!(
+                    "noize must be one of: {}",
+                    NOIZE_VOCABULARY.join(", ")
+                ),
+            )
+        })
+}
+
 pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     for (field, name, port) in [
         ("httpPort", "HTTP", settings.http_port),
@@ -959,26 +1002,7 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             ))
         }
     };
-    allow(
-        "noize",
-        &settings.noize,
-        &[
-            "off",
-            "none",
-            "light",
-            "low",
-            "medium",
-            "balanced",
-            "firewall",
-            "default",
-            "high",
-            "gfw",
-            "max",
-            "aggressive",
-            "heavy",
-            "custom",
-        ],
-    )?;
+    allow("noize", &settings.noize, NOIZE_VOCABULARY)?;
     if settings.noize.eq_ignore_ascii_case("custom") {
         if settings.noize_jmax < settings.noize_jmin {
             return Err(CommandError::validation(
@@ -2741,6 +2765,10 @@ fn test_connection(settings: Settings) -> Result<String, CommandError> {
 }
 
 #[tauri::command]
+// Tauri derives the JS-callable signature from these parameters, so grouping the
+// scan inputs into one struct would change the wire contract the frontend calls
+// with. The count is the cost of that; the values are validated below.
+#[allow(clippy::too_many_arguments)]
 fn scan(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -2751,6 +2779,9 @@ fn scan(
     timeout_ms: u32,
     noize: Option<String>,
 ) -> Result<(), CommandError> {
+    // Before the lock and before the running scan is stopped: a parameter this
+    // command refuses must not be able to take down the scan already in flight.
+    let noize = validated_noize(noize.as_deref())?;
     // Serialize with connect/disconnect/stop_scan (QA-5) so two engine processes
     // can't spawn concurrently (double device registration + proxy-port contention).
     let _operation = state.operation.lock();
@@ -2795,7 +2826,7 @@ fn scan(
         .env("AETHER_SCAN", settings.scan_mode.as_str())
         .env("AETHER_SCAN_EXHAUSTIVE", "1")
         .env("AETHER_IP", ip_version.as_str())
-        .env("AETHER_NOIZE", noize.as_deref().unwrap_or("off"))
+        .env("AETHER_NOIZE", noize)
         .env("AETHER_CONFIG", dir.join("aether.toml"))
         .env("AETHER_SCAN_ONLY", "1")
         .env("AETHER_SCAN_CONCURRENCY", concurrency.to_string())

@@ -67,9 +67,9 @@ internal object HevStop {
             Thread.currentThread().interrupt()
             false
         }
-        failure = failureRef.get()
+        val failure = failureRef.get()
         return when {
-            acked && failure != null -> HevStopOutcome.Failed(failure!!)
+            acked && failure != null -> HevStopOutcome.Failed(failure)
             acked -> HevStopOutcome.Acknowledged
             else -> HevStopOutcome.TimedOut(System.currentTimeMillis() - startedAt)
         }

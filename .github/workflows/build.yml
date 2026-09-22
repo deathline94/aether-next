@@ -21,21 +21,19 @@ env:
   CMAKE_GENERATOR: Ninja
 
 jobs:
-  test:
-    name: Automated test gate
+  # One job per suite, fanned out. These used to be five sequential steps of a
+  # single job, so the first failure — usually a Rust compile error — meant the
+  # desktop and Android suites never ran at all: one red check masked four suites
+  # with no signal, which is how three syntax errors sat on main across two
+  # pushes. Each suite now reports for itself.
+  test-engine:
+    name: Test engine
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: "1.88.0"
-      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
-        with:
-          node-version: "22"
-      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
-        with:
-          distribution: "temurin"
-          java-version: "21"
       - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
       - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Run engine tests
@@ -44,22 +42,81 @@ jobs:
         run: cargo test --release --features test-hooks
         env:
           CMAKE_GENERATOR: Ninja
+
+  test-desktop-backend:
+    name: Test desktop backend
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+      - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Run desktop backend tests
         working-directory: apps/desktop/src-tauri
         run: cargo test --tests
+        env:
+          CMAKE_GENERATOR: Ninja
+
+  test-desktop-ui:
+    name: Test desktop frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
       - name: Run desktop frontend tests
         working-directory: apps/desktop
         run: |
           npm ci
           npm test
+
+  test-android-ui:
+    name: Test android frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/android/package-lock.json
       - name: Run android frontend tests
         working-directory: apps/android
         run: |
           npm ci
           npm test
+
+  test-android-native:
+    name: Test android native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: "temurin"
+          java-version: "21"
       - name: Run android unit tests
         working-directory: apps/android/android
         run: ./gradlew testDebugUnitTest
+
+  # Aggregator so the downstream jobs keep a single dependency and the check name
+  # stays the one branch protection already refers to.
+  test:
+    name: Automated test gate
+    needs:
+      - test-engine
+      - test-desktop-backend
+      - test-desktop-ui
+      - test-android-ui
+      - test-android-native
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "all five suites reported independently"
 
   windows-app:
     name: Windows x64
@@ -73,6 +130,12 @@ jobs:
       # in this job needs either.
       id-token: write
       attestations: write
+    env:
+      # Untagged runs only. The committed witness for aether.exe is still the
+      # placeholder on main, and both build.rs and publish-engine-trust.mjs refuse
+      # to produce or verify a *release* against a placeholder unless this is set
+      # explicitly. A tag leaves it empty, so a release cannot be unwitnessed.
+      AETHER_ALLOW_UNWITNESSED: ${{ !startsWith(github.ref, 'refs/tags/') && '1' || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -139,45 +202,37 @@ jobs:
           Copy-Item -Force "aether/target/release/aether.exe" "$res/aether.exe"
           Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
 
-      # The trust anchor has to be written between the engine build and the app
-      # build: build.rs embeds it into the shell, so the shell ends up vouching
-      # for the exact bytes this run produced and verified. It is still not the
-      # same process as the comparison — hashing resources/aether.exe inside
-      # build.rs made the runtime check structurally unable to fail.
+      # The trust anchor is a committed witness, read here and never written: a
+      # job that generates the digest it then checks against cannot fail, which is
+      # the exact defect packaging/trust/README.md documents. build.rs embeds the
+      # committed anchor, so the shell vouches for bytes a reviewer saw in a diff.
       #
-      # A tag is a different animal: a tagged release must ship bytes somebody
-      # already committed a witness for. Regenerating the anchor here would make
-      # the tag attest to whatever this runner happened to build, which is the
-      # self-referential guarantee all over again. On a tag the publish step is
-      # skipped, so the unconditional --check below compares the staged engine
-      # against the anchor as committed, and a missing/stale witness stops the
-      # bundle. Cut the witness with the prepare-anchor workflow instead.
-      - name: Publish trust anchor for this run
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        shell: pwsh
-        run: |
-          $eng = "apps/desktop/src-tauri/resources/aether.exe"
-          $sig = Get-AuthenticodeSignature -FilePath $eng
-          if ($sig.Status -ne "Valid") { throw "refusing to witness an engine whose signature is not Valid: $($sig.StatusMessage)" }
-          if ($sig.SignerCertificate.Subject -notmatch "CN=deathline94(?:,|$)") { throw "refusing to witness an engine from the wrong publisher: $($sig.SignerCertificate.Subject)" }
-          $certSha = (([Security.Cryptography.SHA256]::Create().ComputeHash($sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
-          node scripts/publish-engine-trust.mjs --name aether.exe --file $eng --cert-sha $certSha --cn $sig.SignerCertificate.Subject
-          node scripts/publish-engine-trust.mjs --name wintun.dll --file packaging/wintun.dll
-
-      - name: Witness stays as committed on a tag build
+      # A tag must ship against a real witness, so it is checked before the build
+      # spends its time. An unwitnessed branch build is still allowed — it is a
+      # dev artifact that can never be published, and it says so at compile time.
+      - name: Refuse a tag build whose witness is a placeholder
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         shell: pwsh
         run: |
-          git diff --exit-code -- packaging/trust/engine-trust.json
-          if ($LASTEXITCODE -ne 0) { throw "a tag build modified its own trust anchor" }
-          Write-Host "Anchor is byte-identical to the committed witness."
+          $anchor = Get-Content -Raw packaging/trust/engine-trust.json | ConvertFrom-Json
+          $zeros = "0000000000000000000000000000000000000000000000000000000000000000"
+          foreach ($f in $anchor.files) {
+            if ($f.file_sha256 -eq $zeros) {
+              throw "tag build has no committed witness for $($f.name); cut one with the prepare-anchor workflow before releasing"
+            }
+          }
+          Write-Host "Committed witness covers every anchored artifact."
 
-      - name: Verify staged binaries against the trust anchor
+      - name: Verify staged wintun against the trust anchor
+        shell: pwsh
+        run: |
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file apps/desktop/src-tauri/resources/wintun.dll
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file packaging/wintun.dll
+
+      - name: Verify staged engine against the committed witness
         shell: pwsh
         run: |
           node scripts/publish-engine-trust.mjs --check --name aether.exe --file apps/desktop/src-tauri/resources/aether.exe
-          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file apps/desktop/src-tauri/resources/wintun.dll
-          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file packaging/wintun.dll
 
       - name: Build app
         working-directory: apps/desktop

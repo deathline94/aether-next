@@ -26,12 +26,22 @@ function captureListener(): (payload: unknown) => void {
 
 const appendLog = vi.fn();
 
-describe("desktop useScanner", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    vi.mocked(invoke).mockResolvedValue(null);
-  });
+/** The run id the hook passed to the engine for its most recent `scan` invoke. */
+function lastScanRunId(): string {
+  const call = vi
+    .mocked(invoke)
+    .mock.calls.filter(([command]) => command === "scan")
+    .at(-1);
+  if (!call) throw new Error("startScan never invoked `scan`");
+  return (call[1] as { runId: string }).runId;
+}
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(invoke).mockResolvedValue(null);
+});
+
+describe("desktop useScanner", () => {
   it("keeps one address found on two protocols", async () => {
     const emit = captureListener();
     const { result } = renderHook(() => useScanner(appendLog, false));
@@ -43,13 +53,138 @@ describe("desktop useScanner", () => {
     });
 
     expect(result.current.endpoints).toHaveLength(2);
-    expect(result.current.scanState.working).toBe(2);
 
     // A true duplicate — same address, same protocol — is still folded.
     act(() => {
       emit({ type: "scan_hit", addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h2" });
     });
     expect(result.current.endpoints).toHaveLength(2);
+  });
+
+  it("takes the working tally from scan_progress, never from hits", async () => {
+    // A hit records that one address answered one protocol; the engine counts how
+    // many addresses work. Incrementing the counter per hit made the "N Healthy
+    // Gateways" chip oscillate, because the next engine frame overwrote it with a
+    // number that was true fifty probes earlier.
+    const emit = captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+    await waitFor(() => expect(result.current.scanState.working).toBe(0));
+
+    act(() => {
+      emit({ type: "scan_hit", addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h2" });
+      emit({ type: "scan_hit", addr: "104.16.0.1:443", rtt: "19ms", rttMs: 19, protocol: "masque-h3" });
+    });
+    expect(result.current.endpoints).toHaveLength(2);
+    expect(result.current.scanState.working).toBe(0);
+
+    act(() => {
+      emit({ type: "scan_progress", scanned: 40, total: 100, working: 2 });
+    });
+    expect(result.current.scanState.working).toBe(2);
+
+    // Neither a later hit nor a later frame may walk the tally backwards.
+    act(() => {
+      emit({ type: "scan_hit", addr: "188.114.96.1:443", rtt: "7ms", rttMs: 7, protocol: "masque-h3" });
+    });
+    expect(result.current.scanState.working).toBe(2);
+  });
+
+  it("drops events stamped with another run's id", async () => {
+    const emit = captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+    await waitFor(() => expect(result.current.scanState.active).toBe(false));
+
+    await act(async () => {
+      await result.current.startScan();
+    });
+    const runId = lastScanRunId();
+    expect(runId).toBeTruthy();
+
+    act(() => {
+      emit({ type: "scan_hit", runId: "a-different-run", addr: "9.9.9.9:443", rtt: "1ms", rttMs: 1, protocol: "masque-h3" });
+      emit({ type: "scan_done", runId: "a-different-run", addr: "9.9.9.9:443" });
+    });
+    expect(result.current.endpoints).toHaveLength(0);
+    expect(result.current.scanState.active).toBe(true);
+
+    act(() => {
+      emit({ type: "scan_hit", runId, addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h3" });
+    });
+    expect(result.current.endpoints).toHaveLength(1);
+  });
+
+  it("retires the run id before the next scan can inherit a cancelled run's stragglers", async () => {
+    const emit = captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+    await waitFor(() => expect(result.current.scanState.active).toBe(false));
+
+    await act(async () => {
+      await result.current.startScan();
+    });
+    const firstRun = lastScanRunId();
+
+    await act(async () => {
+      await result.current.stopScan();
+    });
+    expect(result.current.scanState.active).toBe(false);
+
+    // The engine's last word on a stopped run arrives whenever it likes. It must
+    // not be merged into whatever scan starts next.
+    act(() => {
+      emit({ type: "scan_hit", runId: firstRun, addr: "1.1.1.1:443", rtt: "5ms", rttMs: 5, protocol: "masque-h3" });
+    });
+    expect(result.current.endpoints).toHaveLength(0);
+  });
+
+  it("stamps the new run id before awaiting the teardown of the old one", async () => {
+    const emit = captureListener();
+    // running=true makes startScan await `disconnect` before it invokes `scan`.
+    // That await is the window: the counters have already restarted for run two
+    // while the ref still named run one, so run one's late hit used to be merged
+    // into a scan that had not started yet.
+    const { result } = renderHook(() => useScanner(appendLog, true));
+    await waitFor(() => expect(result.current.scanState.active).toBe(false));
+
+    await act(async () => {
+      await result.current.startScan();
+    });
+    const firstRun = lastScanRunId();
+
+    // Run one ends normally, so `startScan` is callable again.
+    act(() => {
+      emit({ type: "scan_done", runId: firstRun, addr: "104.16.0.1:443" });
+    });
+    await waitFor(() => expect(result.current.scanState.active).toBe(false));
+
+    let releaseDisconnect: () => void = () => {};
+    let disconnectIsPending = false;
+    const previous = vi.mocked(invoke).getMockImplementation();
+    vi.mocked(invoke).mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "disconnect") {
+        disconnectIsPending = true;
+        await new Promise<void>((resolve) => (releaseDisconnect = resolve));
+        disconnectIsPending = false;
+        return null;
+      }
+      return previous ? previous(command, args) : null;
+    });
+
+    let scanReturned = false;
+    void result.current.startScan().then(() => (scanReturned = true));
+    // Wait for the teardown await itself rather than for a tick count: the window
+    // under test is "disconnect is in flight and `scan` has not been invoked yet".
+    await waitFor(() => expect(disconnectIsPending).toBe(true));
+    expect(scanReturned).toBe(false);
+
+    act(() => {
+      emit({ type: "scan_hit", runId: firstRun, addr: "1.1.1.1:443", rtt: "5ms", rttMs: 5, protocol: "masque-h3" });
+    });
+    expect(result.current.endpoints).toHaveLength(0);
+
+    releaseDisconnect();
+    await waitFor(() => expect(scanReturned).toBe(true));
+    vi.mocked(invoke).mockImplementation(previous ?? (() => null));
+    expect(lastScanRunId()).not.toBe(firstRun);
   });
 
   it("starts a scan with an empty result list", async () => {

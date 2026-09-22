@@ -131,11 +131,34 @@ fn main() {
     #[cfg(windows)]
     println!("cargo:rustc-link-search=native={out_dir}");
 
-    if entries.iter().any(|(_, d)| d == PLACEHOLDER_SHA256) {
+    let has_placeholder = entries.iter().any(|(_, d)| d == PLACEHOLDER_SHA256);
+    if has_placeholder {
         println!(
             "cargo:warning=engine-trust.json still carries a placeholder digest, so release \
              builds will refuse that binary until the publish-anchor step records its real one"
         );
+        // A release build that ends up refusing its own engine at runtime is not a
+        // warning — it is a shipped product that cannot connect, and the documented
+        // `cargo build --release` path produced exactly that. Fail here, where the
+        // reason is legible, unless this is a deliberately unwitnessed dev build.
+        let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+        let allow_unwitnessed =
+            matches!(std::env::var("AETHER_ALLOW_UNWITNESSED").as_deref(), Ok(v) if !v.trim().is_empty());
+        if profile == "release" && !allow_unwitnessed {
+            die(
+                "engine-trust.json still carries a placeholder digest, so this release shell \
+                 would refuse to spawn the engine it ships with",
+                "cut the real witness with the prepare-anchor workflow and commit it, or set \
+                 AETHER_ALLOW_UNWITNESSED=1 to build a deliberately unwitnessed dev binary \
+                 (it can never be released: it has no trusted engine to start)",
+            );
+        }
+        if profile == "release" {
+            println!(
+                "cargo:warning=AETHER_ALLOW_UNWITNESSED is set on a release build: this \
+                 artifact has no committed witness and must not be published"
+            );
+        }
     }
 
     let mut code = String::new();
@@ -162,8 +185,7 @@ fn main() {
         "pub static ENGINE_TRUST_ANCHOR_SHA256: &str = {anchor_sha:?};\n"
     ));
     code.push_str(&format!(
-        "pub static ENGINE_TRUST_ANCHOR_HAS_PLACEHOLDER: bool = {};\n",
-        entries.iter().any(|(_, d)| d == PLACEHOLDER_SHA256)
+        "pub static ENGINE_TRUST_ANCHOR_HAS_PLACEHOLDER: bool = {has_placeholder};\n"
     ));
 
     let dest_path: PathBuf = Path::new(&out_dir).join("release_hashes.rs");
