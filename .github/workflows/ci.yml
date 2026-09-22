@@ -178,6 +178,12 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm ci
       - run: npm run build
+      # `npm run build` typechecks and bundles; nothing here ran the frontends'
+      # own tests, so 150 of them - the axe suites, the session-state guard, the
+      # log store's dedupe, the FR-033 signalling checks - existed only on a
+      # developer machine and could rot green.
+      - name: Unit tests
+        run: npm test
 
   desktop-backend:
     name: Desktop backend
@@ -302,6 +308,8 @@ jobs:
           cache-dependency-path: apps/android/package-lock.json
       - run: npm ci
       - run: npm run build
+      - name: Unit tests
+        run: npm test
 
   android-native-payloads:
     name: Android native payload gate
