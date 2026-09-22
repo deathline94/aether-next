@@ -273,19 +273,11 @@ export function ConnectionTab({
               </div>
             </div>
 
-            {/* Micro-sparkline telemetry signal equalizer */}
-            <div className="sparkline-bar-track" aria-hidden="true">
-              {[42, 68, 55, 84, 62, 75, 48, 92, 58, 80, 64, 88, 52, 70, 60, 95].map((val, idx) => (
-                <div
-                  key={idx}
-                  className={`sparkline-bar ${connected ? "active" : ""}`}
-                  style={{
-                    height: connected ? `${val}%` : "18%",
-                    animationDelay: `${idx * 0.08}s`,
-                  }}
-                />
-              ))}
-            </div>
+            {/* No bar chart here: the engine reports no per-packet series, so the
+                previous equalizer drew a fixed array of made-up samples and only
+                animated because a session was up. A graph of nothing is how
+                invented telemetry gets believed. `test_connection`'s round-trip and
+                the endpoint below are the measurements this panel has. */}
           </div>
 
           <div className="bento-footer">

@@ -341,19 +341,23 @@ const GATES = [
     summary: 'no invented telemetry in shipped UI',
     scan(api) {
       const banned = /(< 45 ms|0\.0%|HTTP LISTENING|SOCKS5 READY|END-TO-END TLS 1\.3|V4 DUAL-READY|0-RTT|TRAFFIC SECURE)/g;
+      // A literal list of numbers rendered as bars is a measurement nobody took.
+      const series = /\[\s*\d+\s*(?:,\s*\d+\s*){4,}\]/g;
       const v = [];
       const all = api.files('apps/desktop/src', /\.(tsx|ts)$/).concat(api.files('apps/android/src', /\.(tsx|ts)$/));
       for (const f of all) {
         const t = api.read(f);
         let m;
         while ((m = banned.exec(t))) v.push(`${locate(f, t, m.index)} fabricated metric "${m[1]}"`);
+        while ((m = series.exec(t))) v.push(`${locate(f, t, m.index)} hard-coded sample series "${m[0]}" is presented as telemetry`);
       }
       return v;
     },
     inject() {
       return {
         file: 'apps/desktop/src/__selftest__.tsx',
-        content: 'export const X = () => <b>{"< 45 ms"}</b>;',
+        content:
+          'export const X = () => <b>{"< 45 ms"}{[42, 68, 55, 84, 62, 75].map((v) => <i key={v} />)}</b>;',
       };
     },
   },

@@ -370,7 +370,26 @@
 
 - [ ] T107 [P] [US4] Failing test `drain_survives_undersized_reader` in `aether/src/quic.rs`: a 4 000-byte then a 64-byte datagram must both reach `inbound_tx`, and the queue must never exceed 2048 entries. Today `enable_dgram(true, 65536, 65536)` (`tls.rs:182`) sets an **entry count** (spec.md §Clarifications: the original "wedge" claim was disproved — `dgram_recv` pops before comparing lengths, `quiche/quiche/src/lib.rs:6802-6816`), so the true defects are queue depth permitting tens of MB, and `Err(_) => break` at `quic.rs:844-873` hiding fatal receive errors.
 - [ ] T108 [P] [US4] Failing test in `aether/src/quic.rs`: `Error::Done` from `dgram_send`/`send_body` must increment `dgram_send_dropped` and preserve or report the loss, never discard silently (`:66-79`); with no request stream open, outbound packets must be counted, not dropped invisibly (`:492-508` has no `else`).
-- [ ] T109 [P] [US4] Failing test in `apps/desktop/src/components/__tests__/ConnectionTab.test.tsx`: every stat renders `—` when its field is `null`. Fails today: `ConnectionTab.tsx:88-94` regexes `/(\d+)\s*ms/` against a string containing no timing (`lib.rs:1623` returns `OK via {via} · ip=… loc=…`) and falls back to `< 45 ms`; `:283` shows `PACKET LOSS 0.0%`; `:293` animates `[42,68,55,84,…]`; `:423` prints `HTTP LISTENING / SOCKS5 READY` beside `DORMANT` at `:404-409`; `:348-353` asserts `END-TO-END TLS 1.3` for WireGuard.
+- [x] T109 [P] [US4] Failing test in `apps/desktop/src/components/__tests__/ConnectionTab.test.tsx`: every stat renders `—` when its field is `null`. Fails today: `ConnectionTab.tsx:88-94` regexes `/(\d+)\s*ms/` against a string containing no timing (`lib.rs:1623` returns `OK via {via} · ip=… loc=…`) and falls back to `< 45 ms`; `:283` shows `PACKET LOSS 0.0%`; `:293` animates `[42,68,55,84,…]`; `:423` prints `HTTP LISTENING / SOCKS5 READY` beside `DORMANT` at `:404-409`; `:348-353` asserts `END-TO-END TLS 1.3` for WireGuard.
+  All five claims are gone from the tree, checked against the current file rather than the line
+  numbers in the task (they had moved): latency is `not measured` unless `test_connection` really
+  returned milliseconds, packet loss is `not measured` and always has been unavailable, the
+  `HTTP LISTENING / SOCKS5 READY` and `END-TO-END TLS 1.3` strings no longer appear, and the
+  fabricated equalizer — sixteen bars whose heights came from a literal
+  `[42, 68, 55, 84, …]` and which animated only because `connected` was true — is deleted from
+  **both** UIs, with the reason recorded in place of it. That one was still live when this was
+  re-read: it was the least visible of the five because it asks nothing of the reader and looks
+  exactly like a signal graph.
+  Deviation on form: no `ConnectionTab.test.tsx` was added, because a component asserting today's
+  strings would not catch the class. `no-fabricated-metrics` [BC-14] now bans the claim strings
+  *and* any hard-coded numeric series of five or more values in either app's `src`, so
+  reintroducing a fake chart or a `< 45 ms` fallback fails the gate on any pull. The new
+  alternative's reachability was proven against the pre-fix files (it matched exactly the two
+  sparkline arrays, nothing else in the tree), and the gate's inject defect now carries both
+  banned forms. 10 desktop + 8 Android UI tests and all 13 gates pass.
+  Still open and owned elsewhere: a real latency source for these two rows is T124
+  (`handshake_rtt_ms` / `active_endpoint_rtt_ms` on `RuntimeState`); until then the honest
+  rendering is "not measured", which is what ships.
 - [ ] T110 [P] [US4] Failing test in `apps/android/android/app/src/test/java/app/aethernext/SessionControllerTest.kt`: a stream containing only `connected` reaches connected; log prose containing `"handshake successful"` must **not**. Fails today: `SessionController.kt:314-326` infers state by substring-matching prose — a string absent from the Rust source, so the guard's trigger is unreachable and the JSON parse error is swallowed.
 
 ### Implementation for User Story 4
