@@ -18,11 +18,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The mechanical cross-cutting invariants (BC-03/04/05/09/10/11/14/20). These
-  # are cheap, whole-repo checks that no per-crate test would ever notice:
-  # a kill-switch reappearing in `tls.rs`, a `lock().unwrap()` on the shell
-  # lifecycle path, or a className with no rule behind it.
   invariants:
+    # The mechanical cross-cutting invariants. These are cheap, whole-repo checks
+    # that no per-crate test would ever notice: a kill-switch reappearing in
+    # `tls.rs`, a `lock().unwrap()` on the shell lifecycle path, a className with
+    # no rule behind it, a persisted setting no component can reach. The set is
+    # whatever `scripts/verify-invariants.mjs` defines right now, and its output
+    # names each BC code — an inventory copied into this comment goes stale the
+    # moment a gate lands, which is the prose-versus-truth defect the harness
+    # exists to remove.
     name: Invariant gates
     runs-on: ubuntu-latest
     steps:
@@ -132,6 +136,25 @@ jobs:
       # silently-stale deny.toml is itself a failure.
       - name: deny.toml skip block matches the committed locks
         run: node scripts/measure-deny.mjs
+      # cargo-deny only sees Rust. The two frontends are ~320 packages each and
+      # nothing has ever audited them, so both halves are checked here: the
+      # *shipped* dependency tree blocks (the bundle is built from `dependencies`,
+      # and it is clean today), while the dev tree is reported without gating —
+      # the one advisory left there needs vitest 3 -> 4, and a test-runner major
+      # must not be able to stop a release.
+      - name: npm audit (desktop, shipped dependencies)
+        working-directory: apps/desktop
+        run: npm audit --omit=dev
+      - name: npm audit (android, shipped dependencies)
+        working-directory: apps/android
+        run: npm audit --omit=dev
+      - name: npm audit (dev trees, reported)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for app in desktop android; do
+            (cd "apps/$app" && npm audit) || echo "::warning::apps/$app has advisories in its dev tree (fixable only by a breaking major)"
+          done
       # cargo-deny keys advisories on crates.io name+version, so it cannot see that
       # `quiche 0.29.2` here is not upstream `quiche 0.29.2`. This closes that gap.
       - name: Vendored quiche matches its recorded provenance
