@@ -263,7 +263,7 @@ export function ScannerTab({
       </section>
 
       {/* ─── Probe Parameters Configuration Card ───────────────────────────── */}
-      <section className="settings-section tactical-panel" aria-label="Probe Parameters">
+      <section className="settings-section" aria-label="Probe Parameters">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">PROBE PARAMETERS</p>

@@ -142,7 +142,7 @@ export function SettingsTab({
       )}
 
       {/* ─── Panel 1: Transport & Carrier Engine ─────────────────────────── */}
-      <section className="settings-section tactical-panel">
+      <section className="settings-section">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">CARRIER PROTOCOL & ANTI-DPI</p>
@@ -347,7 +347,7 @@ export function SettingsTab({
       </section>
 
       {/* ─── Panel 2: Discovery & Topology ───────────────────────────────── */}
-      <section className="settings-section tactical-panel">
+      <section className="settings-section">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">AUTO-DISCOVERY & LATENCY SEARCH</p>
@@ -405,7 +405,7 @@ export function SettingsTab({
       </section>
 
       {/* ─── Panel 3: Windows Integration & Routing Policy ───────────────── */}
-      <section className="settings-section tactical-panel">
+      <section className="settings-section">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">PLATFORM & OS INTEGRATION</p>
@@ -471,7 +471,7 @@ export function SettingsTab({
       </section>
 
       {/* ─── Panel 4: Local Ports & Daemon Binary ────────────────────────── */}
-      <section className="settings-section tactical-panel">
+      <section className="settings-section">
         <div className="section-heading">
           <div>
             <p className="panel-eyebrow">LOCAL LISTENERS & BINARY HOOKS</p>
