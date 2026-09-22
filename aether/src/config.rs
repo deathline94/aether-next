@@ -75,16 +75,14 @@ impl TryFrom<PersistedIdentity> for Identity {
         // Address fields become parsed types here. They used to be carried as
         // `String` all the way into packet construction, so a corrupted config
         // produced a malformed tunnel rather than a rejection at load time.
-        let ipv4: Ipv4Addr = p
-            .ipv4
-            .trim()
-            .parse()
-            .map_err(|e| AetherError::Other(format!("invalid ipv4 address {:?}: {e}", p.ipv4)))?;
-        let ipv6: Ipv6Addr = p
-            .ipv6
-            .trim()
-            .parse()
-            .map_err(|e| AetherError::Other(format!("invalid ipv6 address {:?}: {e}", p.ipv6)))?;
+        let ipv4: Ipv4Addr =
+            p.ipv4.trim().parse().map_err(|e| {
+                AetherError::Other(format!("invalid ipv4 address {:?}: {e}", p.ipv4))
+            })?;
+        let ipv6: Ipv6Addr =
+            p.ipv6.trim().parse().map_err(|e| {
+                AetherError::Other(format!("invalid ipv6 address {:?}: {e}", p.ipv6))
+            })?;
         let masque_endpoint = match p.masque_endpoint.as_deref() {
             None => None,
             Some(raw) => {
@@ -92,11 +90,9 @@ impl TryFrom<PersistedIdentity> for Identity {
                 if raw.is_empty() {
                     None
                 } else {
-                    let addr: SocketAddr = raw
-                        .parse()
-                        .map_err(|e| {
-                            AetherError::Other(format!("invalid masque endpoint {raw:?}: {e}"))
-                        })?;
+                    let addr: SocketAddr = raw.parse().map_err(|e| {
+                        AetherError::Other(format!("invalid masque endpoint {raw:?}: {e}"))
+                    })?;
                     Some(addr.to_string())
                 }
             }
@@ -208,7 +204,9 @@ fn key() -> Result<Option<[u8; 32]>> {
 fn path_aad(path: &str) -> Vec<u8> {
     let p = Path::new(path);
     let parent = p.parent().unwrap_or_else(|| Path::new(""));
-    let canonical: PathBuf = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let canonical: PathBuf = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     let mut out: Vec<u8> = Vec::with_capacity(64);
     out.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
     out.push(0);
@@ -246,12 +244,7 @@ fn seal(path: &str, plain: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn seal_with(
-    cipher: &ChaCha20Poly1305,
-    nonce: &[u8],
-    aad: &[u8],
-    plain: &[u8],
-) -> Result<Vec<u8>> {
+fn seal_with(cipher: &ChaCha20Poly1305, nonce: &[u8], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::AeadInPlace;
     let mut buf = plain.to_vec();
     cipher
@@ -260,12 +253,7 @@ fn seal_with(
     Ok(buf)
 }
 
-fn open_with(
-    cipher: &ChaCha20Poly1305,
-    nonce: &[u8],
-    aad: &[u8],
-    body: &[u8],
-) -> Result<Vec<u8>> {
+fn open_with(cipher: &ChaCha20Poly1305, nonce: &[u8], aad: &[u8], body: &[u8]) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::AeadInPlace;
     let mut buf = body.to_vec();
     cipher
@@ -279,7 +267,9 @@ fn open(path: &str, raw: &[u8], k: &[u8; 32]) -> Result<Option<Vec<u8>>> {
     let cipher = ChaCha20Poly1305::new(k.into());
     if let Some(body) = raw.strip_prefix(MAGIC_V2) {
         let Some(&version) = body.first() else {
-            return Err(AetherError::Other("truncated config envelope header".into()));
+            return Err(AetherError::Other(
+                "truncated config envelope header".into(),
+            ));
         };
         if version > SCHEMA_VERSION {
             return Err(AetherError::Other(format!(
@@ -290,7 +280,12 @@ fn open(path: &str, raw: &[u8], k: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         if rest.len() < NONCE_LEN + 16 {
             return Err(AetherError::Other("truncated encrypted config".into()));
         }
-        return Ok(Some(open_with(&cipher, &rest[..NONCE_LEN], &path_aad(path), &rest[NONCE_LEN..])?));
+        return Ok(Some(open_with(
+            &cipher,
+            &rest[..NONCE_LEN],
+            &path_aad(path),
+            &rest[NONCE_LEN..],
+        )?));
     }
     if let Some(body) = raw.strip_prefix(MAGIC_V1) {
         if body.len() < NONCE_LEN + 16 {
@@ -324,7 +319,12 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
     let principal = crate::win_acl::current_user_sid()?;
     let exe = crate::win_exec::system_exe("icacls")?;
     let output = std::process::Command::new(&exe)
-        .args([path, "/inheritance:r", "/grant:r", &format!("*{principal}:F")])
+        .args([
+            path,
+            "/inheritance:r",
+            "/grant:r",
+            &format!("*{principal}:F"),
+        ])
         .output()
         .map_err(|e| {
             AetherError::Other(format!("failed to run {} on {path}: {e}", exe.display()))
@@ -355,12 +355,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 fn temp_name(path: &str) -> String {
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rand: u32 = rand::random();
-    format!(
-        "{path}.{}.{}.{}.tmp",
-        std::process::id(),
-        seq,
-        rand
-    )
+    format!("{path}.{}.{}.{}.tmp", std::process::id(), seq, rand)
 }
 
 /// Atomic + locked-down write for secret files (identity TOML, session
@@ -502,9 +497,9 @@ fn quarantine_backup(path: &str) {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let doomed = format!("{path}.quarantined.{}.{}", std::process::id(), seq);
     match std::fs::rename(&bak, &doomed) {
-        Ok(()) => log::error!(
-            "[config] ignored and quarantined unauthenticated backup {bak} -> {doomed}"
-        ),
+        Ok(()) => {
+            log::error!("[config] ignored and quarantined unauthenticated backup {bak} -> {doomed}")
+        }
         Err(e) => log::error!(
             "[config] could not move {bak} to {doomed}: {e}; leaving it in place. \
              It is never read, and deleting it would destroy evidence a previous \
@@ -601,8 +596,8 @@ fn read_identity(path: &str, allow_plaintext: bool) -> Result<Loaded> {
         None if allow_plaintext => raw,
         None => return Err(plaintext_refused()),
     };
-    let text =
-        String::from_utf8(plain).map_err(|_| AetherError::Other("invalid config encoding".into()))?;
+    let text = String::from_utf8(plain)
+        .map_err(|_| AetherError::Other("invalid config encoding".into()))?;
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Other(format!("config parse: {e}")))?;
     let identity = Identity::try_from(persisted)?;
@@ -625,8 +620,8 @@ fn plaintext_refused() -> AetherError {
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
-    let text =
-        toml::to_string_pretty(&persisted).map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
+    let text = toml::to_string_pretty(&persisted)
+        .map_err(|e| AetherError::Other(format!("config encode: {e}")))?;
     // The parent must exist *before* sealing: `path_aad` canonicalises it, and on
     // a first write into a new directory canonicalisation fails there and falls
     // back to the literal path. `write_private_file` then created the directory,
@@ -857,14 +852,23 @@ mod tests {
         assert!(Identity::try_from(p.clone()).is_ok());
 
         p.ipv4 = "not-an-address".into();
-        assert!(Identity::try_from(p.clone()).is_err(), "a corrupt ipv4 must not start a tunnel");
+        assert!(
+            Identity::try_from(p.clone()).is_err(),
+            "a corrupt ipv4 must not start a tunnel"
+        );
 
         p.ipv4 = "172.16.0.2".into();
         p.masque_endpoint = Some("162.159.198.2:not-a-port".into());
-        assert!(Identity::try_from(p.clone()).is_err(), "endpoint must be a parsed SocketAddr");
+        assert!(
+            Identity::try_from(p.clone()).is_err(),
+            "endpoint must be a parsed SocketAddr"
+        );
 
         p.masque_endpoint = None;
         p.wg_private_key = "short".into();
-        assert!(Identity::try_from(p).is_err(), "a mistyped key must error, not default");
+        assert!(
+            Identity::try_from(p).is_err(),
+            "a mistyped key must error, not default"
+        );
     }
 }

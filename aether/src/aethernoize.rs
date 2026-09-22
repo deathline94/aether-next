@@ -161,8 +161,8 @@ fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     header.extend_from_slice(&sa_payload_length.to_be_bytes());
 
     header.extend_from_slice(&[
-        0x00, 0x00, 0x00, 0x14, 0x01, 0x01, 0x00, 0x04, 0x03, 0x00, 0x00, 0x08, 0x01, 0x00,
-        0x00, 0x0c, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x14, 0x01, 0x01, 0x00, 0x04, 0x03, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00,
+        0x0c, 0x00, 0x00, 0x00, 0x00,
     ]);
 
     header.extend_from_slice(payload);
@@ -185,7 +185,11 @@ fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     };
 
     if size == 0 {
-        return if cfg.allow_zero_size { vec![] } else { vec![0x00] };
+        return if cfg.allow_zero_size {
+            vec![]
+        } else {
+            vec![0x00]
+        };
     }
 
     let mut junk = vec![0u8; size];
@@ -216,7 +220,9 @@ async fn send_intro(sock: &UdpSocket, peer: SocketAddr, pkt: &[u8], what: &str) 
             "{what}: wrote {n} of {} intro bytes",
             pkt.len()
         ))),
-        Err(e) => Err(AetherError::Other(format!("{what} never reached the wire: {e}"))),
+        Err(e) => Err(AetherError::Other(format!(
+            "{what} never reached the wire: {e}"
+        ))),
     }
 }
 
@@ -326,8 +332,10 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
         }
         if let Err(e) = sock.send(&junk).await {
             crate::counters::bump(&crate::counters::DATAGRAM_SEND_DROPPED);
-            log::error!("[-] aethernoize: keepalive decoy lost ({e}); the socket is not \
-                         answering, so the rest of this batch is abandoned");
+            log::error!(
+                "[-] aethernoize: keepalive decoy lost ({e}); the socket is not \
+                         answering, so the rest of this batch is abandoned"
+            );
             return;
         }
 
@@ -393,7 +401,11 @@ mod tests {
         let cfg = AetherNoizeConfig::balanced();
         for _ in 0..100 {
             let junk = generate_junk(&cfg);
-            assert!(junk.len() >= 50 && junk.len() <= 128, "junk len {} out of bounds", junk.len());
+            assert!(
+                junk.len() >= 50 && junk.len() <= 128,
+                "junk len {} out of bounds",
+                junk.len()
+            );
         }
     }
 
@@ -410,10 +422,7 @@ mod tests {
         let err = send_intro(&sock, bogus, b"payload", "signature i1")
             .await
             .expect_err("port 0 cannot accept a datagram");
-        assert!(
-            err.to_string().contains("never reached the wire"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("never reached the wire"), "{err}");
         assert!(
             err.to_string().contains("signature i1"),
             "the failure must say which packet was lost: {err}"
@@ -464,4 +473,3 @@ mod tests {
         assert!(super::from_profile("max").jc_before_hs > 0);
     }
 }
-

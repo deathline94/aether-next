@@ -93,7 +93,9 @@ fn two_processes_updating_the_cache_lose_no_applied_update() {
             .lines()
             .find_map(|l| l.strip_prefix("APPLIED "))
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or_else(|| panic!("writer {slot} reported no applied count; stdout was {out:?}"));
+            .unwrap_or_else(|| {
+                panic!("writer {slot} reported no applied count; stdout was {out:?}")
+            });
         applied.push(count);
     }
 
@@ -107,7 +109,10 @@ fn two_processes_updating_the_cache_lose_no_applied_update() {
     }
 
     let cache = aether::cache::load_endpoints(&base);
-    assert_eq!(cache.version, 2, "a document written under contention must still be versioned");
+    assert_eq!(
+        cache.version, 2,
+        "a document written under contention must still be versioned"
+    );
     for (slot, count) in applied.iter().enumerate() {
         let addr = slot_address(slot);
         let entry = cache

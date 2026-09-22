@@ -64,7 +64,11 @@ pub async fn run_probe(edge: SocketAddr, identity: &Identity, ech: Option<Vec<u8
 
     log::info!(
         "[h3-probe] target={edge} local_ipv4={local_ipv4} mode={} combos={} (timeout {:?} each)",
-        if brute { "brute-request-shape" } else { "diagnostic" },
+        if brute {
+            "brute-request-shape"
+        } else {
+            "diagnostic"
+        },
         combos.len(),
         PROBE_TIMEOUT,
     );
@@ -164,7 +168,11 @@ fn build_brute_matrix(_ech: &Option<Vec<u8>>) -> Vec<Combo> {
 
 /// The original diagnostic matrix: SNI x headers x ECH, plus focused
 /// datagram-mode and authority sweeps against the best-guess recipe.
-fn build_default_matrix(ech: &Option<Vec<u8>>, base_authority: &str, base_path: &str) -> Vec<Combo> {
+fn build_default_matrix(
+    ech: &Option<Vec<u8>>,
+    base_authority: &str,
+    base_path: &str,
+) -> Vec<Combo> {
     let mut combos: Vec<Combo> = Vec::new();
     // Control combo (runs first): a neutral SNI every Cloudflare edge has a cert
     // for. With the former ambient TLS kill-switch=1, reaching quic_established here

@@ -162,17 +162,30 @@ struct FragmentConfig {
 impl FragmentConfig {
     /// Legacy 1/3 split (no delay) when only `AETHER_H2_FRAG_CH=1` is set.
     fn legacy_on() -> Self {
-        Self { enabled: true, size_min: 0, size_max: 0, delay_min_ms: 0, delay_max_ms: 0 }
+        Self {
+            enabled: true,
+            size_min: 0,
+            size_max: 0,
+            delay_min_ms: 0,
+            delay_max_ms: 0,
+        }
     }
 
     fn disabled() -> Self {
-        Self { enabled: false, size_min: 0, size_max: 0, delay_min_ms: 0, delay_max_ms: 0 }
+        Self {
+            enabled: false,
+            size_min: 0,
+            size_max: 0,
+            delay_min_ms: 0,
+            delay_max_ms: 0,
+        }
     }
 
     /// Full random-fragmentation mode driven by AETHER_MASQUE_H2_FRAGMENT* env vars.
     /// Defaults when unset: chunks 16-32 bytes, delay 2-10 ms.
     fn from_env() -> Self {
-        let enabled = is_truthy(&crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT").unwrap_or_default());
+        let enabled =
+            is_truthy(&crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT").unwrap_or_default());
         if !enabled {
             return Self::disabled();
         }
@@ -198,16 +211,25 @@ impl FragmentConfig {
     fn pick_chunk_len(&self, remaining: usize) -> usize {
         if self.size_max == 0 {
             // Legacy mode: split at one-third of the first write.
-            return (remaining / 3).max(90).min(remaining.saturating_sub(1)).max(1);
+            return (remaining / 3)
+                .max(90)
+                .min(remaining.saturating_sub(1))
+                .max(1);
         }
         let mut rng = rand::thread_rng();
         let hi = self.size_max.min(remaining);
         let lo = self.size_min.min(hi);
-        if lo >= hi { hi } else { rng.gen_range(lo..=hi) }
+        if lo >= hi {
+            hi
+        } else {
+            rng.gen_range(lo..=hi)
+        }
     }
 
     fn pick_delay(&self) -> std::time::Duration {
-        if self.delay_max_ms == 0 { return std::time::Duration::ZERO; }
+        if self.delay_max_ms == 0 {
+            return std::time::Duration::ZERO;
+        }
         let mut rng = rand::thread_rng();
         let ms = if self.delay_max_ms <= self.delay_min_ms {
             self.delay_min_ms
@@ -219,17 +241,26 @@ impl FragmentConfig {
 }
 
 fn is_truthy(v: &str) -> bool {
-    matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        v.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
     let spec = spec.trim();
-    if spec.is_empty() { return default; }
+    if spec.is_empty() {
+        return default;
+    }
     match spec.split_once('-') {
         Some((a, b)) => {
             let lo = a.trim().parse().unwrap_or(default.0);
             let hi = b.trim().parse().unwrap_or(default.1);
-            if hi < lo { (hi, lo) } else { (lo, hi) }
+            if hi < lo {
+                (hi, lo)
+            } else {
+                (lo, hi)
+            }
         }
         None => {
             let v = spec.parse().unwrap_or(default.0);
@@ -271,12 +302,10 @@ impl tokio::io::AsyncWrite for FragFirstWrite {
         if let Some(deadline) = this.next_chunk_at {
             let now = std::time::Instant::now();
             if now < deadline {
-                let mut sleep = Box::pin(
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)),
-                );
-                if std::future::Future::poll(sleep.as_mut(), cx)
-                    != std::task::Poll::Ready(())
-                {
+                let mut sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline,
+                )));
+                if std::future::Future::poll(sleep.as_mut(), cx) != std::task::Poll::Ready(()) {
                     return std::task::Poll::Pending;
                 }
             }
@@ -388,7 +417,9 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
     let start = Instant::now();
     let attempt = async {
         let tls_config = build_tls(cfg)?;
-        let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
+        let tcp = TcpStream::connect(cfg.peer)
+            .await
+            .map_err(AetherError::Io)?;
         let _ = tcp.set_nodelay(true);
         let tls = connect_tls(tls_config, &handshake_sni(&cfg.sni), tcp).await?;
         let (h2, connection) = h2::client::handshake(tls)
@@ -437,7 +468,9 @@ pub async fn run(
     let tls_config = build_tls(&cfg)?;
 
     log::info!("[h2] connecting tcp to {}", cfg.peer);
-    let tcp = TcpStream::connect(cfg.peer).await.map_err(AetherError::Io)?;
+    let tcp = TcpStream::connect(cfg.peer)
+        .await
+        .map_err(AetherError::Io)?;
     let _ = tcp.set_nodelay(true);
 
     let tls = connect_tls(tls_config, &handshake_sni(&cfg.sni), tcp).await?;
@@ -627,8 +660,6 @@ pub async fn run(
     result
 }
 
-
-
 async fn verify_dataplane(
     send: &mut h2::SendStream<Bytes>,
     recv_body: &mut h2::RecvStream,
@@ -678,10 +709,16 @@ async fn verify_dataplane(
                             for a in addrs {
                                 if a.ip_version == 4 && a.address.len() == 4 {
                                     let new_ip = std::net::Ipv4Addr::new(
-                                        a.address[0], a.address[1], a.address[2], a.address[3]
+                                        a.address[0],
+                                        a.address[1],
+                                        a.address[2],
+                                        a.address[3],
                                     );
                                     if new_ip != probe_src {
-                                        log::info!("[h2] edge assigned ipv4 {}, updating probe_src", new_ip);
+                                        log::info!(
+                                            "[h2] edge assigned ipv4 {}, updating probe_src",
+                                            new_ip
+                                        );
                                         probe_src = new_ip;
                                         resend_at = Instant::now();
                                     }
@@ -698,7 +735,9 @@ async fn verify_dataplane(
                 return Err(AetherError::Masque(format!("h2 verify recv: {e}")));
             }
             Ok(None) => {
-                return Err(AetherError::Masque("h2 closed during data-plane verify".into()));
+                return Err(AetherError::Masque(
+                    "h2 closed during data-plane verify".into(),
+                ));
             }
             Err(_) => {}
         }
@@ -792,7 +831,10 @@ async fn drain_capsules(
                 for r in &routes {
                     log::info!(
                         "[h2] route advertisement: v{} proto {} {:?}-{:?}",
-                        r.ip_version, r.protocol, r.start, r.end
+                        r.ip_version,
+                        r.protocol,
+                        r.start,
+                        r.end
                     );
                 }
             }
@@ -880,14 +922,20 @@ mod tests {
     fn an_echoed_probe_is_not_data_plane_proof() {
         let resolver = std::net::Ipv4Addr::new(8, 8, 8, 8);
         let echo = probe(std::net::Ipv4Addr::new(198, 18, 0, 1));
-        assert!(!dns::is_dns_reply(&echo, resolver), "echo accepted as a reply");
+        assert!(
+            !dns::is_dns_reply(&echo, resolver),
+            "echo accepted as a reply"
+        );
 
         // The same packet with the source address and port rewritten to look like
         // the resolver's: still a query (QR clear), still not proof.
         let mut spoof = echo.clone();
         spoof[12..16].copy_from_slice(&resolver.octets());
         spoof[20..22].copy_from_slice(&53u16.to_be_bytes());
-        assert!(!dns::is_dns_reply(&spoof, resolver), "spoofed echo accepted");
+        assert!(
+            !dns::is_dns_reply(&spoof, resolver),
+            "spoofed echo accepted"
+        );
 
         // And a genuine reply must pass, or the gate would fail closed.
         let mut real = spoof.clone();

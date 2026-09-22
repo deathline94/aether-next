@@ -131,7 +131,7 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
             }
         }
     }
-    
+
     log::debug!("obfuscation pre-handshake complete");
 }
 
@@ -145,13 +145,19 @@ mod tests {
         assert_eq!(fw.jc_before_hs, 5);
         assert_eq!(fw.jmin, 50);
         assert_eq!(fw.jmax, 128);
-        assert!(!fw.junk_interval.is_zero(), "a zero interval makes the pacing dead code");
+        assert!(
+            !fw.junk_interval.is_zero(),
+            "a zero interval makes the pacing dead code"
+        );
 
         let gfw = NoizeConfig::gfw();
         assert_eq!(gfw.jc_before_hs, 5);
         assert_eq!(gfw.jmin, 50);
         assert_eq!(gfw.jmax, 128);
-        assert!(!gfw.junk_interval.is_zero(), "a zero interval makes the pacing dead code");
+        assert!(
+            !gfw.junk_interval.is_zero(),
+            "a zero interval makes the pacing dead code"
+        );
     }
 
     #[test]
@@ -165,8 +171,11 @@ mod tests {
         let fw = NoizeConfig::firewall();
         for _ in 0..100 {
             let pkt = junk_packet(&fw);
-            assert!(pkt.len() >= 50 && pkt.len() <= 128, "packet len {} out of bounds", pkt.len());
+            assert!(
+                pkt.len() >= 50 && pkt.len() <= 128,
+                "packet len {} out of bounds",
+                pkt.len()
+            );
         }
     }
 }
-

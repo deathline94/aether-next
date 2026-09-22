@@ -103,8 +103,12 @@ pub enum ScopeKind {
         #[serde(default)]
         next_hop: Option<String>,
     },
-    NextHop { next_hop: String },
-    Refused { why: String },
+    NextHop {
+        next_hop: String,
+    },
+    Refused {
+        why: String,
+    },
 }
 
 /// One route we created, as recorded before we created it.
@@ -335,10 +339,7 @@ impl RouteJournal {
 impl From<Scope> for ScopeKind {
     fn from(s: Scope) -> Self {
         match s {
-            Scope::ByInterface {
-                if_index,
-                next_hop,
-            } => ScopeKind::Interface {
+            Scope::ByInterface { if_index, next_hop } => ScopeKind::Interface {
                 if_index,
                 next_hop: next_hop.map(|ip| ip.to_string()),
             },
@@ -453,7 +454,8 @@ pub fn combine_liveness(created_unix: u64, this_boot_unix: u64, probe: Liveness)
 // ---------------------------------------------------------------------------
 
 /// Action verb that takes a route out of the table.
-pub const REMOVE_ROUTE_ACTION: &str = "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
+pub const REMOVE_ROUTE_ACTION: &str =
+    "Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue";
 
 /// T044 — action verb that re-arms the 90 s backstop on an existing route.
 pub fn refresh_lifetime_action() -> String {
@@ -513,7 +515,11 @@ pub fn render_scoped_command(entry: &PlannedRemoval, action: RouteAction) -> Opt
     let action = action.verb();
     let cidr = as_cidr(&entry.destination, &entry.mask)?;
     if !cidr_is_safe(&cidr) {
-        log::error!("[route-repair] cannot express {:?}/{:?} as a prefix; refusing", entry.destination, entry.mask);
+        log::error!(
+            "[route-repair] cannot express {:?}/{:?} as a prefix; refusing",
+            entry.destination,
+            entry.mask
+        );
         return None;
     }
     let selector = match &entry.scope {
@@ -524,10 +530,7 @@ pub fn render_scoped_command(entry: &PlannedRemoval, action: RouteAction) -> Opt
             log::error!("[route-repair] refusing {cidr}: journal entry has no interface index");
             return None;
         }
-        ScopeKind::Interface {
-            if_index,
-            next_hop,
-        } => {
+        ScopeKind::Interface { if_index, next_hop } => {
             let mut guards = vec![format!("$_.InterfaceIndex -eq {if_index}")];
             match next_hop.as_deref() {
                 Some(hop) if ps_literal_is_safe(hop) => {
@@ -594,7 +597,9 @@ pub fn lifetime_refresh_commands(journal: &RouteJournal) -> Vec<String> {
 /// resolution. Returns nothing for an alias that is not a safe literal.
 pub fn adapter_reset_commands(adapter_alias: &str) -> Vec<String> {
     if !ps_literal_is_safe(adapter_alias) {
-        log::error!("[route-repair] refusing to reset adapter config for unsafe alias {adapter_alias:?}");
+        log::error!(
+            "[route-repair] refusing to reset adapter config for unsafe alias {adapter_alias:?}"
+        );
         return Vec::new();
     }
     vec![
@@ -681,7 +686,10 @@ pub struct OwnershipRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationVerdict {
     Proceed,
-    Refuse { why: &'static str, owner: JournalOwner },
+    Refuse {
+        why: &'static str,
+        owner: JournalOwner,
+    },
 }
 
 /// T036 — may this process install routes, given the journals already on disk?
@@ -1050,7 +1058,10 @@ pub fn write_journal(path: &std::path::Path, j: &RouteJournal) -> Result<()> {
     }
     let body = serde_json::to_vec_pretty(j)
         .map_err(|e| AetherError::Other(format!("encode journal: {e}")))?;
-    let tmp = sibling_with_suffix(path, &format!(".{}.{}.tmp", std::process::id(), rand::random::<u32>()));
+    let tmp = sibling_with_suffix(
+        path,
+        &format!(".{}.{}.tmp", std::process::id(), rand::random::<u32>()),
+    );
     std::fs::write(&tmp, body).map_err(|e| AetherError::Other(format!("write journal: {e}")))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| AetherError::Other(format!("rename journal into place: {e}")))?;
@@ -1155,12 +1166,12 @@ mod tests {
             // Every recorded entry carried both keys, so every removal is pinned
             // to an interface *and* the hop we installed it with.
             match &p.scope {
-                ScopeKind::Interface {
-                    if_index,
-                    next_hop,
-                } => {
+                ScopeKind::Interface { if_index, next_hop } => {
                     assert_ne!(*if_index, 0);
-                    assert!(next_hop.is_some(), "recorded hop must scope the removal too");
+                    assert!(
+                        next_hop.is_some(),
+                        "recorded hop must scope the removal too"
+                    );
                 }
                 other => panic!("unexpected scope for a recorded journal: {other:?}"),
             }
@@ -1174,12 +1185,18 @@ mod tests {
     #[test]
     fn abandoned_only_when_holder_is_confirmed_dead() {
         let j = journal();
-        assert!(!j.is_abandoned(Liveness::Alive), "live holder keeps its routes");
+        assert!(
+            !j.is_abandoned(Liveness::Alive),
+            "live holder keeps its routes"
+        );
         assert!(
             !j.is_abandoned(Liveness::Unknown),
             "an unestablished answer never authorises a deletion"
         );
-        assert!(j.is_abandoned(Liveness::Dead), "dead holder's routes are stale");
+        assert!(
+            j.is_abandoned(Liveness::Dead),
+            "dead holder's routes are stale"
+        );
         let mut no_pid = j;
         no_pid.creator_pid = 0;
         assert!(
@@ -1217,7 +1234,10 @@ mod tests {
         assert_eq!(mask_to_prefix_len("256.0.0.0"), None);
         assert_eq!(mask_to_prefix_len(""), None);
         // 255.0.0.0 *is* contiguous ones — it is /8, not a malformed mask.
-        assert_eq!(as_cidr("0.0.0.0", "255.0.0.0").as_deref(), Some("0.0.0.0/8"));
+        assert_eq!(
+            as_cidr("0.0.0.0", "255.0.0.0").as_deref(),
+            Some("0.0.0.0/8")
+        );
         assert_eq!(as_cidr("0.0.0.0", "255.0.255.0"), None);
     }
 

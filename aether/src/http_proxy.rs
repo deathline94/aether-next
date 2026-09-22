@@ -87,7 +87,9 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
                 transient = 0;
                 v
             }
-            Err(e) if socks::is_transient_accept(&e) && transient < socks::MAX_TRANSIENT_ACCEPTS => {
+            Err(e)
+                if socks::is_transient_accept(&e) && transient < socks::MAX_TRANSIENT_ACCEPTS =>
+            {
                 transient += 1;
                 log::warn!(
                     "[http] accept failed ({e}); staying up ({transient}/{})",
@@ -135,18 +137,17 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
 }
 
 async fn refuse_over_capacity(mut client: TcpStream) -> Result<()> {
-    let wrote = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async move {
-            client.write_all(&over_capacity_reply()).await?;
-            client.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        },
-    )
+    let wrote = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        client.write_all(&over_capacity_reply()).await?;
+        client.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    })
     .await;
     match wrote {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AetherError::Other(format!("http refusal write failed: {e}"))),
+        Ok(Err(e)) => Err(AetherError::Other(format!(
+            "http refusal write failed: {e}"
+        ))),
         Err(_) => Err(AetherError::Other("http refusal write timed out".into())),
     }
 }
@@ -190,14 +191,18 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
     if let Some(want) = socks::proxy_credentials() {
         if !proxy_auth_ok(text, &want) {
             let _ = client.write_all(&auth_required_reply()).await;
-            return Err(AetherError::Other("http proxy authentication required".into()));
+            return Err(AetherError::Other(
+                "http proxy authentication required".into(),
+            ));
         }
     }
     let first = text
         .lines()
         .next()
         .ok_or_else(|| AetherError::Other("empty HTTP request".into()))?;
-    if first.len() > MAX_REQUEST_LINE { return Err(AetherError::Other("HTTP request line too long".into())); }
+    if first.len() > MAX_REQUEST_LINE {
+        return Err(AetherError::Other("HTTP request line too long".into()));
+    }
     // `split_whitespace` would also fold a tab or vertical space into a
     // separator, so a request line is only ever three SP-delimited tokens.
     let mut request = first.split(' ');
@@ -246,26 +251,22 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
         }
     };
     let dst = SocketAddr::new(ip, port);
-    let upstream = match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        stack.open_tcp(dst),
-    )
-    .await
-    {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                .await;
-            return Err(error);
-        }
-        Err(_) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n")
-                .await;
-            return Err(AetherError::Other("upstream connect timed out".into()));
-        }
-    };
+    let upstream =
+        match tokio::time::timeout(std::time::Duration::from_secs(20), stack.open_tcp(dst)).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                let _ = client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                    .await;
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = client
+                    .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n")
+                    .await;
+                return Err(AetherError::Other("upstream connect timed out".into()));
+            }
+        };
 
     if method.eq_ignore_ascii_case("CONNECT") {
         client
@@ -466,8 +467,8 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_strict_crlf, basic_credentials, find_header_end, header_value, over_capacity_reply,
-        proxy_auth_ok, rewrite_absolute_uri, auth_required_reply,
+        assert_strict_crlf, auth_required_reply, basic_credentials, find_header_end, header_value,
+        over_capacity_reply, proxy_auth_ok, rewrite_absolute_uri,
     };
 
     /// The session-limit refusal has to be a real HTTP response (T163): the old
@@ -478,8 +479,14 @@ mod tests {
         let reply = over_capacity_reply();
         let text = String::from_utf8(reply.clone()).expect("ascii");
         assert!(text.starts_with("HTTP/1.1 503 "), "{text}");
-        assert!(text.contains("Connection: close\r\n"), "must not be kept alive");
-        assert!(text.ends_with("\r\n\r\n"), "a header block ends at a blank line");
+        assert!(
+            text.contains("Connection: close\r\n"),
+            "must not be kept alive"
+        );
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "a header block ends at a blank line"
+        );
         assert!(text.contains("Retry-After"), "and says when to try again");
         let auth = String::from_utf8(auth_required_reply()).expect("ascii");
         assert!(auth.starts_with("HTTP/1.1 407 "), "{auth}");
@@ -560,7 +567,9 @@ mod tests {
     #[test]
     fn rewrite_absolute_uri_preserves_query_string() {
         // Path with query
-        let req1 = b"GET http://example.com/api/test?foo=bar&baz=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let req1 =
+            b"GET http://example.com/api/test?foo=bar&baz=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+                .to_vec();
         let res1 = rewrite_absolute_uri(req1).unwrap();
         assert!(res1.starts_with(b"GET /api/test?foo=bar&baz=1 HTTP/1.1\r\n"));
 

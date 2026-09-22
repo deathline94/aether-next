@@ -176,8 +176,8 @@ pub fn load_pins(json: &str, now_unix: u64) -> Result<Vec<PinSet>> {
 /// silently emitting *no* digest entries and a later check happily passing on
 /// an empty allow-list.
 pub fn load_anchors(json: &str) -> Result<AnchorSet> {
-    let set: AnchorSet =
-        serde_json::from_str(json).map_err(|e| AetherError::Other(format!("trust anchors: {e}")))?;
+    let set: AnchorSet = serde_json::from_str(json)
+        .map_err(|e| AetherError::Other(format!("trust anchors: {e}")))?;
     if set.version != ANCHOR_SCHEMA {
         return Err(AetherError::Other(format!(
             "unsupported trust anchor schema {} (expected {ANCHOR_SCHEMA})",
@@ -231,11 +231,7 @@ pub fn active_pins(sets: &[PinSet], now_unix: u64) -> Result<()> {
             }
         }
         // An expired pin is normal mid-rotation; *no* live pins is fatal.
-        let live = s
-            .pins
-            .iter()
-            .filter(|p| p.expires_unix > now_unix)
-            .count();
+        let live = s.pins.iter().filter(|p| p.expires_unix > now_unix).count();
         if live == 0 {
             return Err(AetherError::Tls(format!(
                 "every SPKI pin for host {} has expired (latest expiry {}); refresh {}",
@@ -303,9 +299,9 @@ pub fn file_sha256_hex(path: &std::path::Path) -> Result<String> {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf).map_err(|e| {
-            AetherError::Other(format!("read {} for digest: {e}", path.display()))
-        })?;
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| AetherError::Other(format!("read {} for digest: {e}", path.display())))?;
         if n == 0 {
             break;
         }
@@ -332,7 +328,10 @@ mod tests {
     #[test]
     fn empty_anchor_list_is_rejected() {
         let json = r#"{"version":1,"generated_unix":1,"files":[]}"#;
-        assert!(load_anchors(json).is_err(), "an empty allow-list must not pass");
+        assert!(
+            load_anchors(json).is_err(),
+            "an empty allow-list must not pass"
+        );
     }
 
     #[test]

@@ -225,7 +225,10 @@ mod tests {
         let gone = tokio::time::timeout(Duration::from_millis(200), watch_control(lines(b"")))
             .await
             .is_ok();
-        assert!(!gone, "an empty control pipe was treated as a shutdown request");
+        assert!(
+            !gone,
+            "an empty control pipe was treated as a shutdown request"
+        );
     }
 
     /// A handoff line followed by EOF is the real sequence a parent performs.

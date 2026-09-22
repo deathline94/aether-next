@@ -248,9 +248,8 @@ async fn send_resilient(
                 Ok(resp) => {
                     let status = resp.status();
                     if status.as_u16() == 429 || status.is_server_error() {
-                        let wait = retry_after(&resp).unwrap_or_else(|| {
-                            std::time::Duration::from_millis(500u64 << attempt)
-                        });
+                        let wait = retry_after(&resp)
+                            .unwrap_or_else(|| std::time::Duration::from_millis(500u64 << attempt));
                         // The header is server-supplied and this loop runs while the
                         // provision lock is held: an absurd `Retry-After` wedged
                         // provisioning with the UI parked on `identity` and every
@@ -293,7 +292,10 @@ async fn send_resilient(
 fn base_headers() -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE};
     let mut h = HeaderMap::new();
-    h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json; charset=UTF-8"));
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=UTF-8"),
+    );
     h.insert(CONNECTION, HeaderValue::from_static("Keep-Alive"));
     h.insert(
         "CF-Client-Version",
@@ -332,7 +334,11 @@ fn tos_timestamp() -> String {
         .to_string()
 }
 
-pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<(AccountData, [u8; 32])> {
+pub async fn register(
+    model: &str,
+    locale: &str,
+    jwt: Option<&str>,
+) -> Result<(AccountData, [u8; 32])> {
     let (wg_private, wg_public) = generate_x25519_keypair();
 
     let body = Registration {
@@ -374,7 +380,12 @@ pub async fn enroll_key(
         name: name.map(|s| s.to_string()),
     };
 
-    let url = format!("{}/{}/reg/{}", consts::API_URL, consts::API_VERSION, device_id);
+    let url = format!(
+        "{}/{}/reg/{}",
+        consts::API_URL,
+        consts::API_VERSION,
+        device_id
+    );
     let resp = send_resilient(|client| {
         client
             .patch(&url)
@@ -389,10 +400,15 @@ pub async fn enroll_key(
 
 async fn parse_account(resp: reqwest::Response) -> Result<AccountData> {
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| AetherError::Api(e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| AetherError::Api(e.to_string()))?;
 
     if !status.is_success() {
-        return Err(AetherError::Api(format!("upstream account API returned {status}")));
+        return Err(AetherError::Api(format!(
+            "upstream account API returned {status}"
+        )));
     }
     let acct = serde_json::from_str::<AccountData>(&text)
         .map_err(|e| AetherError::Api(format!("invalid account API response: {e}")))?;
@@ -400,7 +416,9 @@ async fn parse_account(resp: reqwest::Response) -> Result<AccountData> {
         if !p.endpoint.host.is_empty() || !p.endpoint.v4.is_empty() || !p.endpoint.v6.is_empty() {
             log::info!(
                 "[account] peer[{i}] endpoint host={:?} v4={:?} v6={:?}",
-                p.endpoint.host, p.endpoint.v4, p.endpoint.v6
+                p.endpoint.host,
+                p.endpoint.v4,
+                p.endpoint.v6
             );
         }
     }
@@ -433,12 +451,18 @@ pub async fn provision_wg(model: &str, locale: &str, jwt: Option<&str>) -> Resul
     let mut client_id_arr = [0u8; 3];
     if !reg.config.client_id.is_empty() {
         log::debug!("[account] received client_id from API");
-        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &reg.config.client_id) {
+        if let Ok(decoded) = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &reg.config.client_id,
+        ) {
             if decoded.len() == 3 {
                 client_id_arr.copy_from_slice(&decoded);
                 log::debug!("[account] decoded client_id: {:02x?}", client_id_arr);
             } else {
-                log::warn!("[account] client_id decoded but wrong length: {}", decoded.len());
+                log::warn!(
+                    "[account] client_id decoded but wrong length: {}",
+                    decoded.len()
+                );
             }
         } else {
             log::warn!("[account] failed to decode client_id base64");
@@ -474,8 +498,13 @@ pub async fn ensure_masque_enrolled(
 
     log::info!("[+] enrolling MASQUE key for device {}", identity.device_id);
     let keypair = generate_masque_keypair()?;
-    let acct =
-        enroll_key(&identity.device_id, &identity.access_token, &keypair.spki_der, None).await?;
+    let acct = enroll_key(
+        &identity.device_id,
+        &identity.access_token,
+        &keypair.spki_der,
+        None,
+    )
+    .await?;
     let endpoint = masque_endpoint_from(&acct);
     log::info!("[+] MASQUE key enrolled (endpoint={endpoint:?})");
     Ok((keypair.cert_pem, keypair.key_pem, endpoint))

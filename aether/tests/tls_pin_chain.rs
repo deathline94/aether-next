@@ -17,8 +17,8 @@ use boring::bn::BigNum;
 use boring::hash::MessageDigest;
 use boring::pkey::{PKey, Private};
 use boring::rsa::Rsa;
-use boring::x509::{X509, X509NameBuilder};
 use boring::x509::X509Builder;
+use boring::x509::{X509NameBuilder, X509};
 
 const HOST: &str = "api.cloudflareclient.com";
 const DAY: i64 = 86_400;
@@ -45,14 +45,10 @@ fn leaf(key: &PKey<Private>, not_before_days: i64, not_after_days: i64) -> X509 
     b.set_issuer_name(&name).expect("issuer");
     b.set_pubkey(key).expect("pubkey");
     let at = now() as i64;
-    b.set_not_before(
-        &Asn1Time::from_unix(at + not_before_days * DAY).expect("not-before asn1"),
-    )
-    .expect("not before");
-    b.set_not_after(
-        &Asn1Time::from_unix(at + not_after_days * DAY).expect("not-after asn1"),
-    )
-    .expect("not after");
+    b.set_not_before(&Asn1Time::from_unix(at + not_before_days * DAY).expect("not-before asn1"))
+        .expect("not before");
+    b.set_not_after(&Asn1Time::from_unix(at + not_after_days * DAY).expect("not-after asn1"))
+        .expect("not after");
     b.sign(key, MessageDigest::sha256()).expect("sign");
     b.build()
 }
@@ -161,7 +157,8 @@ fn a_pin_set_only_covers_the_host_it_is_recorded_under() {
     let mut builder =
         boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).expect("ctx");
     assert!(
-        aether::tls::install_pin_verification(&mut builder, std::slice::from_ref(&set), HOST).is_ok()
+        aether::tls::install_pin_verification(&mut builder, std::slice::from_ref(&set), HOST)
+            .is_ok()
     );
     assert!(
         aether::tls::install_pin_verification(

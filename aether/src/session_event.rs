@@ -105,8 +105,7 @@ pub fn emit(event: SessionEvent) {
 
 /// Emitted at most this often. Below the shell's 15 s stall threshold so three
 /// consecutive misses is unambiguous rather than a scheduling hiccup.
-pub const HEARTBEAT_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(5);
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Coarse session progress, reported with every heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,7 +266,12 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), labels.len(), "phase labels must be distinct");
         // Round-trips through the atomic encoding the heartbeat task reads.
-        for p in [Phase::Starting, Phase::Scan, Phase::Handshake, Phase::Tunnel] {
+        for p in [
+            Phase::Starting,
+            Phase::Scan,
+            Phase::Handshake,
+            Phase::Tunnel,
+        ] {
             super::set_phase(p);
             assert_eq!(super::current_phase(), p);
         }

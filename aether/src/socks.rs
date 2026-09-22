@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use parking_lot::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -100,7 +100,9 @@ fn evict_lru(cache: &mut DnsCache) {
     if cache.map.len() <= DNS_CACHE_MAX {
         return;
     }
-    cache.map.retain(|_, (_, first, _)| first.elapsed() < DNS_CACHE_TTL);
+    cache
+        .map
+        .retain(|_, (_, first, _)| first.elapsed() < DNS_CACHE_TTL);
     let target = DNS_CACHE_MAX - DNS_CACHE_MAX / 4;
     if cache.map.len() <= target {
         return;
@@ -272,18 +274,17 @@ pub const SOCKS_GREETING_REFUSAL: [u8; 2] = [VER, AUTH_NO_ACCEPTABLE];
 
 async fn refuse_over_capacity(mut sock: TcpStream) -> Result<()> {
     // Bound the write: a client that never reads must not pin a task.
-    let wrote = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        async move {
-            sock.write_all(&SOCKS_GREETING_REFUSAL).await?;
-            sock.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        },
-    )
+    let wrote = tokio::time::timeout(HANDSHAKE_TIMEOUT, async move {
+        sock.write_all(&SOCKS_GREETING_REFUSAL).await?;
+        sock.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    })
     .await;
     match wrote {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AetherError::Other(format!("socks refusal write failed: {e}"))),
+        Ok(Err(e)) => Err(AetherError::Other(format!(
+            "socks refusal write failed: {e}"
+        ))),
         Err(_) => Err(AetherError::Other("socks refusal write timed out".into())),
     }
 }
@@ -293,10 +294,14 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
         handshake(&mut sock).await?;
         let mut head = [0u8; 4];
         sock.read_exact(&mut head).await?;
-        if head[0] != VER { return Err(AetherError::Other("bad socks version".into())); }
+        if head[0] != VER {
+            return Err(AetherError::Other("bad socks version".into()));
+        }
         let (target, port) = read_target(&mut sock, head[3]).await?;
         Ok::<_, AetherError>((head[1], target, port))
-    }).await.map_err(|_| AetherError::Other("SOCKS handshake timeout".into()))??;
+    })
+    .await
+    .map_err(|_| AetherError::Other("SOCKS handshake timeout".into()))??;
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
@@ -833,7 +838,9 @@ async fn handle_connect(
 
     if ip.is_ipv6() && is_ipv4_only() {
         let _ = reply(&mut sock, REP_ATYP_NOT_SUPPORTED).await;
-        return Err(AetherError::Other("IPv6 target rejected in IPv4-only mode".into()));
+        return Err(AetherError::Other(
+            "IPv6 target rejected in IPv4-only mode".into(),
+        ));
     }
 
     let dst = SocketAddr::new(ip, port);
@@ -861,7 +868,9 @@ async fn handle_connect(
     // Report the address the client is actually talking to. `0.0.0.0:0` is a
     // placeholder clients that read BND.ADDR (some UDP-over-SOCKS stacks) take
     // literally and then fail to send.
-    let bound = sock.local_addr().unwrap_or_else(|_| ([0, 0, 0, 0], 0).into());
+    let bound = sock
+        .local_addr()
+        .unwrap_or_else(|_| ([0, 0, 0, 0], 0).into());
     reply_bound(&mut sock, bound).await?;
 
     let (sender, mut from_stack) = conn.into_split();
@@ -977,9 +986,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                         let mut map = resolver_routes.lock();
                         note_origin(&mut map, dst, from);
                     }
-                    let _ = resolver_sender
-                        .send_to(dst, payload)
-                        .await;
+                    let _ = resolver_sender.send_to(dst, payload).await;
                 }
                 _ => log::debug!("[socks-udp] resolve failed for {name}; dropping datagram"),
             }
@@ -1126,7 +1133,11 @@ fn parse_udp_request(buf: &[u8]) -> Option<(Target, (u16, Vec<u8>))> {
 /// Record that the client just talked to `dst`, so replies may come back, and
 /// keep the table bounded by age rather than by wiping every flow at once
 /// (`clear()` dropped thousands of live origins on a burst).
-pub fn note_origin(map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>, dst: SocketAddr, from: SocketAddr) {
+pub fn note_origin(
+    map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>,
+    dst: SocketAddr,
+    from: SocketAddr,
+) {
     note_origin_at(map, dst, from, Instant::now());
 }
 
@@ -1150,10 +1161,7 @@ pub fn note_origin_at(
 /// behaviour was `map.clear()` at the cap, which dropped *every* live origin at
 /// once so the next reply had nowhere to go and an attacker's unsolicited source
 /// was just as good as a real one.
-pub fn evict_origins(
-    map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>,
-    now: Instant,
-) -> usize {
+pub fn evict_origins(map: &mut HashMap<SocketAddr, (SocketAddr, Instant)>, now: Instant) -> usize {
     let before = map.len();
     map.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < UDP_ORIGIN_TTL);
     if map.len() <= UDP_ORIGIN_MAX {
@@ -1225,8 +1233,8 @@ mod tests {
         association_expired, build_dns_query, check_listener_bind, decode_qname, evict_lru,
         note_origin, parse_dns_answer_id, parse_domain_name, parse_udp_request, proxy_credentials,
         secret_eq, select_auth_method, session_cap_message, DnsCache, AUTH_NONE,
-        AUTH_NO_ACCEPTABLE, AUTH_USERPASS, DNS_CACHE_MAX, MAX_SESSION,
-        SOCKS_GREETING_REFUSAL, UDP_ASSOC_IDLE, UDP_ASSOC_TICK, UDP_ORIGIN_MAX, VER,
+        AUTH_NO_ACCEPTABLE, AUTH_USERPASS, DNS_CACHE_MAX, MAX_SESSION, SOCKS_GREETING_REFUSAL,
+        UDP_ASSOC_IDLE, UDP_ASSOC_TICK, UDP_ORIGIN_MAX, VER,
     };
     use std::{
         collections::HashMap,
@@ -1341,7 +1349,10 @@ mod tests {
         crate::runtime_env::remove("AETHER_PROXY_USER");
         crate::runtime_env::remove("AETHER_PROXY_PASS");
         assert!(proxy_credentials().is_none());
-        assert!(check_listener_bind(loopback).is_ok(), "loopback must stay usable");
+        assert!(
+            check_listener_bind(loopback).is_ok(),
+            "loopback must stay usable"
+        );
         let err = check_listener_bind(public)
             .expect_err("a routable listener with no credentials must be refused");
         assert!(
@@ -1365,7 +1376,10 @@ mod tests {
         assert_eq!(SOCKS_GREETING_REFUSAL, [VER, AUTH_NO_ACCEPTABLE]);
         let msg = session_cap_message("socks", MAX_SESSION);
         assert!(msg.contains("maximum session length"), "{msg}");
-        assert!(msg.contains("4h"), "the limit must be stated in hours: {msg}");
+        assert!(
+            msg.contains("4h"),
+            "the limit must be stated in hours: {msg}"
+        );
         assert!(msg.contains("Reconnect"), "and the remedy: {msg}");
         assert!(msg.contains("socks"));
     }
@@ -1425,13 +1439,19 @@ mod tests {
     #[test]
     fn decodes_compressed_qname() {
         let mut buf = vec![0u8; 12];
-        buf.extend_from_slice(&[3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0]);
+        buf.extend_from_slice(&[
+            3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+            0,
+        ]);
         // Pointer from elsewhere back to offset 12.
         let with_ptr = [0xc0, 0x0c];
         let mut full = buf.clone();
         full.extend_from_slice(&with_ptr);
         assert_eq!(decode_qname(&full, 12).as_deref(), Some("www.example.com"));
-        assert_eq!(decode_qname(&full, full.len() - 2).as_deref(), Some("www.example.com"));
+        assert_eq!(
+            decode_qname(&full, full.len() - 2).as_deref(),
+            Some("www.example.com")
+        );
     }
 
     /// `clear()` at the cap wiped every live origin at once, so an in-flight
@@ -1439,9 +1459,8 @@ mod tests {
     #[test]
     fn origin_table_ages_out_instead_of_wiping_every_flow() {
         let client = SocketAddr::from(([127, 0, 0, 1], 5150));
-        let peer = |i: usize| {
-            SocketAddr::new(IpAddr::from([1, 2, (i / 251) as u8, (i % 251) as u8]), 443)
-        };
+        let peer =
+            |i: usize| SocketAddr::new(IpAddr::from([1, 2, (i / 251) as u8, (i % 251) as u8]), 443);
         let mut map: HashMap<SocketAddr, (SocketAddr, Instant)> = HashMap::new();
         for i in 0..UDP_ORIGIN_MAX + 500 {
             map.insert(peer(i), (client, Instant::now()));
@@ -1513,7 +1532,9 @@ mod tests {
     fn dns_cache_evicts_least_recently_used() {
         let base = Instant::now();
         let addr = IpAddr::from([93, 184, 216, 34]);
-        let mut cache = DnsCache { map: HashMap::new() };
+        let mut cache = DnsCache {
+            map: HashMap::new(),
+        };
         for i in 0..DNS_CACHE_MAX + 100 {
             let first = base - Duration::from_secs(5);
             // Higher index == touched more recently; key 0 is stale by 10 s.
@@ -1522,7 +1543,9 @@ mod tests {
             } else {
                 base + Duration::from_micros(i as u64)
             };
-            cache.map.insert(format!("host{i}.example.com"), (addr, first, used));
+            cache
+                .map
+                .insert(format!("host{i}.example.com"), (addr, first, used));
         }
         assert!(cache.map.len() > DNS_CACHE_MAX);
         evict_lru(&mut cache);
@@ -1535,6 +1558,8 @@ mod tests {
             !cache.map.contains_key("host0.example.com"),
             "eviction must remove the least-recently-used entry first"
         );
-        assert!(cache.map.contains_key(&format!("host{DNS_CACHE_MAX}.example.com")));
+        assert!(cache
+            .map
+            .contains_key(&format!("host{DNS_CACHE_MAX}.example.com")));
     }
 }

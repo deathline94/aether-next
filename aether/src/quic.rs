@@ -191,15 +191,19 @@ async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
-    use socket2::{Socket, Domain, Type};
-    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    use socket2::{Domain, Socket, Type};
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
-    
+
     let buf_size = 7 * 1024 * 1024; // 7MB
     let _ = sock.set_recv_buffer_size(buf_size);
     let _ = sock.set_send_buffer_size(buf_size);
-    
+
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
@@ -253,12 +257,7 @@ pub struct Internals {
 }
 
 impl Internals {
-    pub fn into_parts(
-        self,
-    ) -> (
-        mpsc::Receiver<Vec<u8>>,
-        mpsc::Sender<Vec<u8>>,
-    ) {
+    pub fn into_parts(self) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
         (self.outbound_rx, self.inbound_tx)
     }
 }
@@ -275,7 +274,9 @@ struct ReaderGuard {
 
 impl ReaderGuard {
     fn new() -> Self {
-        Self { handles: Vec::new() }
+        Self {
+            handles: Vec::new(),
+        }
     }
     fn push(&mut self, h: tokio::task::JoinHandle<()>) {
         self.handles.push(h);
@@ -387,7 +388,11 @@ pub async fn send_version_bait(sock: &UdpSocket, target: SocketAddr, wait: Durat
     }
 }
 
-fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPacket>) -> tokio::task::JoinHandle<()> {
+fn spawn_reader(
+    sock: Arc<UdpSocket>,
+    local: SocketAddr,
+    tx: mpsc::Sender<NetPacket>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -397,7 +402,7 @@ fn spawn_reader(sock: Arc<UdpSocket>, local: SocketAddr, tx: mpsc::Sender<NetPac
                     if tx.send((local, from, buf[..n].to_vec())).await.is_err() {
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     log::debug!("recv error: {e}");
                     break;
@@ -716,7 +721,10 @@ pub async fn run(
                     let dgram = h3c.dgram_enabled_by_peer(&conn);
                     let ext = h3c.extended_connect_enabled_by_peer();
                     dgram_by_peer = dgram;
-                    h3_stage("h3_settings", &format!("dgram_by_peer={dgram} ext_connect={ext}"));
+                    h3_stage(
+                        "h3_settings",
+                        &format!("dgram_by_peer={dgram} ext_connect={ext}"),
+                    );
                     h3_settings_logged = true;
                 }
             }
@@ -737,7 +745,10 @@ pub async fn run(
             let may_probe = addr_assigned || grace_elapsed;
             if may_probe && last_probe.elapsed() >= Duration::from_millis(700) {
                 if let (Some(sid), Some(h3c)) = (req_stream, h3_conn.as_mut()) {
-                    let probe = crate::dns::build_dataplane_probe(probe_src, crate::dns::dataplane_probe_target());
+                    let probe = crate::dns::build_dataplane_probe(
+                        probe_src,
+                        crate::dns::dataplane_probe_target(),
+                    );
                     let use_capsule = h3_dgram_mode.use_capsule(dgram_by_peer);
                     send_ip_h3(&mut conn, h3c, sid, &probe, use_capsule);
                 }
@@ -929,12 +940,15 @@ fn poll_h3(
                         h3_stage("connect_ip_status", &format!("code={status}"));
                         match classify_status(stream_id, req_stream, &status) {
                             StatusAction::Ignore => {
-                                let n =
-                                    crate::counters::bump(&crate::counters::IGNORED_OFFSTREAM_STATUS);
+                                let n = crate::counters::bump(
+                                    &crate::counters::IGNORED_OFFSTREAM_STATUS,
+                                );
                                 log::debug!("[h3] ignoring :status {status} on stream {stream_id} (count {n})");
                             }
                             StatusAction::Interim => {
-                                log::info!("[h3] interim {status} on the request stream; awaiting final");
+                                log::info!(
+                                    "[h3] interim {status} on the request stream; awaiting final"
+                                );
                             }
                             StatusAction::Ready => {
                                 if *h3_ready {
@@ -995,7 +1009,6 @@ fn poll_h3(
     Ok(())
 }
 
-
 fn drain_capsules(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
@@ -1029,7 +1042,10 @@ fn drain_capsules(
                 for r in &routes {
                     log::info!(
                         "route advertisement: v{} proto {} {:?}-{:?}",
-                        r.ip_version, r.protocol, r.start, r.end
+                        r.ip_version,
+                        r.protocol,
+                        r.start,
+                        r.end
                     );
                 }
             }
@@ -1043,7 +1059,9 @@ fn drain_capsules(
                 if inbound_tx.try_send(payload).is_err() {
                     let n = crate::counters::bump(&crate::counters::INBOUND_DROPPED);
                     if n == 1 || n.is_multiple_of(1000) {
-                        log::warn!("[h3] dropped inbound capsule datagram (count {n}): queue saturated");
+                        log::warn!(
+                            "[h3] dropped inbound capsule datagram (count {n}): queue saturated"
+                        );
                     }
                 }
             }
@@ -1059,9 +1077,7 @@ fn drain_capsules(
 
 fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
     match version {
-        4 if bytes.len() == 4 => {
-            Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into()))
-        }
+        4 if bytes.len() == 4 => Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into())),
         6 if bytes.len() == 16 => {
             let mut b = [0u8; 16];
             b.copy_from_slice(bytes);
@@ -1453,7 +1469,9 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                     "verify timeout (no UDP reply — QUIC may be filtered)".into(),
                 ));
             }
-            return Err(AetherError::Other("verify timeout (UDP ok, no connect-ip 200)".into()));
+            return Err(AetherError::Other(
+                "verify timeout (UDP ok, no connect-ip 200)".into(),
+            ));
         }
 
         // Fast-fail filtered / black-holed ports: a QUIC Initial that draws no UDP
@@ -1547,115 +1565,121 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                         return Err(AetherError::Other(reason))
                                     }
                                     ProbeStatus::Ready => {
-                                    // Control-plane OK. Now verify data-plane:
-                                    // send 1 DNS probe through the datagram channel.
-                                    // Fast-path: 1 round-trip is enough during scan.
-                                    let probe_pkt = crate::dns::build_dataplane_probe(
-                                        p.local_ipv4,
-                                        crate::dns::dataplane_probe_target(),
-                                    );
-                                    let use_capsule = crate::masque::H3DgramMode::from_env()
-                                        .use_capsule(h3c.dgram_enabled_by_peer(&conn));
-                                    let mut dp_capsules = CapsuleParser::new();
-                                    let mut dp_body = vec![0u8; 65535];
-                                    send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
-                                    flush_to(&mut conn, &sock, p.peer).await?;
-                                    // Wait for data-plane reply (up to 3.5s).
-                                    let dp_deadline = Instant::now() + Duration::from_millis(3500).min(remaining(deadline));
-                                    let mut dp_successes: u32 = 0;
-                                    // Hoisted: this buffer was being reallocated
-                                    // for every received datagram inside the loop.
-                                    let mut dgram_buf = vec![0u8; 65535];
-                                    loop {
-                                        if Instant::now() >= dp_deadline {
-                                            // Data-plane timeout — endpoint accepts control but drops traffic.
-                                            return Err(AetherError::Other(
-                                                "data-plane probe timeout (200 ok, no traffic)".into(),
-                                            ));
-                                        }
-                                        let dp_wait = dp_deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(200));
-                                        tokio::select! {
-                                            r = sock.recv_from(&mut buf) => {
-                                                if let Ok((n, from)) = r {
-                                                    let info = quiche::RecvInfo { from, to: local };
-                                                    let _ = conn.recv(&mut buf[..n], info);
-                                                    // Check for a QUIC DATAGRAM reply.
-                                                    let mut got_reply = false;
-                                                    loop {
-                                                        match conn.dgram_recv(&mut dgram_buf) {
-                                                            Ok(dn) => {
-                                                                // The same predicate the tunnel applies before
-                                                                // marking its data plane up: an inner packet the
-                                                                // edge could not have forwarded — an ICMP error,
-                                                                // or our own probe echoed back — is not proof.
-                                                                if let Ok(Some(ip)) =
-                                                                    masque::decode_ip_datagram(&dgram_buf[..dn], sid)
-                                                                {
-                                                                    if is_forwardable_ip_packet(&ip) {
-                                                                        if trace {
-                                                                            h3_stage("inbound_datagram", "quic datagram confirmed");
-                                                                        }
-                                                                        got_reply = true;
-                                                                        break;
-                                                                    }
-                                                                    log::debug!("[h3] probe: ignoring a datagram that is not forwardable traffic");
-                                                                }
-                                                            }
-                                                            Err(quiche::Error::Done) => break,
-                                                            Err(_) => break,
-                                                        }
-                                                    }
-                                                    // Also accept a DATAGRAM capsule on the stream (RFC 9297 fallback).
-                                                    if !got_reply {
+                                        // Control-plane OK. Now verify data-plane:
+                                        // send 1 DNS probe through the datagram channel.
+                                        // Fast-path: 1 round-trip is enough during scan.
+                                        let probe_pkt = crate::dns::build_dataplane_probe(
+                                            p.local_ipv4,
+                                            crate::dns::dataplane_probe_target(),
+                                        );
+                                        let use_capsule = crate::masque::H3DgramMode::from_env()
+                                            .use_capsule(h3c.dgram_enabled_by_peer(&conn));
+                                        let mut dp_capsules = CapsuleParser::new();
+                                        let mut dp_body = vec![0u8; 65535];
+                                        send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
+                                        flush_to(&mut conn, &sock, p.peer).await?;
+                                        // Wait for data-plane reply (up to 3.5s).
+                                        let dp_deadline = Instant::now()
+                                            + Duration::from_millis(3500).min(remaining(deadline));
+                                        let mut dp_successes: u32 = 0;
+                                        // Hoisted: this buffer was being reallocated
+                                        // for every received datagram inside the loop.
+                                        let mut dgram_buf = vec![0u8; 65535];
+                                        loop {
+                                            if Instant::now() >= dp_deadline {
+                                                // Data-plane timeout — endpoint accepts control but drops traffic.
+                                                return Err(AetherError::Other(
+                                                    "data-plane probe timeout (200 ok, no traffic)"
+                                                        .into(),
+                                                ));
+                                            }
+                                            let dp_wait = dp_deadline
+                                                .saturating_duration_since(Instant::now())
+                                                .min(Duration::from_millis(200));
+                                            tokio::select! {
+                                                r = sock.recv_from(&mut buf) => {
+                                                    if let Ok((n, from)) = r {
+                                                        let info = quiche::RecvInfo { from, to: local };
+                                                        let _ = conn.recv(&mut buf[..n], info);
+                                                        // Check for a QUIC DATAGRAM reply.
+                                                        let mut got_reply = false;
                                                         loop {
-                                                            match h3c.poll(&mut conn) {
-                                                                Ok((s, h3::Event::Data)) if s == sid => {
-                                                                    while let Ok(bn) = h3c.recv_body(&mut conn, sid, &mut dp_body) {
-                                                                        if bn == 0 { break; }
-                                                                        dp_capsules.push(&dp_body[..bn]);
+                                                            match conn.dgram_recv(&mut dgram_buf) {
+                                                                Ok(dn) => {
+                                                                    // The same predicate the tunnel applies before
+                                                                    // marking its data plane up: an inner packet the
+                                                                    // edge could not have forwarded — an ICMP error,
+                                                                    // or our own probe echoed back — is not proof.
+                                                                    if let Ok(Some(ip)) =
+                                                                        masque::decode_ip_datagram(&dgram_buf[..dn], sid)
+                                                                    {
+                                                                        if is_forwardable_ip_packet(&ip) {
+                                                                            if trace {
+                                                                                h3_stage("inbound_datagram", "quic datagram confirmed");
+                                                                            }
+                                                                            got_reply = true;
+                                                                            break;
+                                                                        }
+                                                                        log::debug!("[h3] probe: ignoring a datagram that is not forwardable traffic");
                                                                     }
                                                                 }
-                                                                Ok(_) => {}
+                                                                Err(quiche::Error::Done) => break,
                                                                 Err(_) => break,
                                                             }
                                                         }
-                                                        loop {
-                                                            match dp_capsules.next() {
-                                                                Ok(Some(masque::Capsule::Datagram(pkt))) => {
-                                                                    if is_forwardable_ip_packet(&pkt) {
-                                                                        if trace {
-                                                                            h3_stage("inbound_datagram", "capsule datagram confirmed");
+                                                        // Also accept a DATAGRAM capsule on the stream (RFC 9297 fallback).
+                                                        if !got_reply {
+                                                            loop {
+                                                                match h3c.poll(&mut conn) {
+                                                                    Ok((s, h3::Event::Data)) if s == sid => {
+                                                                        while let Ok(bn) = h3c.recv_body(&mut conn, sid, &mut dp_body) {
+                                                                            if bn == 0 { break; }
+                                                                            dp_capsules.push(&dp_body[..bn]);
                                                                         }
-                                                                        got_reply = true;
-                                                                        break;
                                                                     }
-                                                                    log::debug!("[h3] probe: ignoring a capsule that is not forwardable traffic");
+                                                                    Ok(_) => {}
+                                                                    Err(_) => break,
                                                                 }
-                                                                Ok(Some(_)) => {}
-                                                                Ok(None) | Err(_) => break,
+                                                            }
+                                                            loop {
+                                                                match dp_capsules.next() {
+                                                                    Ok(Some(masque::Capsule::Datagram(pkt))) => {
+                                                                        if is_forwardable_ip_packet(&pkt) {
+                                                                            if trace {
+                                                                                h3_stage("inbound_datagram", "capsule datagram confirmed");
+                                                                            }
+                                                                            got_reply = true;
+                                                                            break;
+                                                                        }
+                                                                        log::debug!("[h3] probe: ignoring a capsule that is not forwardable traffic");
+                                                                    }
+                                                                    Ok(Some(_)) => {}
+                                                                    Ok(None) | Err(_) => break,
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    if got_reply {
-                                                        dp_successes += 1;
-                                                        if dp_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
-                                                            return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
+                                                        if got_reply {
+                                                            dp_successes += 1;
+                                                            if dp_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
+                                                                return Ok(handshake_rtt.unwrap_or_else(|| start.elapsed()));
+                                                            }
+                                                            send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
                                                         }
-                                                        send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
                                                     }
                                                 }
+                                                _ = tokio::time::sleep(dp_wait) => {
+                                                    conn.on_timeout();
+                                                    // Resend probe.
+                                                    send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
+                                                }
                                             }
-                                            _ = tokio::time::sleep(dp_wait) => {
-                                                conn.on_timeout();
-                                                // Resend probe.
-                                                send_ip_h3(&mut conn, h3c, sid, &probe_pkt, use_capsule);
+                                            flush_to(&mut conn, &sock, p.peer).await?;
+                                            if conn.is_closed() {
+                                                return Err(AetherError::Other(
+                                                    "closed during data-plane probe".into(),
+                                                ));
                                             }
                                         }
-                                        flush_to(&mut conn, &sock, p.peer).await?;
-                                        if conn.is_closed() {
-                                            return Err(AetherError::Other("closed during data-plane probe".into()));
-                                        }
-                                    }
                                     }
                                 }
                             }
@@ -1669,7 +1693,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
             if trace && !settings_logged && h3c.peer_settings_raw().is_some() {
                 let dg = h3c.dgram_enabled_by_peer(&conn);
                 let ext = h3c.extended_connect_enabled_by_peer();
-                h3_stage("h3_settings", &format!("dgram_by_peer={dg} ext_connect={ext}"));
+                h3_stage(
+                    "h3_settings",
+                    &format!("dgram_by_peer={dg} ext_connect={ext}"),
+                );
                 settings_logged = true;
             }
         }
@@ -1679,12 +1706,22 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         if conn.is_closed() {
             let mut reason = String::new();
             if let Some(local_err) = conn.local_error() {
-                reason.push_str(&format!("local_error: {:?} (code {}) ", local_err.reason, local_err.error_code));
+                reason.push_str(&format!(
+                    "local_error: {:?} (code {}) ",
+                    local_err.reason, local_err.error_code
+                ));
             }
             if let Some(peer_err) = conn.peer_error() {
-                reason.push_str(&format!("peer_error: {:?} (code {}) ", peer_err.reason, peer_err.error_code));
+                reason.push_str(&format!(
+                    "peer_error: {:?} (code {}) ",
+                    peer_err.reason, peer_err.error_code
+                ));
             }
-            log::debug!("probe {} -> other: closed before 200, reason: {}", p.peer, reason);
+            log::debug!(
+                "probe {} -> other: closed before 200, reason: {}",
+                p.peer,
+                reason
+            );
             return Err(AetherError::Other(format!("closed before 200: {reason}")));
         }
     }
@@ -1739,11 +1776,7 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-async fn flush_to(
-    conn: &mut quiche::Connection,
-    sock: &UdpSocket,
-    peer: SocketAddr,
-) -> Result<()> {
+async fn flush_to(conn: &mut quiche::Connection, sock: &UdpSocket, peer: SocketAddr) -> Result<()> {
     // Fixed size, so the datagram buffer is a stack array rather than a
     // per-call heap allocation on the probe path.
     let mut out = [0u8; MAX_DATAGRAM_SIZE];
@@ -1850,8 +1883,10 @@ mod tests {
     fn data_plane_proof_rejects_icmp_errors_and_accepts_replies() {
         // A real 20-byte IPv4 header: proto at offset 9, src 12..16, dst 16..20.
         fn ipv4(proto: u8) -> Vec<u8> {
-            let h = vec![0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00, 64, proto, 0x00, 0x00,
-                             1, 1, 1, 1, 2, 2, 2, 2];
+            let h = vec![
+                0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00, 64, proto, 0x00, 0x00, 1, 1, 1, 1,
+                2, 2, 2, 2,
+            ];
             assert_eq!(h[9], proto);
             h
         }
@@ -1894,7 +1929,10 @@ mod tests {
             resolve_h3_sni_from(Some("   ".into()), Some("b.example".into())),
             "b.example"
         );
-        assert_eq!(resolve_h3_sni_from(Some(String::new()), None), consts::CONNECT_SNI);
+        assert_eq!(
+            resolve_h3_sni_from(Some(String::new()), None),
+            consts::CONNECT_SNI
+        );
     }
 
     #[test]

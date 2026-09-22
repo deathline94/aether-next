@@ -33,7 +33,10 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// authenticating a certificate years after it expired, and an edge that
 /// presented a *not-yet-valid* leaf (clock skew, misprovisioned deployment) was
 /// accepted just as happily.
-fn leaf_is_temporally_valid(leaf: &boring::x509::X509Ref, now_unix: u64) -> std::result::Result<(), String> {
+fn leaf_is_temporally_valid(
+    leaf: &boring::x509::X509Ref,
+    now_unix: u64,
+) -> std::result::Result<(), String> {
     use boring::asn1::Asn1Time;
     // `time_t` is 64-bit on the desktop ABIs and 32-bit on the 32-bit Android
     // ones, so the conversion must follow the target instead of naming a width
@@ -208,8 +211,8 @@ pub struct TlsParams<'a> {
 }
 
 pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
-    let mut builder = SslContextBuilder::new(SslMethod::tls())
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
 
     builder
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -232,7 +235,11 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
     let _ = builder.set_cipher_list(cipher_sets[idx]);
 
     let groups = crate::runtime_env::var("AETHER_TLS_GROUPS");
-    let groups = groups.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(CHROME_GROUPS);
+    let groups = groups
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CHROME_GROUPS);
     builder
         .set_curves_list(groups)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -245,8 +252,8 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     let cert = X509::from_pem(params.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
-    let key = PKey::private_key_from_pem(params.key_pem)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    let key =
+        PKey::private_key_from_pem(params.key_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
         .set_certificate(&cert)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -321,7 +328,9 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
             config.set_initial_crypto_fragment(frag);
             static FRAG_LOG: std::sync::Once = std::sync::Once::new();
             FRAG_LOG.call_once(|| {
-                log::info!("[tls] QUIC Initial fragmentation ON: first CRYPTO fragment = {frag} bytes");
+                log::info!(
+                    "[tls] QUIC Initial fragmentation ON: first CRYPTO fragment = {frag} bytes"
+                );
             });
         }
     }

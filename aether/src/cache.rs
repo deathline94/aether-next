@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AetherError, Result};
 
@@ -430,7 +430,12 @@ impl ProvisionGuard {
             .create(true)
             .truncate(false)
             .open(lock_file_path)
-            .map_err(|e| AetherError::Other(format!("open provision lock {}: {e}", lock_file_path.display())))?;
+            .map_err(|e| {
+                AetherError::Other(format!(
+                    "open provision lock {}: {e}",
+                    lock_file_path.display()
+                ))
+            })?;
 
         loop {
             match file.try_lock_exclusive() {
@@ -439,19 +444,31 @@ impl ProvisionGuard {
                     let mut f = &file;
                     f.seek(SeekFrom::Start(0)).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!("seek provision lock {}: {e}", lock_file_path.display()))
+                        AetherError::Other(format!(
+                            "seek provision lock {}: {e}",
+                            lock_file_path.display()
+                        ))
                     })?;
                     f.set_len(0).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!("truncate provision lock {}: {e}", lock_file_path.display()))
+                        AetherError::Other(format!(
+                            "truncate provision lock {}: {e}",
+                            lock_file_path.display()
+                        ))
                     })?;
                     writeln!(f, "pid={}", std::process::id()).map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!("write pid to provision lock {}: {e}", lock_file_path.display()))
+                        AetherError::Other(format!(
+                            "write pid to provision lock {}: {e}",
+                            lock_file_path.display()
+                        ))
                     })?;
                     f.flush().map_err(|e| {
                         let _ = file.unlock();
-                        AetherError::Other(format!("flush provision lock {}: {e}", lock_file_path.display()))
+                        AetherError::Other(format!(
+                            "flush provision lock {}: {e}",
+                            lock_file_path.display()
+                        ))
                     })?;
 
                     // Also write unlocked companion owner file for non-blocking diagnostics
@@ -748,7 +765,10 @@ pub fn add_to_masque_with_rtt(
 }
 
 /// Cached masque endpoints that were measured over `transport`, best first.
-pub fn get_masque_sorted_for(base_config: &str, transport: TransportKind) -> Vec<(SocketAddr, u32)> {
+pub fn get_masque_sorted_for(
+    base_config: &str,
+    transport: TransportKind,
+) -> Vec<(SocketAddr, u32)> {
     let mut eps = load_endpoints(base_config).masque;
     eps.retain(|e| e.transport == transport);
     // The connect path compares against handshake numbers.
@@ -766,13 +786,21 @@ pub fn add_to_wireguard_with_rtt(
     measurement: Measurement,
 ) -> Mutation {
     with_cache_nowait(base_config, move |cache| {
-        upsert(&mut cache.wireguard, endpoints, TransportKind::default(), measurement)
+        upsert(
+            &mut cache.wireguard,
+            endpoints,
+            TransportKind::default(),
+            measurement,
+        )
     })
 }
 
 /// Cached wireguard endpoints sorted by trust score (highest first).
 pub fn get_wireguard_sorted(base_config: &str) -> Vec<(SocketAddr, u32)> {
-    sorted(load_endpoints(base_config).wireguard, Measurement::HandshakeProbe)
+    sorted(
+        load_endpoints(base_config).wireguard,
+        Measurement::HandshakeProbe,
+    )
 }
 
 fn sorted(mut eps: Vec<CachedEndpoint>, expected: Measurement) -> Vec<(SocketAddr, u32)> {
@@ -787,7 +815,11 @@ fn sorted(mut eps: Vec<CachedEndpoint>, expected: Measurement) -> Vec<(SocketAdd
 /// Record a successful connection. Upserts: an endpoint reached via the
 /// enroll/anycast fallback (never a scan hit) still accrues trust.
 pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) -> Mutation {
-    let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
+    let transport = if is_masque {
+        active_masque_transport()
+    } else {
+        TransportKind::default()
+    };
     with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
@@ -804,7 +836,10 @@ fn record_success_on(
     transport: TransportKind,
     now: u64,
 ) {
-    if let Some(ep) = list.iter_mut().find(|e| e.addr == addr && e.transport == transport) {
+    if let Some(ep) = list
+        .iter_mut()
+        .find(|e| e.addr == addr && e.transport == transport)
+    {
         ep.successes = ep.successes.saturating_add(1);
         ep.consecutive_failures = 0;
         ep.timestamp = now;
@@ -837,7 +872,11 @@ fn record_success_on(
 /// so a gateway that had never once failed over the transport in use was deleted
 /// after three failures of a transport we were not even using.
 pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) -> Mutation {
-    let transport = if is_masque { active_masque_transport() } else { TransportKind::default() };
+    let transport = if is_masque {
+        active_masque_transport()
+    } else {
+        TransportKind::default()
+    };
     with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
@@ -854,7 +893,10 @@ fn record_failure_on(
     transport: TransportKind,
     now: u64,
 ) {
-    if let Some(idx) = list.iter().position(|e| e.addr == addr && e.transport == transport) {
+    if let Some(idx) = list
+        .iter()
+        .position(|e| e.addr == addr && e.transport == transport)
+    {
         list[idx].failures = list[idx].failures.saturating_add(1);
         list[idx].consecutive_failures = list[idx].consecutive_failures.saturating_add(1);
         list[idx].timestamp = now;
@@ -886,7 +928,8 @@ mod tests {
     /// never failed over the transport the tunnel was actually using.
     #[test]
     fn a_failure_over_one_transport_cannot_evict_the_other() {
-        let dir = std::env::temp_dir().join(format!("aether_cache_transport_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aether_cache_transport_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("aether.toml").to_string_lossy().to_string();
@@ -1011,7 +1054,10 @@ mod tests {
         assert_eq!(r.clamped_counters, 1);
         assert_eq!(r.implausible_rtt, 1);
         assert_eq!(clamped[0].successes, MAX_SUCCESSES);
-        assert_eq!(clamped[0].rtt_ms, 0, "an impossible rtt must not earn points");
+        assert_eq!(
+            clamped[0].rtt_ms, 0,
+            "an impossible rtt must not earn points"
+        );
     }
 
     /// The old private copy of this rule looked only at `is_loopback` (`::1`),
@@ -1133,7 +1179,10 @@ mod tests {
 
         let cache = load_endpoints(&base);
         assert!(cache.masque.is_empty());
-        assert!(path.exists(), "a read must not rename or delete the cache file");
+        assert!(
+            path.exists(),
+            "a read must not rename or delete the cache file"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "{ not json at all",
@@ -1154,7 +1203,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let base = dir.join("aether.toml").to_string_lossy().to_string();
-        add_to_masque_with_rtt(&base, vec![("93.184.216.34:443".parse().unwrap(), 42)], Measurement::default());
+        add_to_masque_with_rtt(
+            &base,
+            vec![("93.184.216.34:443".parse().unwrap(), 42)],
+            Measurement::default(),
+        );
         let written = std::fs::read_to_string(cache_path(&base)).unwrap();
         let doc: EndpointsCache = serde_json::from_str(&written).unwrap();
         assert_eq!(doc.version, CACHE_VERSION, "a writer must stamp its schema");
@@ -1246,7 +1299,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let base = dir.join("aether.toml");
         let base = base.to_string_lossy().to_string();
-        add_to_masque_with_rtt(&base, vec![("1.1.1.1:443".parse().unwrap(), 42)], Measurement::default());
+        add_to_masque_with_rtt(
+            &base,
+            vec![("1.1.1.1:443".parse().unwrap(), 42)],
+            Measurement::default(),
+        );
         let got = get_masque_sorted(&base);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, 42);
