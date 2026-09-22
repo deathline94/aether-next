@@ -1514,7 +1514,7 @@ pub enum KeepaliveTick {
 impl Keepalive {
     /// One interval tick: send a probe, or report that the tunnel is dead.
     pub fn tick(&mut self) -> KeepaliveTick {
-        if self.unanswered >= KEEPALIVE_MAX_UNANSWER {
+        if self.unanswered >= KEEPALIVE_MAX_UNANSWERED {
             return KeepaliveTick::GiveUp {
                 unanswered: self.unanswered,
             };
