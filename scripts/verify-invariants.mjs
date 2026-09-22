@@ -74,6 +74,167 @@ function locate(abs, text, idx) {
 /* ------------------------------------------------------------------- gates */
 /* Each gate: name, invariant, summary, scan(api), inject() -> {file, content} */
 
+/* ------------------------------------------------- WCAG colour arithmetic */
+/*
+ * Shared by the contrast gates. A ratio somebody eyeballed in a mockup is not a
+ * contract; these are the numbers WCAG 1.4.3/1.4.11 actually specify, including
+ * the step that design tools fake and browsers really do: a translucent layer
+ * must be composited over its backdrop *before* it can be measured. Measuring
+ * `--coral-border` as "#ff5c5c, 6.26:1" is what let the repo's token comments
+ * quote AA-passing numbers for colours that composite to 1.59:1 on screen.
+ */
+function parseColour(token) {
+  const t = String(token).trim();
+  let m = t.match(/^#([0-9a-f]{3,8})$/i);
+  if (m) {
+    let h = m[1].toLowerCase();
+    if (h.length === 3 || h.length === 4) h = h.split('').slice(0, 3).map((c) => c + c).join('');
+    if (h.length === 8) h = h.slice(0, 6);
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16), 1];
+  }
+  m = t.match(/^rgba?\(([^)]*)\)$/i);
+  if (m) {
+    const p = m[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+    if (p.length < 3) return null;
+    return [p[0], p[1], p[2], p.length > 3 ? p[3] : 1];
+  }
+  return null;
+}
+
+function channel(c) {
+  const v = c / 255;
+  return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+function colourRatio(a, b) {
+  const la = 0.2126 * channel(a[0]) + 0.7152 * channel(a[1]) + 0.0722 * channel(a[2]);
+  const lb = 0.2126 * channel(b[0]) + 0.7152 * channel(b[1]) + 0.0722 * channel(b[2]);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/** `layer` painted with its own alpha on top of an opaque `base`. */
+function compositeOver(layer, base) {
+  const a = layer[3];
+  return [
+    layer[0] * a + base[0] * (1 - a),
+    layer[1] * a + base[1] * (1 - a),
+    layer[2] * a + base[2] * (1 - a),
+    1,
+  ];
+}
+
+/** Top-level commas only: `rgba(1, 2, 3, .4), url(x)` splits into two layers. */
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of s) {
+    if (ch === '(') depth += 1;
+    if (ch === ')') depth -= 1;
+    if (ch === ',' && depth === 0) {
+      out.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+/** `:root` custom properties of one sheet, with `var(--x)` chains resolved. */
+function sheetColourTokens(src) {
+  const raw = {};
+  for (const m of src.matchAll(/(--[\w-]+)\s*:\s*([^;{}]+);/g)) {
+    if (!(m[1] in raw)) raw[m[1]] = m[2].trim();
+  }
+  const resolved = {};
+  const solve = (name, seen) => {
+    if (name in resolved) return resolved[name];
+    if (seen.has(name)) return null;
+    seen.add(name);
+    let v = raw[name];
+    if (v === undefined) return null;
+    for (let i = 0; i < 8; i += 1) {
+      const m = v.match(/^var\(\s*(--[\w-]+)\s*\)$/);
+      if (!m) break;
+      const inner = solve(m[1], seen);
+      if (inner === null) return null;
+      v = inner;
+    }
+    resolved[name] = v;
+    return v;
+  };
+  Object.keys(raw).forEach((n) => solve(n, new Set()));
+  return { raw, resolved };
+}
+
+function expandVars(value, tokens) {
+  let v = value;
+  for (let i = 0; /var\(/.test(v) && i < 12; i += 1) {
+    v = v.replace(/var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*))?\)/g, (_all, n, fb) => tokens.resolved[n] ?? fb ?? '');
+  }
+  return v;
+}
+
+/**
+ * Colours a declaration actually paints with. A `linear-gradient` background
+ * yields its stops as `stops` and the rule is measured against each of them,
+ * because the text sits on whichever stop is worst for it, not on an average.
+ */
+function declarationColours(value, tokens) {
+  const v = expandVars(value, tokens);
+  const out = { scalars: [], stops: null, resolved: false };
+  let work = v;
+  const g = v.match(/(?:linear|radial|conic)-gradient\(([^)]*(?:\([^)]*\)[^)]*)*)\)/i);
+  if (g) {
+    work = `${v.slice(0, g.index)} ${v.slice(g.index + g[0].length)}`;
+    out.stops = [];
+    for (const part of splitTopLevel(g[1])) {
+      const c = part.match(/(#[0-9a-f]{3,8}|rgba?\([^)]*\))/i);
+      const p = c && parseColour(c[0]);
+      if (p) out.stops.push(p);
+    }
+    if (!out.stops.length) out.stops = null;
+  }
+  for (const part of splitTopLevel(work)) {
+    const c = part.match(/(#[0-9a-f]{3,8}|rgba?\([^)]*\))/i);
+    const p = c && parseColour(c[0]);
+    if (p) {
+      out.scalars.push(p);
+      out.resolved = true;
+    }
+  }
+  if (out.stops) out.resolved = true;
+  return out;
+}
+
+/** Every opaque background a piece of text can end up sitting on. */
+function sheetSurfaces(tokens) {
+  const out = [];
+  for (const [name, value] of Object.entries(tokens.resolved)) {
+    if (!/^(--bg-|--panel)/.test(name)) continue;
+    const p = parseColour(value);
+    if (p && p[3] === 1) out.push([name, p]);
+  }
+  return out;
+}
+
+/** Innermost rule blocks as [selector, body, offset], comments blanked out. */
+function ruleBlocks(maskedSrc) {
+  const out = [];
+  const re = /([^{}]+)\{([^{}]*)\}/g;
+  let m;
+  while ((m = re.exec(maskedSrc))) {
+    const sel = m[1].trim().split('\n').pop().trim();
+    if (!sel || sel.startsWith('@')) continue;
+    out.push([sel, m[2], m.index]);
+  }
+  return out;
+}
+
+const blankComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, (c) => c.replace(/[^\n]/g, ' '));
+
 const GATES = [
   {
     name: 'config-single-reader',
@@ -837,6 +998,176 @@ const GATES = [
       return {
         file: 'packages/__selftest__/package.json',
         content: '{ "name": "phantom-workspace", "workspaces": ["apps/*"] }\n',
+      };
+    },
+  },
+  {
+    name: 'wcag-pair-contrast',
+    invariant: 'BC-12',
+    summary: 'every colour-on-background pair a rule declares clears WCAG 1.4.3 after compositing',
+    scan(api) {
+      /*
+       * FR-033/BC-12 asked for "informational text >= 4.5:1" and the repo had no
+       * way to observe it: both axe suites pass `color-contrast: disabled` (axe
+       * cannot compute it in jsdom, which has no layout), so the only contrast
+       * evidence in the project was a number quoted in a CSS comment. Those
+       * comments were measured against bare surfaces; the moment a translucent
+       * chip sits over one the number changes, and two rules in this repo were
+       * below AA because of it (.nav-shortcut at 4.33:1, .empty-term-icon at
+       * 1.59:1). So the check composites the declaration the way the browser
+       * does, and it is conservative about the backdrop: a rule that does not
+       * set its own background is measured against *every* surface it can
+       * inherit, and a gradient is measured against each of its stops.
+       *
+       * Known limit, stated rather than hidden: text that inherits its colour
+       * from an ancestor is only measured at the rule that declares it. That is
+       * still every colour in the sheets, because each one is declared somewhere.
+       */
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const src = api.read(f);
+        const masked = blankComments(src);
+        const tokens = sheetColourTokens(masked);
+        const surfaces = sheetSurfaces(tokens);
+        if (!surfaces.length) continue;
+        for (const [sel, body, at] of ruleBlocks(masked)) {
+          const cd = body.match(/(?:^|[;{\s])color:\s*([^;]+)/);
+          if (!cd) continue;
+          const fg = declarationColours(cd[1].trim(), tokens);
+          if (!fg.resolved || !fg.scalars.length) continue;
+          const bd = body.match(/(?:^|[;{\s])background(?:-color)?:\s*([^;]+)/);
+          let bases = surfaces.map(([n, s]) => [n, s]);
+          if (bd) {
+            const bg = declarationColours(bd[1].trim(), tokens);
+            if (!bg.resolved) continue;
+            const layers = (bg.stops ?? []).concat(bg.scalars);
+            if (!layers.length) continue;
+            bases = [];
+            for (const l of layers) {
+              if (l[3] === 1) bases.push([bd[1].trim().slice(0, 26), l]);
+              else for (const [n, s] of surfaces) bases.push([`${bd[1].trim().slice(0, 20)} on ${n}`, compositeOver(l, s)]);
+            }
+          }
+          // WCAG large text: >= 24px, or >= 18.66px at a bold weight.
+          const px = Number((body.match(/font-size:\s*([\d.]+)px/) ?? [])[1]);
+          const weight = /font-weight:\s*(bold|[6-9]00)/.test(body);
+          const need = px >= 24 || (px >= 18.66 && weight) ? 3 : 4.5;
+          const colour = fg.scalars[0];
+          let worst = null;
+          for (const [bn, bgColour] of bases) {
+            const r = colourRatio(compositeOver(colour, bgColour), bgColour);
+            if (!worst || r < worst.r) worst = { r, bn };
+          }
+          if (worst && worst.r < need) {
+            v.push(
+              `${locate(f, masked, at)} ${sel.slice(0, 44)}: color ${cd[1].trim()} on ${worst.bn} is ${worst.r.toFixed(2)}:1, needs ${need}:1`,
+            );
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: ':root{--panel:#0d1116;}\n.dim{color:#334155;background:var(--panel);font-size:13px;}\n',
+      };
+    },
+  },
+  {
+    name: 'wcag-state-edges',
+    invariant: 'BC-12',
+    summary: 'state edge tokens and control boundaries clear WCAG 1.4.11 (3:1) on every surface',
+    scan(api) {
+      /*
+       * FR-032: "edges that carry meaning must meet >=3:1". Meaning-carrying is
+       * decided by role, not by alpha, so this gate looks at the two places the
+       * role is written down: a `--*-border` / `--edge-*` token exists *to*
+       * signal state, and a control's boundary is the only thing showing its
+       * extent. Everything else (beacon rings, the signal meter's unlit bars,
+       * card hairlines) is decoration next to text that already says the same
+       * thing, and 1.4.11 does not ask anything of it.
+       *
+       * A `--*-dim` wash is a background, not an edge, so it is measured by the
+       * pair gate as whatever sits on it; `--*-glow` is a shadow, which conveys
+       * no information by itself.
+       */
+      const CONTROL = /(input|select|textarea|combobox|search|stepper|chassis|toggle|knob|checkbox|radio|-btn|button)/i;
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const src = api.read(f);
+        const masked = blankComments(src);
+        const tokens = sheetColourTokens(masked);
+        const surfaces = sheetSurfaces(tokens);
+        if (!surfaces.length) continue;
+        const worstAgainst = (colour) => {
+          let worst = null;
+          for (const [n, s] of surfaces) {
+            const r = colourRatio(compositeOver(colour, s), s);
+            if (!worst || r < worst.r) worst = { r, n };
+          }
+          return worst;
+        };
+        for (const [name, value] of Object.entries(tokens.resolved)) {
+          if (!(/-border$/.test(name) || name.startsWith('--edge-'))) continue;
+          const colour = parseColour(value);
+          if (!colour) continue;
+          const w = worstAgainst(colour);
+          if (w && w.r < 3) {
+            v.push(`${rel(f)}:0 ${name} = ${value} is ${w.r.toFixed(2)}:1 on ${w.n}, needs 3:1 (WCAG 1.4.11)`);
+          }
+        }
+        for (const [sel, body, at] of ruleBlocks(masked)) {
+          if (!CONTROL.test(sel)) continue;
+          for (const bd of body.matchAll(/(?:^|[;{\s])border(?:-color)?:\s*([^;]+)/g)) {
+            const colours = declarationColours(bd[1].trim(), tokens);
+            for (const colour of colours.scalars) {
+              const w = worstAgainst(colour);
+              if (w && w.r < 3) {
+                v.push(
+                  `${locate(f, masked, at)} ${sel.slice(0, 44)}: control boundary ${bd[1].trim().slice(0, 28)} is ${w.r.toFixed(2)}:1 on ${w.n}, needs 3:1 (WCAG 1.4.11)`,
+                );
+              }
+            }
+          }
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: ':root{--panel:#0d1116;--weak-border:rgba(255,92,92,0.32);}\n.weak-input{border:1px solid var(--weak-border);}\n',
+      };
+    },
+  },
+  {
+    name: 'type-scale-floor',
+    invariant: 'BC-12',
+    summary: 'no font-size below 11px, in a token or in a literal',
+    scan(api) {
+      // FR-033 pairs the 4.5:1 floor with an 11px one, and both sheets used to
+      // sit under it in 44 declarations -- of the *status* layer (timestamps,
+      // stat labels, field hints). The floor is `--text-micro`; this gate keeps
+      // either spelling from drifting back down.
+      const FLOOR = 11;
+      const v = [];
+      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+        const src = api.read(f);
+        const masked = blankComments(src);
+        for (const m of masked.matchAll(/(--text-[\w-]+)\s*:\s*([\d.]+)px/g)) {
+          if (Number(m[2]) < FLOOR) v.push(`${locate(f, masked, m.index)} ${m[1]} is ${m[2]}px, below the ${FLOOR}px floor`);
+        }
+        for (const m of masked.matchAll(/font-size:\s*([\d.]+)px/g)) {
+          if (Number(m[1]) < FLOOR) v.push(`${locate(f, masked, m.index)} font-size: ${m[1]}px is below the ${FLOOR}px floor`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__.css',
+        content: '.tiny{font-size:9.5px}\n',
       };
     },
   },

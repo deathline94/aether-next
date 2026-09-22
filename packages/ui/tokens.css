@@ -95,16 +95,23 @@
   --green-dark: #092618;
 
   /* Tactical signal accents */
+  /*
+   * State-bearing borders composite, they do not sit flat on a swatch: coral at
+   * the old 0.32 measured 1.59:1 on --bg-app, and 1.4.11 asks 3:1 of an edge
+   * that tells you which state a control is in. The alphas below are the solved
+   * minima (coral .66, yellow .43, blue .48) rounded up one step, and
+   * `wcag-state-edges` re-derives them on every run.
+   */
   --coral: #ff5c5c;
   --coral-dim: rgba(255, 92, 92, 0.12);
-  --coral-border: rgba(255, 92, 92, 0.32);
+  --coral-border: rgba(255, 92, 92, 0.68);
   --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
   --yellow: #facc15;
   --yellow-dim: rgba(250, 204, 21, 0.12);
-  --yellow-border: rgba(250, 204, 21, 0.32);
+  --yellow-border: rgba(250, 204, 21, 0.45);
   --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
   --blue-dim: rgba(92, 200, 255, 0.12);
-  --blue-border: rgba(92, 200, 255, 0.32);
+  --blue-border: rgba(92, 200, 255, 0.5);
   --amber: #facc15;
   --violet: #a78bfa;
 
@@ -121,8 +128,10 @@
    * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
    * non-text floor for the .heartbeat-dot state LED. It now aliases
    * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
-   * --panel-hover (all >=4.5) and >=3.14:1 as the dot. One repoint fixes all 12
-   * consumers at once.
+   * --panel-hover and 4.70 vs --panel-active. Those are bare-surface ratios; a
+   * translucent chip on top of the surface lifts it further, which is how
+   * .nav-shortcut measured 4.33:1 and moved to --muted. Verify a pair against
+   * its composite, not the token, before quoting a number here.
    */
   --muted-dark: var(--muted-strong);
 

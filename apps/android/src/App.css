@@ -73,16 +73,23 @@
   --green-dark: #092618;
 
   /* Tactical signal accents */
+  /*
+   * State-bearing borders composite, they do not sit flat on a swatch: coral at
+   * the old 0.32 measured 1.59:1 on --bg-app, and 1.4.11 asks 3:1 of an edge
+   * that tells you which state a control is in. The alphas below are the solved
+   * minima (coral .66, yellow .43, blue .48) rounded up one step, and
+   * `wcag-state-edges` re-derives them on every run.
+   */
   --coral: #ff5c5c;
   --coral-dim: rgba(255, 92, 92, 0.12);
-  --coral-border: rgba(255, 92, 92, 0.32);
+  --coral-border: rgba(255, 92, 92, 0.68);
   --coral-glow: 0 0 24px rgba(255, 92, 92, 0.22);
   --yellow: #facc15;
   --yellow-dim: rgba(250, 204, 21, 0.12);
-  --yellow-border: rgba(250, 204, 21, 0.32);
+  --yellow-border: rgba(250, 204, 21, 0.45);
   --blue: #5cc8ff;            /* sheets carried #38bdf8 vs this file's #5cc8ff — reconciled to #5cc8ff (10.60:1 on --bg-app) */
   --blue-dim: rgba(92, 200, 255, 0.12);
-  --blue-border: rgba(92, 200, 255, 0.32);
+  --blue-border: rgba(92, 200, 255, 0.5);
   --amber: #facc15;
   --violet: #a78bfa;
 
@@ -99,8 +106,10 @@
    * AA (4.5:1) for the 8.5-11px labels that use it as text, and below the 3:1
    * non-text floor for the .heartbeat-dot state LED. It now aliases
    * --muted-strong (#7d8b96): 5.42:1 vs --panel, 5.19 vs --panel-2, 4.96 vs
-   * --panel-hover (all >=4.5) and >=3.14:1 as the dot. One repoint fixes all 12
-   * consumers at once.
+   * --panel-hover and 4.70 vs --panel-active. Those are bare-surface ratios; a
+   * translucent chip on top of the surface lifts it further, which is how
+   * .nav-shortcut measured 4.33:1 and moved to --muted. Verify a pair against
+   * its composite, not the token, before quoting a number here.
    */
   --muted-dark: var(--muted-strong);
 
@@ -773,7 +782,7 @@ code, kbd, pre {
   transition: color 0.3s var(--ease-spring), background-color 0.3s var(--ease-spring), border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), transform 0.3s var(--ease-spring), opacity 0.3s var(--ease-spring);
 }
 .master-switch-chassis.connected {
-  border-color: rgba(0, 240, 138, 0.4);
+  border-color: var(--emerald-border);
   box-shadow: 0 0 0 5px #07090b,
               0 0 0 6px rgba(0, 240, 138, 0.25),
               0 0 35px rgba(0, 240, 138, 0.25),
@@ -781,7 +790,7 @@ code, kbd, pre {
               inset 0 1px 1px rgba(255, 255, 255, 0.25);
 }
 .master-switch-chassis.connecting {
-  border-color: rgba(250, 204, 21, 0.4);
+  border-color: var(--yellow-border);
   box-shadow: 0 0 0 5px #07090b,
               0 0 0 6px rgba(250, 204, 21, 0.25),
               0 0 32px rgba(250, 204, 21, 0.2),
@@ -789,7 +798,7 @@ code, kbd, pre {
               inset 0 1px 1px rgba(255, 255, 255, 0.25);
 }
 .master-switch-chassis.error {
-  border-color: rgba(255, 92, 92, 0.4);
+  border-color: var(--coral-border);
   box-shadow: 0 0 0 5px #07090b,
               0 0 0 6px rgba(255, 92, 92, 0.25),
               0 0 32px rgba(255, 92, 92, 0.2),
@@ -827,7 +836,7 @@ code, kbd, pre {
   width: 90px;
   height: 90px;
   border-radius: 50%;
-  border: 1px solid rgba(0, 240, 138, 0.35);
+  border: 1px solid var(--emerald-border);
   background: radial-gradient(circle at 50% 28%, #163625 0%, #0d2116 100%);
   color: var(--emerald);
   display: grid;
@@ -854,7 +863,7 @@ code, kbd, pre {
               inset 0 -1px 2px rgba(255, 255, 255, 0.15);
 }
 .master-toggle-btn.stop {
-  border-color: rgba(255, 92, 92, 0.35);
+  border-color: var(--coral-border);
   background: radial-gradient(circle at 50% 28%, #3c1916 0%, #240e0c 100%);
   color: var(--coral);
 }@media (hover: hover) and (pointer: fine){
@@ -1197,7 +1206,7 @@ code, kbd, pre {
 .tactile-copy-btn {
   width: 28px;
   height: 28px;
-  border: 1px solid var(--border-card);
+  border: 1px solid var(--edge-interactive);
   border-radius: 6px;
   background: var(--panel-2);
   color: var(--muted);
@@ -1895,7 +1904,7 @@ code, kbd, pre {
   align-items: center;
   justify-content: space-between;
   background: #07090b;
-  border: 1px solid var(--border-card);
+  border: 1px solid var(--edge-interactive);
   border-radius: 7px;
   overflow: hidden;
   height: 36px;
@@ -2681,7 +2690,7 @@ code, kbd, pre {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--edge);
+  border: 1px solid var(--edge-interactive);
   border-radius: 14px;
   background: #07090b;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), var(--inner-highlight);
@@ -2752,7 +2761,7 @@ code, kbd, pre {
   height: 28px;
   padding: 0 11px;
   border-radius: 6px;
-  border: 1px solid var(--edge);
+  border: 1px solid var(--edge-interactive);
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted-light);
   font-size: 11px;
@@ -2992,7 +3001,11 @@ code, kbd, pre {
   padding: 40px 20px;
 }
 .empty-term-icon {
-  color: #334155;
+  /* aria-hidden decoration, so it belongs to the decorative edge tier, not to a
+     text colour: it was #334155, a Tailwind slate that appears in no Aether
+     palette. `stroke` wins over Lucide's `stroke="currentColor"` because a
+     presentation attribute loses to any CSS declaration. */
+  stroke: var(--edge);
   margin-bottom: 8px;
 }
 .empty-logs strong {
