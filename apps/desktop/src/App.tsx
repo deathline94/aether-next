@@ -31,7 +31,7 @@ function App() {
     settings, runtime, busy, testBusy, saved, saveError, admin, testResult, appVersion, updateAvailable,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
-  } = useRuntime(appendLog, clearLogs);
+  } = useRuntime(appendLog);
 
   const scanner = useScanner(appendLog, running, clearLogs);
 

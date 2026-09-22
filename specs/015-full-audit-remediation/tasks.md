@@ -627,7 +627,17 @@
   stops counting. Doing it properly means the scanner's structured events feeding the log entries
   themselves (a `hitKey` on the entry rather than a regex over prose), which touches how `appendLog` is
   called from three places; left open rather than half-migrated behind a compatibility shim.
-- [ ] T183 [US6] Stop clearing logs on every connect/disconnect/test in `apps/desktop/src/hooks/useRuntime.ts:160,181,204` — the error line the user was about to copy currently vanishes the instant they press "Try again"; keep clearing only in the Activity tab's own Clear action.
+- [x] T183 [US6] Stop clearing logs on every connect/disconnect/test in `apps/desktop/src/hooks/useRuntime.ts:160,181,204` — the error line the user was about to copy currently vanishes the moment they press the button the error told them to press.
+  Done in both UIs: three call sites in desktop, two-plus in Android, and the `clearLogs` parameter is gone from
+  `useRuntime` entirely (both `App.tsx` wirings updated). The Activity tab already has its own Clear button, so
+  the capability stays where the user chooses it; what went away is the automatic wipe that deleted the evidence
+  behind "try another protocol or scan mode" — the message was unreadable one click later, by construction.
+  No test added: asserting the absence of a call is brittle, and the removal is structural instead — with no
+  `clearLogs` in the signature, bringing the behaviour back means editing the hook *and* both wirings, which is
+  a review-visible change rather than one extra statement in a callback. 18 desktop and 12 Android UI tests and
+  both typechecks pass.
+  Deliberately left: `useScanner.startScan` still clears, which is a new activity rather than a response to a
+  failure. If T182's structured-event rewrite lands, both hooks should read from the same log-store contract.
 - [ ] T184 [US6] Fix the auto-scroll latch in `apps/desktop/src/components/ActivityTab.tsx:84-89` by resetting `isProgrammaticScrollRef` synchronously after the scroll assignment, not inside a `requestAnimationFrame` throttled when the window is hidden to tray.
 - [ ] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
 - [ ] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.

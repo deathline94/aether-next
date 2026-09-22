@@ -11,7 +11,6 @@ const SAVE_DEBOUNCE_MS = 400;
 
 export function useRuntime(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
-  clearLogs?: () => void,
 ) {
   const [settings, setSettings] = useState<Settings>(defaults);
   // Settings must not be editable until hydrated from disk — otherwise a
@@ -195,7 +194,6 @@ export function useRuntime(
 
   const toggleConnection = useCallback(async () => {
     if (busy) return;
-    clearLogs?.();
     setBusy(true);
     setTestResult(null);
     try {
@@ -212,11 +210,10 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
+  }, [busy, running, settings, appendLog, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busy) return;
-    clearLogs?.();
     setBusy(true);
     try {
       if (running) {
@@ -236,10 +233,9 @@ export function useRuntime(
     } finally {
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, clearLogs, safeDisconnect]);
+  }, [busy, running, settings, appendLog, safeDisconnect]);
 
   const runTest = useCallback(async () => {
-    clearLogs?.();
     setTestBusy(true);
     setTestResult(null);
     try {
@@ -253,7 +249,7 @@ export function useRuntime(
     } finally {
       setTestBusy(false);
     }
-  }, [settings, appendLog, clearLogs]);
+  }, [settings, appendLog]);
 
   const dismissError = useCallback(async () => {
     try { await invoke("disconnect"); } catch { /* already stopped */ }
