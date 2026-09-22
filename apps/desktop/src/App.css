@@ -3274,16 +3274,16 @@ code, kbd, pre {
 }
 
 /* ─── Responsive Media Queries ────────────────────────────────────────────── */
-@media (max-width: 900px) {
+/* Collapses the labelled sidebar to a 78 px icon rail. The threshold has to sit
+   *above* the window minimum (minWidth is 900): at exactly the minimum the query
+   still applies, and it used to switch off `.sidebar-bottom` (the connection
+   beacon) and `.version-bar` there, leaving the narrowest legal window with no
+   status indication and no other way to get one. */
+@media (max-width: 980px) {
   .app-shell { grid-template-columns: 78px minmax(0, 1fr); }
   .sidebar { padding-inline: 10px; }
   .brand { padding-inline: 4px; justify-content: center; }
   .brand-text, .nav-pill-label, .nav-pill-trailing { display: none; }
-  /* `.sidebar-bottom` holds the connection beacon and `.version-bar` the running
-     version: this rule used to switch both off at the smallest *legal* window
-     (minWidth is 900, so this query is the only one a desktop user can reach),
-     which left a narrow window with no status indication at all. The rail is
-     already 78 px wide here — the beacon and the version line still fit. */
   .nav-pill { justify-content: center; padding: 0; }
   .bento-col-7, .bento-col-5, .bento-col-6 { grid-column: span 12; }
 }

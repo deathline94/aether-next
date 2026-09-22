@@ -924,9 +924,12 @@ const GATES = [
         for (const m of src.matchAll(/@media[^{]*?\((max-width|max-height):\s*(\d+)px\)/g)) {
           const limit = m[1] === 'max-width' ? minWidth : minHeight;
           const px = Number(m[2]);
-          if (px < limit) {
+          // Contract U-F2 forbids *coincidence*, not just an unreachable query:
+          // at exactly the minimum the block still applies, which is what let it
+          // switch off the app's only status widget while looking reachable.
+          if (px <= limit) {
             v.push(
-              `${locate(f, src, m.index)} (${m[1]}: ${px}px) can never match: the window cannot be smaller than ${limit}px, so every rule in this block is dead`,
+              `${locate(f, src, m.index)} (${m[1]}: ${px}px) sits at or below the window minimum of ${limit}px: ${px === limit ? 'it is the boundary layout the user is forced into, so anything it hides has no other way to appear' : 'it can never match, so every rule in this block is dead'}`,
             );
           }
         }
@@ -1207,6 +1210,96 @@ const GATES = [
     },
   },
   {
+    name: 'touch-target-minimum',
+    invariant: 'BC-14',
+    summary: 'controls declare a target box at least 24px (44px for the primary ones)',
+    scan(api) {
+      /*
+       * U-F4 / WCAG 2.5.8. Two things make this more than a regex over CSS.
+       * First, the target is the element a pointer lands on, so the classes
+       * that matter come from the JSX (button/input/select/a/[role]), not from
+       * every selector that happens to contain "btn" -- the knob inside a
+       * switch and the icon inside a button are 18px on purpose. Second, a
+       * control's box is declared across its base rule, its state rules and its
+       * media overrides, so the sizes merge per class and the *largest* declared
+       * box is what a finger meets.
+       *
+       * It is measured on the sheet rather than on a rendered page because the
+       * test environment has no layout engine (jsdom) and the browser surface
+       * here reports a 0x0 viewport: a "just measure it" check would silently
+       * measure nothing, which is the failure mode this harness exists for.
+       */
+      const MIN = 24;
+      const PRIMARY = new Set(['master-switch-chassis', 'master-toggle-btn', 'primary-cta']);
+      const px = (body, prop) => {
+        const m = body.match(new RegExp(`(?:^|[;\\s])${prop}:\\s*(?:calc\\()?(\\d+(?:\\.\\d+)?)px`));
+        return m ? Number(m[1]) : null;
+      };
+      const v = [];
+      // Only the leading class counts as what an element *is*: the tokens after
+      // it are state modifiers (`.profile-card.active`) and utilities
+      // (`font-mono`), and `[a-z][a-z0-9-]*` keeps the camelCase expressions out
+      // of the vocabulary entirely.
+      const classToken = (s) => (s ?? '').split(/[\s${}]+/).find((t) => /^[a-z][a-z0-9-]*$/.test(t)) ?? null;
+      for (const app of ['apps/desktop', 'apps/android']) {
+        const classes = new Map();
+        const note = (token, where) => {
+          if (token && !classes.has(token)) classes.set(token, where);
+        };
+        for (const f of api.files(`${app}/src`, /\.tsx$/)) {
+          if (/[.\-/]tests?[.\-]/.test(rel(f)) || f.endsWith('.test.tsx')) continue;
+          const src = api.read(f);
+          for (const m of src.matchAll(/<(?:button|input|select|a)\b[\s\S]{0,600}?className\s*=\s*(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
+            note(classToken(m[1] ?? m[2]), locate(f, src, m.index));
+          }
+          // A div is a pointer target when it says so with an interactive role
+          // or a handler. `aria-label` alone is not enough: the 6px progress bar
+          // carries one and nobody taps it.
+          for (const m of src.matchAll(/className\s*=\s*(?:"([^"]*)"|\{`([^`]*)`\})[^>]{0,400}?(?:onClick|onKeyDown|onPointerDown|role\s*=\s*"(?:button|tab|checkbox|switch|link|menuitem|option)")[^>]*>/g)) {
+            note(classToken(m[1] ?? m[2]), locate(f, src, m.index));
+          }
+        }
+        const size = new Map();
+        // A gate that inspected nothing must not report success.
+        if (!classes.size) v.push(`${app}: no pointer targets found in the JSX, so this gate is checking nothing`);
+        for (const f of api.files(app, /\.css$/)) {
+          const code = blankComments(api.read(f));
+          for (const [sel, body] of ruleBlocks(code)) {
+            const h = Math.max(px(body, 'height') ?? -Infinity, px(body, 'min-height') ?? -Infinity);
+            const w = Math.max(px(body, 'width') ?? -Infinity, px(body, 'min-width') ?? -Infinity);
+            const pad = /(?:^|[;\s])padding/.test(body);
+            for (const cls of sel.match(/\.([\w-]+)/g) ?? []) {
+              const name = cls.slice(1);
+              if (!classes.has(name)) continue;
+              const cur = size.get(name) ?? { h: -Infinity, w: -Infinity, pad: false };
+              size.set(name, { h: Math.max(cur.h, h), w: Math.max(cur.w, w), pad: cur.pad || pad });
+            }
+          }
+        }
+        for (const [name, where] of classes) {
+          const floor = PRIMARY.has(name) ? 44 : MIN;
+          const box = size.get(name);
+          if (!box || (box.h === -Infinity && box.w === -Infinity)) {
+            if (!box?.pad) v.push(`${where}: .${name} is a pointer target with no declared size or padding, so its box is whatever its content is`);
+            continue;
+          }
+          if (box.h !== -Infinity && box.h < floor) v.push(`${where}: .${name} is ${box.h}px tall, below the ${floor}px target floor`);
+          if (box.w !== -Infinity && box.w < floor) v.push(`${where}: .${name} is ${box.w}px wide, below the ${floor}px target floor`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return [
+        {
+          file: 'apps/desktop/src/__selftest__.tsx',
+          content: 'export const V = () => <button className="tiny-btn">x</button>;\n',
+        },
+        { file: 'apps/desktop/src/__selftest__.css', content: '.tiny-btn{height:18px;width:18px}\n' },
+      ];
+    },
+  },
+  {
     name: 'colour-single-source',
     invariant: 'BC-11',
     summary: 'no colour literal in an app sheet outside the fenced token block',
@@ -1297,10 +1390,13 @@ function realApi() {
 
 /** API where exactly one synthetic file is visible to the gate. */
 function injectedApi(spec) {
-  const abs = join(ROOT, spec.file);
+  // A gate whose defect spans two artefacts (a class in the JSX *and* the rule
+  // that sizes it) injects a list; every other gate injects one file.
+  const specs = Array.isArray(spec) ? spec : [spec];
+  const byBasename = specs.map((s) => [join(ROOT, s.file), s.content]);
   return {
-    files: (_dir, re) => (re.test(basename(spec.file)) ? [abs] : []),
-    read: (p) => (p === abs ? spec.content : readFileSync(p, 'utf8')),
+    files: (_dir, re) => byBasename.filter(([abs]) => re.test(basename(abs))).map(([abs]) => abs),
+    read: (p) => byBasename.find(([abs]) => abs === p)?.[1] ?? readFileSync(p, 'utf8'),
   };
 }
 
