@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
 import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, SCAN_MAX_TIMEOUT_MS, SCAN_MIN_TIMEOUT_MS } from "../../../../packages/ui/src";
 import { rttLike } from "../hooks/useScanner";
 import { nextOptionIndex, NumberField, Segmented } from "./ui";
 
@@ -292,12 +292,12 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Timeout (ms)</strong>
-                <span className="field-hint">100–30000 ms</span>
+                <span className="field-hint">{SCAN_MIN_TIMEOUT_MS}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
               <NumberField
                 label="Per-probe timeout in milliseconds"
-                min={100}
-                max={30000}
+                min={SCAN_MIN_TIMEOUT_MS}
+                max={SCAN_MAX_TIMEOUT_MS}
                 step={100}
                 value={timeoutMs}
                 disabled={active}
