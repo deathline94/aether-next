@@ -223,16 +223,18 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
 
     builder.set_grease_enabled(true);
 
-    // #3: Rotate ClientHello profile per-session. Randomize cipher suite order
-    // so JA3/JA4 fingerprints differ across connections, defeating DPI caching.
-    let cipher_sets: &[&str] = &[
-        "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256",
-        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
-        "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
-        "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384",
-    ];
-    let idx = rand::random::<usize>() % cipher_sets.len();
-    let _ = builder.set_cipher_list(cipher_sets[idx]);
+    // No per-session cipher-suite rotation here, whatever this block used to
+    // claim (#3, "randomize cipher suite order so JA3/JA4 differ"): the four
+    // strings were TLS 1.3 suite names handed to `set_cipher_list`, which in
+    // BoringSSL configures the TLS 1.2-and-below list - and BoringSSL has no
+    // `set_ciphersuites` at all, its TLS 1.3 suite order is fixed. The call could
+    // only ever fail, and `let _ =` is how that stayed invisible while the feature
+    // was advertised: fingerprint variance that provably never ran.
+    //
+    // What does vary the ClientHello is GREASE above, the curve list below
+    // (`AETHER_TLS_GROUPS`) and the pre-handshake junk of the noize layer. Every
+    // builder call that can be honoured is checked with `?`, because a TLS policy
+    // that fails to apply must fail the session rather than be reported as applied.
 
     let groups = crate::runtime_env::var("AETHER_TLS_GROUPS");
     let groups = groups

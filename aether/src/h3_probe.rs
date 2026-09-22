@@ -38,10 +38,7 @@ struct Combo {
 
 /// Probe `edge` across the selected matrix and log a summary table.
 pub async fn run_probe(edge: SocketAddr, identity: &Identity, ech: Option<Vec<u8>>) -> Result<()> {
-    let local_ipv4: Ipv4Addr = identity
-        .ipv4
-        .parse()
-        .unwrap_or_else(|_| Ipv4Addr::new(172, 16, 0, 2));
+    let local_ipv4: Ipv4Addr = identity.tunnel_ipv4()?;
 
     let base_authority = crate::runtime_env::var("AETHER_MASQUE_H3_AUTHORITY")
         .map(|s| s.trim().to_string())

@@ -115,16 +115,49 @@ fn env_usize(key: &str) -> Option<usize> {
     crate::runtime_env::usize(key)
 }
 
+/// The bounds a custom junk profile may take, shared with the shells that edit it
+/// (`SessionController.NOIZE_JC_MAX` / `NOIZE_SIZE_MAX` on Android and the UI's
+/// own stepper caps) so the number a user can enter is the number the engine can
+/// be handed.
+///
+/// Before this the values went from `AETHER_NOIZE_*` straight into the config:
+/// `jc` drives `for _ in 0..cfg.jc_before_hs` and `jmax` sizes a
+/// `vec![0u8; size]` per packet, so one typo'd environment variable was an
+/// unbounded loop and an unbounded allocation on the handshake path — a
+/// self-DoS with no ceiling to find.
+pub const MAX_JUNK_PACKETS: usize = 64;
+pub const MAX_JUNK_SIZE: usize = 2048;
+
+fn junk_count(key: &str) -> Option<usize> {
+    let raw = env_usize(key)?;
+    let clamped = raw.min(MAX_JUNK_PACKETS);
+    if clamped != raw {
+        log::warn!("{key}={raw} exceeds the engine's ceiling; sending junk as {clamped} packets");
+    }
+    Some(clamped)
+}
+
+fn junk_size(key: &str) -> Option<usize> {
+    let raw = env_usize(key)?;
+    let clamped = raw.min(MAX_JUNK_SIZE);
+    if clamped != raw {
+        log::warn!("{key}={raw} exceeds the MTU-safe ceiling; sizing junk at {clamped} bytes");
+    }
+    Some(clamped)
+}
+
 /// Optional custom knobs from env (used when profile is `custom`).
 fn apply_custom_noize(mut cfg: NoizeConfig) -> NoizeConfig {
-    if let Some(v) = env_usize("AETHER_NOIZE_JC") {
+    if let Some(v) = junk_count("AETHER_NOIZE_JC") {
         cfg.jc_before_hs = v;
         cfg.jc_after_i1 = 0;
     }
-    if let Some(v) = env_usize("AETHER_NOIZE_JMIN") {
+    if let Some(v) = junk_size("AETHER_NOIZE_JMIN") {
         cfg.jmin = v;
     }
-    if let Some(v) = env_usize("AETHER_NOIZE_JMAX") {
+    if let Some(v) = junk_size("AETHER_NOIZE_JMAX") {
+        // Clamped first and only then ordered against `jmin`, so an inverted
+        // pair cannot raise a value back over the ceiling.
         cfg.jmax = v.max(cfg.jmin);
     }
     if let Some(ms) = env_usize("AETHER_NOIZE_INTERVAL_MS") {
@@ -134,16 +167,16 @@ fn apply_custom_noize(mut cfg: NoizeConfig) -> NoizeConfig {
 }
 
 fn apply_custom_aethernoize(mut cfg: AetherNoizeConfig) -> AetherNoizeConfig {
-    if let Some(v) = env_usize("AETHER_NOIZE_JC") {
+    if let Some(v) = junk_count("AETHER_NOIZE_JC") {
         cfg.jc = v;
         cfg.jc_before_hs = v;
         cfg.jc_after_i1 = 0;
         cfg.jc_after_hs = 0;
     }
-    if let Some(v) = env_usize("AETHER_NOIZE_JMIN") {
+    if let Some(v) = junk_size("AETHER_NOIZE_JMIN") {
         cfg.jmin = v;
     }
-    if let Some(v) = env_usize("AETHER_NOIZE_JMAX") {
+    if let Some(v) = junk_size("AETHER_NOIZE_JMAX") {
         cfg.jmax = v.max(cfg.jmin);
     }
     if let Some(ms) = env_usize("AETHER_NOIZE_INTERVAL_MS") {

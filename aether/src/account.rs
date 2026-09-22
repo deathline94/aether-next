@@ -526,6 +526,25 @@ fn masque_endpoint_from(acct: &AccountData) -> Option<String> {
 }
 
 impl Identity {
+    /// The tunnel's inner IPv4 address, parsed.
+    ///
+    /// Six call sites used to parse `identity.ipv4` themselves and paper over a
+    /// failure - four with `unwrap_or(172.16.0.2)`, one with `.ok()` that turned
+    /// it into a silent `None`, one with an `Other("invalid ipv4")` that said
+    /// nothing about which identity or which value. An account record whose
+    /// `ipv4` was empty, truncated or written by a different provisioner therefore
+    /// produced a *plausible* tunnel: it came up, the peer dropped every packet
+    /// that did not match, and no log line said the identity was unreadable. A
+    /// config value that cannot be parsed is an error, not a chance to guess.
+    pub fn tunnel_ipv4(&self) -> Result<std::net::Ipv4Addr> {
+        self.ipv4.trim().parse::<std::net::Ipv4Addr>().map_err(|_| {
+            AetherError::Config(format!(
+                "account config carries an unusable tunnel IPv4 ({:?}); re-provision rather than guess",
+                self.ipv4
+            ))
+        })
+    }
+
     pub fn private_key_bytes(&self) -> Result<[u8; 32]> {
         Ok(self.wg_private_key)
     }

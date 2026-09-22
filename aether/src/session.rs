@@ -199,11 +199,25 @@ pub enum Protocol {
 }
 
 impl Protocol {
+    /// The transport a name selects, defaulting to MASQUE.
+    ///
+    /// The default is deliberate but it is not silent: an unrecognised value
+    /// (`AETHER_PROTOCOL=wiregrd`) used to fall through to MASQUE with nothing
+    /// written down, which for a tool whose whole job is *which* path your traffic
+    /// takes is the one substitution nobody should discover from a capture.
     pub fn parse(s: &str) -> Protocol {
-        match s.trim().to_lowercase().as_str() {
+        let name = s.trim().to_lowercase();
+        match name.as_str() {
             "wg" | "wireguard" => Protocol::WireGuard,
             "gool" | "wiw" | "warp-in-warp" | "warpinwarp" => Protocol::WarpInWarp,
-            _ => Protocol::Masque,
+            "masque" | "masque-h2" | "masque-h3" | "h3" | "h2" | "" => Protocol::Masque,
+            _ => {
+                log::warn!(
+                    "[+] unrecognised protocol {s:?}; running MASQUE - expected one of \
+                     masque|wg|wireguard|gool|warp-in-warp"
+                );
+                Protocol::Masque
+            }
         }
     }
 
@@ -641,6 +655,10 @@ async fn select_peer(
     match protocol {
         Protocol::Masque => {
             log::info!("[*] hunting for a working MASQUE gateway (deep connect-ip verification)");
+            // Parsed once for the arm: both the probe and the cached-gateway
+            // verification bind the same inner address, and a failure now stops the
+            // session instead of handing both of them 172.16.0.2.
+            let local_ipv4 = identity.tunnel_ipv4()?;
             let ech_config = resolve_ech().await;
             let mode = prober::ScanMode::parse(&mode_str);
             let probe = prober::MasqueProbe {
@@ -657,10 +675,7 @@ async fn select_peer(
                 noize: noize_config(),
                 ports: prober::MASQUE_PORTS.to_vec(),
                 ip,
-                local_ipv4: identity
-                    .ipv4
-                    .parse()
-                    .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2)),
+                local_ipv4,
                 config_path: base_config.to_string(),
             };
 
@@ -686,12 +701,7 @@ async fn select_peer(
                                 authority: probe.authority.clone(),
                                 cert_pem: identity.cert_pem.clone(),
                                 key_pem: identity.key_pem.clone(),
-                                probe_src: Some(
-                                    identity
-                                        .ipv4
-                                        .parse()
-                                        .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2)),
-                                ),
+                                probe_src: Some(local_ipv4),
                             };
                             masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
                         } else {
@@ -768,10 +778,7 @@ async fn select_peer(
                 private_key: std::sync::Arc::new(private_key),
                 peer_public_key: std::sync::Arc::new(peer_public),
                 client_id: identity.client_id,
-                local_ipv4: identity
-                    .ipv4
-                    .parse()
-                    .map_err(|_| AetherError::Other("invalid ipv4".into()))?,
+                local_ipv4: identity.tunnel_ipv4()?,
                 aethernoize: aethernoize_config(),
                 ports: wireguard::WG_PORTS.to_vec(),
                 ip,
@@ -817,10 +824,7 @@ async fn quick_verify_masque(
     sni: &str,
     ech: Option<&[u8]>,
 ) -> Result<std::time::Duration> {
-    let local_ipv4: std::net::Ipv4Addr = identity
-        .ipv4
-        .parse()
-        .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2));
+    let local_ipv4 = identity.tunnel_ipv4()?;
 
     let vp = quic::VerifyParams {
         peer,
@@ -933,6 +937,10 @@ async fn run_masque_tunnel(
         capped
     };
     let (chans, internals) = quic::channels();
+    // The inner address the tunnel is bound to, parsed once: the config below and
+    // the H2 probe source are the same value, and neither used to be able to say
+    // "the identity I was handed has no readable tunnel address".
+    let local_ipv4 = identity.tunnel_ipv4()?;
 
     let cfg = quic::TunnelConfig {
         peer,
@@ -945,10 +953,7 @@ async fn run_masque_tunnel(
         path: crate::quic::resolve_h3_path(),
         cert_pem: identity.cert_pem.clone(),
         key_pem: identity.key_pem.clone(),
-        local_ipv4: identity
-            .ipv4
-            .parse()
-            .unwrap_or(std::net::Ipv4Addr::new(172, 16, 0, 2)),
+        local_ipv4,
         ech_config_list: ech,
         noize: noize_config(),
     };
@@ -1012,7 +1017,7 @@ async fn run_masque_tunnel(
     // H3 gets its data-plane probe source from TunnelConfig.local_ipv4; H2 takes it
     // as a param below. No process-global AETHER_PROBE_SRC clobber between a scan
     // and a tunnel that share one process.
-    let probe_src: Option<std::net::Ipv4Addr> = identity.ipv4.parse().ok();
+    let probe_src = Some(local_ipv4);
 
     let tunnel_handle = if masque_h2::enabled() {
         let h2cfg = masque_h2::H2TunnelConfig {
@@ -1165,10 +1170,7 @@ async fn run_wireguard(
 
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
-    let ipv4: std::net::Ipv4Addr = identity
-        .ipv4
-        .parse()
-        .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
+    let ipv4 = identity.tunnel_ipv4()?;
 
     let primary_profile =
         runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| "balanced".to_string());
