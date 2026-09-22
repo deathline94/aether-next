@@ -1199,6 +1199,11 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
             let host_bits = 32u32.saturating_sub(p as u32);
             let host = if host_bits == 0 {
                 0
+            } else if host_bits >= 32 {
+                // A /0 v4 prefix leaves nothing to mask: the shift below would be
+                // `1u32 << 32`, which panics in debug and wraps in release. The
+                // v4 sampler beside this one already guards exactly this.
+                rng.gen::<u32>()
             } else {
                 rng.gen::<u32>() & ((1u32 << host_bits) - 1)
             };

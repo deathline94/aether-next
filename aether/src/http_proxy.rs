@@ -77,8 +77,27 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(socks::MAX_CLIENTS));
+    // Same policy as the SOCKS listener: a client that races its own connect must
+    // not be allowed to end the tunnel. `session.rs` watches this future's `Err`
+    // as "the http proxy exited" and tears the session down on it.
+    let mut transient = 0u32;
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (socket, peer) = match listener.accept().await {
+            Ok(v) => {
+                transient = 0;
+                v
+            }
+            Err(e) if socks::is_transient_accept(&e) && transient < socks::MAX_TRANSIENT_ACCEPTS => {
+                transient += 1;
+                log::warn!(
+                    "[http] accept failed ({e}); staying up ({transient}/{})",
+                    socks::MAX_TRANSIENT_ACCEPTS
+                );
+                tokio::time::sleep(socks::ACCEPT_BACKOFF).await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let permit = match permits.clone().try_acquire_owned() {
             Ok(p) => p,
             // T163: an explicit, protocol-level refusal instead of a dropped

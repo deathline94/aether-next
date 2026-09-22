@@ -251,6 +251,22 @@ async fn send_resilient(
                         let wait = retry_after(&resp).unwrap_or_else(|| {
                             std::time::Duration::from_millis(500u64 << attempt)
                         });
+                        // The header is server-supplied and this loop runs while the
+                        // provision lock is held: an absurd `Retry-After` wedged
+                        // provisioning with the UI parked on `identity` and every
+                        // other caller waiting on the same lock.
+                        const MAX_RETRY_AFTER: std::time::Duration =
+                            std::time::Duration::from_secs(30);
+                        let wait = if wait > MAX_RETRY_AFTER {
+                            log::warn!(
+                                "[provision] server asked to wait {}s; capping at {}s",
+                                wait.as_secs(),
+                                MAX_RETRY_AFTER.as_secs()
+                            );
+                            MAX_RETRY_AFTER
+                        } else {
+                            wait
+                        };
                         last = format!("HTTP {status}");
                         tokio::time::sleep(wait).await;
                         continue;

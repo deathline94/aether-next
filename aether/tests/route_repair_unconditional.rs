@@ -12,10 +12,19 @@ use aether::route_repair::{
     self, decide_replay, list_journal_paths, repair_host_state_now, Liveness, Replay, RouteJournal,
 };
 
+/// A stand-in for "this boot", as [`aether::route_repair::combine_liveness`]
+/// understands it: any journal written more than its 300 s slack before this came
+/// from an earlier boot, and no process survives a reboot.
+const THIS_BOOT: u64 = 1_700_000_000;
+
 fn journal(creator_pid: u32) -> RouteJournal {
+    journal_written_in(creator_pid, THIS_BOOT)
+}
+
+fn journal_written_in(creator_pid: u32, created_unix: u64) -> RouteJournal {
     RouteJournal {
         version: route_repair::JOURNAL_VERSION,
-        created_unix: 1,
+        created_unix,
         creator_pid,
         tun_if_index: 44,
         phys_if_index: 11,
@@ -30,7 +39,7 @@ fn journal(creator_pid: u32) -> RouteJournal {
 fn replay_only_acts_on_a_journal_whose_holder_is_demostrably_gone() {
     let me = 9_999;
     assert_eq!(
-        decide_replay(&journal(4242), Liveness::Dead, me),
+        decide_replay(&journal(4242), Liveness::Dead, me, THIS_BOOT),
         Replay::Remove,
         "a crashed run's routes are the whole point of the replay"
     );
@@ -40,21 +49,43 @@ fn replay_only_acts_on_a_journal_whose_holder_is_demostrably_gone() {
     ] {
         assert!(
             matches!(
-                decide_replay(&journal(4242), holder, me),
+                decide_replay(&journal(4242), holder, me, THIS_BOOT),
                 Replay::LeaveAlone(_)
             ),
             "a holder that is {why} must never have its routes deleted"
         );
     }
-    // Our own journal: this is the call that fires inside `tun_win::spawn`, and it
-    // must not delete the routes the caller is about to install.
+    // Our own journal, this boot: this is the call that fires inside
+    // `tun_win::spawn`, and it must not delete the routes the caller is about to
+    // install — even if a liveness probe were to answer oddly for our own pid.
     assert!(matches!(
-        decide_replay(&journal(me), Liveness::Dead, me),
+        decide_replay(&journal(me), Liveness::Dead, me, THIS_BOOT),
+        Replay::LeaveAlone(_)
+    ));
+    // Pid reuse across a reboot. The journal names *our* pid but was written in an
+    // earlier boot, so it cannot be ours: no process survives a reboot, and the
+    // caller has already reasoned that through `combine_liveness`. Deciding on pid
+    // equality alone discarded that verdict, so such a journal was never replayed
+    // and never deleted — its routes kept black-holing traffic indefinitely.
+    assert_eq!(
+        decide_replay(
+            &journal_written_in(me, THIS_BOOT - 10_000),
+            Liveness::Dead,
+            me,
+            THIS_BOOT
+        ),
+        Replay::Remove,
+        "a recycled pid must not claim an earlier boot's journal"
+    );
+    // A journal from before the boot field existed carries no creation time, so
+    // there is no evidence it is not ours; it stays conservative.
+    assert!(matches!(
+        decide_replay(&journal_written_in(me, 0), Liveness::Alive, me, THIS_BOOT),
         Replay::LeaveAlone(_)
     ));
     // No owner recorded at all is not evidence that nobody owns it.
     assert!(matches!(
-        decide_replay(&journal(0), Liveness::Dead, me),
+        decide_replay(&journal(0), Liveness::Dead, me, THIS_BOOT),
         Replay::LeaveAlone(_)
     ));
 }

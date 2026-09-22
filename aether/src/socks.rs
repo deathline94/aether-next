@@ -37,11 +37,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// cannot disagree about what a legal name is.
 const MAX_DNS_NAME_LEN: usize = 253;
 /// How long to sit out after a transient `accept()` failure before trying again.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 /// Consecutive transient accept failures tolerated before the listener is called
 /// dead. Without a bound a genuinely broken listener would log-and-sleep forever
 /// and the tunnel would never learn its proxy had gone.
-const MAX_TRANSIENT_ACCEPTS: u32 = 32;
+pub(crate) const MAX_TRANSIENT_ACCEPTS: u32 = 32;
 
 /// Did this `accept()` error kill the *connection* or the *listener*?
 ///
@@ -56,7 +56,7 @@ const MAX_TRANSIENT_ACCEPTS: u32 = 32;
 /// On both platforms these arrive as `Uncategorized`, so the raw code is not
 /// checked: the streak bound in [`MAX_TRANSIENT_ACCEPTS`] is what keeps a
 /// non-transient failure from spinning here forever.
-fn is_transient_accept(e: &std::io::Error) -> bool {
+pub(crate) fn is_transient_accept(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::ConnectionAborted

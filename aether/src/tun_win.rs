@@ -688,7 +688,12 @@ fn recover_legacy_state_file() -> bool {
     let mut keep_for_later = false;
     if let Some(journal) = journal {
         let holder = combine(process_liveness(journal.creator_pid), &journal);
-        match route_repair::decide_replay(&journal, holder, std::process::id()) {
+        match route_repair::decide_replay(
+            &journal,
+            holder,
+            std::process::id(),
+            route_repair::boot_id(),
+        ) {
             route_repair::Replay::Remove => {
                 log::warn!(
                     "[tun] recovering legacy routes from dead pid {}",
@@ -899,12 +904,18 @@ pub async fn spawn(
     let ipv4 = parse_v4(ipv4_cidr)?;
     // Wait briefly for adapter to appear in Windows.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // Reclaim a crashed predecessor's routes *before* this adapter is configured.
+    // The plan `recover_stale_routes` executes folds in
+    // `Set-DnsClientServerAddress -ResetServerAddresses` for this very alias (see
+    // `route_repair::teardown_plan`), so running it after `configure_adapter_ip`
+    // wiped the resolvers that call had just pinned: DNS leaked to the physical
+    // adapter while the tunnel still reported itself ready.
+    recover_stale_routes();
     configure_adapter_ip(ADAPTER_NAME, ipv4, mtu)?;
 
     let session = adapter
         .start_session(MAX_RING_CAPACITY)
         .map_err(|e| AetherError::Other(format!("start session: {e}")))?;
-    recover_stale_routes();
     let journal = match install_routes(peer, ipv4) {
         Ok(journal) => journal,
         Err(error) => {
@@ -969,7 +980,18 @@ pub async fn spawn(
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
-            let Ok(rt) = rt else { return };
+            let Ok(rt) = rt else {
+                // This used to be a bare `return`, which is how "connected, nothing
+                // loads" happened: the adapter is up and the routes are installed by
+                // now, so every external signal says ready while the tunnel→kernel
+                // direction is dead. Returning also drops the captured session, which
+                // releases the ring; the important part is that the reason is logged.
+                log::error!(
+                    "[tun] cannot build the kernel-TX runtime; packets the tunnel \
+                     receives cannot be delivered to the OS, and the session is ending"
+                );
+                return;
+            };
             rt.block_on(async move {
                 let mut inbound_rx = inbound_rx;
                 let mut n: u64 = 0;

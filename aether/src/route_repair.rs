@@ -729,11 +729,25 @@ pub enum Replay {
     LeaveAlone(&'static str),
 }
 
-pub fn decide_replay(journal: &RouteJournal, holder: Liveness, my_pid: u32) -> Replay {
+pub fn decide_replay(
+    journal: &RouteJournal,
+    holder: Liveness,
+    my_pid: u32,
+    my_boot_unix: u64,
+) -> Replay {
     if journal.creator_pid == 0 {
         return Replay::LeaveAlone("journal records no owner");
     }
-    if journal.creator_pid == my_pid {
+    // "Same pid" only means "same process" within one boot. Pids are recycled, and
+    // a journal's `created_unix` says which boot wrote it; nothing survives a
+    // reboot, so a pre-boot journal is not ours however its pid compares. The
+    // early pid-equality return used to fire *before* that was asked, so it threw
+    // away the `Dead` verdict the caller had already derived from
+    // [`combine_liveness`] and left the recycled case installed forever: never
+    // replayed, never deleted, routes still black-holed.
+    let ours_this_boot = journal.creator_pid == my_pid
+        && combine_liveness(journal.created_unix, my_boot_unix, Liveness::Alive) == Liveness::Alive;
+    if ours_this_boot {
         return Replay::LeaveAlone("journal is ours; this process is the holder");
     }
     match holder {
@@ -909,7 +923,7 @@ pub fn replay_abandoned_journals(
     let this_boot = boot_id();
     let mut handled = 0usize;
     for stale in scan_journals(this_boot, &probe) {
-        match decide_replay(&stale.journal, stale.holder, me) {
+        match decide_replay(&stale.journal, stale.holder, me, this_boot) {
             Replay::Remove => {
                 log::warn!(
                     "[route-repair] recovering routes abandoned by dead pid {}",
