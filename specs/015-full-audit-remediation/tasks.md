@@ -845,6 +845,20 @@ Checked each part against the current tree rather than assuming the task text wa
 **Purpose**: The long tail of the audit — drift, dead code, silent substitutions and remaining bounds — plus final validation.
 
 - [ ] T242 [P] Sweep dead code and drifted duplicates in `aether/src/`: unify two identical `bytes_to_ip` (`quic.rs:816`, `masque_h2.rs:810`) and two `drain_capsules` with opposite drop policies into `masque.rs`; stop `H3DgramMode::from_env()` being read once in `run` but re-read per probe and per 200 ms tick; fix `ReaderGuard`'s comment citing "every Migrate" while migration is disabled (`tls.rs:181`); replace `session.rs:1094`'s hardcoded 2048 with `tunnel::NET_QUEUE`; delete the dead `ScanCancellationToken` (`prober.rs:310-339`) and `SCAN_GENERATION` (`:341`, stored at `:396`, never read); correct `session.rs:167-169`'s port-tier comment, which is the **reverse** of `MASQUE_PORTS_T1/T2` (`prober.rs:1106-1107`).
+
+  **Partly done, and re-verified against the current tree** (`cf80018`, plus the
+  queue/global cleanup in the commit after it): `bytes_to_ip` now lives once in
+  `tunnel.rs`; `skip_name` - identical in `dns.rs` and `socks.rs`, and not on this
+  list until it was re-found - now has one owner in `dns.rs`; the WireGuard
+  runner's two literal `2048`s read `tunnel::NET_QUEUE`; `SCAN_GENERATION` is
+  gone (a global mirroring `SCAN_REGISTRY.generation`, written on every
+  registration and read by nobody). Still open here, each needing a compile this
+  machine cannot do: `drain_capsules`' two opposite drop policies,
+  `H3DgramMode::from_env()` re-read per probe and per tick (`quic.rs:19` also
+  keeps a private `NET_QUEUE = 2048` beside the shared one), `ReaderGuard`'s
+  stale comment, `ScanCancellationToken` (`prober.rs:435`, alive next to the
+  registry that replaced its job), and the port-tier comment, whose tiers are now
+  `T1 = [443]` / `T2 = [500, 1701, 4500]`.
 - [ ] T243 [P] Propagate instead of substituting remaining identity/config parse errors in `aether/src/session.rs`: `parse().unwrap_or(Ipv4Addr::new(172,16,0,2))` at `:471-474,589-592,689-692` (a malformed tunnel address becomes a **wrong source address**, then fails as "network blocking QUIC"), `.parse().ok()` at `:756`, and `Protocol::parse` at `:92-98` mapping any typo to MASQUE; plus `account.rs:411-422` silently zeroing a corrupt `client_id`.
 - [ ] T244 [P] Fix remaining engine leaks in `aether/src/`: bind and abort the H2 connection driver task (`masque_h2.rs:478-482`, today spawned with no handle while `send_task`/`recv_task` are correctly aborted at `:637-638`); cap the unbounded `while let Ok(more) = try_recv()` batch (`quic.rs:492-508`) at 128 as `masque_h2.rs:561` already does; use `base.saturating_add(off)` at `prober.rs:1028` mirroring `enumerate_cidr_v4` at `:1004`.
 - [ ] T245 [P] Add obfuscation-layer bounds in `aether/src/{aethernoize.rs,obfuscation.rs}`: clamp `jmin/jmax` to `[0,512]` (an unbounded `AETHER_NOIZE_JMIN=1e8` allocates 100 MB per packet today), keep totals under the path MTU, replace the constant `0x00` emitted for a `(0,0)` pair (a worse fingerprint than sending nothing) with random 1-4-byte filler, remap the decoy first byte so the `+0x40` collision fix does not re-enter WG's 1-4 type range (`aethernoize.rs:281-284`), and `u16::try_from` the IKEv2 `sa_payload_length` (`:134`) instead of `as u16` truncation that makes the header lie.

@@ -1386,8 +1386,8 @@ async fn establish_wg(
         aethernoize: std::sync::Arc::new(profile),
     };
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(2048);
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(2048);
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(crate::tunnel::NET_QUEUE);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(crate::tunnel::NET_QUEUE);
 
     let wg_tunnel = wireguard::WgTunnel::new(cfg, inbound_tx).await?;
 

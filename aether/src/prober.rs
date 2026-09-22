@@ -461,8 +461,6 @@ impl ScanCancellationToken {
     }
 }
 
-pub static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 struct ScanRegistry {
     generation: u64,
     /// One token per **live** scan, keyed by the generation that minted it.
@@ -550,7 +548,6 @@ pub fn register_scan_session() -> Result<(u64, CancellationToken)> {
     let mut reg = SCAN_REGISTRY.lock();
     reg.generation += 1;
     let gen = reg.generation;
-    SCAN_GENERATION.store(gen, std::sync::atomic::Ordering::SeqCst);
     let token = CancellationToken::new();
     reg.tokens.insert(gen, token.clone());
     Ok((gen, token))
