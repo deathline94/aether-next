@@ -438,7 +438,30 @@
 - [ ] T122 [US4] Add the `phase` heartbeat (≤15 s) in `aether/src/{session.rs,session_event.rs}` and treat three misses as a stall in `apps/desktop/src-tauri/src/lib.rs`.
 - [x] T123 [US4] Make the engine's exit status agree with its event stream: `aether/src/main.rs` returns non-zero on an error outcome so the shell cannot observe a clean exit for a failed session.
 - [ ] T124 [US4] Add `handshake_rtt_ms: Option<u32>` (from `aether/src/tunnelping.rs`) and `active_endpoint_rtt_ms: Option<u32>` to `RuntimeState` in `apps/desktop/src-tauri/src/lib.rs:292-297`, exported via `bindings.ts`, and delete every stat lacking a source (T109's list) rather than zero-filling it.
-- [ ] T125 [US4] Fix keep-alive/idle in `aether/src/{quic.rs,tls.rs}`: 15 s ack-eliciting ping **followed by `flush()` in the same iteration** (`send_ack_eliciting` only sets a flag — `quiche/quiche/src/lib.rs:6744-6750`, emission at `:5343-5354` gated `:8268`), `conn.stats()` `recv` deltas with two unanswered pings tearing down, and `set_max_idle_timeout(45_000)` — quiche's effective timeout is `min(local,peer)` floored to 3×PTO (`:8897-8928`), so today's 120 s is both shortened by peers and far beyond NAT soft state.
+- [x] T125 [US4] Fix keep-alive/idle in `aether/src/{quic.rs,tls.rs}`: 15 s ack-eliciting ping **followed by `flush()` in the same iteration** (`send_ack_eliciting` only sets a flag — `quiche/quiche/src/lib.rs:6744-6750`, emission at `:5343-5354` gated `:8268`), `conn.stats()` `recv` deltas with two unanswered pings tearing down, and `set_max_idle_timeout(45_000)` — quiche's effective timeout is `min(local,peer)` floored to 3×PTO (`:8897-8928`), so today's 120 s is both shortened by peers and far beyond NAT soft state.
+Checked each part against the current tree rather than assuming the task text was still true:
+  * **flush in the same iteration — already satisfied.** `run()`'s loop tail calls
+    `flush(&mut conn, &sockets)` on every wake, so the flag set by `send_ack_eliciting` does
+    leave the process. The task's premise was met; the missing piece was never the flush.
+  * **idle timeout — already 45 s** (`aether/src/tls.rs:296`), not the 120 s described.
+  * **two unanswered pings — was missing, and is the real defect.** The keepalive arm sent a
+    probe every 20 s and nobody asked whether it was answered: a session that stopped carrying
+    traffic stayed "connected" until quiche's idle timer fired, and a peer that answered
+    *anything* kept that timer from ever firing, so the failure mode was a green badge over a
+    dead tunnel. Now 15 s probes, one inbound packet (`Ok` *or* `Done` — a datagram arrived
+    either way) clears the budget, and the third tick gives up: `fatal` is set and the
+    connection closed, which is the path that returns `Err` (so the endpoint is struck, not
+    credited) and reads "no reply to 2 keepalive probes; the session stopped carrying traffic".
+  `Keepalive` is a pure counter with three tests, one asserting the relationship instead of
+  trusting arithmetic: `KEEPALIVE_INTERVAL × (MAX_UNANSWERED + 1) <= 45 s`, so the give-up
+  always precedes quiche's silent close. Verified on CI — `Rust engine` and `Rust engine
+  (Windows)` both ran the three tests green; this is engine code and cannot be compiled on this
+  machine, and the first push did fail there on `KEEPALIVE_MAX_UNANSWER` vs `…UNANSWERED`,
+  which is the price of that and cheaper than not doing the work.
+  Not taken: the `conn.stats()` `recv`-delta formulation. An inbound packet already resets the
+  budget, so a stats delta measures the same fact less directly; if the intent was to notice a
+  tunnel that is acknowledged but not carrying IP traffic, that is T124's measurement work, not
+  this teardown rule.
 - [ ] T126 [US4] Fix the WireGuard reuse/PSK decisions in `aether/src/{wireguard.rs,session.rs}`: thread `persistent_keepalive` into the probe (hardcoded `Some(25)` at `wireguard.rs:446`, and `from_established` silently discards `AETHER_WG_KEEPALIVE`); **delete** `preshared_key` (WARP enrolment returns none, and a nonzero PSK folds into `k2`/`mac2` in boringtun making the handshake unpairable); replace `WgSessionCache`'s `map.clear()` at 4 with a TTL of `REJECT_AFTER_TIME − REKEY_TIMEOUT = 175 s` plus LRU eviction; swap `.lock().unwrap()` for `parking_lot` so a poison cannot panic every later probe.
 - [x] T127 [US4] Remove the misleading status claims in `apps/desktop/src/components/ConnectionTab.tsx`: `:21-26` shows `ENGAGING // 0-RTT PROBING` and `ACTIVE // 0-RTT TUNNEL` regardless of transport; `:189` claims an update "is ready" when none was downloaded; `:287` prints `V4 DUAL-READY`. Wire to measured state or delete.
   Done in both UIs. The desktop hero now derives its badge and body from
