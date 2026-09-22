@@ -203,7 +203,6 @@ export function ActivityTab({
                   }
                 }}
                 title="Resume auto-scroll"
-                aria-label="Resume following the log to its newest line"
                 aria-label="Resume auto-scroll"
               >
                 <ArrowDown size={13} aria-hidden="true" />
