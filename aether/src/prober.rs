@@ -190,7 +190,7 @@ pub enum VerifyCost {
 
 /// Per-probe budget floors/ceilings for expensive (QUIC/BoringSSL) verification.
 /// Ceiling on an adaptive scan budget: past this the user is better served by
-    /// the Stop button than by a scan that keeps running.
+/// the Stop button than by a scan that keeps running.
 const MAX_SCAN_DEADLINE: Duration = Duration::from_secs(300);
 const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis(6000);
 const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
@@ -275,7 +275,12 @@ fn measured_as(ironclad: bool) -> crate::cache::Measurement {
 }
 
 /// The verify closure type: given (ip, port, timeout, ironclad) → Option<ProbeResult>.
-pub type VerifyFn<'a> = dyn Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>>
+pub type VerifyFn<'a> = dyn Fn(
+        IpAddr,
+        u16,
+        Duration,
+        bool,
+    ) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>>
     + Send
     + Sync
     + 'a;
@@ -344,9 +349,14 @@ pub async fn race_cached_endpoints(
                             .write_with_rtt(
                                 config_path,
                                 vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
-                                // Tier-0 is a bare handshake race: nothing here has
-                                // carried real HTTP through a tunnel.
-                                crate::cache::Measurement::HandshakeProbe,
+                                // Whatever was actually measured: `verify` above is
+                                // called with the scan's `ironclad` flag, so in
+                                // Ironclad mode this race carried a real HTTP round
+                                // trip through a live tunnel. Recording that as a
+                                // handshake probe ranked a tunnel-inclusive RTT
+                                // against bare handshake RTTs — the exact comparison
+                                // `Measurement` exists to keep apart.
+                                measured_as(ironclad),
                             )
                             .was_skipped()
                         {
@@ -380,7 +390,10 @@ pub async fn host_has_ipv6() -> bool {
     // tests "is there a route to a global v6 address", not reachability of one
     // specific host. Try more than one target so a single withdrawn prefix does
     // not produce a false negative.
-    for target in ["[2606:4700:d0::a29f:c001]:443", "[2001:4860:4860::8888]:443"] {
+    for target in [
+        "[2606:4700:d0::a29f:c001]:443",
+        "[2001:4860:4860::8888]:443",
+    ] {
         if sock.connect(target).await.is_ok() {
             return true;
         }
@@ -452,14 +465,25 @@ pub static SCAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 struct ScanRegistry {
     generation: u64,
-    token: Option<CancellationToken>,
-    cancelled: bool,
+    /// One token per **live** scan, keyed by the generation that minted it.
+    ///
+    /// A single `Option<CancellationToken>` slot meant the second
+    /// `register_scan_session` overwrote the first scan's token: `request_scan_cancel`
+    /// could only ever reach the newest scan, and the older scan's own guard could
+    /// not clean up after it either (generation mismatch). Two scans then probed at
+    /// twice the intended concurrency while the UI's Stop hit only one of them.
+    tokens: std::collections::BTreeMap<u64, CancellationToken>,
+    /// The newest generation a Stop was requested *against*. Monotonic, and a fresh
+    /// scan registers with a strictly larger generation, so a Stop pressed while
+    /// nothing runs can never be consumed by the next Connect — it used to be, and
+    /// that Connect failed once with a misleading "no working gateway".
+    cancelled_through: u64,
 }
 
 static SCAN_REGISTRY: parking_lot::Mutex<ScanRegistry> = parking_lot::Mutex::new(ScanRegistry {
     generation: 0,
-    token: None,
-    cancelled: false,
+    tokens: std::collections::BTreeMap::new(),
+    cancelled_through: 0,
 });
 
 pub struct ScanRunGuard(pub u64);
@@ -467,19 +491,26 @@ pub struct ScanRunGuard(pub u64);
 impl Drop for ScanRunGuard {
     fn drop(&mut self) {
         let mut reg = SCAN_REGISTRY.lock();
-        if reg.generation == self.0 {
-            if let Some(t) = reg.token.take() {
-                t.cancel();
-            }
-            reg.cancelled = false;
+        // Retire *this* scan's token whatever else is live. The old code only acted
+        // when the generation was the newest, so an older scan left a cancelled-by-
+        // nobody entry behind that could still be reached by a later Stop.
+        if let Some(t) = reg.tokens.remove(&self.0) {
+            t.cancel();
         }
     }
 }
 
 pub fn request_scan_cancel() {
     let mut reg = SCAN_REGISTRY.lock();
-    reg.cancelled = true;
-    if let Some(t) = reg.token.as_ref() {
+    // Stamp the generation that is current *now*; a scan started after this point
+    // gets a higher number and is not covered by it.
+    reg.cancelled_through = reg.generation;
+    if reg.tokens.is_empty() {
+        // Nothing was running: the Stop is dropped, and that has to be visible.
+        crate::counters::bump(&crate::counters::STALE_SCAN_CANCELS);
+    }
+    // Every live scan, not just the newest one.
+    for t in reg.tokens.values() {
         t.cancel();
     }
 }
@@ -487,27 +518,104 @@ pub fn request_scan_cancel() {
 #[allow(dead_code)]
 pub fn current_cancel_token() -> CancellationToken {
     let reg = SCAN_REGISTRY.lock();
-    reg.token.clone().unwrap_or_default()
+    reg.tokens.values().next_back().cloned().unwrap_or_default()
 }
 
 pub fn scan_cancelled() -> bool {
     let reg = SCAN_REGISTRY.lock();
-    reg.cancelled || reg.token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false)
+    (reg.cancelled_through != 0 && reg.cancelled_through >= reg.generation)
+        || reg.tokens.values().any(|t| t.is_cancelled())
 }
 
+/// Cancellation as seen by one specific scan: a Stop raised while it (or any newer
+/// scan) was live, or a cancel of its own token. Per-generation so a Stop aimed at a
+/// finished or unrelated scan cannot end this one, and the reverse.
+pub fn scan_cancelled_for(gen: u64) -> bool {
+    let reg = SCAN_REGISTRY.lock();
+    (reg.cancelled_through != 0 && reg.cancelled_through >= gen)
+        || reg
+            .tokens
+            .get(&gen)
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
+}
+
+/// Mint a run id and a cancellation token for one scan.
+///
+/// Returns `Err` only as an API guard for callers that already handle it: a
+/// cancellation raised *before* this call belongs to an older generation and is
+/// deliberately not inherited. Once a scan is registered, `cancel_token` and
+/// `scan_cancelled_for(gen)` are the only paths that can stop it.
 pub fn register_scan_session() -> Result<(u64, CancellationToken)> {
     let mut reg = SCAN_REGISTRY.lock();
-    if reg.cancelled {
-        reg.cancelled = false;
-        return Err(AetherError::NoCleanEndpoint);
-    }
     reg.generation += 1;
     let gen = reg.generation;
     SCAN_GENERATION.store(gen, std::sync::atomic::Ordering::SeqCst);
     let token = CancellationToken::new();
-    reg.token = Some(token.clone());
-    reg.cancelled = false;
+    reg.tokens.insert(gen, token.clone());
     Ok((gen, token))
+}
+
+/// Progress accounting, split out of the scan loop so it can be tested without a
+/// network.
+///
+/// `scanned` answers one question — how much of the queued sweep is done — and the
+/// UI compares it against the `total` announced by `ScanStart` to decide whether
+/// the scan finished. Stage-2 drill-downs probe a neighbour list that was **never
+/// queued**, so folding their count into `scanned` pushed it past the total, the
+/// completion line never fired, and the bar read "1431/1200". Drill probes are
+/// therefore tallied apart, and the reported number is clamped to the total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanTally {
+    scanned: usize,
+    drill_probes: usize,
+    total: usize,
+}
+
+impl ScanTally {
+    pub fn new(total: usize) -> Self {
+        Self {
+            scanned: 0,
+            drill_probes: 0,
+            total,
+        }
+    }
+
+    /// One queued candidate came back (hit or miss).
+    pub fn candidate_done(&mut self) {
+        self.scanned += 1;
+    }
+
+    /// A drill-down wave examined `examined` neighbours nobody queued.
+    pub fn drill_down_done(&mut self, examined: usize) {
+        self.drill_probes = self.drill_probes.saturating_add(examined);
+    }
+
+    /// What the UI may be told, never more than the total it was promised.
+    pub fn reported(&self) -> usize {
+        self.scanned.min(self.total)
+    }
+
+    /// Drill-down probes, reported apart from the sweep.
+    pub fn drill_probes(&self) -> usize {
+        self.drill_probes
+    }
+
+    /// Total probe work, for the log line only.
+    pub fn probes_sent(&self) -> usize {
+        self.scanned.saturating_add(self.drill_probes)
+    }
+
+    /// Terminal condition — `>=` rather than `==` so overshoot cannot strand it.
+    pub fn is_complete(&self) -> bool {
+        self.scanned >= self.total
+    }
+
+    /// Whether this tick deserves a progress event: every 50 candidates, and always
+    /// at completion.
+    pub fn should_report(&self) -> bool {
+        self.reported().is_multiple_of(50) || self.is_complete()
+    }
 }
 
 pub async fn hunt_best(
@@ -630,9 +738,7 @@ pub async fn hunt_best(
             .per_probe_timeout
             .saturating_mul(waves.saturating_add(2) as u32);
         let before = st.overall_deadline;
-        st.overall_deadline = needed
-            .max(before)
-            .min(MAX_SCAN_DEADLINE);
+        st.overall_deadline = needed.max(before).min(MAX_SCAN_DEADLINE);
         if st.overall_deadline > before {
             log::debug!(
                 "[prober] {} candidates / {} concurrent at {:?} => deadline {:?} (was {:?}, cap {:?})",
@@ -651,19 +757,15 @@ pub async fn hunt_best(
         concurrency: st.concurrency,
     });
     let cancel_child = cancel_token.clone();
-    let stream = futures::stream::iter(
-        candidates
-            .into_iter()
-            .map(|(ip, port)| {
-                let tok = cancel_child.clone();
-                async move {
-                    tokio::select! {
-                        _ = tok.cancelled() => None,
-                        res = verify(ip, port, timeout, ironclad) => res,
-                    }
-                }
-            }),
-    )
+    let stream = futures::stream::iter(candidates.into_iter().map(|(ip, port)| {
+        let tok = cancel_child.clone();
+        async move {
+            tokio::select! {
+                _ = tok.cancelled() => None,
+                res = verify(ip, port, timeout, ironclad) => res,
+            }
+        }
+    }))
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
 
@@ -674,7 +776,8 @@ pub async fn hunt_best(
     };
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
-    let mut scanned = 0usize;
+    // Queued candidates vs drill-down probes, kept apart: see `ScanTally`.
+    let mut tally = ScanTally::new(total_candidates);
     // `(ip, port)` already reported. Without it a drill-down that reached the
     // same neighbour as the main sweep counted one working gateway as two, and
     // `target_successes` stopped the scan early on phantom hits.
@@ -704,7 +807,7 @@ pub async fn hunt_best(
             }
         }
 
-        if scan_cancelled() {
+        if scan_cancelled_for(gen) {
             log::info!("[*] scan cancelled by request; finalizing with best so far");
             break;
         }
@@ -718,9 +821,16 @@ pub async fn hunt_best(
                 match item {
                     None => break,
                     Some(res) => {
-                        scanned += 1;
-                        if scanned.is_multiple_of(50) || scanned == total_candidates {
-                            log::info!("[*] scanning... {}/{} ips, found {} working", scanned, total_candidates, found);
+                        tally.candidate_done();
+                        if tally.should_report() {
+                            let scanned = tally.reported();
+                            log::info!(
+                                "[*] scanning... {}/{} ips, found {} working, {} probes so far",
+                                scanned,
+                                total_candidates,
+                                found,
+                                tally.probes_sent()
+                            );
                             crate::session_event::emit(crate::session_event::SessionEvent::ScanProgress {
                                 scanned,
                                 total: total_candidates,
@@ -747,17 +857,50 @@ pub async fn hunt_best(
                                 };
                                 if hot_subnets.insert(sub_key) {
                                     log::info!("[🔥] Hot subnet detected near {}! Launching Stage-2 drill-down...", pr.ip);
-                                    // Note: kept inline — the verify closure is not
-                                    // 'static, so this cannot be spawned off. Cost is
-                                    // bounded: drill-downs probe a small fixed
-                                    // neighbor list at min(concurrency,16).
-                                    let (hot_hits, drill_examined) =
-                                        drill_down_hot_subnet(verify, pr.ip, pr.port, timeout, ironclad, st.concurrency, cancel_token.clone()).await;
-                                    // The drill-down examined a neighbour list, not
-                                    // one candidate — counting it as 1 made the
-                                    // progress bar claim fewer probes than ran and
-                                    // `scanned == total_candidates` never matched.
-                                    scanned += 1 + drill_examined;
+                                    // The verify closure is not 'static so the wave
+                                    // cannot be spawned off — but awaiting it inline
+                                    // used to freeze this whole `select!`: while it
+                                    // ran, neither `cancel_token` nor the scan
+                                    // deadline was polled, so one wave per hot /24
+                                    // (>=6 s per probe in expensive H3) overshot both
+                                    // Stop and the budget. Race it against the two
+                                    // things that are meant to end a scan.
+                                    let drill_budget = match effective {
+                                        Some(eff) => eff
+                                            .saturating_duration_since(Instant::now())
+                                            .min(Duration::from_secs(DRILL_DOWN_MAX_SECS)),
+                                        // Exhaustive scans have no deadline; the
+                                        // drill-down still has a bound of its own.
+                                        None => Duration::from_secs(DRILL_DOWN_MAX_SECS),
+                                    };
+                                    let drilled = tokio::select! {
+                                        r = drill_down_hot_subnet(
+                                            verify,
+                                            pr.ip,
+                                            pr.port,
+                                            timeout,
+                                            ironclad,
+                                            st.concurrency,
+                                            cancel_token.clone(),
+                                        ) => Some(r),
+                                        _ = cancel_token.cancelled() => None,
+                                        _ = tokio::time::sleep(drill_budget) => None,
+                                    };
+                                    let (hot_hits, drill_examined) = match drilled {
+                                        Some(done) => done,
+                                        None => {
+                                            // The neighbours it never reached were not
+                                            // probed, and the tally must not claim
+                                            // they were.
+                                            crate::counters::bump(
+                                                &crate::counters::DRILL_DOWN_WAVES_ABANDONED,
+                                            );
+                                            (Vec::new(), 0usize)
+                                        }
+                                    };
+                                    // Drill probes are counted apart from the queued
+                                    // sweep — see `ScanTally`.
+                                    tally.drill_down_done(drill_examined);
                                     for h_pr in hot_hits {
                                         if !reported.insert((h_pr.ip, h_pr.port)) {
                                             continue;
@@ -816,7 +959,11 @@ pub async fn hunt_best(
         Some(pr) => {
             log::info!("[+] best {} {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
             let rtt_ms = pr.rtt.as_millis() as u32;
-            config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)], measured_as(ironclad));
+            config.cache_kind.write_with_rtt(
+                &config.config_path,
+                vec![(SocketAddr::new(pr.ip, pr.port), rtt_ms)],
+                measured_as(ironclad),
+            );
             Ok(pr)
         }
         None => {
@@ -847,6 +994,14 @@ const STAGE2_OFFSETS: [u32; 21] = [
     1, 2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 75, 90, 100, 120, 150, 180, 200,
 ];
 
+/// Hard ceiling on one drill-down wave, in seconds.
+///
+/// A wave is ~40 neighbours at `min(concurrency, 16)` lanes, so at the
+/// `EXPENSIVE_MIN_TIMEOUT` per-probe budget it can outlast the whole remaining
+/// scan. The caller races this against cancel and the scan deadline; exhaustive
+/// scans, which have no deadline, still get this bound.
+const DRILL_DOWN_MAX_SECS: u64 = 8;
+
 /// Both directions from `current`, saturating and confined to usable hosts.
 ///
 /// Saturating rather than `% 254` is the fix: a hit on `.250` used to wrap its
@@ -856,7 +1011,10 @@ const STAGE2_OFFSETS: [u32; 21] = [
 fn v4_neighbor_hosts(current: u32, offsets: &[u32]) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::with_capacity(offsets.len() * 2);
     for &offset in offsets {
-        for h in [current.saturating_add(offset), current.saturating_sub(offset)] {
+        for h in [
+            current.saturating_add(offset),
+            current.saturating_sub(offset),
+        ] {
             if h != current && (1..=254).contains(&h) && !out.contains(&h) {
                 out.push(h);
             }
@@ -892,7 +1050,9 @@ async fn drill_down_hot_subnet(
             for offset in [1, 2, 3, 4, 5, 10, 20, 50, 100] {
                 let last = current_last.saturating_add(offset);
                 if last != current_last && last != 0 {
-                    let neighbor_ip = IpAddr::V6(Ipv6Addr::new(segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], last));
+                    let neighbor_ip = IpAddr::V6(Ipv6Addr::new(
+                        segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], last,
+                    ));
                     if !neighbors.contains(&(neighbor_ip, port)) {
                         neighbors.push((neighbor_ip, port));
                     }
@@ -907,19 +1067,15 @@ async fn drill_down_hot_subnet(
     }
 
     let cancel_child = cancel_token.clone();
-    let stream = futures::stream::iter(
-        neighbors
-            .into_iter()
-            .map(|(nip, nport)| {
-                let tok = cancel_child.clone();
-                async move {
-                    tokio::select! {
-                        _ = tok.cancelled() => None,
-                        res = verify(nip, nport, timeout, ironclad) => res,
-                    }
-                }
-            }),
-    )
+    let stream = futures::stream::iter(neighbors.into_iter().map(|(nip, nport)| {
+        let tok = cancel_child.clone();
+        async move {
+            tokio::select! {
+                _ = tok.cancelled() => None,
+                res = verify(nip, nport, timeout, ironclad) => res,
+            }
+        }
+    }))
     .buffer_unordered(concurrency.min(16));
     tokio::pin!(stream);
 
@@ -943,15 +1099,28 @@ async fn drill_down_hot_subnet(
 // Candidate generation (shared)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u16)> {
+fn build_candidates(
+    config: &ProbeConfig,
+    st: &Strategy,
+    ports: &[u16],
+    ip: IpScan,
+) -> Vec<(IpAddr, u16)> {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
 
     // Port priority: dedup while preserving priority order from caller
     let dedup_ports: Vec<u16> = {
         let mut seen_port: HashSet<u16> = HashSet::new();
-        let deduped: Vec<u16> = ports.iter().copied().filter(|p| seen_port.insert(*p)).collect();
-        if deduped.is_empty() { vec![443] } else { deduped }
+        let deduped: Vec<u16> = ports
+            .iter()
+            .copied()
+            .filter(|p| seen_port.insert(*p))
+            .collect();
+        if deduped.is_empty() {
+            vec![443]
+        } else {
+            deduped
+        }
     };
 
     let is_masque = config.label.contains("gateway");
@@ -959,14 +1128,41 @@ fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpSc
     // ── Port tiering: split ports into T1 (first), T2 (next), T3 (last) ──
     let (t1_ports, t2_ports, t3_ports): (Vec<u16>, Vec<u16>, Vec<u16>) = {
         if is_masque {
-            let t1: Vec<u16> = dedup_ports.iter().copied().filter(|p| MASQUE_PORTS_T1.contains(p)).collect();
-            let t2: Vec<u16> = dedup_ports.iter().copied().filter(|p| MASQUE_PORTS_T2.contains(p)).collect();
-            let t3: Vec<u16> = dedup_ports.iter().copied().filter(|p| !MASQUE_PORTS_T1.contains(p) && !MASQUE_PORTS_T2.contains(p)).collect();
+            let t1: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| MASQUE_PORTS_T1.contains(p))
+                .collect();
+            let t2: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| MASQUE_PORTS_T2.contains(p))
+                .collect();
+            let t3: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| !MASQUE_PORTS_T1.contains(p) && !MASQUE_PORTS_T2.contains(p))
+                .collect();
             (if t1.is_empty() { vec![443] } else { t1 }, t2, t3)
         } else {
-            let t1: Vec<u16> = dedup_ports.iter().copied().filter(|p| crate::wireguard::WG_PORTS_T1.contains(p)).collect();
-            let t2: Vec<u16> = dedup_ports.iter().copied().filter(|p| crate::wireguard::WG_PORTS_T2.contains(p)).collect();
-            let t3: Vec<u16> = dedup_ports.iter().copied().filter(|p| !crate::wireguard::WG_PORTS_T1.contains(p) && !crate::wireguard::WG_PORTS_T2.contains(p)).collect();
+            let t1: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| crate::wireguard::WG_PORTS_T1.contains(p))
+                .collect();
+            let t2: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| crate::wireguard::WG_PORTS_T2.contains(p))
+                .collect();
+            let t3: Vec<u16> = dedup_ports
+                .iter()
+                .copied()
+                .filter(|p| {
+                    !crate::wireguard::WG_PORTS_T1.contains(p)
+                        && !crate::wireguard::WG_PORTS_T2.contains(p)
+                })
+                .collect();
             (if t1.is_empty() { vec![500, 4500] } else { t1 }, t2, t3)
         }
     };
@@ -989,10 +1185,16 @@ fn build_candidates(config: &ProbeConfig, st: &Strategy, ports: &[u16], ip: IpSc
         .chain(t3_ports.iter())
         .copied()
         .collect();
-    let mut v4_seeds: Vec<Ipv4Addr> =
-        config.seeds_v4.iter().filter_map(|s| s.parse().ok()).collect();
-    let mut v6_seeds: Vec<Ipv6Addr> =
-        config.seeds_v6.iter().filter_map(|s| s.parse().ok()).collect();
+    let mut v4_seeds: Vec<Ipv4Addr> = config
+        .seeds_v4
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let mut v6_seeds: Vec<Ipv6Addr> = config
+        .seeds_v6
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     v4_seeds.shuffle(&mut rng);
     v6_seeds.shuffle(&mut rng);
     let mut seeds_out: Vec<(IpAddr, u16)> = Vec::new();
@@ -1068,7 +1270,11 @@ fn cidr_pool(
         }
     }
     if ip.want_v6() {
-        let per = if st.sample_per_cidr == 0 { 96 } else { st.sample_per_cidr };
+        let per = if st.sample_per_cidr == 0 {
+            96
+        } else {
+            st.sample_per_cidr
+        };
         for c in config.cidrs_v6 {
             for a in sample_cidr_v6(c, per, config.cidrs_v4) {
                 for &p in port_set {
@@ -1118,7 +1324,10 @@ fn cap_and_order(
 
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((u32::from(ip.parse::<Ipv4Addr>().ok()?), prefix.parse().ok()?))
+    Some((
+        u32::from(ip.parse::<Ipv4Addr>().ok()?),
+        prefix.parse().ok()?,
+    ))
 }
 
 fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
@@ -1153,7 +1362,11 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
         None => return Vec::new(),
     };
     let host_bits = 32u32.saturating_sub(prefix as u32);
-    let size = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
+    let size = if host_bits >= 32 {
+        u32::MAX
+    } else {
+        1u32 << host_bits
+    };
     if size <= 2 {
         return vec![Ipv4Addr::from(base)];
     }
@@ -1176,7 +1389,10 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
 
 fn parse_cidr_v6(cidr: &str) -> Option<(u128, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((u128::from(ip.parse::<Ipv6Addr>().ok()?), prefix.parse().ok()?))
+    Some((
+        u128::from(ip.parse::<Ipv6Addr>().ok()?),
+        prefix.parse().ok()?,
+    ))
 }
 
 fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
@@ -1332,7 +1548,17 @@ impl MasqueProbe {
     }
 
     /// Create the verify closure for MASQUE probing.
-    pub fn verify_fn<'a>(&'a self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>> + Send + Sync + 'a {
+    pub fn verify_fn<'a>(
+        &'a self,
+    ) -> impl Fn(
+        IpAddr,
+        u16,
+        Duration,
+        bool,
+    ) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>>
+           + Send
+           + Sync
+           + 'a {
         move |ip: IpAddr, port: u16, timeout: Duration, ironclad: bool| {
             Box::pin(async move {
                 if ironclad {
@@ -1348,9 +1574,17 @@ impl MasqueProbe {
                         local_ipv4_str: self.local_ipv4.to_string(),
                         local_ipv6_str: String::new(),
                     };
-                    return match crate::tunnelping::masque_http_ping(&params, IRONCLAD_TCPING_TIMEOUT).await {
+                    return match crate::tunnelping::masque_http_ping(
+                        &params,
+                        IRONCLAD_TCPING_TIMEOUT,
+                    )
+                    .await
+                    {
                         Ok(rtt) => {
-                            log::info!("[+] ironclad verified {ip}:{port} real http round trip rtt={:?}", rtt);
+                            log::info!(
+                                "[+] ironclad verified {ip}:{port} real http round trip rtt={:?}",
+                                rtt
+                            );
                             Some(ProbeResult { ip, port, rtt })
                         }
                         Err(e) => {
@@ -1510,11 +1744,7 @@ impl WgSessionCache {
         Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
     }
 
-    pub fn insert_capped(
-        &self,
-        peer: SocketAddr,
-        session: crate::wireguard::EstablishedSession,
-    ) {
+    pub fn insert_capped(&self, peer: SocketAddr, session: crate::wireguard::EstablishedSession) {
         let mut map = self.0.lock();
         let now = Instant::now();
         let entries: Vec<(SocketAddr, Instant)> =
@@ -1609,10 +1839,12 @@ mod wg_cache_tests {
     fn a_zero_capacity_cache_does_not_underflow() {
         let now = Instant::now();
         let entries = vec![(peer(1), now)];
-        assert_eq!(wg_evictions(&entries, now, WG_SESSION_TTL, 0), vec![peer(1)]);
+        assert_eq!(
+            wg_evictions(&entries, now, WG_SESSION_TTL, 0),
+            vec![peer(1)]
+        );
     }
 }
-
 
 impl WgProbe {
     /// Build a [`ProbeConfig`] for WireGuard scanning.
@@ -1638,7 +1870,17 @@ impl WgProbe {
     }
 
     /// Create the verify closure for WireGuard probing.
-    pub fn verify_fn<'a>(&'a self) -> impl Fn(IpAddr, u16, Duration, bool) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>> + Send + Sync + 'a {
+    pub fn verify_fn<'a>(
+        &'a self,
+    ) -> impl Fn(
+        IpAddr,
+        u16,
+        Duration,
+        bool,
+    ) -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + 'a>>
+           + Send
+           + Sync
+           + 'a {
         move |ip: IpAddr, port: u16, timeout: Duration, ironclad: bool| {
             Box::pin(async move {
                 let peer = SocketAddr::new(ip, port);
@@ -1673,10 +1915,23 @@ impl WgProbe {
                     local_ipv6: "::1".parse().unwrap(),
                     aethernoize: self.aethernoize.clone(),
                 };
-                match crate::tunnelping::wg_http_ping_established(session, &params, WG_IRONCLAD_TCPING_TIMEOUT).await {
+                match crate::tunnelping::wg_http_ping_established(
+                    session,
+                    &params,
+                    WG_IRONCLAD_TCPING_TIMEOUT,
+                )
+                .await
+                {
                     Ok(http_rtt) => {
-                        log::info!("[+] ironclad verified wg {ip}:{port} real http round trip rtt={:?}", http_rtt);
-                        Some(ProbeResult { ip, port, rtt: http_rtt })
+                        log::info!(
+                            "[+] ironclad verified wg {ip}:{port} real http round trip rtt={:?}",
+                            http_rtt
+                        );
+                        Some(ProbeResult {
+                            ip,
+                            port,
+                            rtt: http_rtt,
+                        })
                     }
                     Err(e) => {
                         log::debug!("[-] ironclad wg {ip}:{port} failed real http check: {e}");
@@ -1712,7 +1967,10 @@ mod candidate_tests {
             near_top.iter().all(|h| (1..=254).contains(h)),
             "a stage-2 neighbour left the usable host range: {near_top:?}"
         );
-        assert!(!near_top.contains(&250), "the hit itself must not be re-probed");
+        assert!(
+            !near_top.contains(&250),
+            "the hit itself must not be re-probed"
+        );
 
         let near_bottom = v4_neighbor_hosts(3, &offsets);
         assert!(!near_bottom.contains(&0) && !near_bottom.contains(&255));
@@ -1775,7 +2033,10 @@ mod candidate_tests {
             .map(|s| s.parse().unwrap())
             .collect();
         for c in cands.iter().take(4) {
-            assert!(seed_ips.contains(&c.0), "first candidates must be seeds, got {c:?}");
+            assert!(
+                seed_ips.contains(&c.0),
+                "first candidates must be seeds, got {c:?}"
+            );
         }
         // Both the primary (443) and alt port (500) are covered by seeds first, so a
         // DPI-blocked 443 still reaches the alt port early.
@@ -1785,16 +2046,28 @@ mod candidate_tests {
 
     #[test]
     fn candidates_are_deduplicated() {
-        let cands = build_candidates(&test_config(), &test_strategy(), &[443, 500, 443], IpScan::V4);
+        let cands = build_candidates(
+            &test_config(),
+            &test_strategy(),
+            &[443, 500, 443],
+            IpScan::V4,
+        );
         let set: std::collections::HashSet<(IpAddr, u16)> = cands.iter().copied().collect();
-        assert_eq!(set.len(), cands.len(), "duplicate (ip, port) candidates must not appear");
+        assert_eq!(
+            set.len(),
+            cands.len(),
+            "duplicate (ip, port) candidates must not appear"
+        );
     }
 
     #[test]
     fn enumerate_cidr_caps_large_prefix_instead_of_empty() {
         // Regression: host_bits > 12 used to return an empty vec (silent skip).
         let big = enumerate_cidr_v4("10.5.0.0/16");
-        assert!(!big.is_empty(), "large CIDR must not silently yield nothing");
+        assert!(
+            !big.is_empty(),
+            "large CIDR must not silently yield nothing"
+        );
         assert!(big.len() <= 4096, "enumeration must be capped");
         // A small CIDR still enumerates fully (excludes network + broadcast).
         assert_eq!(enumerate_cidr_v4("10.9.9.0/30").len(), 2);
@@ -1819,12 +2092,19 @@ mod candidate_tests {
         // The seed VIP verifies and, like a user hitting Stop, requests cancellation
         // on that first hit; every other candidate fails.
         let hit: IpAddr = "10.0.0.1".parse().unwrap();
-        let verify = move |ip: IpAddr, port: u16, _t: Duration, _iron: bool|
-            -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
+        let verify = move |ip: IpAddr,
+                           port: u16,
+                           _t: Duration,
+                           _iron: bool|
+              -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
             Box::pin(async move {
                 if ip == hit {
                     request_scan_cancel();
-                    Some(ProbeResult { ip, port, rtt: Duration::from_millis(10) })
+                    Some(ProbeResult {
+                        ip,
+                        port,
+                        rtt: Duration::from_millis(10),
+                    })
                 } else {
                     None
                 }
@@ -1835,9 +2115,18 @@ mod candidate_tests {
             .enable_all()
             .build()
             .unwrap();
-        let res = rt.block_on(hunt_best(&config, &[443], IpScan::V4, ScanMode::Balanced, &verify));
+        let res = rt.block_on(hunt_best(
+            &config,
+            &[443],
+            IpScan::V4,
+            ScanMode::Balanced,
+            &verify,
+        ));
 
-        assert!(res.is_ok(), "a cancelled scan that already found an endpoint must finalize Ok");
+        assert!(
+            res.is_ok(),
+            "a cancelled scan that already found an endpoint must finalize Ok"
+        );
         assert_eq!(res.unwrap().ip, hit);
         // The best-so-far must be written to the cache on cancel, not discarded.
         let cached = crate::cache::get_masque_sorted(&cfg_path);
@@ -1870,18 +2159,22 @@ mod tier0_tests {
         let seen: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
 
         let recorder = seen.clone();
-        let verify = move |ip: IpAddr, port: u16, _t: Duration, ironclad: bool|
-         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
-            let recorder = recorder.clone();
-            Box::pin(async move {
-                recorder.lock().push(ironclad);
-                Some(ProbeResult {
-                    ip,
-                    port,
-                    rtt: Duration::from_millis(25),
+        let verify =
+            move |ip: IpAddr,
+                  port: u16,
+                  _t: Duration,
+                  ironclad: bool|
+                  -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+                let recorder = recorder.clone();
+                Box::pin(async move {
+                    recorder.lock().push(ironclad);
+                    Some(ProbeResult {
+                        ip,
+                        port,
+                        rtt: Duration::from_millis(25),
+                    })
                 })
-            })
-        };
+            };
 
         let out = race_cached_endpoints(
             vec![(gw, 25)],
@@ -1922,18 +2215,105 @@ mod tier0_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The proof Tier-0 runs and the label it writes must be the same act. The
+    /// race above is entered with `ironclad = true`, so the winner's RTT includes a
+    /// real HTTP round trip through a live tunnel — but the entry was written as a
+    /// bare `HandshakeProbe` unconditionally, which is exactly the cross-kind
+    /// comparison `Measurement` exists to keep apart: the cache then ranked a
+    /// tunnel-inclusive RTT against handshake RTTs and trusted the cheaper number.
+    #[tokio::test]
+    async fn an_ironclad_race_records_an_http_round_trip() {
+        let dir = std::env::temp_dir().join(format!("aether_tier0_meas_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let gw: SocketAddr = "162.159.193.1:443".parse().unwrap();
+
+        let verify =
+            move |ip: IpAddr,
+                  port: u16,
+                  _t: Duration,
+                  _ironclad: bool|
+                  -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+                Box::pin(async move {
+                    Some(ProbeResult {
+                        ip,
+                        port,
+                        rtt: Duration::from_millis(25),
+                    })
+                })
+            };
+
+        let out = race_cached_endpoints(
+            vec![(gw, 25)],
+            &verify,
+            &CacheKind::Masque,
+            &base,
+            Duration::from_secs(1),
+            true,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(out, Tier0Outcome::Winner(_)), "{out:?}");
+
+        let entry = crate::cache::load_endpoints(&base)
+            .masque
+            .iter()
+            .find(|e| e.addr == gw)
+            .expect("the race winner must be in the cache");
+        assert_eq!(
+            entry.measurement,
+            crate::cache::Measurement::HttpRoundTrip,
+            "an ironclad Tier-0 win was recorded as a bare handshake probe"
+        );
+
+        // The other direction: a handshake-mode race must not claim to have carried
+        // HTTP either.
+        let base2 = dir
+            .join("aether-handshake.toml")
+            .to_string_lossy()
+            .to_string();
+        let out = race_cached_endpoints(
+            vec![(gw, 25)],
+            &verify,
+            &CacheKind::Masque,
+            &base2,
+            Duration::from_secs(1),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(out, Tier0Outcome::Winner(_)), "{out:?}");
+        let entry = crate::cache::load_endpoints(&base2)
+            .masque
+            .iter()
+            .find(|e| e.addr == gw)
+            .expect("the race winner must be in the cache");
+        assert_eq!(
+            entry.measurement,
+            crate::cache::Measurement::HandshakeProbe,
+            "a handshake Tier-0 win must not be labelled as HTTP"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn an_empty_cache_is_a_miss_not_a_hang() {
         let seen: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
         let recorder = seen.clone();
-        let verify = move |_ip: IpAddr, _port: u16, _t: Duration, _ironclad: bool|
-         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
-            let recorder = recorder.clone();
-            Box::pin(async move {
-                recorder.lock().push(true);
-                None
-            })
-        };
+        let verify =
+            move |_ip: IpAddr,
+                  _port: u16,
+                  _t: Duration,
+                  _ironclad: bool|
+                  -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+                let recorder = recorder.clone();
+                Box::pin(async move {
+                    recorder.lock().push(true);
+                    None
+                })
+            };
         let out = race_cached_endpoints(
             Vec::new(),
             &verify,
@@ -1951,15 +2331,19 @@ mod tier0_tests {
     #[tokio::test]
     async fn cancellation_during_the_race_is_reported_as_cancelled() {
         let recorder: std::sync::Arc<Mutex<Vec<bool>>> = Default::default();
-        let verify = move |ip: IpAddr, port: u16, _t: Duration, _ironclad: bool|
-         -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
-            let recorder = recorder.clone();
-            Box::pin(async move {
-                recorder.lock().push(true);
-                let _ = (ip, port);
-                None
-            })
-        };
+        let verify =
+            move |ip: IpAddr,
+                  port: u16,
+                  _t: Duration,
+                  _ironclad: bool|
+                  -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send + '_>> {
+                let recorder = recorder.clone();
+                Box::pin(async move {
+                    recorder.lock().push(true);
+                    let _ = (ip, port);
+                    None
+                })
+            };
         let token = CancellationToken::new();
         token.cancel();
         let out = race_cached_endpoints(

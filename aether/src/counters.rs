@@ -45,6 +45,11 @@ counters! {
     CACHE_ENTRIES_REJECTED => "cache_entries_rejected",
     /// H3 responses ignored because they did not belong to the request stream.
     IGNORED_OFFSTREAM_STATUS => "ignored_offstream_status",
+    /// Scan Stop requests dropped because no scan was running to receive them.
+    STALE_SCAN_CANCELS => "stale_scan_cancels",
+    /// Hot-subnet drill-down waves abandoned by cancellation or the scan deadline
+    /// before they finished their neighbour list.
+    DRILL_DOWN_WAVES_ABANDONED => "drill_down_waves_abandoned",
 }
 
 fn peek(c: &AtomicU64) -> u64 {
@@ -74,7 +79,9 @@ mod tests {
         let after = bump(&MALFORMED_EVENTS);
         assert_eq!(after, before + 2);
         assert_eq!(
-            snapshot()[name].as_u64().expect("counter present in snapshot"),
+            snapshot()[name]
+                .as_u64()
+                .expect("counter present in snapshot"),
             after,
             "{name} is not wired into snapshot()"
         );
