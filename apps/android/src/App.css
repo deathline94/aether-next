@@ -3515,3 +3515,21 @@ code, kbd, pre {
   color: var(--blue);
   background: var(--blue-dim);
 }
+
+/* Focus rings have to survive the panels that clip their contents. Every container
+   below is overflow: hidden — which is what keeps a card's square children inside
+   a rounded corner — and a control on the first or last row sits flush against
+   that edge, so the default 2px outset ring was cut off and the keyboard focus
+   position was invisible precisely where it mattered. Drawing the ring inside the
+   border keeps the clip and restores the indicator. */
+.profiles-panel :focus-visible,
+.proxy-panel :focus-visible,
+.settings-section :focus-visible,
+.test-panel :focus-visible,
+.tactical-panel :focus-visible,
+.radar-hud-container :focus-visible,
+.discovered-panel :focus-visible,
+.tactical-terminal-chassis :focus-visible,
+.stepper-input-wrapper:focus-within {
+  outline-offset: -2px;
+}
