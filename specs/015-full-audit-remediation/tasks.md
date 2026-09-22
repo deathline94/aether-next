@@ -853,7 +853,7 @@ Checked each part against the current tree rather than assuming the task text wa
 - [ ] T248 [P] Replace relative-path defaults in `aether/src/engine_config.rs:30` (`config_path` defaults to `"aether.toml"` against the CWD, so a desktop-shortcut launch can read/write in `C:\Windows`) with a per-user data directory, reject a relative `AETHER_CONFIG`, and stop deriving `cache_path`/`session_ticket_path` by string surgery on it.
 - [ ] T249 [P] Add `cargo fmt --check`, `npx tsc --noEmit` for both apps, and stylelint to `.github/workflows/ci.yml`; run `npx stylelint 'apps/*/src/**/*.css' --fix` after T192's structural edits, then hand-verify the token diff.
 - [x] T250 [P] Update `Docs/GUIDE.en.md`, `README.md` and `PRODUCT.md` for the ratified constitution's invariants, the pin-rotation procedure, `--repair-routes`/`--repair-proxy`, the diagnostics export, and the deliberately-unsigned-updater decision.
-- [ ] T251 [P] Mark `specs/001`–`specs/014` superseded by `015` with a one-line note each rather than deleting them, so no future reader treats `014`'s 40/40 `[x]` as evidence of fixed behaviour.
+- [x] T251 [P] Mark `specs/001`–`specs/014` superseded by `015` with a one-line note each rather than deleting them, so no future reader treats `014`'s 40/40 `[x]` as evidence of fixed behaviour. Done as a blockquote under each H1 (five lines, naming the failure mode: guards that are unreachable, inverted, or never wired into CI), in all 14 `spec.md` files.
 - [ ] T252 Run the complete `quickstart.md` validation end to end (all 9 sections including the §1 soak and §9 device pass), attach artefacts, and record each guard's step-3 mutation result.
 - [ ] T253 Run `/speckit-converge` to diff the shipped tree against FR-001…FR-047 and append any unbuilt work as new tasks, then `/speckit-analyze` for cross-artifact consistency, then re-verify every `tasks.md` checkbox against source rather than trusting it — the discipline this feature exists to install.
 
@@ -1111,7 +1111,7 @@ audit read it as stale.
   (generated bindings; BC-08 is today enforced by hand-maintained types +
   name-parity gates only), T022 (`EndpointRegistry` actor), T230,
   T231's `permissions: {}` + `environment:` review gates, T234, T240/T241,
-  T249 (stylelint and osv-scanner are still absent), T251, and the checkpoint
+  T249 (stylelint and osv-scanner are still absent), and the checkpoint
   tasks (T030, T052, T078, T103, T130, T164, T201, T252, T253), which are
   validation runs - several need a clean Windows 11 VM, a device, or CI, and
   none can be signed off from this machine.

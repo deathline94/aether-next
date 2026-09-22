@@ -1,3 +1,10 @@
+
+> **Superseded by `specs/015-full-audit-remediation`.** Every "fixed" statement
+> below describes the tree as it was when this document was written. 015
+> re-audited these claims against source and found that several of the guards
+> they record were unreachable, inverted, or never wired into CI. Read the code
+> before quoting this file as evidence that something is done.
+
 ﻿# Feature Specification: Backend & Technical Bug Fixes (MASQUE H3 Pool, SPKI Pins, Android VPN Traffic, IP/Port Sync, Activity Header Spacing)
 
 **Feature Branch**: `007-fix-backend-vpn-masque-bugs`

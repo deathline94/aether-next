@@ -1,3 +1,10 @@
+
+> **Superseded by `specs/015-full-audit-remediation`.** Every "fixed" statement
+> below describes the tree as it was when this document was written. 015
+> re-audited these claims against source and found that several of the guards
+> they record were unreachable, inverted, or never wired into CI. Read the code
+> before quoting this file as evidence that something is done.
+
 ﻿# Feature Specification: Visual & Functional Bug Remediation
 
 **Feature Branch**: `002-visual-functional-bug-audit`
