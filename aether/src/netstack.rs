@@ -187,6 +187,11 @@ impl SocketClass {
     }
 }
 
+/// Ingress frames serviced per loop iteration before egress gets a pass.
+const MAX_INGRESS_PER_TICK: usize = 32;
+/// Floor for the "nothing to wait for" case while frames are still queued.
+const MIN_POLL_DELAY: std::time::Duration = std::time::Duration::from_micros(250);
+
 pub struct StackDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
@@ -1008,8 +1013,23 @@ async fn run(
 ) -> Result<()> {
     loop {
         let now = stack_now(clock_base);
+        // Bounded interleave rather than one `iface.poll()`. A single poll drains
+        // the whole device RX ring before it will service egress, so one client
+        // blasting uploads held the loop away from every other flow's outbound
+        // packet for the length of that burst. Ingress is capped per tick and
+        // egress then gets its own pass.
         let poll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            s.iface.poll(now, &mut s.device, &mut s.sockets);
+            let mut ingressed = 0usize;
+            while ingressed < MAX_INGRESS_PER_TICK {
+                match s
+                    .iface
+                    .poll_ingress_single(now, &mut s.device, &mut s.sockets)
+                {
+                    smoltcp::iface::PollIngressSingleResult::None => break,
+                    _ => ingressed += 1,
+                }
+            }
+            s.iface.poll_egress(now, &mut s.device, &mut s.sockets);
         }));
         if poll_outcome.is_err() {
             // L4 fix: a smoltcp poll panic is surfaced, not swallowed. The
@@ -1041,10 +1061,16 @@ async fn run(
             }
         }
 
-        let delay = s
+        let mut delay = s
             .iface
             .poll_delay(stack_now(clock_base), &s.sockets)
             .map(|d| std::time::Duration::from_micros(d.total_micros()));
+        if delay.is_none() && !s.device.rx.is_empty() {
+            // smoltcp says "act now" because a frame is queued; we just handed
+            // that work its bounded share, so wait long enough for the select to
+            // mean something instead of spinning at 0.
+            delay = Some(MIN_POLL_DELAY);
+        }
 
         tokio::select! {
             maybe = inbound_rx.recv() => {
