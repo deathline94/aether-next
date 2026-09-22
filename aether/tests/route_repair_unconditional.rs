@@ -43,10 +43,7 @@ fn replay_only_acts_on_a_journal_whose_holder_is_demostrably_gone() {
         Replay::Remove,
         "a crashed run's routes are the whole point of the replay"
     );
-    for (holder, why) in [
-        (Liveness::Alive, "alive"),
-        (Liveness::Unknown, "unknown"),
-    ] {
+    for (holder, why) in [(Liveness::Alive, "alive"), (Liveness::Unknown, "unknown")] {
         assert!(
             matches!(
                 decide_replay(&journal(4242), holder, me, THIS_BOOT),

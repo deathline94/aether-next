@@ -21,7 +21,10 @@ pub async fn fetch_ech_config() -> Result<Vec<u8>> {
             };
             match query_ech(addr, host).await {
                 Ok(ech) if !ech.is_empty() => {
-                    log::info!("fetched ECHConfigList ({} bytes) for {host} via {server}", ech.len());
+                    log::info!(
+                        "fetched ECHConfigList ({} bytes) for {host} via {server}",
+                        ech.len()
+                    );
                     return Ok(ech);
                 }
                 Ok(_) => {}
@@ -33,7 +36,11 @@ pub async fn fetch_ech_config() -> Result<Vec<u8>> {
 }
 
 async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
-    let bind = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     let sock = UdpSocket::bind(bind).await?;
     sock.connect(server).await?;
 
@@ -280,7 +287,7 @@ pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {
     pkt.extend_from_slice(&53u16.to_be_bytes());
     pkt.extend_from_slice(&(udp_len as u16).to_be_bytes());
     pkt.extend_from_slice(&[0x00, 0x00]); // UDP checksum (optional for IPv4)
-    // DNS payload
+                                          // DNS payload
     pkt.extend_from_slice(&dns);
     pkt
 }
@@ -357,7 +364,10 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_answer() {
         let msg = reply(0x8180, 1, NAME);
-        assert_eq!(parse_https_ech(&msg, QID, NAME).as_deref(), Some(&[0xde, 0xad, 0xbe, 0xef][..]));
+        assert_eq!(
+            parse_https_ech(&msg, QID, NAME).as_deref(),
+            Some(&[0xde, 0xad, 0xbe, 0xef][..])
+        );
     }
 
     #[test]
@@ -366,7 +376,10 @@ mod tests {
         // late reply to an earlier query looks like.
         assert_eq!(parse_https_ech(&reply(0x8180, 1, NAME), 0x4321, NAME), None);
         // Answering a name nobody asked about must not configure ECH.
-        assert_eq!(parse_https_ech(&reply(0x8180, 1, "evil.example"), QID, NAME), None);
+        assert_eq!(
+            parse_https_ech(&reply(0x8180, 1, "evil.example"), QID, NAME),
+            None
+        );
         // Truncated: a partial ECHConfig is worse than none.
         assert_eq!(parse_https_ech(&reply(0x8380, 1, NAME), QID, NAME), None);
         // Not a response, an error, or a non-standard opcode.
