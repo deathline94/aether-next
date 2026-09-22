@@ -172,13 +172,20 @@
   input-level consumer, and only the two ports are marked `aria-invalid`); that is the Android UI
   lifecycle work, not this wire change.
 
-- [ ] T052b [P] Add an invariant gate that every `uses:` pin in `.github/workflows/` is a full
+- [x] T052b [P] Add an invariant gate that every `uses:` pin in `.github/workflows/` is a full
   40-character commit SHA (and that one action does not carry two different pins). The
   `engine-windows` job failed three runs in a row with "unable to resolve action
   `dtolnay/rust-toolchain@02cb101e…`", and the message echoed the *truncated* string, so it read as
   the same pin the passing jobs use and was written off as a transient runner fault twice before
   anyone compared the strings: the copy had lost six characters. A typo in a supply-chain pin is
   invisible to review and only shows up as infrastructure flakiness.
+  Gate 14 `actions-pinned-to-full-commit` [BC-22] does all three: a hex ref that is not 40
+  characters, a floating ref (`@v4`, `@master` — anything that can move without a commit here), and
+  one action pinned to two different commits. Its `inject` case carries both defect shapes at once,
+  and `--selftest-fail` confirms the gate notices them, so the gate is proven able to fail rather
+  than assumed; the 39-character ref in the fixture is the same class as the 34-character one that
+  broke `engine-windows`. All 14 gates pass on the current tree, where every action is a full SHA
+  and one SHA per action.
 - [ ] T052 [US1] **Checkpoint**: T031–T036 green; then re-run each with its new guard deleted and confirm all go red again (quickstart step 3). Record both in the PR — a guard nobody has killed is not a guard.
 
 **Checkpoint**: At this point US1 is fully functional and independently testable: the app can no longer leave the host's network misconfigured by any termination path.

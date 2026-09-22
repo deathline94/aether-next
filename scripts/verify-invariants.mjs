@@ -475,6 +475,42 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'actions-pinned-to-full-commit',
+    invariant: 'BC-22',
+    summary: 'workflow actions are pinned to a full commit SHA, one SHA per action',
+    scan(api) {
+      const v = [];
+      const seen = new Map();
+      for (const f of api.files('.github/workflows', /\.ya?ml$/)) {
+        const t = api.read(f);
+        for (const m of t.matchAll(/uses:\s*([^\s@]+)@([^\s#]+)/g)) {
+          const action = m[1];
+          const ref = m[2];
+          if (action.startsWith('./')) continue; // local composite action
+          if (!/^[0-9a-f]{40}$/.test(ref)) {
+            const why = /^[0-9a-f]+$/.test(ref)
+              ? `a ${ref.length}-character hex ref is not a commit — GitHub reports "unable to resolve action", which reads as runner flakiness, and it took three red runs to notice`
+              : `floating ref "${ref}" can move under the workflow without a commit here`;
+            v.push(`${locate(f, t, m.index)} ${action}@${ref}: ${why}`);
+            continue;
+          }
+          const prior = seen.get(action);
+          if (prior && prior !== ref) {
+            v.push(`${locate(f, t, m.index)} ${action} is pinned to two different commits (${prior.slice(0, 8)}… and ${ref.slice(0, 8)}…)`);
+          }
+          seen.set(action, ref);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: '.github/workflows/__selftest__.yml',
+        content: 'jobs:\n  a:\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af68\n      - uses: actions/setup-node@v4\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */
