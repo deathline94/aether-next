@@ -203,6 +203,7 @@ export function ActivityTab({
                   }
                 }}
                 title="Resume auto-scroll"
+                aria-label="Resume following the log to its newest line"
                 aria-label="Resume auto-scroll"
               >
                 <ArrowDown size={13} aria-hidden="true" />
@@ -215,6 +216,7 @@ export function ActivityTab({
               onClick={handleCopy}
               disabled={empty}
               title="Copy visible or complete logs to clipboard"
+              aria-label="Copy the log to the clipboard"
             >
               {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
               <span>{copied ? "Copied" : "Copy Buffer"}</span>
@@ -225,6 +227,7 @@ export function ActivityTab({
               onClick={clearLogs}
               disabled={empty}
               title="Flush current session logs"
+              aria-label="Clear this session's log view"
             >
               <Ban size={13} aria-hidden="true" />
               <span>Clear</span>
