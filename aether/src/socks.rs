@@ -312,9 +312,44 @@ pub fn parse_dns_servers(raw: &str) -> Vec<SocketAddr> {
 
 /// Resolvers are configurable (`AETHER_DNS=ip[,ip...]`, bare IP or
 /// `ip:port`; bare IPv6 literals are accepted and paired with port 53).
-fn configured_dns_servers() -> Vec<SocketAddr> {
+///
+/// `pub(crate)` because the TUN path has to set the *same* resolvers on the
+/// adapter that the in-tunnel stub resolver forwards to; two sources of truth
+/// here meant the proxy honoured `AETHER_DNS` while TUN silently ignored it.
+pub(crate) fn configured_dns_servers() -> Vec<SocketAddr> {
     let raw = crate::runtime_env::var("AETHER_DNS").unwrap_or_default();
     parse_dns_servers(&raw)
+}
+
+/// Resolvers to pin on the tunnel adapter, from the list the in-tunnel stub
+/// forwards to.
+///
+/// Hardcoded `'1.1.1.1','1.0.0.1'` here meant a user's `AETHER_DNS` — a local
+/// resolver, an internal box, a filtering one — was honoured by the proxy path and
+/// silently discarded by TUN, and the *restore* path then reset the adapter to
+/// "whatever DHCP says" rather than to what it had been.
+///
+/// IPv4 only: the adapter's IPv6 binding is disabled just above, and a
+/// mixed-family `-ServerAddresses` call fails outright.
+pub(crate) fn dns_servers_for_adapter(list: &[SocketAddr]) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for sa in list {
+        if let IpAddr::V4(v4) = sa.ip() {
+            if !out.contains(&v4) {
+                out.push(v4);
+            }
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        // A configured list of nothing but IPv6 resolvers must still leave the
+        // adapter able to resolve: defaults beat an empty list.
+        out.push(Ipv4Addr::new(1, 1, 1, 1));
+        out.push(Ipv4Addr::new(1, 0, 0, 1));
+    }
+    out
 }
 
 fn valid_dns_name(name: &str) -> bool {
@@ -851,6 +886,40 @@ mod tests {
         net::{IpAddr, SocketAddr},
         time::{Duration, Instant},
     };
+
+    /// The TUN path used to hardcode `1.1.1.1`/`1.0.0.1` on the adapter while the
+    /// proxy path honoured `AETHER_DNS`, so the same setting worked in one mode
+    /// and was discarded in the other — for a user on a filtering or internal
+    /// resolver, the tunnel then silently bypassed it.
+    #[test]
+    fn adapter_resolvers_come_from_the_configured_list() {
+        use super::{dns_servers_for_adapter, parse_dns_servers};
+        let list = parse_dns_servers("9.9.9.9, 1.0.0.1, 9.9.9.9, [2606:4700:4700::1111]");
+        let got = dns_servers_for_adapter(&list);
+        assert_eq!(
+            got,
+            vec![
+                std::net::Ipv4Addr::new(9, 9, 9, 9),
+                std::net::Ipv4Addr::new(1, 0, 0, 1)
+            ],
+            "order preserved, duplicates dropped, IPv6 excluded (the adapter has no v6 binding)"
+        );
+
+        // IPv6-only configuration must still leave the adapter able to resolve.
+        let v6only = parse_dns_servers("2606:4700:4700::1111");
+        assert_eq!(
+            dns_servers_for_adapter(&v6only),
+            vec![
+                std::net::Ipv4Addr::new(1, 1, 1, 1),
+                std::net::Ipv4Addr::new(1, 0, 0, 1)
+            ]
+        );
+
+        // Windows accepts a bounded list; more than that is not silently truncated
+        // in a way that reorders what the user asked for.
+        let many = parse_dns_servers("10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.5");
+        assert_eq!(dns_servers_for_adapter(&many).len(), 4);
+    }
 
     #[test]
     fn parses_dns_servers_handles_bare_and_bracketed_ipv6_and_ports() {

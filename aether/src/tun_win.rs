@@ -165,6 +165,14 @@ fn configure_adapter_ip(name: &str, ipv4: Ipv4Addr, mtu: usize) -> Result<()> {
     // scan/tunnel in the same process cannot clobber it.
     let mtu = mtu.clamp(1280, 1400);
     let ip = ipv4.to_string();
+    // Each entry is an `Ipv4Addr` rendered by `to_string`, so the literals below
+    // cannot be steered by configuration.
+    let resolvers = crate::socks::dns_servers_for_adapter(&crate::socks::configured_dns_servers());
+    let dns_literal = resolvers
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     // Enable + purge old IPv4 config, then set address/DNS/MTU/metric in one shot.
     // Also disable IPv6 on the adapter to prevent router advertisements from overriding.
     let script = format!(
@@ -179,7 +187,7 @@ Get-NetRoute -InterfaceAlias $n -ErrorAction SilentlyContinue |
   Where-Object {{ $_.DestinationPrefix -ne '255.255.255.255/32' }} |
   Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 New-NetIPAddress -InterfaceAlias $n -IPAddress '{ip}' -PrefixLength 32 -PolicyStore ActiveStore | Out-Null
-Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @('1.1.1.1','1.0.0.1')
+Set-DnsClientServerAddress -InterfaceAlias $n -ServerAddresses @({dns_literal})
 Set-NetIPInterface -InterfaceAlias $n -InterfaceMetric 1 -NlMtuBytes {mtu} -ErrorAction SilentlyContinue
 Write-Output 'ok'
 "#
@@ -203,19 +211,23 @@ Write-Output 'ok'
                     "none",
                 ],
             )?;
-            run_cmd(
-                "netsh",
-                &[
-                    "interface",
-                    "ip",
-                    "set",
-                    "dns",
-                    &format!("name={name}"),
-                    "static",
-                    "1.1.1.1",
-                    "primary",
-                ],
-            )?;
+            let mut dns_args: Vec<String> = vec![
+                "interface".into(),
+                "ip".into(),
+                "set".into(),
+                "dns".into(),
+                format!("name={name}"),
+                "static".into(),
+                resolvers[0].to_string(),
+                "primary".into(),
+            ];
+            run_cmd("netsh", &dns_args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            if let Some(second) = resolvers.get(1) {
+                // `add dns` appends the secondary; `set dns` above replaced the list.
+                dns_args[3] = "add".into();
+                dns_args[7] = second.to_string();
+                run_cmd("netsh", &dns_args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            }
             let _ = run_cmd(
                 "netsh",
                 &[
