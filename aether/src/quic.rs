@@ -477,7 +477,8 @@ pub async fn run(
 
     flush(&mut conn, &sockets).await?;
 
-    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
+    let mut keepalive = Keepalive::default();
+    let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut started = Instant::now();
 
@@ -506,8 +507,19 @@ pub async fn run(
             
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
-                    if let Err(e) = conn.send_ack_eliciting() {
-                        log::debug!("keepalive ping failed: {e}");
+                    match keepalive.tick() {
+                        KeepaliveTick::Send => {
+                            if let Err(e) = conn.send_ack_eliciting() {
+                                log::debug!("keepalive ping failed: {e}");
+                            }
+                        }
+                        KeepaliveTick::GiveUp { unanswered } => {
+                            let msg = format!(
+                                "no reply to {unanswered} keepalive probes; the session stopped carrying traffic");
+                            log::error!("[h3] {msg}");
+                            fatal = Some(msg);
+                            let _ = conn.close(false, 0x1, b"keepalive timeout");
+                        }
                     }
                 }
             }
@@ -528,7 +540,11 @@ pub async fn run(
                             log::debug!("recv {} bytes type={:?} version=0x{:x} from {}", data.len(), hdr.ty, hdr.version, from);
                         }
                         let info = quiche::RecvInfo { from, to: to_local };
-                        if let Err(e) = conn.recv(&mut data, info) {
+                        let received = conn.recv(&mut data, info);
+                        if matches!(received, Ok(_) | Err(quiche::Error::Done)) {
+                            keepalive.inbound();
+                        }
+                        if let Err(e) = received {
                             // `Done` is benign; anything else is a protocol
                             // failure that quiche expects us to act on. It used
                             // to be logged at debug and swallowed, which left the
@@ -1473,6 +1489,51 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     }
 }
 
+/// How often the tunnel asks the edge to prove it is still answering, and how many
+/// times that ask may go unanswered before the session is called dead.
+///
+/// The pair has to fit inside the 45 s idle timeout `tls::build_config` sets
+/// (`tls.rs:296`). Otherwise quiche's own timer is the only thing that could
+/// notice, and it notices by closing the connection at 45 s with no reason a
+/// caller can act on — the GUI keeps showing a session that stopped carrying
+/// traffic. Fifteen seconds times three ticks is 45 s, so this fires first.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const KEEPALIVE_MAX_UNANSWERED: u32 = 2;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Keepalive {
+    unanswered: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeepaliveTick {
+    Send,
+    GiveUp { unanswered: u32 },
+}
+
+impl Keepalive {
+    /// One interval tick: send a probe, or report that the tunnel is dead.
+    pub fn tick(&mut self) -> KeepaliveTick {
+        if self.unanswered >= KEEPALIVE_MAX_UNANSWER {
+            return KeepaliveTick::GiveUp {
+                unanswered: self.unanswered,
+            };
+        }
+        self.unanswered += 1;
+        KeepaliveTick::Send
+    }
+
+    /// Any inbound packet answers every probe sent so far — quiche does not tell
+    /// us which of them an ack covered, and does not need to.
+    pub fn inbound(&mut self) {
+        self.unanswered = 0;
+    }
+
+    pub fn unanswered(&self) -> u32 {
+        self.unanswered
+    }
+}
+
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
@@ -1506,6 +1567,36 @@ async fn flush_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_unanswered_keepalives_end_the_session() {
+        let mut ka = Keepalive::default();
+        assert_eq!(ka.tick(), KeepaliveTick::Send);
+        assert_eq!(ka.tick(), KeepaliveTick::Send);
+        assert_eq!(ka.tick(), KeepaliveTick::GiveUp { unanswered: 2 });
+    }
+
+    #[test]
+    fn one_inbound_packet_answers_every_pending_probe() {
+        let mut ka = Keepalive::default();
+        assert_eq!(ka.tick(), KeepaliveTick::Send);
+        assert_eq!(ka.tick(), KeepaliveTick::Send);
+        ka.inbound();
+        assert_eq!(ka.unanswered(), 0);
+        assert_eq!(ka.tick(), KeepaliveTick::Send, "the budget restarts");
+    }
+
+    #[test]
+    fn the_keepalive_budget_is_spent_inside_the_idle_timeout() {
+        // `tls.rs:296` sets a 45 s idle timeout. If this cadence ever grows past
+        // it, quiche closes the connection first and the reason nobody sees is a
+        // silent 45 s stall rather than a dead tunnel.
+        let worst_case = KEEPALIVE_INTERVAL * (KEEPALIVE_MAX_UNANSWERED + 1);
+        assert!(
+            worst_case <= Duration::from_millis(45_000),
+            "keepalive gives up after {worst_case:?}, past the 45 s idle timeout"
+        );
+    }
 
     #[test]
     fn status_is_stream_scoped_and_interim_responses_are_not_fatal() {
