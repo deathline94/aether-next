@@ -35,8 +35,12 @@ fn is_hex64(v: &str) -> bool {
     v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Reads the anchor and returns `(name, file_digest, cert_digest)` triples, or
-/// stops the build.
+/// One anchored artifact: its name, the sha256 of its bytes, and the sha256 of
+/// the signing leaf that vouches for it (absent on an anchor written before the
+/// cert pin existed).
+type AnchorEntry = (String, String, Option<String>);
+
+/// Reads the anchor and returns [`AnchorEntry`] triples, or stops the build.
 ///
 /// `cert_digest` is `cert_sha256`: sha256 over the signing leaf's DER, as
 /// defined by the anchor's own `$comment`. It was read by nobody, so "verify the
@@ -44,7 +48,7 @@ fn is_hex64(v: &str) -> bool {
 /// themselves. The field is optional in the JSON only for the sake of an
 /// anchor written before it existed; the runtime treats absent as unpinned and,
 /// in a release build, refuses.
-fn read_anchor() -> (PathBuf, Vec<u8>, Vec<(String, String, Option<String>)>) {
+fn read_anchor() -> (PathBuf, Vec<u8>, Vec<AnchorEntry>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(ANCHOR_REL)
         .canonicalize()

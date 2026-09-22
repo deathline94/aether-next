@@ -2770,9 +2770,11 @@ async fn command_blocking<T: Send + 'static>(
     name: &'static str,
     task: impl FnOnce() -> Result<T, CommandError> + Send + 'static,
 ) -> Result<T, CommandError> {
+    // `?` unwraps the *join* handle only: a panic inside the blocking task becomes
+    // `internal`, while the task's own Err reaches the caller unchanged.
     tauri::async_runtime::spawn_blocking(task)
         .await
-        .map_err(|e| CommandError::new("internal", format!("{name} task did not run: {e}")))
+        .map_err(|e| CommandError::new("internal", format!("{name} task did not run: {e}")))?
 }
 
 #[tauri::command]
@@ -3374,8 +3376,9 @@ fn test_connection_blocking(settings: Settings) -> Result<String, CommandError> 
 #[tauri::command]
 // Tauri derives the JS-callable signature from these parameters, so grouping the
 // scan inputs into one struct would change the wire contract the frontend calls
-// with. The count is the cost of that; the values are validated in `scan_blocking`.
-fn scan(
+// with. `state` is resolved inside the body instead, which also keeps the
+// argument count under clippy's threshold.
+async fn scan(
     app: AppHandle,
     run_id: String,
     protocol: String,
