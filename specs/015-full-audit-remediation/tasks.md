@@ -427,7 +427,20 @@
   naming a banned phrase trips it — the comments speak around the literals instead of
   weakening the gate.
 
-- [ ] T128 [US4] Downgrade the update banner in `apps/desktop/src/hooks/useRuntime.ts:99-116` + `components/ConnectionTab.tsx:185-201` to "a new version is available" with an opener link; document that `tauri-plugin-updater` is deliberately not adopted (needs `createUpdaterArtifacts`, a literal minisign pubkey, endpoint templates, an `updater:default` capability and a CI-generated manifest — with no key custody it would be misconfigured), and that today's check is an unauthenticated `api.github.com` fetch with `.catch(() => {})` so rate limiting makes the banner silently never appear.
+- [x] T128 [US4] Downgrade the update banner in `apps/desktop/src/hooks/useRuntime.ts:99-116` + `components/ConnectionTab.tsx:185-201` to "a new version is available" with an opener link; document that `tauri-plugin-updater` is deliberately not adopted (needs `createUpdaterArtifacts`, a literal minisign pubkey, endpoint templates, an `updater:default` capability and a CI-generated manifest — with no key custody it would be misconfigured), and that today's check is an unauthenticated `api.github.com` fetch with `.catch(() => {})` so rate limiting makes the banner silently never appear.
+  Done. The banner said "Aether {version} is ready. Restart or click to update!" over a
+  button whose only effect is opening a URL, and the dismiss control was the same weight
+  as an action that performed nothing — the app has no updater, so the sentence described
+  a capability it does not have. It now reads "A new version is available: {version}" with
+  a "View release" button. The hook carries why the fetch is advisory (unauthenticated
+  `api.github.com`, error swallowed, so the 60/h IP limit can make it never appear) and
+  why `tauri-plugin-updater` stays unadopted: an auto-updater is the one component that
+  could install code as the user, and without key custody its signing setup would be
+  misconfigured by construction.
+  Deviation: the task text points at `ConnectionTab.tsx:185-201`; the banner is at
+  `:211-227` now (the file moved under earlier work). The Android UI has no update banner,
+  so there was nothing to mirror there. No test added — the defect is a sentence, and the
+  guard against reintroducing it is the comment that explains the omission.
 - [ ] T129 [US4] Replace the Android log-substring status path in `apps/android/.../SessionController.kt:303-326` with structured `AETHER_EVENT` consumption and a fail-closed `disconnected` default (fixes T110), surfacing the parse error into the log stream instead of swallowing it.
 - [ ] T130 [US4] **Checkpoint**: T104–T110 green; delete the `closing` flag, the stream-scoped readiness check and the promoted `is_dns_reply`, confirming each has a red test.
 

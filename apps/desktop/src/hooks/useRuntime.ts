@@ -101,7 +101,19 @@ export function useRuntime(
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
   }, []);
 
-  // Check for updates once the real version is known (semver-aware).
+  // "A new version exists", nothing more.
+  //
+  // This is an unauthenticated `api.github.com` fetch with a swallowed error, so
+  // the 60-requests-per-hour IP limit means the banner can simply never appear —
+  // it is advisory and its absence is not evidence of being up to date.
+  //
+  // `tauri-plugin-updater` is deliberately not adopted: it needs
+  // `createUpdaterArtifacts`, a literal minisign public key compiled in, an
+  // endpoint template, an `updater:default` capability and a CI-generated
+  // manifest, and with no key custody (the signing key would have to live in the
+  // repo or be generated per run) the result would be an auto-updater that is
+  // misconfigured by construction — the one component of this app that could
+  // install arbitrary code as the user, without a witness anyone reviewed.
   useEffect(() => {
     if (!appVersion || appVersion === FALLBACK_VERSION) return;
     fetch("https://api.github.com/repos/deathline94/aether-next/releases/latest")

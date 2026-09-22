@@ -213,13 +213,13 @@ export function ConnectionTab({
         <div className="update-banner">
           <div className="error-banner-content">
             <Sparkles size={17} aria-hidden="true" />
-            <span>Aether {updateAvailable.version} is ready. Restart or click to update!</span>
+            <span>A new version is available: {updateAvailable.version}</span>
           </div>
           <button
             type="button"
             onClick={() => invoke("plugin:opener|open_url", { url: updateAvailable.url }).catch(() => window.open(updateAvailable.url, "_blank"))}
           >
-            Update Now
+            View release
           </button>
           <button type="button" className="banner-dismiss" onClick={dismissUpdate} aria-label="Dismiss update notice">
             <X size={16} aria-hidden="true" />
