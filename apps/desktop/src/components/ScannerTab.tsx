@@ -3,9 +3,15 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
 import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, SCAN_MAX_TIMEOUT_MS, SCAN_MIN_TIMEOUT_MS } from "../../../../packages/ui/src";
+import {
+  nextOptionIndex,
+  SCAN_MAX_CONCURRENCY,
+  SCAN_MIN_CONCURRENCY,
+  SCAN_MAX_TIMEOUT_MS,
+  SCAN_MIN_TIMEOUT_MS,
+} from "../../../../packages/ui/src";
 import { rttLike } from "../hooks/useScanner";
-import { nextOptionIndex, NumberField, Segmented } from "./ui";
+import { NumberField, Segmented } from "./ui";
 
 interface ScannerTabProps {
   protocol: ScanProtocol;

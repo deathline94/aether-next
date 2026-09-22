@@ -60,5 +60,32 @@ export function noiseIsInert(protocol: string, transport: string): boolean {
   return protocol === "masque" && transport === "h2";
 }
 
-/** Re-export point for shared components as they move in (T197). */
-export {};
+/**
+ * Where the arrow keys take you in a one-of-N control, or `null` when the key is
+ * none of theirs.
+ *
+ * `role="radio"`/`role="tab"` are not decoration: the pattern behind them is a
+ * single stop in the tab order that the arrows walk. Desktop's filter dock had
+ * the handler and Android had none — every segmented group on the phone (carrier
+ * protocol, transport, IP family) was a column of tab stops whose selected member
+ * could not be told from the rest by keyboard or assistive tech. One rule, both
+ * surfaces.
+ */
+export function nextOptionIndex(current: number, key: string, length: number): number | null {
+  if (length <= 0) return null;
+  const at = (index: number) => ((index % length) + length) % length;
+  switch (key) {
+    case "ArrowRight":
+    case "ArrowDown":
+      return at(current + 1);
+    case "ArrowLeft":
+    case "ArrowUp":
+      return at(current - 1);
+    case "Home":
+      return at(0);
+    case "End":
+      return at(length - 1);
+    default:
+      return null;
+  }
+}

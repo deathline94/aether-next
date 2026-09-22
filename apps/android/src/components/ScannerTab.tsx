@@ -1,11 +1,17 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
 // The ceiling the engine will actually run, not the number the slider was set to:
 // this field used to offer 1-2000 while the shell clamped to 500, so the "Workers
 // Active" chip contradicted the input the user had just filled in.
-import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY, SCAN_MAX_TIMEOUT_MS, SCAN_MIN_TIMEOUT_MS } from "../../../../packages/ui/src";
+import {
+  nextOptionIndex,
+  SCAN_MAX_CONCURRENCY,
+  SCAN_MIN_CONCURRENCY,
+  SCAN_MAX_TIMEOUT_MS,
+  SCAN_MIN_TIMEOUT_MS,
+} from "../../../../packages/ui/src";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
 
@@ -103,6 +109,30 @@ export function ScannerTab({
       }).length,
     [endpoints]
   );
+
+  const protoTabs: { id: ProtoFilter; label: string; count: number }[] = [
+    { id: "all", label: "All Protocols", count: endpoints.length },
+    { id: "masque-h3", label: "MASQUE H3", count: h3Count },
+    { id: "masque-h2", label: "MASQUE H2", count: h2Count },
+    { id: "wireguard", label: "WireGuard", count: wgCount },
+  ];
+
+  const resultsId = useId();
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // `role="tablist"` is a promise about the keyboard: one stop in the tab order,
+  // arrows between the tabs, and a panel each tab names. The desktop copy got the
+  // handler; this one announced four tabs that only a mouse could move between.
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const selected = Math.max(0, protoTabs.findIndex((t) => t.id === protoFilter));
+    const next = nextOptionIndex(selected, event.key, protoTabs.length);
+    if (next === null) return;
+    event.preventDefault();
+    const tab = protoTabs[next];
+    if (!tab) return;
+    setProtoFilter(tab.id);
+    tabRefs.current[next]?.focus();
+  };
 
   const progressPct = scanState.total > 0
     ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
@@ -315,47 +345,26 @@ export function ScannerTab({
         </div>
 
         {endpoints.length > 0 && (
-          <div className="discovered-proto-dock" role="tablist" aria-label="Filter by protocol">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "all"}
-              className={`proto-tab ${protoFilter === "all" ? "active" : ""}`}
-              onClick={() => setProtoFilter("all")}
-            >
-              <span>All Protocols</span>
-              <span className="chip-count tabular-nums">{endpoints.length}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "masque-h3"}
-              className={`proto-tab ${protoFilter === "masque-h3" ? "active" : ""}`}
-              onClick={() => setProtoFilter("masque-h3")}
-            >
-              <span>MASQUE H3</span>
-              <span className="chip-count tabular-nums">{h3Count}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "masque-h2"}
-              className={`proto-tab ${protoFilter === "masque-h2" ? "active" : ""}`}
-              onClick={() => setProtoFilter("masque-h2")}
-            >
-              <span>MASQUE H2</span>
-              <span className="chip-count tabular-nums">{h2Count}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "wireguard"}
-              className={`proto-tab ${protoFilter === "wireguard" ? "active" : ""}`}
-              onClick={() => setProtoFilter("wireguard")}
-            >
-              <span>WireGuard</span>
-              <span className="chip-count tabular-nums">{wgCount}</span>
-            </button>
+          <div className="discovered-proto-dock" role="tablist" aria-label="Filter by protocol" onKeyDown={onTabKeyDown}>
+            {protoTabs.map((tab, index) => (
+              <button
+                key={tab.id}
+                ref={(node) => {
+                  tabRefs.current[index] = node;
+                }}
+                type="button"
+                role="tab"
+                id={`proto-tab-${tab.id}`}
+                aria-selected={protoFilter === tab.id}
+                aria-controls={resultsId}
+                tabIndex={protoFilter === tab.id ? 0 : -1}
+                className={`proto-tab ${protoFilter === tab.id ? "active" : ""}`}
+                onClick={() => setProtoFilter(tab.id)}
+              >
+                <span>{tab.label}</span>
+                <span className="chip-count tabular-nums">{tab.count}</span>
+              </button>
+            ))}
           </div>
         )}
 
@@ -372,7 +381,12 @@ export function ScannerTab({
             </span>
           </div>
         ) : (
-          <div className="discovered-list">
+          <div
+            className="discovered-list"
+            id={resultsId}
+            role="tabpanel"
+            aria-labelledby={`proto-tab-${protoFilter}`}
+          >
             {filteredEndpoints.map((item) => {
               const { tierClass, badgeText } = getRttTier(item.rttMs);
               return (

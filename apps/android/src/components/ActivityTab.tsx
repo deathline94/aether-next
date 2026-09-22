@@ -8,6 +8,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { nextOptionIndex } from "../../../../packages/ui/src";
 import { RENDER_CAP } from "../hooks/useLogs";
 import { formatLogTime } from "../types";
 import type { LogEntry, LogFilter, ScanState } from "../types";
@@ -181,7 +182,10 @@ export function ActivityTab({
             <span className="win-dot red" aria-hidden="true" />
             <span className="win-dot yellow" aria-hidden="true" />
             <span className="win-dot green" aria-hidden="true" />
-            <span className="terminal-title-text font-mono">aether@android:~# session-log</span>
+            {/* Decorative window chrome. A shell prompt promises a shell: nothing
+                here takes input, and a screen reader would have read the typed
+                command as content. The console below carries the real name. */}
+            <span className="terminal-title-text font-mono" aria-hidden="true">session-log · aether@android</span>
           </div>
 
           <div className="terminal-center-telemetry">
@@ -203,7 +207,6 @@ export function ActivityTab({
                   }
                 }}
                 title="Resume auto-scroll"
-                aria-label="Resume auto-scroll"
               >
                 <ArrowDown size={13} aria-hidden="true" />
                 <span>Follow</span>
@@ -215,7 +218,6 @@ export function ActivityTab({
               onClick={handleCopy}
               disabled={empty}
               title="Copy visible or complete logs to clipboard"
-              aria-label="Copy the log to the clipboard"
             >
               {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
               <span>{copied ? "Copied" : "Copy Buffer"}</span>
@@ -226,7 +228,6 @@ export function ActivityTab({
               onClick={clearLogs}
               disabled={empty}
               title="Flush current session logs"
-              aria-label="Clear this session's log view"
             >
               <Ban size={13} aria-hidden="true" />
               <span>Clear</span>
@@ -235,7 +236,20 @@ export function ActivityTab({
         </header>
 
         {/* Sticky Filter Pill Bar */}
-        <div className="tactical-filter-dock" role="radiogroup" aria-label="Log filter">
+        <div
+          className="tactical-filter-dock"
+          role="radiogroup"
+          aria-label="Log filter"
+          onKeyDown={(event) => {
+            const selected = Math.max(0, FILTERS.findIndex((f) => f.id === logFilter));
+            const next = nextOptionIndex(selected, event.key, FILTERS.length);
+            if (next === null) return;
+            event.preventDefault();
+            const filter = FILTERS[next];
+            if (!filter) return;
+            setLogFilter(filter.id);
+          }}
+        >
           <div className="filter-pill-group">
             {FILTERS.map((f) => (
               <button
@@ -243,6 +257,8 @@ export function ActivityTab({
                 type="button"
                 role="radio"
                 aria-checked={logFilter === f.id}
+                // One tab stop for the group, arrows between the chips.
+                tabIndex={logFilter === f.id ? 0 : -1}
                 className={`filter-chip ${logFilter === f.id ? "active" : ""}`}
                 onClick={() => setLogFilter(f.id)}
               >
@@ -253,7 +269,9 @@ export function ActivityTab({
           </div>
 
           <div className="terminal-mode-indicator">
-            <span className="mode-tag font-mono">TTY: LIVE</span>
+            {/* The stream is live; the terminal is not a TTY — it cannot be
+                written to, and saying otherwise advertised a prompt. */}
+            <span className="mode-tag font-mono">STREAM: LIVE</span>
           </div>
         </div>
 
@@ -263,6 +281,9 @@ export function ActivityTab({
           className="activity-console tactical-terminal-screen font-mono"
           onScroll={handleScroll}
           aria-label="Engine log output"
+          // A scroll region the keyboard cannot reach: `tabIndex={0}` is what lets
+          // PageUp/PageDown and the arrows read the lines above the fold.
+          tabIndex={0}
         >
           {hasMore && (
             <div className="log-more-hint">

@@ -1,5 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { nextOptionIndex } from "../../../../packages/ui/src";
 
+/**
+ * Same radiogroup contract as the desktop control: one stop in the tab order,
+ * arrows walk the choice. Without it every option of "Carrier Protocol", "MASQUE
+ * Transport" and "IP Pool Family" was its own tab stop, and the keyboard could
+ * not tell which one was selected.
+ */
 export function Segmented<T extends string>({
   value,
   options,
@@ -14,13 +21,37 @@ export function Segmented<T extends string>({
   /** Accessible name for the group. */
   label: string;
 }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const selected = Math.max(0, options.findIndex((option) => option.value === value));
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const next = nextOptionIndex(selected, event.key, options.length);
+    if (next === null) return;
+    event.preventDefault();
+    const option = options[next];
+    if (!option) return;
+    onChange(option.value);
+    refs.current[next]?.focus();
+  };
+
   return (
-    <div className={`segmented ${disabled ? "disabled" : ""}`} role="radiogroup" aria-label={label}>
-      {options.map((option) => (
+    <div
+      className={`segmented ${disabled ? "disabled" : ""}`}
+      role="radiogroup"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+    >
+      {options.map((option, index) => (
         <button
+          ref={(node) => {
+            refs.current[index] = node;
+          }}
           type="button"
           role="radio"
           aria-checked={value === option.value}
+          // Roving tabindex: the group is one stop, and the arrows move the choice.
+          tabIndex={index === selected ? 0 : -1}
           key={option.value}
           disabled={disabled}
           className={value === option.value ? "active" : ""}

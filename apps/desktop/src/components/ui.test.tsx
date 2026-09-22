@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { NumberField, Segmented, draftNumber, nextOptionIndex } from "./ui";
+import { nextOptionIndex } from "../../../../packages/ui/src";
+import { NumberField, Segmented, draftNumber } from "./ui";
 
 // vitest runs without `globals: true`, which disables testing-library's automatic
 // cleanup — without this every render in the file stays in the same document and

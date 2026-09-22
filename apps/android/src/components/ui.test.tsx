@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { NumberField, draftNumber } from "./ui";
+import { NumberField, Segmented, draftNumber } from "./ui";
 
 // vitest runs without `globals: true`, which disables testing-library's automatic
 // cleanup — without this every render in the file stays in the same document and
@@ -42,3 +42,50 @@ describe("NumberField", () => {
 function spinbutton(): HTMLElement {
   return screen.getByRole("spinbutton", { name: "burst" });
 }
+
+const PICKS = [
+  { value: "masque", label: "MASQUE" },
+  { value: "wireguard", label: "WireGuard" },
+  { value: "gool", label: "Gool" },
+];
+
+describe("Segmented", () => {
+  it("is one tab stop, not a column of them", () => {
+    // The Android copy rendered every option as its own stop with no key
+    // handling — desktop had the roving tabindex. With a keyboard attached,
+    // "Carrier Protocol" was three tab stops whose selected member was
+    // indistinguishable, and the arrows did nothing.
+    render(<Segmented label="Carrier protocol" value="wireguard" options={PICKS} onChange={() => {}} />);
+    expect(screen.getAllByRole("radio").map((r) => r.getAttribute("tabindex"))).toEqual([
+      "-1",
+      "0",
+      "-1",
+    ]);
+  });
+
+  it("moves the selection with the arrow keys", () => {
+    const onChange = vi.fn();
+    render(<Segmented label="Carrier protocol" value="masque" options={PICKS} onChange={onChange} />);
+    fireEvent.keyDown(screen.getAllByRole("radio")[0]!, { key: "ArrowRight" });
+    expect(onChange).toHaveBeenCalledWith("wireguard");
+    fireEvent.keyDown(screen.getAllByRole("radio")[0]!, { key: "End" });
+    expect(onChange).toHaveBeenCalledWith("gool");
+  });
+
+  it("stays put while the group is disabled", () => {
+    // `settingsLocked` means a live tunnel: the keys must not be able to change
+    // the carrier under a running session.
+    const onChange = vi.fn();
+    render(
+      <Segmented
+        label="Carrier protocol"
+        value="masque"
+        options={PICKS}
+        disabled
+        onChange={onChange}
+      />,
+    );
+    fireEvent.keyDown(screen.getAllByRole("radio")[0]!, { key: "ArrowRight" });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});

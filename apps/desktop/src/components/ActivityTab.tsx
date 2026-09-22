@@ -11,7 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useRef, useState } from "react";
 import { RENDER_CAP } from "../hooks/useLogs";
 import type { DisplayedScanState, LogEntry, LogFilter } from "../types";
-import { nextOptionIndex } from "./ui";
+import { nextOptionIndex } from "../../../../packages/ui/src";
 
 interface ActivityTabProps {
   visibleLogs: LogEntry[];
@@ -196,7 +196,10 @@ export function ActivityTab({
             <span className="win-dot red" aria-hidden="true" />
             <span className="win-dot yellow" aria-hidden="true" />
             <span className="win-dot green" aria-hidden="true" />
-            <span className="terminal-title-text font-mono">aether@daemon:~# session-log</span>
+            {/* Decorative window chrome. A shell prompt promises a shell: nothing
+                here takes input, and a screen reader would have read the typed
+                command as content. The console below carries the real name. */}
+            <span className="terminal-title-text font-mono" aria-hidden="true">session-log · aether@daemon</span>
           </div>
 
           <div className="terminal-center-telemetry">
@@ -218,7 +221,6 @@ export function ActivityTab({
                   }
                 }}
                 title="Resume auto-scroll"
-                aria-label="Resume auto-scroll"
               >
                 <ArrowDown size={13} aria-hidden="true" />
                 <span>Follow</span>
@@ -281,7 +283,9 @@ export function ActivityTab({
           </div>
 
           <div className="terminal-mode-indicator">
-            <span className="mode-tag font-mono">TTY: LIVE</span>
+            {/* The stream is live; the terminal is not a TTY — it cannot be
+                written to, and saying otherwise advertised a prompt. */}
+            <span className="mode-tag font-mono">STREAM: LIVE</span>
           </div>
         </div>
 
