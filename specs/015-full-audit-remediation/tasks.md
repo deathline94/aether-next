@@ -537,7 +537,16 @@
 - [ ] T165 [P] [US6] Wire the remaining gates into `scripts/verify-invariants.*`: bindings-diff; `className`→selector; banned-CSS (`100vh`, `transition: all`, bare `:hover`, `border: 1px solid rgba(255,255,255,<0.10)`, undefined `var(--x)`); contrast-from-tokens; "no breakpoint equals a window minimum"; "same component defined twice with different bodies". **Each fails today** with the evidence recorded in `contracts/ui-design-contract.md`.
 - [ ] T166 [P] [US6] Failing test in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: scan A (40 H3 hits) then scan B (WireGuard) ⇒ heading reflects only B and rows key on `addr + protocol`. Fails today: `useScanner.ts:106` filters only same-protocol rows, and dedup at `:68` keys on `addr` alone, so an IP live on both transports keeps the old protocol and RTT and lands in the wrong bucket.
 - [ ] T167 [P] [US6] Failing test `bestRtt`/`working` in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: `bestRtt` is the minimum of the sorted list and `working` is authoritative from `scan_progress`. Fails today: `useScanner.ts:65` `bestRtt: ev.rtt || prev.bestRtt` shows the most recent hit ("Best: 240 ms" above a "12 ms" row), and `:64`'s per-hit `working + 1` oscillates against `:57`'s overwrite from the engine's every-50-probes count.
-- [ ] T168 [P] [US6] Failing test in `apps/desktop/src/components/__tests__/SettingsTab.test.tsx`: a rejected save renders an inline field error and clears optimistic state. Fails today: `useRuntime.ts:134-141` only appends a log line while `SettingsTab.tsx:497,515` keep reading "Synchronizing changes…" / "Auto-Saving" forever.
+- [x] T168 [P] [US6] Failing test in `apps/desktop/src/components/__tests__/SettingsTab.test.tsx`: a rejected save renders an inline field error and clears optimistic state. Fails today: `useRuntime.ts:134-141` only appends a log line while `SettingsTab.tsx:497,515` keep reading "Synchronizing changes…" / "Auto-Saving" forever.
+  Fixed by T051b, tested here rather than in the file the task names (the repo keeps component tests
+  beside their components, not under `__tests__`). `SettingsTab.render.test.tsx` (3): the shell's
+  rejection is visible in the save dock with its real wording and the indicator says "Save Rejected"
+  instead of spinning; `aria-invalid` is on the refused port and *not* on the other one, so the
+  field-level claim is asserted rather than the message being shown somewhere; and with no rejection
+  the tab still says "Synchronizing changes…" and shows nothing red — the negative control that stops
+  the first two from passing on a component that renders an error unconditionally. Clearing the
+  optimistic state on the next edit is covered at the hook level in `useRuntime.test.ts`.
+  25 desktop UI tests pass and `tsc --noEmit` is clean.
 - [x] T169 [P] [US6] Failing test: `NumberField` at value `0` steps to the clamped neighbour, not back to the previous value.
   Landed as `apps/desktop/src/components/ui.test.tsx` (4) in both UIs via the T181 fix; see that entry.
   Test infrastructure note worth keeping: vitest here runs without `globals: true`, which switches off
@@ -621,7 +630,22 @@
   observed order of `invoke` calls and the rejection landing last), or a shell-side serialisation of
   `save_settings` that makes the ordering question moot.
 - [ ] T179 [US6] Roll back optimistic commits on rejection in `apps/desktop/src/hooks/useRuntime.ts:188-194`: "Connect Direct" persists protocol/transport/pinned peer through the settings effect **and** `lib.rs:1340`, so a failed attempt permanently rewrites the user's carrier protocol and shows "Targeting forced endpoint" for a tunnel that never came up.
-- [ ] T180 [US6] Commit free-text settings on blur/Enter with existence validation in `apps/desktop/src/components/SettingsTab.tsx:472-479` (the 400 ms debounce alone currently persists `C:\Users\SLiM\Desk` half-typed) and add a `saveError` state rendered in the save dock (fixes T168).
+- [x] T180 [US6] Commit free-text settings on blur/Enter with existence validation in `apps/desktop/src/components/SettingsTab.tsx:472-479` (the 400 ms debounce alone currently persists `C:\Users\SLiM\Desk` half-typed) and add a `saveError` state rendered in the save dock (fixes T168).
+  Done in both layers. The engine-path input holds a local draft and commits on blur or Enter —
+  `commitPath(draft, current)` returns null when nothing changed, so a blur on an untouched field
+  writes nothing. It used to patch per keystroke, and because the form autosaves 400 ms after the
+  last change, `C:` and `C:\Users` reached the disk as configured values; an abandoned edit stayed.
+  `validate_settings` refuses a non-empty `engine_path` that is not an existing file, with
+  `field: enginePath`, so T051b's typed error marks that input and a half-typed path cannot be saved
+  even by another widget. Existence is all it asserts: whether a file that exists may be executed is
+  the allow-list and the trust anchor's decision, and making this one look like that would blur two
+  different boundaries. A directory is refused — an engine is a file.
+  `saveError` rendered in the save dock: landed with T051b (banner, "Save Rejected" indicator,
+  `aria-invalid` on the refused port, cleared by the next edit), which is also T168's ask.
+  Tests: `SettingsTab.test.ts` (2) and two cases in `ipc_error_shape_test.rs`. Deleting the
+  validation reddens both Rust tests ("enginePath was accepted; the case does not test anything").
+  47 shell tests, clippy at the pinned 1.88, 22 desktop UI tests and all 14 gates pass. Android has
+  no engine-path field, so the UI half there is nothing to change.
 - [x] T181 [US6] Fix `NumberField`'s zero handling in `apps/desktop/src/components/ui.tsx` to `Number.isNaN(parsed) ? value : parsed`.
   Done in both UIs. Three sites read the draft as `Number.parseInt(draft, 10) || value`, which cannot tell
   "the user typed 0" from "the box is empty": stepping up from 0 committed the number just replaced, and
