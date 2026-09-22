@@ -393,7 +393,22 @@
   such rather than papered over.
 
 - [x] T120 [US4] Serialise event payloads with `serde_json` in `aether/src/quic.rs:85-88` — `detail` currently carries `String::from_utf8_lossy(header value)` from the **peer** inside a hand-built JSON string, so the comment's "must not contain double quotes" is unenforced and a peer can forge sibling fields on the GUI's status channel.
-- [ ] T121 [US4] Implement the shell-side 90 s connect watchdog in `apps/desktop/src-tauri/src/lib.rs`, stamped against the existing `generation: AtomicU64` (`:315`,`:1170-1178`), killing the child and emitting `error` if that generation is still `connecting`. It must live in the shell: `watch_child` (`:1217`) fires only on process exit and WebView2 throttles timers in hidden windows (`:2216` hides to tray). Port semantics from `apps/android/src/hooks/useRuntime.ts` `CONNECT_WATCHDOG_MS = 90_000`.
+- [x] T121 [US4] Implement the shell-side 90 s connect watchdog in `apps/desktop/src-tauri/src/lib.rs`, stamped against the existing `generation: AtomicU64` (`:315`,`:1170-1178`), killing the child and emitting `error` if that generation is still `connecting`. It must live in the shell: `watch_child` (`:1217`) fires only on process exit and WebView2 throttles timers in hidden windows (`:2216` hides to tray). Port semantics from `apps/android/src/hooks/useRuntime.ts` `CONNECT_WATCHDOG_MS = 90_000`.
+  Done. `connect` stamps `(generation, Instant)` when it emits `connecting`; `watch_child`'s
+  existing 500 ms loop consults it through `connect_watchdog_action`, a pure function of the stamp,
+  the current generation, the status and the budget — because the two facts that decide it are easy
+  to get wrong and impossible to exercise through a real hang: a stamp belongs to the session that
+  made it (otherwise an old timeout kills the session running now), and a session that reached any
+  terminal state must not be killed for a stamp it left behind. On a genuine timeout it takes the
+  stamp before anything else (the loop would otherwise re-fire every tick), writes `shutdown`,
+  kills, waits, runs `cleanup_routing`, bumps the generation, and emits `error` with the same
+  "what could not be undone" suffix `disconnect` uses, so a timed-out connect cannot leave the
+  system proxy configured.
+  `connect_watchdog_action` is the guard; deleting its generation and status checks reddens exactly
+  the two tests that assert them (verified by mutation, and the file was restored byte-identically
+  afterwards). 40 shell tests and all 13 gates pass; clippy at the pinned 1.88 is clean.
+  Side effect worth noting: because the shell now leaves `connecting`, the Settings tab unlocks on
+  its own, which is half of what T174 asks for; T174's UI mirror is still open.
 - [ ] T122 [US4] Add the `phase` heartbeat (≤15 s) in `aether/src/{session.rs,session_event.rs}` and treat three misses as a stall in `apps/desktop/src-tauri/src/lib.rs`.
 - [x] T123 [US4] Make the engine's exit status agree with its event stream: `aether/src/main.rs` returns non-zero on an error outcome so the shell cannot observe a clean exit for a failed session.
 - [ ] T124 [US4] Add `handshake_rtt_ms: Option<u32>` (from `aether/src/tunnelping.rs`) and `active_endpoint_rtt_ms: Option<u32>` to `RuntimeState` in `apps/desktop/src-tauri/src/lib.rs:292-297`, exported via `bindings.ts`, and delete every stat lacking a source (T109's list) rather than zero-filling it.

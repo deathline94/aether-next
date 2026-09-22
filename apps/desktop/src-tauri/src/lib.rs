@@ -510,6 +510,10 @@ struct AppState {
     connected_once: AtomicBool,
     connecting: AtomicBool,
     generation: AtomicU64,
+    /// `(generation, when)` for the session currently in `connecting`. The
+    /// watchdog in `watch_child` fires only while the generation still matches,
+    /// so a session that reached any terminal state leaves the stamp inert.
+    connect_since: Mutex<Option<(u64, std::time::Instant)>>,
     operation: Mutex<()>,
     #[cfg(windows)]
     job: Mutex<Option<engine_job::Job>>,
@@ -598,6 +602,7 @@ impl Default for AppState {
             connected_once: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            connect_since: Mutex::new(None),
             operation: Mutex::new(()),
             #[cfg(windows)]
             job: Mutex::new(None),
@@ -1669,6 +1674,48 @@ fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> {
 #[cfg(windows)]
 const PROXY_COHERENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a session may sit in `connecting` before the shell stops it.
+///
+/// The engine can fail to connect without ever exiting or emitting an error — a
+/// black-holed edge, a probe that never returns — and then nothing else in this
+/// process notices: `watch_child` reacted only to process exit, and a UI timer is
+/// not a substitute because WebView2 throttles timers in a hidden (tray) window,
+/// which is the normal state for this app. The Android UI already had exactly this
+/// watchdog at the same interval; the desktop one belongs in the shell so it runs
+/// whatever the window is doing.
+pub const CONNECT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchdogAction {
+    LeaveAlone,
+    TimedOut,
+}
+
+/// The whole decision, as a function of the four facts that matter, so the cases
+/// the old one-shot `Instant` could not express are testable: a stamp belongs to a
+/// session that has since been replaced, and a session that reached any terminal
+/// state must not be killed for it.
+pub fn connect_watchdog_action(
+    stamp: Option<(u64, std::time::Duration)>,
+    current_generation: u64,
+    status: &str,
+    timeout: std::time::Duration,
+) -> WatchdogAction {
+    let Some((generation, elapsed)) = stamp else {
+        return WatchdogAction::LeaveAlone;
+    };
+    if generation != current_generation {
+        return WatchdogAction::LeaveAlone;
+    }
+    if !status.eq_ignore_ascii_case("connecting") {
+        return WatchdogAction::LeaveAlone;
+    }
+    if elapsed >= timeout {
+        return WatchdogAction::TimedOut;
+    }
+    WatchdogAction::LeaveAlone
+}
+
 fn watch_child(app: AppHandle) {
     #[cfg(windows)]
     let mut last_coherence = std::time::Instant::now();
@@ -1711,6 +1758,45 @@ fn watch_child(app: AppHandle) {
                         }
                     }
                 }
+            }
+        }
+        if let Some((generation, started)) = *state.connect_since.lock() {
+            let status = state.runtime.lock().status.clone();
+            let action = connect_watchdog_action(
+                Some((generation, started.elapsed())),
+                state.generation.load(Ordering::SeqCst),
+                &status,
+                CONNECT_WATCHDOG_TIMEOUT,
+            );
+            if action == WatchdogAction::TimedOut {
+                // Take the stamp before doing anything else: this loop runs every
+                // 500 ms and a teardown that outlives one tick must not re-fire.
+                *state.connect_since.lock() = None;
+                let detail = "Connection timed out after 90 s: the engine reported no ready route.";
+                emit_log(&app, format!("{detail} Stopping it so the next connect can start."));
+                state.generation.fetch_add(1, Ordering::SeqCst);
+                state.connecting.store(false, Ordering::SeqCst);
+                if let Some(mut child) = state.child.lock().take() {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(b"shutdown\n");
+                        let _ = stdin.flush();
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let endpoint = state.runtime.lock().endpoint.clone();
+                let problems = cleanup_routing(&app, &state);
+                let detail = if problems.is_empty() {
+                    detail.to_string()
+                } else {
+                    for problem in &problems {
+                        eprintln!("[aether] {problem}");
+                    }
+                    format!("{detail} · {}", problems.join(" · "))
+                };
+                emit_state(&app, &state, "error", &detail, None, endpoint);
+                continue;
             }
         }
         let mut child_slot = state.child.lock();
@@ -2036,6 +2122,7 @@ fn connect(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Re
             Some(pid),
             None,
         );
+        *state.connect_since.lock() = Some((generation, std::time::Instant::now()));
         if let Some(stdout) = stdout {
             stream_output(
                 app.clone(),
