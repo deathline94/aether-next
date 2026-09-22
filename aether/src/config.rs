@@ -311,30 +311,48 @@ pub static ACL_FAIL_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
-fn restrict_windows_acl(path: &str) -> Result<()> {
+fn restrict_windows_acl(path: &str, fresh: bool) -> Result<()> {
     #[cfg(any(test, feature = "test-hooks"))]
     if ACL_FAIL_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(AetherError::Config("forced ACL failure for test".into()));
     }
     let principal = crate::win_acl::current_user_sid()?;
     let exe = crate::win_exec::system_exe("icacls")?;
-    let output = std::process::Command::new(&exe)
-        .args([
-            path,
-            "/inheritance:r",
-            "/grant:r",
-            &format!("*{principal}:F"),
-        ])
-        .output()
-        .map_err(|e| {
-            AetherError::Config(format!("failed to run {} on {path}: {e}", exe.display()))
-        })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(AetherError::Config(format!(
-            "icacls failed to restrict permissions on {path}: {}",
-            err.trim()
-        )));
+    // `/grant:r` replaces the grant for *this* trustee and nothing else, and
+    // `/inheritance:r` strips only the inherited ACEs. A file that already
+    // carried an explicit grant for someone else - the `SYSTEM`/`BUILTIN\Administrators`
+    // pair that older builds wrote, which is what an upgrade replaces - therefore
+    // kept it, quietly and forever, next to the new one. `/reset` first puts the
+    // DACL back to what the directory hands out, and stripping inheritance then
+    // leaves exactly one ACE to reason about.
+    //
+    // Only for a file that holds nothing yet: resetting the DACL of a written
+    // config would widen its read access for the duration of the call, so the
+    // post-rename pass asserts the grant it can add without touching the rest.
+    let mut steps: Vec<Vec<String>> = Vec::new();
+    if fresh {
+        steps.push(vec![path.into(), "/reset".into()]);
+    }
+    steps.push(vec![
+        path.into(),
+        "/inheritance:r".into(),
+        "/grant:r".into(),
+        format!("*{principal}:F"),
+    ]);
+    for args in steps {
+        let output = std::process::Command::new(&exe)
+            .args(&args)
+            .output()
+            .map_err(|e| {
+                AetherError::Config(format!("failed to run {} on {path}: {e}", exe.display()))
+            })?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(AetherError::Config(format!(
+                "icacls failed to restrict permissions on {path}: {}",
+                err.trim()
+            )));
+        }
     }
     Ok(())
 }
@@ -343,7 +361,7 @@ fn restrict_windows_acl(path: &str) -> Result<()> {
 /// called from Windows paths; the stub exists to keep the call sites uniform.
 #[cfg(not(windows))]
 #[allow(dead_code)]
-fn restrict_windows_acl(_path: &str) -> Result<()> {
+fn restrict_windows_acl(_path: &str, _fresh: bool) -> Result<()> {
     Ok(())
 }
 
@@ -386,7 +404,7 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
         {
             // Nothing has been written yet: restrict the name first, then write
             // through the handle we already hold — never re-open the name.
-            if let Err(e) = restrict_windows_acl(&tmp) {
+            if let Err(e) = restrict_windows_acl(&tmp, true) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e);
             }
@@ -437,7 +455,7 @@ pub fn write_private_file(path: &str, data: &[u8]) -> Result<()> {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
-        if let Err(e) = restrict_windows_acl(path) {
+        if let Err(e) = restrict_windows_acl(path, false) {
             // Propagated, not warned: a final file whose DACL was inherited from
             // the directory is exactly the exposure the whole writer exists to
             // avoid, and reporting success would hide it. The bytes stay in

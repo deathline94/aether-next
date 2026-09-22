@@ -64,6 +64,7 @@ offset 24  ciphertext ‖ tag  ChaCha20-Poly1305
 | Unknown TOML keys | `#[serde(deny_unknown_fields)]` — a mistyped `wg_priv_key` must not silently default. |
 
 **File ACL** (Windows): descriptor `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;<sid>)` applied with `SetNamedSecurityInfoW`, principal derived from the **process token / active console session**, never `%USERNAME%`. Preferred design (R21): the elevated child does not open this file at all — the GUI decrypts and hands configuration over the child's stdin.
+> **As shipped (2026-09-22):** the principal rule is what the code does — `config.rs::restrict_windows_acl` grants `*<token SID>:F` and strips inheritance, through `icacls` rather than `SetNamedSecurityInfoW`, and **no** grant is made to SYSTEM or the Administrators group. The descriptor above was the original plan and was only ever built by a function nothing called; it is kept here as history. Do not "fix" the code back to it: the envelope is sealed with DPAPI against the user's master key, so those two trustees could read ciphertext and nothing else, which is a wider readable set for no extra recoverability.
 
 ---
 

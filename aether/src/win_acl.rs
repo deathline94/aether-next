@@ -7,6 +7,17 @@
 //! ordinary user — the next normal launch could not read its own config and
 //! re-provisioned a second WARP device. A SID cannot be ambiguous about which
 //! account it names, and it is derived from the token that will open the file.
+//!
+//! What the ACL itself is: `config.rs` applies `/inheritance:r /grant:r
+//! *<sid>:F` through `icacls`, i.e. one explicit grant to the token's own
+//! account and nothing inherited. This module used to also build
+//! `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWX;<sid>)` and never apply it - no
+//! `ConvertStringSecurityDescriptorToSecurityDescriptorW` call existed anywhere.
+//! The difference is not cosmetic and the shipped form is the tighter one: the
+//! envelope is only decryptable by this user's DPAPI master key anyway, so
+//! handing `GA` to SYSTEM and the Administrators group widened *who can read the
+//! ciphertext* without widening who can read the plaintext. The spec's older
+//! wording is corrected alongside this, not the code.
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -86,29 +97,6 @@ pub fn current_user_sid() -> Result<String> {
     }
 }
 
-/// Grant a file to exactly the account running this process, plus the system and
-/// administrators so servicing tools are not locked out, and strip inheritance.
-///
-/// `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWX;<current user>)` — `P` protects the
-/// object from inherited grants, which is the part that mattered: without it the
-/// file kept whatever the parent directory handed out.
-pub fn protective_descriptor() -> String {
-    match current_user_sid() {
-        Ok(sid) => format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWX;{sid})"),
-        Err(e) => {
-            // The descriptor still protects the file, but it grants it to SYSTEM
-            // and Administrators only: the ordinary account that owns the config
-            // cannot read it back, which is the failure that made a second WARP
-            // device get provisioned over the first. Never silent.
-            log::error!(
-                "[acl] no SID for the current token ({e}): the descriptor omits the user grant, \
-                 so this account cannot open the file it is written for"
-            );
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_string()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,12 +108,5 @@ mod tests {
         assert!(sid.starts_with("S-1-"), "{sid} is not a SID");
         assert!(!sid.contains(' '), "SID must not contain spaces");
         assert!(sid.len() > 10, "{sid} looks truncated");
-    }
-
-    #[test]
-    fn descriptor_carries_the_current_sid_and_no_inheritance() {
-        let d = protective_descriptor();
-        assert!(d.starts_with("D:P(A;;GA;;;SY)(A;;GA;;;BA)"), "{d}");
-        assert!(d.contains("(A;;GRGWX;S-1-"), "user grant missing from {d}");
     }
 }

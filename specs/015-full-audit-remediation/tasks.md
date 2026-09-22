@@ -321,6 +321,29 @@
 - [x] T092 [US3] Give `write_private_file` in `aether/src/config.rs:162` the `{path}.{pid}.{seq}.{rand}.tmp` pattern already proven in `aether/src/cache.rs:353-356`, created exclusively; on Unix fsync the file **and** the parent directory after rename.
 - [x] T093 [US3] Add `#[serde(deny_unknown_fields)]` to the persisted identity types in `aether/src/config.rs` so a mistyped `wg_priv_key` errors instead of silently defaulting, and validate `ipv4`/`ipv6`/`masque_endpoint` as parsed types.
 - [x] T094 [US3] Apply the SID-derived protective ACL in `aether/src/config.rs`: principal from `OpenProcessToken` + `GetTokenInformation(TokenUser)` (or the active console session), descriptor `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;<sid>)` via `ConvertStringSecurityDescriptorToSecurityDescriptorW` + `SetNamedSecurityInfoW(DACL_SECURITY_INFORMATION)`.
+  <!-- Half of this was never true, and the half that is true is stronger than the
+       text claims. What ships (`config.rs::restrict_windows_acl`) is
+       `icacls <path> /inheritance:r /grant:r *<sid>:F`, with `<sid>` from
+       `win_acl::current_user_sid()` - token-derived, so the `%USERNAME%` failure
+       this task was written for is genuinely fixed. No
+       `ConvertStringSecurityDescriptorToSecurityDescriptorW` call has ever
+       existed in the tree: `win_acl::protective_descriptor()` built that SDDL and
+       was called only by its own unit test, which is why the same string appears
+       in `data-model.md` and `research.md` as though it were the shipped policy.
+       Corrected 2026-09-22: the dead builder is deleted and the two spec
+       statements now describe the grant the code makes. Not "the same thing,
+       spelled differently" - the documented descriptor hands `GA` to SYSTEM and
+       the Administrators group, while the shipped ACL grants the file to the
+       token's own account alone, and the envelope inside it is DPAPI-sealed to
+       that user anyway, so the extra trustees could read the ciphertext and
+       nothing else. Same pass: `/grant:r` replaces only *that trustee's* grant,
+       so an explicit ACE left by an older build survived forever; the temp file
+       is now reset before it holds a single byte (`fresh`), while the
+       post-rename pass adds the grant without touching the rest (`false`), since
+       resetting a written config would widen its own read access for the
+       duration of the call. Both forms fail closed on a non-zero exit, and
+       `aether/tests/atomic_write_test.rs` exercises that path on Windows CI. -->
+
 - [x] T095 [US3] Stop letting the elevated child own the identity file: decrypt in the GUI and hand configuration to the child over stdin; remove `AETHER_CONFIG_KEY` from the spawn env in `apps/desktop/src-tauri/src/lib.rs:1400`/`:1667` and `apps/android/.../EngineRunner.kt:103`/`:208`, zeroizing after handoff (the existing zeroize at `lib.rs:1470-1473` shows the intent).
 - [ ] T096 [US3] Implement Keychain (macOS) and `libsecret` (Linux) key sources in `apps/desktop/src-tauri/src/lib.rs` so the off-Windows no-op path is gone (T088); absent a service, fall through to T089's refuse-secrets behaviour.
 - [x] T097 [US3] Add `#[derive(ZeroizeOnDrop)]` to `Identity` (`aether/src/account.rs:88-97`) and `Zeroize` on `[u8;32]` key arrays; pass keys by reference instead of by value into `WgConfig`/`WgProbe`/`verify_endpoint_keep_session` (today one copy per scanned IP:port); generate from `StaticSecret::random_from_rng(OsRng)` rather than `thread_rng().fill_bytes` (`account.rs:284-296`). `zeroize` is currently a declared dependency used nowhere in `aether/src`.
