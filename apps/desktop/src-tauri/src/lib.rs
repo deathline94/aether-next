@@ -418,6 +418,12 @@ pub mod dpapi {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+// A config written before a field existed must load with that field at its
+// default. Without this, one missing key failed the whole file: the shell reported
+// a hydration error, the UI ran on defaults, and the first save overwrote the
+// user's protocol, ports and obfuscation choices. Invalid values are still errors;
+// this covers absent keys only.
+#[serde(default)]
 pub struct Settings {
     pub protocol: String,
     pub transport: String,

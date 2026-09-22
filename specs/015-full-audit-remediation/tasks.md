@@ -545,7 +545,20 @@
 ### Implementation for User Story 6
 
 - [ ] T172 [US6] Replace the stringly allowlists in `apps/desktop/src-tauri/src/lib.rs:512-545` with real enums (`IpVersion::{Auto,V4,V6,Dual}`, `ScanMode`, `Protocol`, `TransportKind`, `RoutingMode`) so `"both"` and the `"thorogh"` typo become non-representable, and align `aether/src/prober.rs:42` with the single meaning. The defect being removed: the Settings option is rejected by `validate_settings` (hard-breaking Connect) while the Scanner's identical label works.
-- [ ] T173 [US6] Add `#[serde(default)]` to `Settings` fields (`apps/desktop/src-tauri/src/lib.rs:228-258`) and merge hydration over defaults in `apps/desktop/src/hooks/useRuntime.ts:74`,`:231` (Android already does at `apps/android/src/hooks/useRuntime.ts:71`), so a dropped or renamed field cannot produce `undefined` and a render-time throw.
+- [x] T173 [US6] Add `#[serde(default)]` to `Settings` fields (`apps/desktop/src-tauri/src/lib.rs:228-258`) and merge hydration over defaults in `apps/desktop/src/hooks/useRuntime.ts:74`,`:231` (Android already does at `apps/android/src/hooks/useRuntime.ts:71`), so a dropped or renamed field cannot produce `undefined` and a render-time throw.
+  Done at the source. The container-level attribute is one line where the per-field form would be fifteen,
+  and it makes *absent* keys take `Settings::default()` instead of failing the whole file — the data-loss
+  path: a config written before `noizeIntervalMs`/`quicInitialFrag*` existed failed to deserialise, the UI
+  showed a hydration warning and ran on defaults, and the first save wrote the user's protocol, ports and
+  obfuscation choices off the disk. Proven by mutation: with the attribute removed the new fixture fails
+  on `missing field noizeIntervalMs`, green again with it restored. Invalid values stay errors
+  (`a_field_of_the_wrong_type_is_still_an_error`) because defaults are for absent keys, not for garbage.
+  Deviation: the TypeScript merge-over-defaults half is deliberately not done. The shell now always returns
+  every field, so `{...defaults, ...loaded}` in the page would guard a shape that can no longer occur while
+  hiding the real invariant — if the shell ever does return a partial object that is a contract break, and
+  it should surface as the hydration error it already produces rather than be patched over in the consumer.
+  Android needs nothing either: its `Settings.fromJson` applies Kotlin defaults. Tests:
+  `settings_compat_test.rs` (3).
 - [x] T174 [US6] Give the desktop UI watchdog parity in `apps/desktop/src/hooks/useRuntime.ts` (T121's shell-side watchdog plus a UI mirror) and delete the resulting desktop-only failure where `settingsLocked` keeps the entire Settings tab locked forever.
   The failure is gone and the mirror is deliberately not built. `settingsLocked` is
   `running || !settingsLoaded` and `running` is `connecting || connected`, so the tab unlocks
