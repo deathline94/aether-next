@@ -57,6 +57,29 @@ const LEVEL_LABELS: Record<"info" | "warn" | "error" | "debug", string> = {
   debug: "DEBUG",
 };
 
+/**
+ * Scroll the console to the newest line and leave the "was that us?" latch clear.
+ *
+ * The reset used to be deferred into `requestAnimationFrame`, which does not run
+ * while the window is hidden to the tray — so the latch stayed set, and the next
+ * time the window came back the user's own scrolling could no longer pause the
+ * follow. Clearing it synchronously is enough: a programmatic scroll lands at the
+ * bottom, and the scroll handler only pauses when the viewport is away from it.
+ */
+export function scrollConsoleToBottom(
+  panel: { scrollTop: number; scrollHeight: number },
+  endMarker: { scrollIntoView: (arg?: ScrollIntoViewOptions | boolean) => void } | null,
+  latch: { current: boolean },
+): void {
+  latch.current = true;
+  try {
+    panel.scrollTop = panel.scrollHeight;
+    endMarker?.scrollIntoView({ behavior: "auto" });
+  } finally {
+    latch.current = false;
+  }
+}
+
 export function ActivityTab({
   visibleLogs,
   hasMore,
@@ -81,12 +104,7 @@ export function ActivityTab({
     // Direct container scroll lock + programmatic scroll guard so daemon log rates
     // never trigger an accidental auto-scroll pause.
     if (autoScroll && consoleRef.current) {
-      isProgrammaticScrollRef.current = true;
-      consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
-      logEndRef.current?.scrollIntoView({ behavior: "auto" });
-      requestAnimationFrame(() => {
-        isProgrammaticScrollRef.current = false;
-      });
+      scrollConsoleToBottom(consoleRef.current, logEndRef.current, isProgrammaticScrollRef);
     }
   }, [visibleLogs, autoScroll, logEndRef]);
 

@@ -648,7 +648,18 @@
   both typechecks pass.
   Deliberately left: `useScanner.startScan` still clears, which is a new activity rather than a response to a
   failure. If T182's structured-event rewrite lands, both hooks should read from the same log-store contract.
-- [ ] T184 [US6] Fix the auto-scroll latch in `apps/desktop/src/components/ActivityTab.tsx:84-89` by resetting `isProgrammaticScrollRef` synchronously after the scroll assignment, not inside a `requestAnimationFrame` throttled when the window is hidden to tray.
+- [x] T184 [US6] Fix the auto-scroll latch in `apps/desktop/src/components/ActivityTab.tsx:84-89` by resetting `isProgrammaticScrollRef` synchronously after the scroll assignment, not inside a `requestAnimationFrame` throttled when the window is hidden to tray.
+  Done in both UIs as an extracted `scrollConsoleToBottom(panel, endMarker, latch)`: the latch is set
+  for the assignment and cleared in a `finally` before returning, instead of inside
+  `requestAnimationFrame`. A rAF callback does not run while the window is hidden to the tray, so the
+  latch stuck set and the user's own scroll could no longer pause the follow — the auto-scroll could
+  not be turned off by scrolling up, which is the only way to read a line while the engine is chatty.
+  The `finally` also covers the case the old code had not considered: a detached marker node throwing
+  inside `scrollIntoView` used to leave the latch set permanently.
+  Tests: `ActivityTab.test.ts` (2) — the latch is observed *during* the scroll assignment (so the
+  programmatic scroll is still marked as ours) and is clear on return. Reinstating the deferred reset
+  reddens both; the file was restored from a backup afterwards. 20 desktop and 14 Android UI tests
+  pass, both typecheck.
 - [ ] T185 [US6] Adopt `@tanstack/react-virtual` 3.x (`useVirtualizer`, `estimateSize` + `measureElement`, `overscan: 8`) in `apps/desktop/src/components/ScannerTab.tsx:354` with `useMemo` on `filteredEndpoints` and the sort; `content-visibility: auto` for the log view only (it skips paint but never reduces node count).
 - [ ] T186 [US6] Move `ErrorBoundary` to per-tab scope inside each `role="tabpanel"` in `apps/desktop/src/App.tsx` with `resetKeys={[tab, settingsLoadError]}` and a Retry calling `refreshSettings()`; today it wraps only `<App/>` (`main.tsx:8`) so one unexpected payload white-screens the window. Add a payload guard in the `session://state` listener, `heroCopy[status] ?? heroCopy.disconnected` in `ConnectionTab.tsx:86`, and `noUncheckedIndexedAccess` in `apps/desktop/tsconfig.json`.
 - [ ] T187 [US6] Self-host the fonts: add `@fontsource-variable/geist` + `geist-mono` (OFL-1.1), import their CSS from TS so Vite hashes the woff2 into `dist/` same-origin under the existing `font-src 'self'`, and delete the Google Fonts `<link>`s from `apps/desktop/index.html:8-10`. No `asset:` protocol (needs enabling, scoping and `font-src asset: http://asset.localhost`) and no CSP relaxation for `fonts.gstatic.com` — a circumvention tool must not make a pre-tunnel third-party request from its UI, which dev mode currently does live.
