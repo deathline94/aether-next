@@ -2,16 +2,48 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { initialScanState } from "../types";
-import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
+import type {
+  DiscoveredEndpoint,
+  DisplayedScanState,
+  LogInput,
+  NoizeProfile,
+  ScanEvent,
+  ScanState,
+} from "../types";
 import { errorMessage } from "../ipcError";
 import { hitAddressKey } from "./useLogs";
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
+import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
+import type { ScanProtocol } from "../../../../packages/ui/src/enums";
+
+/**
+ * The noise profile a scan will actually run, which is the one the panel may show.
+ *
+ * `masque-h2` probes are TCP handshakes: UDP junk frames have nowhere to go, and
+ * the select used to read "Off — no noise" while `startScan` forwarded the stored
+ * profile regardless. One value, computed here, feeds both the `scan` invoke and
+ * the control that displays it, so the label and the wire cannot disagree. The
+ * user's own choice survives a transport that cannot carry it.
+ */
+export function scanNoizeFor(protocol: ScanProtocol, noize: NoizeProfile): NoizeProfile {
+  if (protocol === "masque-h2") return "off";
+  // A profile the shell does not know is not a profile: send nothing rather than
+  // an invented name that fails the scan for a reason nobody can see.
+  return oneOf(noize, NOIZE_PROFILES, "off");
+}
+
+/** Workers the engine will run, which is the only range worth offering. */
+export function clampConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return SCAN_MIN_CONCURRENCY;
+  return Math.min(SCAN_MAX_CONCURRENCY, Math.max(SCAN_MIN_CONCURRENCY, Math.round(value)));
+}
 
 /**
  * A round-trip that can be shown: the engine's own text, or a measured number
  * formatted. Anything empty or absent is `null`, so a caller keeps the previous
  * value or says nothing rather than storing `""` and printing it.
  */
-function rttLike(value: string | number | null | undefined): string | null {
+export function rttLike(value: string | number | null | undefined): string | null {
   if (typeof value === "number") return Number.isFinite(value) ? `${value} ms` : null;
   const text = typeof value === "string" ? value.trim() : "";
   return text.length > 0 ? text : null;
@@ -72,13 +104,14 @@ export function useScanner(
   running: boolean,
   clearLogs?: () => void,
 ) {
-  const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
+  const [protocol, setProtocol] = useState<ScanProtocol>("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
   const [concurrency, setConcurrency] = useState(250);
   // 6s: at or above the engine's expensive-mode (H3/BoringSSL) per-probe floor so
   // the UI default never silently under-budgets QUIC handshake probes.
   const [timeoutMs, setTimeoutMs] = useState(6000);
-  const [noize, setNoize] = useState("off");
+  const [noize, setNoize] = useState<NoizeProfile>("off");
+  const effectiveNoize = useMemo(() => scanNoizeFor(protocol, noize), [protocol, noize]);
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
   const [busy, setBusy] = useState(false);
@@ -96,7 +129,7 @@ export function useScanner(
   const active = scanState.active;
   // `bestRtt` on the stored state is never read: the chip is the minimum of the
   // rows below it, so it is computed here and nowhere else.
-  const displayedScanState = useMemo<ScanState>(
+  const displayedScanState = useMemo<DisplayedScanState>(
     () => ({ ...scanState, bestRtt: bestRttOf(endpoints) }),
     [scanState, endpoints],
   );
@@ -117,7 +150,6 @@ export function useScanner(
             concurrency: ev.concurrency,
             scanned: 0,
             working: 0,
-            bestRtt: null,
             phase: "Probing Pool",
           });
           break;
@@ -205,16 +237,27 @@ export function useScanner(
     endpointsRef.current = [];
     setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
+    // The two values are clamped before they are both announced and sent, so the
+    // log line describes the run the engine will actually perform.
+    const workers = clampConcurrency(concurrency);
+    const timeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
+    const noiseProfile = scanNoizeFor(protocol, noize);
     appendLog({
       level: "info",
-      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${concurrency}, timeout=${timeoutMs}ms)`,
+      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${workers}, timeout=${timeout}ms, noise=${noiseProfile})`,
     });
     try {
       if (running) {
         await invoke("disconnect");
       }
-      const effectiveTimeout = protocol === "masque-h3" ? Math.max(6000, timeoutMs) : Math.max(3000, timeoutMs);
-      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
+      await invoke("scan", {
+        runId,
+        protocol,
+        ipVersion: ipScan,
+        concurrency: workers,
+        timeoutMs: timeout,
+        noize: noiseProfile,
+      });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
@@ -244,7 +287,7 @@ export function useScanner(
     ipScan, setIpScan,
     concurrency, setConcurrency,
     timeoutMs, setTimeoutMs,
-    noize, setNoize,
+    noize: effectiveNoize, setNoize,
     endpoints, active, scanState: displayedScanState, busy,
     startScan, stopScan,
   };

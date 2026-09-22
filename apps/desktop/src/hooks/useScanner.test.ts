@@ -8,6 +8,9 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { initialScanState } from "../types";
+import { SCAN_MAX_CONCURRENCY } from "../../../../packages/ui/src";
+import { scanNoizeFor } from "./useScanner";
 
 type Listener = (event: { payload: unknown }) => void;
 
@@ -27,13 +30,17 @@ function captureListener(): (payload: unknown) => void {
 const appendLog = vi.fn();
 
 /** The run id the hook passed to the engine for its most recent `scan` invoke. */
-function lastScanRunId(): string {
+function lastScanArgs(): Record<string, unknown> {
   const call = vi
     .mocked(invoke)
     .mock.calls.filter(([command]) => command === "scan")
     .at(-1);
   if (!call) throw new Error("startScan never invoked `scan`");
-  return (call[1] as { runId: string }).runId;
+  return call[1] as Record<string, unknown>;
+}
+
+function lastScanRunId(): string {
+  return lastScanArgs().runId as string;
 }
 
 beforeEach(() => {
@@ -159,7 +166,7 @@ describe("desktop useScanner", () => {
     let releaseDisconnect: () => void = () => {};
     let disconnectIsPending = false;
     const previous = vi.mocked(invoke).getMockImplementation();
-    vi.mocked(invoke).mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    vi.mocked(invoke).mockImplementation((async (command: string, args?: Record<string, unknown>) => {
       if (command === "disconnect") {
         disconnectIsPending = true;
         await new Promise<void>((resolve) => (releaseDisconnect = resolve));
@@ -167,7 +174,7 @@ describe("desktop useScanner", () => {
         return null;
       }
       return previous ? previous(command, args) : null;
-    });
+    }) as never);
 
     let scanReturned = false;
     void result.current.startScan().then(() => (scanReturned = true));
@@ -183,7 +190,7 @@ describe("desktop useScanner", () => {
 
     releaseDisconnect();
     await waitFor(() => expect(scanReturned).toBe(true));
-    vi.mocked(invoke).mockImplementation(previous ?? (() => null));
+    if (previous) vi.mocked(invoke).mockImplementation(previous);
     expect(lastScanRunId()).not.toBe(firstRun);
   });
 
@@ -204,5 +211,76 @@ describe("desktop useScanner", () => {
     // Rows from a previous run outlive the counters that describe them, so the
     // table and "N working" disagree until the engine's own scan_start lands.
     expect(result.current.endpoints).toHaveLength(0);
+  });
+
+  it("sends the noise profile the panel displays", async () => {
+    captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+
+    act(() => result.current.setNoize("custom"));
+    expect(result.current.noize).toBe("custom");
+
+    // H2 probes are TCP: UDP junk frames cannot be sent at all. The select read
+    // "off" while the scan still forwarded `noize: "custom"`.
+    act(() => result.current.setProtocol("masque-h2"));
+    expect(result.current.noize).toBe("off");
+    await act(async () => {
+      await result.current.startScan();
+    });
+    expect(lastScanArgs().noize).toBe("off");
+
+    // The user's own choice is not erased by the transport that cannot carry it.
+    act(() => result.current.setProtocol("masque-h3"));
+    expect(result.current.noize).toBe("custom");
+  });
+
+  it("never asks the engine for more workers than it will run", async () => {
+    captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+    await waitFor(() => expect(result.current.scanState.active).toBe(false));
+
+    await act(async () => {
+      await result.current.startScan();
+    });
+    expect(Number(lastScanArgs().concurrency)).toBeLessThanOrEqual(SCAN_MAX_CONCURRENCY);
+
+    act(() => result.current.setConcurrency(SCAN_MAX_CONCURRENCY * 4));
+    await act(async () => {
+      await result.current.stopScan();
+    });
+    await act(async () => {
+      await result.current.startScan();
+    });
+    expect(Number(lastScanArgs().concurrency)).toBe(SCAN_MAX_CONCURRENCY);
+  });
+
+  it("derives the Best chip from the rows, which are its only owner", () => {
+    // `ScanState.bestRtt` used to be both stored (and rewritten per hit) and
+    // derived, so the chip could sit directly above a faster first row.
+    expect("bestRtt" in initialScanState).toBe(false);
+
+    const emit = captureListener();
+    const { result } = renderHook(() => useScanner(appendLog, false));
+
+    act(() => {
+      emit({ type: "scan_hit", addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h3" });
+      emit({ type: "scan_hit", addr: "188.114.96.1:443", rtt: "240ms", rttMs: 240, protocol: "masque-h3" });
+    });
+
+    expect(result.current.scanState.bestRtt).toBe("12ms");
+  });
+});
+
+describe("scanNoizeFor", () => {
+  it("resolves the profile a scan will actually run", () => {
+    expect(scanNoizeFor("masque-h2", "custom")).toBe("off");
+    expect(scanNoizeFor("masque-h2", "off")).toBe("off");
+    expect(scanNoizeFor("masque-h3", "high")).toBe("high");
+    expect(scanNoizeFor("wireguard", "medium")).toBe("medium");
+  });
+
+  it("falls back to sending nothing rather than to a name the shell rejects", () => {
+    expect(scanNoizeFor("masque-h3", "turbo-udp" as never)).toBe("off");
+    expect(scanNoizeFor("masque-h3", "" as never)).toBe("off");
   });
 });

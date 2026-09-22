@@ -7,10 +7,11 @@ import {
   Sparkles,
   Terminal,
 } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useRef, useState } from "react";
 import { RENDER_CAP } from "../hooks/useLogs";
-import { formatLogTime } from "../types";
-import type { LogEntry, LogFilter, ScanState } from "../types";
+import type { DisplayedScanState, LogEntry, LogFilter } from "../types";
+import { nextOptionIndex } from "./ui";
 
 interface ActivityTabProps {
   visibleLogs: LogEntry[];
@@ -23,9 +24,12 @@ interface ActivityTabProps {
   setAutoScroll: (v: boolean) => void;
   exportLogs: () => Promise<boolean>;
   clearLogs: () => void;
-  scanState: ScanState;
+  scanState: DisplayedScanState;
   status: string;
 }
+
+/** Row height before it has been measured; the real rows are one line of mono. */
+const ESTIMATED_ROW_PX = 26;
 
 const FILTERS: { id: LogFilter; label: string }[] = [
   { id: "milestones", label: "Milestones" },
@@ -99,6 +103,17 @@ export function ActivityTab({
   const consoleRef = useRef<HTMLElement | null>(null);
 
   const isProgrammaticScrollRef = useRef(false);
+
+  // A scan writes lines faster than the console can be painted, and the whole
+  // visible window was in the DOM at once. Only the rows on screen — plus a small
+  // overscan — are mounted now, positioned inside a spacer of the full height so
+  // the scrollbar still describes the buffer.
+  const rows = useVirtualizer({
+    count: visibleLogs.length,
+    getScrollElement: () => consoleRef.current,
+    estimateSize: () => ESTIMATED_ROW_PX,
+    overscan: 10,
+  });
 
   useEffect(() => {
     // Direct container scroll lock + programmatic scroll guard so daemon log rates
@@ -233,7 +248,18 @@ export function ActivityTab({
         </header>
 
         {/* Sticky Filter Pill Bar */}
-        <div className="tactical-filter-dock" role="radiogroup" aria-label="Log filter">
+        <div
+          className="tactical-filter-dock"
+          role="radiogroup"
+          aria-label="Log filter"
+          onKeyDown={(event) => {
+            const selected = Math.max(0, FILTERS.findIndex((f) => f.id === logFilter));
+            const next = nextOptionIndex(selected, event.key, FILTERS.length);
+            if (next === null) return;
+            event.preventDefault();
+            setLogFilter(FILTERS[next].id);
+          }}
+        >
           <div className="filter-pill-group">
             {FILTERS.map((f) => (
               <button
@@ -241,6 +267,8 @@ export function ActivityTab({
                 type="button"
                 role="radio"
                 aria-checked={logFilter === f.id}
+                // One tab stop for the group, arrows between the chips.
+                tabIndex={logFilter === f.id ? 0 : -1}
                 className={`filter-chip ${logFilter === f.id ? "active" : ""}`}
                 onClick={() => setLogFilter(f.id)}
               >
@@ -261,6 +289,9 @@ export function ActivityTab({
           className="activity-console tactical-terminal-screen font-mono"
           onScroll={handleScroll}
           aria-label="Engine log output"
+          // A scroll region the keyboard cannot reach: `tabIndex={0}` is what lets
+          // PageUp/PageDown and the arrows read the lines above the fold.
+          tabIndex={0}
         >
           {hasMore && (
             <div className="log-more-hint">
@@ -281,24 +312,48 @@ export function ActivityTab({
               </span>
             </div>
           ) : (
-            visibleLogs.map((entry) => {
-              const category = getLogCategory(entry);
-              const label = LEVEL_LABELS[category];
-              return (
-                <div className={`terminal-log-row ${category}`} key={entry.id} title={category.toUpperCase()}>
-                  <span className="row-gutter">
-                    <span className="gutter-dot" aria-hidden="true" />
-                  </span>
-                  <time className="tabular-nums font-mono" dateTime={new Date(entry.ts).toISOString()}>
-                    {formatLogTime(entry.ts)}
-                  </time>
-                  <span className={`log-level-badge ${category} font-mono`}>
-                    [{label}]
-                  </span>
-                  <p className="log-message-body font-mono">{entry.message}</p>
-                </div>
-              );
-            })
+            <div
+              style={{ height: rows.getTotalSize(), position: "relative", width: "100%" }}
+              role="log"
+              aria-label="Log rows"
+            >
+              {rows.getVirtualItems().map((row) => {
+                const entry = visibleLogs[row.index];
+                if (!entry) return null;
+                const category = getLogCategory(entry);
+                const label = LEVEL_LABELS[category];
+                return (
+                  <div
+                    key={entry.id}
+                    data-index={row.index}
+                    ref={rows.measureElement}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${row.start}px)`,
+                    }}
+                  >
+                    <div className={`terminal-log-row ${category}`} title={category.toUpperCase()}>
+                      <span className="row-gutter">
+                        <span className="gutter-dot" aria-hidden="true" />
+                      </span>
+                      {/* The clock is a field of the entry, formatted once when the
+                          line arrived: `toLocaleTimeString()` per row per render was
+                          a locale-sensitive call 200 times over on every scan line. */}
+                      <time className="tabular-nums font-mono" dateTime={new Date(entry.ts).toISOString()}>
+                        {entry.time}
+                      </time>
+                      <span className={`log-level-badge ${category} font-mono`}>
+                        [{label}]
+                      </span>
+                      <p className="log-message-body font-mono">{entry.message}</p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
           <div ref={logEndRef} />
         </section>

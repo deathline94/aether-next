@@ -46,7 +46,15 @@ export interface ErrorBoundaryProps {
   onRetry?: () => void;
 }
 
-/** Last-resort guard: a render error must not white-screen the whole app. */
+/**
+ * Guard a subtree against a render error.
+ *
+ * Mounted twice over, deliberately: once at the root in `main.tsx` with no props
+ * (the last resort, whose fallback says "Something went wrong"), and once per tab
+ * in `App.tsx` with a `label` and `resetKeys` (the recovery path: a fresh session
+ * frame, a settings reload, or simply switching tabs and back). A boundary is
+ * mounted with its tab, so leaving a crashed tab and returning resets it.
+ */
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = { error: null, resetKeys: this.props.resetKeys };
 

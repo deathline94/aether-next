@@ -18,6 +18,78 @@ function profileActive(settings: Settings, patch: Partial<Settings>) {
   return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);
 }
 
+/**
+ * The measured round-trip, or the honest absence.
+ *
+ * This tile used to be `testResult.match(/(\d+)\s*ms/i)` — prose scraped for a
+ * number. `test_connection` answers with sentences that contain no `ms` at all, so
+ * the tile was permanently "not measured" while the shell sent a real
+ * `handshakeRttMs` on every `session://state` that nothing read; and on a *failed*
+ * test the same regex could catch a timeout figure and print it as latency. Read
+ * the typed field, or say nothing.
+ */
+export function formatRttMs(rttMs: number | null): string {
+  return typeof rttMs === "number" && Number.isFinite(rttMs) ? `${Math.round(rttMs)} ms` : "not measured";
+}
+
+/** Every carrier the shell can report, keyed so a new arm fails to compile. */
+type CarrierCopy = {
+  chip: (t: Settings["transport"]) => string;
+  transport: (t: Settings["transport"]) => string;
+};
+
+const CARRIER_CHIP: Record<Settings["protocol"], CarrierCopy> = {
+  masque: {
+    chip: (t) => (t === "h3" ? "QUIC/UDP" : "H2/TLS"),
+    transport: (t) => (t === "h3" ? "HTTP/3" : "HTTP/2"),
+  },
+  wireguard: { chip: () => "WIREGUARD/UDP", transport: () => "UDP WireGuard" },
+  gool: { chip: () => "WARP-IN-WARP", transport: () => "WireGuard (in WARP)" },
+};
+
+export function carrierChip(settings: Settings): string {
+  // Two arms only, so a Gool session advertised WIREGUARD.
+  return CARRIER_CHIP[settings.protocol].chip(settings.transport);
+}
+
+export function transportChip(settings: Settings): string {
+  return CARRIER_CHIP[settings.protocol].transport(settings.transport);
+}
+
+/** Exhaustive by construction: adding an `IpVersion` arm breaks the build here. */
+const IP_STACK_COPY: Record<Settings["ipVersion"], string> = {
+  v4: "IPv4",
+  v6: "IPv6",
+  both: "IPv4 + IPv6",
+};
+
+export function ipStackCopy(ipVersion: Settings["ipVersion"]): string {
+  return IP_STACK_COPY[ipVersion];
+}
+
+/**
+ * What the two listener tiles may claim.
+ *
+ * Both were keyed on `status === "connected"` and shouted "HTTP proxy configured"
+ * in every routing mode, which contradicts `connectedCopy` a few pixels away: in
+ * `proxy-only` nothing is configured system-wide until an application points at
+ * the listeners, and in `tun` the route is the tunnel device, not the proxy.
+ */
+export function portStateCopy(
+  connected: boolean,
+  routingMode: Settings["routingMode"],
+): { http: string; socks: string } {
+  if (!connected) return { http: "idle", socks: "idle" };
+  switch (routingMode) {
+    case "system-proxy":
+      return { http: "HTTP proxy configured", socks: "SOCKS5 configured" };
+    case "proxy-only":
+      return { http: "HTTP listener open", socks: "SOCKS5 listener open" };
+    case "tun":
+      return { http: "HTTP listener available (TUN routes)", socks: "SOCKS5 listener available (TUN routes)" };
+  }
+}
+
 const heroCopy: Record<RuntimeState["status"], { eyebrow: string; title: string; badge: string }> = {
   disconnected: { eyebrow: "LOCAL LISTENERS CLOSED", title: "Not Connected", badge: "STANDBY // CLICK TO ENGAGE" },
   connecting: { eyebrow: "NEGOTIATING // EDGE HANDSHAKE", title: "Establishing Edge Path", badge: "CONNECTING" },
@@ -114,11 +186,11 @@ export function ConnectionTab({
   const active = connectedCopy(settings.routingMode);
   const badge = runtime.status === "connected" ? active.badge : hero.badge;
 
-  // Only a measured round-trip may be shown as a number: the engine reports no
-  // latency of its own, so anything else here would be invented telemetry.
-  const parsedLatency = testResult?.match(/(\d+)\s*ms/i)?.[1];
-  const displayLatency = parsedLatency ? `${parsedLatency} ms` : "not measured";
+  // The only latency this app has is the shell's measurement of the probe that
+  // proved the endpoint; `testResult` is a sentence, not a reading.
+  const displayLatency = formatRttMs(runtime.handshakeRttMs);
   const displayLoss = "not measured";
+  const listeners = portStateCopy(connected, settings.routingMode);
 
   return (
     <div className="home-view">
@@ -234,7 +306,16 @@ export function ConnectionTab({
             <span>Targeting forced endpoint:</span>
             <code>{settings.peer}</code>
           </div>
-          <button type="button" className="pinned-peer-clear-btn" onClick={() => patchSettings({ peer: "" })}>
+          <button
+            type="button"
+            className="pinned-peer-clear-btn"
+            onClick={() => patchSettings({ peer: "" })}
+            // `patchSettings` is a no-op while a session runs or before hydration,
+            // so the control has to look like it is: a visible button that does
+            // nothing is worse than a disabled one that says why.
+            disabled={settingsLocked}
+            title={settingsLocked ? "Disconnect the tunnel to change the target endpoint" : "Stop targeting this endpoint"}
+          >
             Clear (Scan dynamically)
           </button>
         </div>
@@ -311,7 +392,7 @@ export function ConnectionTab({
               </div>
               <div className="stat-unit">
                 <span className="stat-label">IP STACK</span>
-                <span className="stat-value tabular-nums">{settings.ipVersion.toUpperCase()}</span>
+                <span className="stat-value tabular-nums">{ipStackCopy(settings.ipVersion)}</span>
               </div>
             </div>
 
@@ -344,15 +425,13 @@ export function ConnectionTab({
                 </strong>
               </div>
             </div>
-            <span className="bento-chip-cyan">
-              {settings.protocol === "masque" ? (settings.transport === "h3" ? "QUIC/UDP" : "H2/TLS") : "WIREGUARD"}
-            </span>
+            <span className="bento-chip-cyan">{carrierChip(settings)}</span>
           </div>
 
           <div className="cipher-specs-grid">
             <div className="spec-badge">
               <span>TRANSPORT</span>
-              <strong>{settings.protocol === "masque" ? (settings.transport === "h3" ? "HTTP/3" : "HTTP/2") : "UDP WireGuard"}</strong>
+              <strong>{transportChip(settings)}</strong>
             </div>
             <div className="spec-badge">
               <span>OBFUSCATION</span>
@@ -439,8 +518,8 @@ export function ConnectionTab({
               </div>
             </div>
             <div className="daemon-metrics-row">
-              <div className="daemon-tag">PORT {settings.httpPort}: <strong>{runtime.status === "connected" ? "HTTP proxy configured" : "idle"}</strong></div>
-              <div className="daemon-tag">PORT {settings.socksPort}: <strong>{runtime.status === "connected" ? "SOCKS5 configured" : "idle"}</strong></div>
+              <div className="daemon-tag">PORT {settings.httpPort}: <strong>{listeners.http}</strong></div>
+              <div className="daemon-tag">PORT {settings.socksPort}: <strong>{listeners.socks}</strong></div>
             </div>
           </div>
 

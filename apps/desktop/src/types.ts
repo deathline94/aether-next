@@ -1,3 +1,30 @@
+/**
+ * The wire enums live in `@aether/ui` (`packages/ui/src/enums.ts`) so the desktop
+ * and Android shells cannot drift into offering different legal values for the
+ * same setting. It is reached by relative path, exactly as the Android front end
+ * does (there is no workspace install step yet — see the note in
+ * `apps/desktop/README`/T197): the alternative was a fourth private copy.
+ */
+import {
+  IP_FAMILIES,
+  NOIZE_PROFILES,
+  ROUTING_MODES,
+  SCAN_MODES,
+  TRANSPORTS,
+  TUNNEL_PROTOCOLS,
+  oneOf,
+} from "../../../packages/ui/src/enums";
+import type {
+  IpFamily,
+  NoizeProfile,
+  RoutingMode,
+  ScanMode,
+  TunnelProtocol,
+  Transport,
+} from "../../../packages/ui/src/enums";
+
+export type { IpFamily, NoizeProfile, RoutingMode, ScanMode, TunnelProtocol, Transport };
+
 export type View = "home" | "scanner" | "settings" | "logs";
 export type Status = "disconnected" | "connecting" | "connected" | "error";
 export type LogFilter = "milestones" | "hits" | "errors" | "raw";
@@ -9,6 +36,14 @@ export interface DiscoveredEndpoint {
   protocol: string;
 }
 
+/**
+ * What the engine reports about a running scan.
+ *
+ * `bestRtt` is deliberately absent: it is a property of the endpoint rows on
+ * screen, computed by the scanner hook (`bestRttOf`) and overlaid here as
+ * `DisplayedScanState`. Storing it as well as deriving it is how the "Best" chip
+ * ended up naming a slower endpoint than the first row beneath it.
+ */
 export interface ScanState {
   active: boolean;
   mode: string;
@@ -16,9 +51,10 @@ export interface ScanState {
   total: number;
   concurrency: number;
   working: number;
-  bestRtt: string | null;
   phase: string;
 }
+
+export type DisplayedScanState = ScanState & { bestRtt: string | null };
 
 export const initialScanState: ScanState = {
   active: false,
@@ -27,21 +63,25 @@ export const initialScanState: ScanState = {
   total: 0,
   concurrency: 0,
   working: 0,
-  bestRtt: null,
   phase: "Idle",
 };
 
+/**
+ * The settings the shell persists. Every field is required: an optional field is
+ * a field some panel has to remember to guard, and `settings.ipVersion...` had no
+ * guard. A payload that is missing one is corrected by `parseSettings` instead.
+ */
 export type Settings = {
-  protocol: "masque" | "wireguard" | "gool";
-  transport: "h2" | "h3";
-  scanMode: "turbo" | "balanced" | "thorough" | "stealth";
-  ipVersion: "v4" | "v6" | "both";
-  noize: string;
+  protocol: TunnelProtocol;
+  transport: Transport;
+  scanMode: ScanMode;
+  ipVersion: IpFamily;
+  noize: NoizeProfile;
   noizeJc: number;
   noizeJmin: number;
   noizeJmax: number;
   noizeIntervalMs: number;
-  routingMode: "system-proxy" | "proxy-only" | "tun";
+  routingMode: RoutingMode;
   socksPort: number;
   httpPort: number;
   startMinimized: boolean;
@@ -53,7 +93,6 @@ export type Settings = {
   quicInitialFrag: boolean;
   /** H3 anti-DPI: bytes of ClientHello in the first Initial (16–512). */
   quicInitialFragSize: number;
-  endpointPreset?: "warp" | "gool";
 };
 
 export type RuntimeState = {
@@ -61,6 +100,14 @@ export type RuntimeState = {
   detail: string;
   pid: number | null;
   endpoint: string | null;
+  /**
+   * The round-trip of the probe that proved this session's endpoint, in ms, as
+   * the shell's `RuntimeState::handshake_rtt_ms`. `null` until something has been
+   * measured. This is the only latency the UI has: the tile used to regex-scrape a
+   * number out of `test_connection` prose — which contained no `ms` at all, and on
+   * a failed test could scrape a timeout value and print it as latency.
+   */
+  handshakeRttMs: number | null;
 };
 
 /** The statuses the UI has copy, colours and a beacon for. */
@@ -89,6 +136,12 @@ export function parseRuntimeState(payload: unknown): RuntimeState | null {
     detail: typeof raw.detail === "string" ? raw.detail : "",
     pid: typeof raw.pid === "number" && Number.isFinite(raw.pid) ? raw.pid : null,
     endpoint: typeof raw.endpoint === "string" ? raw.endpoint : null,
+    // A round-trip is a count of milliseconds or nothing; a stringly or negative
+    // one is not a measurement, and "not measured" must not render as `0 ms`.
+    handshakeRttMs:
+      typeof raw.handshakeRttMs === "number" && Number.isFinite(raw.handshakeRttMs) && raw.handshakeRttMs >= 0
+        ? raw.handshakeRttMs
+        : null,
   };
 }
 
@@ -96,8 +149,14 @@ export type LogEntry = {
   id: number;
   level: "info" | "warn" | "error";
   message: string;
-  /** Epoch milliseconds — formatted at render time so exports keep the date. */
+  /**
+   * Epoch milliseconds, kept machine-readable for the buffer export. The console
+   * row prints `time` instead: formatting here on every render multiplied a
+   * `toLocaleTimeString` call by the visible rows on every appended line.
+   */
   ts: number;
+  /** `ts` already rendered as HH:MM:SS, computed once when the line was appended. */
+  time: string;
   /**
    * Set when this line *is* a hit rather than a line that mentions one: the
    * address+protocol the structured event named, verbatim. `useLogs` dedupes on
@@ -117,7 +176,15 @@ export type LogEntry = {
 export type LogInput = Pick<LogEntry, "level" | "message"> & { hitKey?: string };
 
 export function formatLogTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  // `hour12: false`: the console is a fixed-width column of timestamps, and an
+  // AM/PM string of a different length per locale is what the tabular column and
+  // the log export have to cope with.
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 export const defaults: Settings = {
@@ -141,11 +208,89 @@ export const defaults: Settings = {
   quicInitialFragSize: 96,
 };
 
+/**
+ * `get_settings` / the post-write value, merged over `defaults` field by field.
+ *
+ * The desktop hook used to do `setSettings(loadedSettings)`: a shell build that
+ * dropped a field, or renamed its enum arm, handed the panels `undefined` or a
+ * value no option list contains, and the next `settings.ipVersion.toUpperCase()`
+ * threw on the Settings/Connection render. Android already merged over defaults,
+ * which is why the same dropped field only ever white-screened one of the two
+ * front ends (`packages/ui/src/index.ts` names this). Merging is not enough on its
+ * own either — `{ protocol: "masque" }` is a valid object and a broken setting —
+ * so each field is validated against the same lists the option controls offer, and
+ * every correction is reported back so the log says which field came up short
+ * rather than the form silently persisting the default over the user's value.
+ */
+export function parseSettings(raw: unknown): { settings: Settings; corrected: string[] } {
+  const src: Record<string, unknown> =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  const corrected: string[] = [];
+  const note = (field: string) => {
+    if (!corrected.includes(field)) corrected.push(field);
+  };
+
+  const enumeration = <T extends string>(
+    field: keyof Settings,
+    allowed: readonly T[],
+    fallback: T,
+  ): T => {
+    const value = oneOf(src[field], allowed, fallback);
+    if (value !== src[field]) note(field);
+    return value;
+  };
+  const finiteNumber = (field: keyof Settings, fallback: number): number => {
+    const value = src[field];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    note(field);
+    return fallback;
+  };
+  const boolean = (field: keyof Settings, fallback: boolean): boolean => {
+    const value = src[field];
+    if (typeof value === "boolean") return value;
+    note(field);
+    return fallback;
+  };
+  const text = (field: keyof Settings, fallback: string): string => {
+    const value = src[field];
+    if (typeof value === "string") return value;
+    note(field);
+    return fallback;
+  };
+
+  return {
+    settings: {
+      protocol: enumeration("protocol", TUNNEL_PROTOCOLS, defaults.protocol),
+      transport: enumeration("transport", TRANSPORTS, defaults.transport),
+      scanMode: enumeration("scanMode", SCAN_MODES, defaults.scanMode),
+      ipVersion: enumeration("ipVersion", IP_FAMILIES, defaults.ipVersion),
+      noize: enumeration("noize", NOIZE_PROFILES, defaults.noize),
+      noizeJc: finiteNumber("noizeJc", defaults.noizeJc),
+      noizeJmin: finiteNumber("noizeJmin", defaults.noizeJmin),
+      noizeJmax: finiteNumber("noizeJmax", defaults.noizeJmax),
+      noizeIntervalMs: finiteNumber("noizeIntervalMs", defaults.noizeIntervalMs),
+      routingMode: enumeration("routingMode", ROUTING_MODES, defaults.routingMode),
+      socksPort: finiteNumber("socksPort", defaults.socksPort),
+      httpPort: finiteNumber("httpPort", defaults.httpPort),
+      startMinimized: boolean("startMinimized", defaults.startMinimized),
+      launchAtLogin: boolean("launchAtLogin", defaults.launchAtLogin),
+      enginePath: text("enginePath", defaults.enginePath),
+      peer: text("peer", defaults.peer),
+      quicInitialFrag: boolean("quicInitialFrag", defaults.quicInitialFrag),
+      quicInitialFragSize: finiteNumber("quicInitialFragSize", defaults.quicInitialFragSize),
+    },
+    corrected,
+  };
+}
+
 export const initialRuntime: RuntimeState = {
   status: "disconnected",
   detail: "Ready",
   pid: null,
   endpoint: null,
+  handshakeRttMs: null,
 };
 
 /**

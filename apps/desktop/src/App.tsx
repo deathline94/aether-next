@@ -7,12 +7,13 @@ import "@fontsource-variable/geist-mono";
 import "./App.css";
 import { ActivityTab } from "./components/ActivityTab";
 import { ConnectionTab } from "./components/ConnectionTab";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ScannerTab } from "./components/ScannerTab";
 import { SettingsTab } from "./components/SettingsTab";
 import { useLogs } from "./hooks/useLogs";
 import { engineDiagnostics, useRuntime } from "./hooks/useRuntime";
 import { useScanner } from "./hooks/useScanner";
-import type { DiscoveredEndpoint, View } from "./types";
+import type { DiscoveredEndpoint, LogFilter, RuntimeState, Settings, View } from "./types";
 
 // Single definition per view — label + heading copy live together so they
 // can't drift apart.
@@ -23,16 +24,68 @@ const navigation: { id: View; label: string; eyebrow: string; shortcut: string; 
   { id: "logs", label: "Activity", eyebrow: "LIVE ENGINE OUTPUT", shortcut: "4", icon: ScrollText },
 ];
 
+/** Digit → view, for the `1`–`4` navigation keys. */
+const VIEW_BY_SHORTCUT: Record<string, View> = {
+  "1": "home",
+  "2": "scanner",
+  "3": "settings",
+  "4": "logs",
+};
+
+/**
+ * Should this keystroke switch tabs?
+ *
+ * The handler only asked whether focus sat in a field, so Ctrl/Alt/Cmd+1..4 — the
+ * browser's and the OS's own tab and workspace keys — drove the view as well. A
+ * modified key is never ours.
+ */
+export function navigationShortcut(event: {
+  key: string;
+  ctrlKey?: boolean;
+  altKey?: boolean;
+  metaKey?: boolean;
+  shiftKey?: boolean;
+  tagName?: string;
+  isContentEditable?: boolean;
+}): View | null {
+  const tag = (event.tagName ?? "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return null;
+  if (event.isContentEditable) return null;
+  if (event.ctrlKey || event.altKey || event.metaKey) return null;
+  return VIEW_BY_SHORTCUT[event.key] ?? null;
+}
+
+/**
+ * The state a tab's crash can plausibly be blamed on.
+ *
+ * `resetKeys` is what clears a boundary's fallback, so each tab is keyed on the
+ * data it renders: a session frame that arrives after a malformed one heals the
+ * Connection tab, a settings reload heals the Settings tab. Switching tabs also
+ * heals any of them, because a tab's boundary is mounted with the tab.
+ */
+function tabResetKeys(view: View, runtime: RuntimeState, settings: Settings, logFilter: LogFilter) {
+  switch (view) {
+    case "home":
+      return [runtime, settings.protocol, settings.transport, settings.routingMode];
+    case "scanner":
+      return [settings.protocol, runtime.status];
+    case "settings":
+      return [settings, runtime.status];
+    case "logs":
+      return [logFilter, runtime.status];
+  }
+}
+
 function App() {
   const [view, setView] = useState<View>("home");
 
   const {
-    logs, setLogs, clearLogs, logFilter, setLogFilter, appendLog,
+    logs, clearLogs, logFilter, setLogFilter, appendLog,
     visibleLogs, hasMore, filterCounts, logEndRef, autoScroll, setAutoScroll,
   } = useLogs();
 
   const {
-    settings, runtime, busy, testBusy, saved, saveError, admin, testResult, appVersion, updateAvailable,
+    settings, runtime, busy, testBusy, saved, dirty, saveError, admin, testResult, appVersion, updateAvailable,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   } = useRuntime(appendLog);
@@ -42,14 +95,17 @@ function App() {
   // Global keyboard shortcuts for navigation (1-4 when not inside input elements)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const activeTag = (document.activeElement?.tagName || "").toLowerCase();
-      if (activeTag === "input" || activeTag === "textarea" || activeTag === "select") {
-        return;
-      }
-      if (e.key === "1") setView("home");
-      else if (e.key === "2") setView("scanner");
-      else if (e.key === "3") setView("settings");
-      else if (e.key === "4") setView("logs");
+      const target = e.target as HTMLElement | null;
+      const next = navigationShortcut({
+        key: e.key,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        tagName: document.activeElement?.tagName ?? target?.tagName,
+        isContentEditable: target?.isContentEditable,
+      });
+      if (next) setView(next);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
@@ -163,50 +219,68 @@ function App() {
           </div>
         </header>
 
+        {/* One boundary per tab, mounted with the tab: a view that cannot be drawn
+            used to take the whole window — and the tunnel status with it — because
+            the only boundary in the tree sat above `App` with no reset keys, so the
+            per-tab `resetKeys`/`onRetry` machinery below it could never fire. */}
         {view === "home" && (
-          <ConnectionTab
-            settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
-            connected={connected} running={running} settingsLocked={settingsLocked}
-            settingsLoaded={settingsLoaded}
-            admin={admin} testResult={testResult} appVersion={appVersion}
-            updateAvailable={updateAvailable} dismissUpdate={dismissUpdate}
-            toggleConnection={toggleConnection} patchSettings={patchSettings}
-            runTest={runTest} dismissError={dismissError} appendLog={appendLog}
-          />
+          <ErrorBoundary label="Connection tab" resetKeys={tabResetKeys("home", runtime, settings, logFilter)}>
+            <ConnectionTab
+              settings={settings} runtime={runtime} busy={busy} testBusy={testBusy}
+              connected={connected} running={running} settingsLocked={settingsLocked}
+              settingsLoaded={settingsLoaded}
+              admin={admin} testResult={testResult} appVersion={appVersion}
+              updateAvailable={updateAvailable} dismissUpdate={dismissUpdate}
+              toggleConnection={toggleConnection} patchSettings={patchSettings}
+              runTest={runTest} dismissError={dismissError} appendLog={appendLog}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "scanner" && (
-          <ScannerTab
-            protocol={scanner.protocol} setProtocol={scanner.setProtocol}
-            ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
-            concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
-            timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
-            noize={scanner.noize} setNoize={scanner.setNoize}
-            endpoints={scanner.endpoints} active={scanner.active}
-            scanState={scanner.scanState} busy={scanner.busy}
-            startScan={scanner.startScan} stopScan={scanner.stopScan}
-            connectDirect={connectDirect} connectBusy={busy}
-          />
+          <ErrorBoundary label="Scanner tab" resetKeys={tabResetKeys("scanner", runtime, settings, logFilter)}>
+            <ScannerTab
+              protocol={scanner.protocol} setProtocol={scanner.setProtocol}
+              ipScan={scanner.ipScan} setIpScan={scanner.setIpScan}
+              concurrency={scanner.concurrency} setConcurrency={scanner.setConcurrency}
+              timeoutMs={scanner.timeoutMs} setTimeoutMs={scanner.setTimeoutMs}
+              noize={scanner.noize} setNoize={scanner.setNoize}
+              endpoints={scanner.endpoints} active={scanner.active}
+              scanState={scanner.scanState} busy={scanner.busy}
+              startScan={scanner.startScan} stopScan={scanner.stopScan}
+              connectDirect={connectDirect} connectBusy={busy}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "settings" && (
-          <SettingsTab
-            settings={settings} settingsLocked={settingsLocked}
-            settingsLoaded={settingsLoaded}
-            settingsLoadError={settingsLoadError}
-            retrySettings={retrySettings}
-            saved={saved} saveError={saveError} patchSettings={patchSettings}
-          />
+          <ErrorBoundary
+            label="Settings tab"
+            resetKeys={tabResetKeys("settings", runtime, settings, logFilter)}
+            // The one retry that can genuinely fix this view: re-read the profile
+            // from disk rather than re-render the input that crashed.
+            onRetry={() => void retrySettings()}
+          >
+            <SettingsTab
+              settings={settings} settingsLocked={settingsLocked}
+              settingsLoaded={settingsLoaded}
+              settingsLoadError={settingsLoadError}
+              retrySettings={retrySettings}
+              saved={saved} dirty={dirty} saveError={saveError} patchSettings={patchSettings}
+            />
+          </ErrorBoundary>
         )}
 
         {view === "logs" && (
-          <ActivityTab
-            visibleLogs={visibleLogs} hasMore={hasMore}
-            filterCounts={filterCounts} logFilter={logFilter} setLogFilter={setLogFilter}
-            logEndRef={logEndRef} autoScroll={autoScroll} setAutoScroll={setAutoScroll}
-            exportLogs={exportLogs} clearLogs={() => setLogs([])}
-            scanState={scanner.scanState} status={runtime.status}
-          />
+          <ErrorBoundary label="Activity tab" resetKeys={tabResetKeys("logs", runtime, settings, logFilter)}>
+            <ActivityTab
+              visibleLogs={visibleLogs} hasMore={hasMore}
+              filterCounts={filterCounts} logFilter={logFilter} setLogFilter={setLogFilter}
+              logEndRef={logEndRef} autoScroll={autoScroll} setAutoScroll={setAutoScroll}
+              exportLogs={exportLogs} clearLogs={clearLogs}
+              scanState={scanner.scanState} status={runtime.status}
+            />
+          </ErrorBoundary>
         )}
       </section>
     </main>

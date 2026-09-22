@@ -1,22 +1,27 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import type { DiscoveredEndpoint, ScanState } from "../types";
-import { NumberField, Segmented } from "./ui";
+import { useEffect, useId, useRef, useState } from "react";
+import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
+import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
+import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
+import { SCAN_MAX_CONCURRENCY, SCAN_MIN_CONCURRENCY } from "../../../../packages/ui/src";
+import { rttLike } from "../hooks/useScanner";
+import { nextOptionIndex, NumberField, Segmented } from "./ui";
 
 interface ScannerTabProps {
-  protocol: "masque-h3" | "masque-h2" | "wireguard";
-  setProtocol: (v: "masque-h3" | "masque-h2" | "wireguard") => void;
-  ipScan: "v4" | "v6" | "both";
-  setIpScan: (v: "v4" | "v6" | "both") => void;
+  protocol: ScanProtocol;
+  setProtocol: (v: ScanProtocol) => void;
+  ipScan: IpFamily;
+  setIpScan: (v: IpFamily) => void;
   concurrency: number;
   setConcurrency: (v: number) => void;
   timeoutMs: number;
   setTimeoutMs: (v: number) => void;
-  noize: string;
-  setNoize: (v: string) => void;
+  /** The profile the scan will really send — see `scanNoizeFor`. */
+  noize: NoizeProfile;
+  setNoize: (v: NoizeProfile) => void;
   endpoints: DiscoveredEndpoint[];
   active: boolean;
-  scanState: ScanState;
+  scanState: DisplayedScanState;
   busy: boolean;
   startScan: () => void;
   stopScan: () => void;
@@ -24,11 +29,28 @@ interface ScannerTabProps {
   connectBusy: boolean;
 }
 
-function getRttTier(rttMs: number): { tierClass: string; badgeText: string } {
-  if (rttMs < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST" };
-  if (rttMs <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL" };
-  if (rttMs <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL" };
-  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY" };
+/**
+ * The four tier classes, in the order the shell's own thresholds put them.
+ *
+ * `getRttTier(rttMs)` was called on whatever arrived, and its last arm is a
+ * fallback: a missing or zero measurement — the documented answer for a forced
+ * peer, which the engine never times — came out of it as "HIGH LATENCY", so a
+ * blank row was badged as the worst kind. An absent round-trip is now its own
+ * state, with no colour to lean the claim.
+ */
+export function rttBadge(item: DiscoveredEndpoint): { tierClass: string; badgeText: string; text: string } {
+  const measured =
+    typeof item.rttMs === "number" && Number.isFinite(item.rttMs) && item.rttMs > 0
+      ? item.rttMs
+      : null;
+  // The engine's own wording first, then the number it measured, then nothing.
+  const text = rttLike(item.rtt) ?? (measured === null ? null : rttLike(measured));
+  if (text === null) return { tierClass: "", badgeText: "NOT MEASURED", text: "not measured" };
+  if (measured === null) return { tierClass: "", badgeText: "UNRANKED", text };
+  if (measured < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST", text };
+  if (measured <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL", text };
+  if (measured <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL", text };
+  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY", text };
 }
 
 function CopyIpButton({ addr }: { addr: string }) {
@@ -68,7 +90,9 @@ export function ScannerTab({
   startScan, stopScan,
   connectDirect, connectBusy,
 }: ScannerTabProps) {
-  const [protoFilter, setProtoFilter] = useState<"all" | "masque-h3" | "masque-h2" | "wireguard">("all");
+  const [protoFilter, setProtoFilter] = useState<ScanProtocolFilter>("all");
+  const resultsId = useId();
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   const progressPct = scanState.total > 0
     ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
@@ -85,6 +109,25 @@ export function ScannerTab({
     if (protoFilter === "wireguard") return e.protocol.toLowerCase().includes("wireguard");
     return true;
   });
+
+  const protoTabs: { id: ScanProtocolFilter; label: string; count: number }[] = [
+    { id: "all", label: "All Protocols", count: endpoints.length },
+    { id: "masque-h3", label: "MASQUE H3", count: h3Count },
+    { id: "masque-h2", label: "MASQUE H2", count: h2Count },
+    { id: "wireguard", label: "WireGuard", count: wgCount },
+  ];
+
+  // `role="tablist"` is a promise about the keyboard: one stop in the tab order,
+  // arrows between the tabs, and a panel each tab names. None of that was wired,
+  // so the markup claimed a pattern the component did not implement.
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const selected = Math.max(0, protoTabs.findIndex((t) => t.id === protoFilter));
+    const next = nextOptionIndex(selected, event.key, protoTabs.length);
+    if (next === null) return;
+    event.preventDefault();
+    setProtoFilter(protoTabs[next].id);
+    tabRefs.current[next]?.focus();
+  };
 
   return (
     <div className="scanner-view">
@@ -228,12 +271,14 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Concurrency (Workers)</strong>
-                <span className="field-hint">1–2000 active</span>
+                <span className="field-hint">
+                  {SCAN_MIN_CONCURRENCY}&ndash;{SCAN_MAX_CONCURRENCY} active
+                </span>
               </div>
               <NumberField
                 label="Scan concurrency"
-                min={1}
-                max={2000}
+                min={SCAN_MIN_CONCURRENCY}
+                max={SCAN_MAX_CONCURRENCY}
                 step={10}
                 value={concurrency}
                 disabled={active}
@@ -265,12 +310,14 @@ export function ScannerTab({
             <strong>Handshake Obfuscation</strong>
             <span>{protocol === "masque-h2" ? "UDP noise is not applicable for H2 (TCP)" : "Anti-DPI noise profile injected during probe"}</span>
           </div>
+          {/* One source of truth: `noize` is the profile `startScan` sends, so the
+              label cannot read "Off" while junk frames are still being injected. */}
           <select
             aria-label="Obfuscation noise profile for probes"
             className="tactical-select"
-            value={protocol === "masque-h2" ? "off" : noize}
+            value={noize}
             disabled={active || protocol === "masque-h2"}
-            onChange={(e) => setNoize(e.target.value)}
+            onChange={(e) => setNoize(oneOf(e.target.value, NOIZE_PROFILES, noize))}
           >
             <option value="off">Off — no noise</option>
             <option value="light">Light — low noise</option>
@@ -293,47 +340,26 @@ export function ScannerTab({
         </div>
 
         {endpoints.length > 0 && (
-          <div className="discovered-proto-dock" role="tablist" aria-label="Filter by protocol">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "all"}
-              className={`proto-tab ${protoFilter === "all" ? "active" : ""}`}
-              onClick={() => setProtoFilter("all")}
-            >
-              <span>All Protocols</span>
-              <span className="chip-count tabular-nums">{endpoints.length}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "masque-h3"}
-              className={`proto-tab ${protoFilter === "masque-h3" ? "active" : ""}`}
-              onClick={() => setProtoFilter("masque-h3")}
-            >
-              <span>MASQUE H3</span>
-              <span className="chip-count tabular-nums">{h3Count}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "masque-h2"}
-              className={`proto-tab ${protoFilter === "masque-h2" ? "active" : ""}`}
-              onClick={() => setProtoFilter("masque-h2")}
-            >
-              <span>MASQUE H2</span>
-              <span className="chip-count tabular-nums">{h2Count}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={protoFilter === "wireguard"}
-              className={`proto-tab ${protoFilter === "wireguard" ? "active" : ""}`}
-              onClick={() => setProtoFilter("wireguard")}
-            >
-              <span>WireGuard</span>
-              <span className="chip-count tabular-nums">{wgCount}</span>
-            </button>
+          <div className="discovered-proto-dock" role="tablist" aria-label="Filter by protocol" onKeyDown={onTabKeyDown}>
+            {protoTabs.map((tab, index) => (
+              <button
+                key={tab.id}
+                ref={(node) => {
+                  tabRefs.current[index] = node;
+                }}
+                type="button"
+                role="tab"
+                id={`proto-tab-${tab.id}`}
+                aria-selected={protoFilter === tab.id}
+                aria-controls={resultsId}
+                tabIndex={protoFilter === tab.id ? 0 : -1}
+                className={`proto-tab ${protoFilter === tab.id ? "active" : ""}`}
+                onClick={() => setProtoFilter(tab.id)}
+              >
+                <span>{tab.label}</span>
+                <span className="chip-count tabular-nums">{tab.count}</span>
+              </button>
+            ))}
           </div>
         )}
 
@@ -350,9 +376,14 @@ export function ScannerTab({
             <span>Switch to "All Protocols" or launch another scan targeting this protocol.</span>
           </div>
         ) : (
-          <div className="discovered-list">
+          <div
+            className="discovered-list"
+            id={resultsId}
+            role="tabpanel"
+            aria-labelledby={`proto-tab-${protoFilter}`}
+          >
             {filteredEndpoints.map((item) => {
-              const { tierClass, badgeText } = getRttTier(item.rttMs);
+              const { tierClass, badgeText, text } = rttBadge(item);
               return (
                 <div className="discovered-row" key={`${item.addr}|${item.protocol}`}>
                   <div className="discovered-info">
@@ -364,7 +395,7 @@ export function ScannerTab({
                   <div className="discovered-actions">
                     <span className={`rtt-badge ${tierClass}`} title={badgeText}>
                       <span className="rtt-dot" />
-                      <span className="tabular-nums">{item.rtt}</span>
+                      <span className="tabular-nums">{text}</span>
                     </span>
                     <button
                       type="button"

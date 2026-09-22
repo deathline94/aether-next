@@ -1,4 +1,34 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+
+/**
+ * Where the arrow keys take you in a one-of-N control, or `null` when the key is
+ * none of theirs.
+ *
+ * `role="radio"`/`role="tab"` are not decoration: the pattern behind them is a
+ * single stop in the tab order that the arrows walk. Both groups in this app were
+ * rendered as a list of `<button role="radio">` with no key handling at all, so a
+ * keyboard user could only Tab through them one by one — and a group whose
+ * *inactive* members are all tabbable is a group whose active member cannot be
+ * told from the rest by assistive tech.
+ */
+export function nextOptionIndex(current: number, key: string, length: number): number | null {
+  if (length <= 0) return null;
+  const at = (index: number) => ((index % length) + length) % length;
+  switch (key) {
+    case "ArrowRight":
+    case "ArrowDown":
+      return at(current + 1);
+    case "ArrowLeft":
+    case "ArrowUp":
+      return at(current - 1);
+    case "Home":
+      return at(0);
+    case "End":
+      return at(length - 1);
+    default:
+      return null;
+  }
+}
 
 export function Segmented<T extends string>({
   value,
@@ -14,13 +44,35 @@ export function Segmented<T extends string>({
   /** Accessible name for the group. */
   label: string;
 }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const selected = Math.max(0, options.findIndex((option) => option.value === value));
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const next = nextOptionIndex(selected, event.key, options.length);
+    if (next === null) return;
+    event.preventDefault();
+    onChange(options[next].value);
+    refs.current[next]?.focus();
+  };
+
   return (
-    <div className={`segmented ${disabled ? "disabled" : ""}`} role="radiogroup" aria-label={label}>
-      {options.map((option) => (
+    <div
+      className={`segmented ${disabled ? "disabled" : ""}`}
+      role="radiogroup"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+    >
+      {options.map((option, index) => (
         <button
+          ref={(node) => {
+            refs.current[index] = node;
+          }}
           type="button"
           role="radio"
           aria-checked={value === option.value}
+          // Roving tabindex: the group is one stop, and the arrows move the choice.
+          tabIndex={index === selected ? 0 : -1}
           key={option.value}
           disabled={disabled}
           className={value === option.value ? "active" : ""}
@@ -126,7 +178,6 @@ export function NumberField({
         onClick={() => handleStep(-step)}
         disabled={disabled || (draftNumber(draft, value)) <= min}
         aria-label={`Decrease ${label}`}
-        tabIndex={-1}
       >
         −
       </button>
@@ -153,7 +204,6 @@ export function NumberField({
         onClick={() => handleStep(step)}
         disabled={disabled || (draftNumber(draft, value)) >= max}
         aria-label={`Increase ${label}`}
-        tabIndex={-1}
       >
         +
       </button>

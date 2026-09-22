@@ -11,7 +11,8 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Settings } from "../types";
+import type { NoizeProfile, Settings } from "../types";
+import { NOIZE_OPTIONS, NOIZE_PROFILES, SCAN_MODE_OPTIONS, oneOf } from "../../../../packages/ui/src/enums";
 import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
 
@@ -29,13 +30,36 @@ export function commitPath(draft: string, current: string): string | null {
   return next === current.trim() ? null : next;
 }
 
+/**
+ * Which of the two noise controls the transport can carry.
+ *
+ * UDP junk frames have nowhere to go on an HTTP/2 TCP stream, so the profile
+ * select is disabled there — but only for MASQUE. WireGuard and Gool ride UDP
+ * whatever `transport` says, so their select stayed live and accepted `custom`
+ * while the parameter matrix rendered only for `transport !== "h2"`: the profile
+ * went to disk with four numbers nobody could see or edit. Both halves now read
+ * the same predicate, so a profile is only pickable where its parameters are
+ * showable.
+ */
+export function noiseFieldState(settings: Settings): { blocked: boolean; showMatrix: boolean } {
+  const blocked = settings.protocol === "masque" && settings.transport === "h2";
+  return { blocked, showMatrix: !blocked && settings.noize === "custom" };
+}
+
 interface SettingsTabProps {
   settings: Settings;
   settingsLocked: boolean;
   settingsLoaded: boolean;
   settingsLoadError?: boolean;
   retrySettings?: () => void | Promise<void>;
+  /** The shell has just accepted a write; the dock flashes "Synchronized". */
   saved: boolean;
+  /**
+   * An edit of ours has not been accepted yet — queued, in flight, or refused.
+   * Without it the dock had no idle state: `!saved` was the only test, so it pulsed
+   * "Auto-Saving / Synchronizing changes…" from first paint.
+   */
+  dirty: boolean;
   /** The last save the shell refused, if one is still outstanding. */
   saveError?: IpcError | null;
   patchSettings: (patch: Partial<Settings>) => void;
@@ -48,10 +72,12 @@ export function SettingsTab({
   settingsLoadError,
   retrySettings,
   saved,
+  dirty,
   saveError,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
+  const noise = noiseFieldState(settings);
   // `field` is the machine-readable half of the rejection: the shell says which
   // setting it refused, so the input itself can be marked, not just the log.
   const rejected = (field: string) => saveError?.field === field;
@@ -214,31 +240,30 @@ export function SettingsTab({
           <div>
             <div className="setting-label-row">
               <strong>Handshake Obfuscation</strong>
-              {settings.noize !== "off" && <span className="tactical-chip amber">ACTIVE JUNK</span>}
+              {settings.noize !== "off" && !noise.blocked && <span className="tactical-chip amber">ACTIVE JUNK</span>}
             </div>
             <span>
-              {settings.protocol === "masque" && settings.transport === "h2"
+              {noise.blocked
                 ? "UDP junk frames are not applicable for HTTP/2 TCP streams"
                 : "Inject randomized pre-handshake padding to prevent active protocol fingerprinting"}
             </span>
           </div>
           <select
-            disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")}
+            disabled={settingsLocked || noise.blocked}
             aria-label="Obfuscation noise profile"
             className="tactical-select"
-            value={["off", "light", "medium", "high", "max", "custom"].includes(settings.noize) ? settings.noize : "medium"}
-            onChange={(e) => patchSettings({ noize: e.target.value })}
+            value={NOIZE_PROFILES.includes(settings.noize as NoizeProfile) ? settings.noize : "medium"}
+            onChange={(e) => patchSettings({ noize: oneOf(e.target.value, NOIZE_PROFILES, "medium") })}
           >
-            <option value="off">Off — Zero Noise</option>
-            <option value="light">Light — Subtle Disruption</option>
-            <option value="medium">Medium — Standard Defense</option>
-            <option value="high">High — Heavy Resistance</option>
-            <option value="max">Max — Maximum Entropy</option>
-            <option value="custom">Custom — Parameter Matrix</option>
+            {NOIZE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
           </select>
         </div>
 
-        {settings.noize === "custom" && settings.transport !== "h2" && (
+        {noise.showMatrix && (
           <div className="custom-noise-matrix">
             <div className="matrix-title">
               <SlidersHorizontal size={14} aria-hidden="true" />
@@ -345,13 +370,17 @@ export function SettingsTab({
             disabled={settingsLocked}
             aria-label="Scan mode"
             className="tactical-select"
-            value={settings.scanMode}
+            // Every mode the shell accepts, from the shared list: `ironclad` was a
+            // legal wire value with no option, so a config that carried it showed a
+            // blank selection and the next patch silently changed it.
+            value={SCAN_MODE_OPTIONS.some((o) => o.value === settings.scanMode) ? settings.scanMode : "balanced"}
             onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}
           >
-            <option value="turbo">Turbo (Fastest startup, high concurrency)</option>
-            <option value="balanced">Balanced (Optimal speed and route fidelity)</option>
-            <option value="thorough">Thorough (Deep probe across extensive pools)</option>
-            <option value="stealth">Stealth (Low rate to minimize traffic anomaly)</option>
+            {SCAN_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
           </select>
         </div>
 
@@ -549,11 +578,17 @@ export function SettingsTab({
               ? "Last save was rejected — see the message above"
               : saved
               ? "All parameters synchronized with runtime daemon"
-              : "Synchronizing changes…"}
+              : dirty
+              ? "Synchronizing changes…"
+              : "No changes pending — the form matches the profile on disk"}
           </span>
         </div>
 
-        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : ""}`}>
+        {/* Four states, and the pulse only on the one that is pulsing: this branch
+            used to be `!saved`, so "Auto-Saving" spun from first paint until the
+            first 1.2 s "Synchronized" flash — a save indicator that lied about a
+            write in progress. */}
+        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : dirty ? "" : "idle"}`}>
           {portsCollide ? (
             <>
               <X size={15} aria-hidden="true" />
@@ -569,10 +604,15 @@ export function SettingsTab({
               <Check size={15} aria-hidden="true" />
               <span>Synchronized</span>
             </>
-          ) : (
+          ) : dirty ? (
             <>
               <div className="save-sync-pulse" aria-hidden="true" />
               <span>Auto-Saving</span>
+            </>
+          ) : (
+            <>
+              <span className="save-idle-dot" aria-hidden="true" />
+              <span>Idle</span>
             </>
           )}
         </div>

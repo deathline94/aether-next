@@ -1,13 +1,31 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { defaults, initialRuntime } from "../types";
+import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
 const FALLBACK_VERSION = "0.0.0";
 const SAVE_DEBOUNCE_MS = 400;
+const UPDATE_CHECK_URL = "https://api.github.com/repos/deathline94/aether-next/releases/latest";
+
+/**
+ * A session frame the guard refused, named without trusting its contents: the
+ * log line is for whoever ships the shell, so it has to say what arrived.
+ */
+export function describeRejected(payload: unknown): string {
+  if (typeof payload !== "object" || payload === null) return `non-object payload (${typeof payload})`;
+  const raw = (payload as Record<string, unknown>).status;
+  if (raw === undefined) return "no status field";
+  if (typeof raw !== "string") return `status is ${typeof raw}`;
+  return `status "${raw}"`;
+}
+
+/** A state the UI asserts for itself, with nothing measured. */
+function uiState(status: RuntimeState["status"], detail: string): RuntimeState {
+  return { status, detail, pid: null, endpoint: null, handshakeRttMs: null };
+}
 
 /**
  * Engine-side diagnostics for the activity export: which binary ran, what the
@@ -36,6 +54,11 @@ export function useRuntime(
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  // True while a change of ours has not been accepted by the shell: the debounce
+  // window, the in-flight write, and a refusal. `!saved` was the whole idle test,
+  // which made the Settings dock pulse "Auto-Saving / Synchronizing changes…" from
+  // first paint with nothing pending — the form cannot show a save it is not doing.
+  const [dirty, setDirty] = useState(false);
   // The last save the shell refused. Without this the form's only signal is a
   // log line, and the status text stays on "Synchronizing changes…" forever.
   const [saveError, setSaveError] = useState<IpcError | null>(null);
@@ -54,6 +77,9 @@ export function useRuntime(
   // Mirrors the last settings object seen by the persist effect so hydration
   // does not trigger a redundant write-back to disk.
   const settingsRef = useRef(settings);
+  // Malformed session frames are logged once per distinct shape, not once per
+  // event: a shell stuck in a bad emit loop must not fill the log buffer.
+  const rejectedStatuses = useRef(new Set<string>());
 
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
@@ -67,9 +93,26 @@ export function useRuntime(
 
     async function initialize() {
       try {
-        const unlistenState = await listen<RuntimeState>("session://state", (event) => {
+        const unlistenState = await listen<unknown>("session://state", (event) => {
           receivedRuntimeEvent.current = true;
-          setRuntime(event.payload);
+          const next = parseRuntimeState(event.payload);
+          if (next) {
+            setRuntime(next);
+            return;
+          }
+          // A frame the guard refuses is not a state: keep rendering the last one
+          // that was, and say so once per distinct shape. Writing the payload
+          // through was how one unknown `status` threw inside `heroCopy[status]`
+          // and white-screened the window from a background event.
+          const seen = rejectedStatuses.current;
+          const key = describeRejected(event.payload);
+          if (!seen.has(key)) {
+            seen.add(key);
+            appendLog({
+              level: "error",
+              message: `Ignored a session state the interface cannot render (${key}); showing the previous one.`,
+            });
+          }
         });
         if (disposed) { unlistenState(); return; }
         cleanup.push(unlistenState);
@@ -93,13 +136,23 @@ export function useRuntime(
         ]);
         if (disposed) return;
         if (loadedSettings) {
-          settingsRef.current = loadedSettings;
-          setSettings(loadedSettings);
+          // Merge, never replace: a field this build's shell does not send has to
+          // fall back to the default the panels assume, not become `undefined`.
+          const { settings: merged, corrected } = parseSettings(loadedSettings);
+          settingsRef.current = merged;
+          setSettings(merged);
           setSettingsLoadError(false);
+          if (corrected.length > 0) {
+            appendLog({
+              level: "warn",
+              message: `Settings from disk were incomplete or out of range (${corrected.join(", ")}); the defaults are in use for those until you change them.`,
+            });
+          }
         } else {
           setSettingsLoadError(true);
         }
-        if (state && !receivedRuntimeEvent.current) setRuntime(state);
+        const parsed = state ? parseRuntimeState(state) : null;
+        if (parsed && !receivedRuntimeEvent.current) setRuntime(parsed);
         setAdmin(isAdmin);
         setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
       } finally {
@@ -133,21 +186,35 @@ export function useRuntime(
   // install arbitrary code as the user, without a witness anyone reviewed.
   useEffect(() => {
     if (!appVersion || appVersion === FALLBACK_VERSION) return;
-    fetch("https://api.github.com/repos/deathline94/aether-next/releases/latest")
+    // The app's own content policy states the pre-tunnel window must not reach out
+    // to a third party at all — for a circumvention client the request *is* the
+    // leak, made before there is any path to hide it behind. This used to fire on
+    // mount, on every machine, tunnel or no tunnel. A connected session at least
+    // puts it behind the route the user chose.
+    if (!connected) return;
+    // ...and the answer must not land after the session dropped or the window
+    // unmounted, which is what an uncancelled `fetch` does.
+    const controller = new AbortController();
+    fetch(UPDATE_CHECK_URL, { signal: controller.signal })
       .then((res) => res.json())
       .then((data) => {
+        if (controller.signal.aborted) return;
         if (data?.tag_name) {
           const latest = String(data.tag_name).replace(/^v/, "");
           if (semverGt(latest, appVersion)) {
             setUpdateAvailable({
               version: data.tag_name,
-              url: data.html_url || "https://github.com/deathline94/aether-next/releases/latest",
+              url: typeof data.html_url === "string"
+                ? data.html_url
+                : "https://github.com/deathline94/aether-next/releases/latest",
             });
           }
         }
       })
+      // Advisory: a failure, a rate limit or an abort means no banner, nothing else.
       .catch(() => {});
-  }, [appVersion]);
+    return () => controller.abort();
+  }, [appVersion, connected]);
 
   /**
    * Stop the current session without letting a partial teardown block the next
@@ -187,12 +254,16 @@ export function useRuntime(
         if (mine !== saveSeqRef.current) return; // superseded by a newer save
         setSaveError(null);
         setSaved(true);
+        setDirty(false);
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
         savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
       } catch (error) {
         if (mine !== saveSeqRef.current) return;
         const err = ipcError(error);
         setSaveError(err);
+        // Still pending: the form must not read as idle over a value the disk
+        // does not hold.
+        setDirty(true);
         appendLog({ level: "error", message: err.message });
       }
     }, SAVE_DEBOUNCE_MS);
@@ -210,6 +281,7 @@ export function useRuntime(
     const prev = settingsRef.current;
     settingsRef.current = settings;
     if (!settingsLoaded || prev === settings) return;
+    setDirty(true);
     persistSettings(settings);
   }, [settings, settingsLoaded, persistSettings]);
 
@@ -221,12 +293,12 @@ export function useRuntime(
       if (running) {
         await safeDisconnect();
       } else {
-        setRuntime({ status: "connecting", detail: "Starting engine", pid: null, endpoint: null });
+        setRuntime(uiState("connecting", "Starting engine"));
         await invoke("connect", { settings });
       }
     } catch (error) {
       const detail = errorMessage(error);
-      setRuntime({ status: "error", detail, pid: null, endpoint: null });
+      setRuntime(uiState("error", detail));
       appendLog({ level: "error", message: detail });
     } finally {
       setBusy(false);
@@ -246,7 +318,7 @@ export function useRuntime(
       // Keep UI state in sync with what the engine actually runs — otherwise
       // the Connection tab reports the previous protocol.
       setSettings(nextSettings);
-      setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
+      setRuntime(uiState("connecting", `Connecting to ${peer}`));
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
       const detail = errorMessage(error);
@@ -255,7 +327,7 @@ export function useRuntime(
       // attempt used to leave the user's carrier protocol permanently rewritten
       // by a tunnel that never came up.
       setSettings(previous);
-      setRuntime({ status: "error", detail, pid: null, endpoint: null });
+      setRuntime(uiState("error", detail));
       appendLog({ level: "error", message: `Direct connect error: ${detail}` });
     } finally {
       setBusy(false);
@@ -289,11 +361,20 @@ export function useRuntime(
     try {
       const loaded = await invoke<Settings>("get_settings");
       if (loaded) {
-        settingsRef.current = loaded;
-        setSettings(loaded);
+        // The same merge as hydration: "Retry" must not be a second, weaker path.
+        const { settings: merged, corrected } = parseSettings(loaded);
+        settingsRef.current = merged;
+        setSettings(merged);
         setSettingsLoadError(false);
         setSettingsLoaded(true);
-        appendLog({ level: "info", message: "Settings loaded from disk." });
+        if (corrected.length > 0) {
+          appendLog({
+            level: "warn",
+            message: `Settings from disk were incomplete or out of range (${corrected.join(", ")}); the defaults are in use for those.`,
+          });
+        } else {
+          appendLog({ level: "info", message: "Settings loaded from disk." });
+        }
       }
     } catch (error) {
       setSettingsLoadError(true);
@@ -303,7 +384,7 @@ export function useRuntime(
 
   return {
     settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
-    saved, saveError, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
+    saved, dirty, saveError, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorCode, errorField, errorMessage, ipcError } from "./ipcError";
+import { errorCode, errorMessage, ipcError } from "./ipcError";
 
 describe("ipcError", () => {
   it("reads the code the shell sends", () => {

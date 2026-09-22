@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook, act, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 import { useRuntime } from "./useRuntime";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -8,26 +8,89 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
+  listen: vi.fn(),
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
-describe("desktop useRuntime hook", () => {
-  const appendLog = vi.fn();
+type Handler = (event: { payload: unknown }) => void;
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("completes hydration in finally block even when get_settings rejects", async () => {
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === "get_settings") throw new Error("IPC error");
-      if (cmd === "get_state") return null;
-      if (cmd === "is_admin") return false;
-      if (cmd === "app_info") return { version: "1.2.9" };
-      return null;
+/** Every `session://state` handler the hook subscribes, so a test can emit. */
+function captureState(): (payload: unknown) => void {
+  const handlers: Handler[] = [];
+  vi.mocked(listen).mockImplementation(((event: string, handler: Handler) => {
+    if (event === "session://state") handlers.push(handler);
+    return Promise.resolve(() => {});
+  }) as typeof listen);
+  return (payload: unknown) => {
+    if (handlers.length === 0) throw new Error("the hook never subscribed to session://state");
+    act(() => {
+      for (const h of handlers) h({ payload });
     });
+  };
+}
+
+const appendLog = vi.fn();
+
+/**
+ * A realistic `get_settings` payload: all eighteen fields the Rust `Settings`
+ * serialises. The previous mock returned three of them and asserted only
+ * `protocol`, so the suite passed green on the very render that dereferences
+ * `settings.ipVersion` / `scanMode` / `noize`.
+ */
+function shellSettings(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    protocol: "masque",
+    transport: "h2",
+    scanMode: "balanced",
+    ipVersion: "v4",
+    noize: "off",
+    noizeJc: 5,
+    noizeJmin: 50,
+    noizeJmax: 128,
+    noizeIntervalMs: 0,
+    routingMode: "system-proxy",
+    socksPort: 1080,
+    httpPort: 8080,
+    startMinimized: false,
+    launchAtLogin: false,
+    enginePath: "",
+    peer: "",
+    quicInitialFrag: false,
+    quicInitialFragSize: 96,
+    ...over,
+  };
+}
+
+function stubInvoke(loaded: Record<string, unknown> | null) {
+  vi.mocked(invoke).mockImplementation(async (command: string) => {
+    if (command === "get_settings") {
+      if (loaded === null) throw new Error("IPC error");
+      return loaded;
+    }
+    if (command === "get_state") return null;
+    if (command === "is_admin") return false;
+    if (command === "app_info") return { version: "1.2.9" };
+    return null;
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  appendLog.mockClear();
+  // The default `listen` subscription: a no-op unlisten, like the real one.
+  vi.mocked(listen).mockImplementation(async () => async () => {});
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("desktop useRuntime hydration", () => {
+  it("completes hydration in finally block even when get_settings rejects", async () => {
+    stubInvoke(null);
 
     const { result } = renderHook(() => useRuntime(appendLog));
 
@@ -37,18 +100,15 @@ describe("desktop useRuntime hook", () => {
 
     expect(result.current.settingsLoadError).toBe(true);
     expect(result.current.settings.protocol).toBe("masque");
+    // The fallback has to be usable by every reader, not merely shaped enough to
+    // satisfy a `protocol` assertion.
+    expect(result.current.settings.ipVersion).toBe("v4");
+    expect(result.current.settings.noize).toBe("off");
+    expect(result.current.settings.scanMode).toBe("balanced");
   });
 
   it("applies loaded settings when get_settings succeeds", async () => {
-    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === "get_settings") {
-        return { protocol: "wireguard", routingMode: "system", socksPort: 1080, httpPort: 8080 };
-      }
-      if (cmd === "get_state") return null;
-      if (cmd === "is_admin") return false;
-      if (cmd === "app_info") return { version: "1.2.9" };
-      return null;
-    });
+    stubInvoke(shellSettings({ protocol: "wireguard" }));
 
     const { result } = renderHook(() => useRuntime(appendLog));
 
@@ -58,16 +118,61 @@ describe("desktop useRuntime hook", () => {
 
     expect(result.current.settingsLoadError).toBe(false);
     expect(result.current.settings.protocol).toBe("wireguard");
+    // Every field the panels dereference survived the round trip.
+    expect(Object.keys(result.current.settings).sort()).toEqual(
+      Object.keys(shellSettings()).sort(),
+    );
+    expect(result.current.settings.ipVersion).toBe("v4");
+    expect(result.current.settings.scanMode).toBe("balanced");
+    expect(result.current.settings.noize).toBe("off");
+  });
+
+  it("merges a payload that is missing fields over the defaults", async () => {
+    // A shell build that drops a field used to hand the UI `undefined` there,
+    // and `settings.ipVersion.toUpperCase()` threw on the next render.
+    const partial = shellSettings();
+    delete (partial as Record<string, unknown>).ipVersion;
+    delete (partial as Record<string, unknown>).scanMode;
+    stubInvoke(partial);
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    expect(result.current.settings.ipVersion).toBe("v4");
+    expect(result.current.settings.scanMode).toBe("balanced");
+    expect(appendLog.mock.calls.map((c) => c[0].message).join("\n")).toMatch(/ipVersion/);
+    // The merge is not itself an edit: nothing may be written back to disk.
+    expect(vi.mocked(invoke).mock.calls.some(([c]) => c === "save_settings")).toBe(false);
+  });
+
+  it("refuses an out-of-enum value instead of rendering it", async () => {
+    stubInvoke(shellSettings({ routingMode: "system", noize: "turbo-udp" }) as Record<string, unknown>);
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    expect(result.current.settings.routingMode).toBe("system-proxy");
+    expect(result.current.settings.noize).toBe("off");
+  });
+
+  it("does not write the hydrated settings straight back to disk", async () => {
+    stubInvoke(shellSettings());
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    // Past the 400 ms save debounce: hydration is not an edit.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 600));
+    });
+    expect(vi.mocked(invoke).mock.calls.some(([c]) => c === "save_settings")).toBe(false);
+    expect(result.current.dirty).toBe(false);
   });
 
   it("recovers from hydration failure when retrySettings succeeds", async () => {
     let failFirst = true;
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "get_settings") {
-        if (failFirst) {
-          throw new Error("Disk error");
-        }
-        return { protocol: "gool", routingMode: "tun", socksPort: 1080, httpPort: 8080 };
+        if (failFirst) throw new Error("Disk error");
+        return shellSettings({ protocol: "gool", routingMode: "tun" });
       }
       return null;
     });
@@ -86,6 +191,7 @@ describe("desktop useRuntime hook", () => {
 
     expect(result.current.settingsLoadError).toBe(false);
     expect(result.current.settings.protocol).toBe("gool");
+    expect(result.current.settings.ipVersion).toBe("v4");
   });
 
   it("maintains settingsLoadError when retrySettings fails again", async () => {
@@ -107,17 +213,108 @@ describe("desktop useRuntime hook", () => {
 
     expect(result.current.settingsLoadError).toBe(true);
   });
+});
 
+describe("desktop useRuntime session state", () => {
+  it("applies a well-formed session state including the measured round-trip", async () => {
+    const emit = captureState();
+    stubInvoke(shellSettings());
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    emit({
+      status: "connected",
+      detail: "Session active",
+      pid: 4242,
+      endpoint: "104.16.0.1:443",
+      handshakeRttMs: 17,
+    });
+
+    expect(result.current.runtime.status).toBe("connected");
+    expect(result.current.runtime.handshakeRttMs).toBe(17);
+    expect(result.current.connected).toBe(true);
+  });
+
+  it("rejects a payload whose status the UI cannot render, and says so", async () => {
+    const emit = captureState();
+    stubInvoke(shellSettings());
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    // `heroCopy["reconnecting"]` is undefined and the next property access throws,
+    // taking the whole window down. The listener used to write the raw payload.
+    emit({ status: "reconnecting", detail: "x", pid: null, endpoint: null });
+
+    expect(result.current.runtime.status).toBe("disconnected");
+    const messages = appendLog.mock.calls.map((c) => c[0].message).join("\n");
+    expect(messages).toMatch(/reconnecting/);
+    expect(appendLog.mock.calls.map((c) => c[0].level)).toContain("error");
+
+    // A second copy of the same malformed frame does not shout again.
+    const before = appendLog.mock.calls.length;
+    emit({ status: "reconnecting", detail: "x", pid: null, endpoint: null });
+    expect(appendLog.mock.calls.length).toBe(before);
+
+    // ...and a valid frame still lands.
+    emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
+    expect(result.current.runtime.status).toBe("connected");
+  });
+
+  it("keeps the last understood state when the frame is not an object at all", async () => {
+    const emit = captureState();
+    stubInvoke(shellSettings());
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    emit({ status: "connecting", detail: "Handshaking", pid: 3, endpoint: null });
+    expect(result.current.runtime.detail).toBe("Handshaking");
+
+    emit("nope");
+    emit(null);
+    expect(result.current.runtime.detail).toBe("Handshaking");
+  });
+
+  it("releases the Settings lock as soon as the session reaches a terminal state", async () => {
+    stubInvoke(shellSettings({ routingMode: "proxy-only" }));
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.settingsLocked).toBe(false);
+
+    act(() => {
+      result.current.setRuntime({
+        status: "connecting",
+        detail: "x",
+        pid: 1,
+        endpoint: null,
+        handshakeRttMs: null,
+      });
+    });
+    expect(result.current.settingsLocked).toBe(true);
+
+    act(() => {
+      result.current.setRuntime({
+        status: "error",
+        detail: "Connection timed out",
+        pid: null,
+        endpoint: null,
+        handshakeRttMs: null,
+      });
+    });
+    expect(result.current.settingsLocked).toBe(false);
+  });
+});
+
+describe("desktop useRuntime save state", () => {
   it("keeps the reason a save was rejected, not only a log line", async () => {
-    // The defect: `save_settings` failing appended a log entry and left the form
-    // reading "Synchronizing changes…" over a value that would never be accepted,
-    // because the rejection's code and field were stringified away on the wire.
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === "get_settings") {
-        return { protocol: "masque", routingMode: "proxy-only", socksPort: 1080, httpPort: 8080 };
-      }
+      if (cmd === "get_settings") return shellSettings({ routingMode: "proxy-only" });
       if (cmd === "save_settings") {
-        throw { code: "validation", message: "custom obfuscation: max size must be <= 2048 (got 4000)", field: "noizeJmax" };
+        throw {
+          code: "validation",
+          message: "custom obfuscation: max size must be <= 2048 (got 4000)",
+          field: "noizeJmax",
+        };
       }
       return null;
     });
@@ -130,11 +327,14 @@ describe("desktop useRuntime hook", () => {
     act(() => {
       result.current.patchSettings({ noize: "custom", noizeJmax: 4000 });
     });
+    expect(result.current.dirty).toBe(true);
 
     await waitFor(() => expect(result.current.saveError).not.toBeNull());
     expect(result.current.saveError?.code).toBe("validation");
     expect(result.current.saveError?.field).toBe("noizeJmax");
     expect(result.current.saved).toBe(false);
+    // The rejected value is still pending on disk, so the form must not go idle.
+    expect(result.current.dirty).toBe(true);
 
     // Editing again is not a new complaint about the old value.
     act(() => {
@@ -143,30 +343,60 @@ describe("desktop useRuntime hook", () => {
     expect(result.current.saveError).toBeNull();
   });
 
-  it("releases the Settings lock as soon as the session reaches a terminal state", async () => {
-    // The desktop-only failure this guards: a connect that never finished left
-    // `running` true forever, which kept the whole Settings tab locked, because
-    // nothing ever moved the session out of `connecting`. The shell's 90 s
-    // watchdog emits `error`, and the lock has to follow it without a reload.
+  it("is idle before the first edit and settled once the shell accepts one", async () => {
+    // The defect: `!saved` was the whole idle test, so the Settings dock pulsed
+    // "Auto-Saving / Synchronizing changes…" from first paint with nothing pending.
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
-      if (cmd === "get_settings") {
-        return { protocol: "masque", routingMode: "proxy-only", socksPort: 1080, httpPort: 8080 };
-      }
+      if (cmd === "get_settings") return shellSettings();
       return null;
     });
 
     const { result } = renderHook(() => useRuntime(appendLog));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
-    expect(result.current.settingsLocked).toBe(false);
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.saved).toBe(false);
 
     act(() => {
-      result.current.setRuntime({ status: "connecting", detail: "x", pid: 1, endpoint: null });
+      result.current.patchSettings({ noize: "light" });
     });
-    expect(result.current.settingsLocked).toBe(true);
+    expect(result.current.dirty).toBe(true);
 
-    act(() => {
-      result.current.setRuntime({ status: "error", detail: "Connection timed out", pid: null, endpoint: null });
-    });
-    expect(result.current.settingsLocked).toBe(false);
+    await waitFor(() => expect(result.current.saved).toBe(true));
+    expect(result.current.dirty).toBe(false);
+  });
+});
+
+describe("desktop useRuntime update check", () => {
+  it("does not contact the release host before a tunnel exists", async () => {
+    const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    stubInvoke(shellSettings());
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    expect(result.current.connected).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("checks once the session is up, and aborts a check that outlives the view", async () => {
+    const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const emit = captureState();
+    stubInvoke(shellSettings());
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("api.github.com");
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal?.aborted).toBe(false);
+
+    cleanup();
+    expect(init.signal?.aborted).toBe(true);
   });
 });

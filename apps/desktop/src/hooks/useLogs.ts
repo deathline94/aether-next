@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from "react";
+import { formatLogTime } from "../types";
 import type { LogEntry, LogFilter, LogInput } from "../types";
 
 const MAX_LOGS = 1000;
@@ -72,25 +73,6 @@ export function hitKeyOf(entry: Pick<LogEntry, "message"> & Partial<Pick<LogEntr
   return candidate ? hitAddressKey(candidate) : null;
 }
 
-/**
- * A hit is an endpoint, not a line that mentioned one. The engine writes both a
- * structured `scan_hit` and a human "candidate ok" line for the same address, so
- * counting lines counted one endpoint two and three times. Keep the first line per
- * address so the list under "Hits" and the number beside it are the same fact.
- */
-export function uniqueHits(logs: LogEntry[]): LogEntry[] {
-  const seen = new Set<string>();
-  const out: LogEntry[] = [];
-  for (const l of logs) {
-    const key = hitKeyOf(l);
-    if (key === null) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(l);
-  }
-  return out;
-}
-
 const isError = (l: LogEntry) => l.level === "error" || l.level === "warn";
 // milestones: exclude noisy progress and probe error lines so high-level transitions stand out
 const isMilestone = (l: LogEntry) =>
@@ -100,15 +82,104 @@ const isMilestone = (l: LogEntry) =>
   !l.message.includes("probe timeout") &&
   !l.message.includes("candidate rejected");
 
-const predicates: Record<LogFilter, (l: LogEntry) => boolean> = {
-  milestones: isMilestone,
-  hits: (l) => hitKeyOf(l) !== null,
-  errors: isError,
-  raw: () => true,
+/**
+ * One line plus the three verdicts taken about it.
+ *
+ * Classifying at append time is the difference between reading a regex over a
+ * 1000-entry buffer once per *line* and once per *rendered row per appended line*:
+ * the filter chips, the Hits list and the visible window all used to re-derive
+ * those answers from the text on the same commit that painted 200 rows, which is
+ * the scan-time freeze.
+ */
+type Classified = {
+  entry: LogEntry;
+  hitKey: string | null;
+  isHit: boolean;
+  isMilestone: boolean;
+  isError: boolean;
 };
 
+type Store = {
+  /** Oldest first, capped at `MAX_LOGS`. */
+  lines: Classified[];
+  /**
+   * The designated line per address, in buffer order — the list under "Hits".
+   * Kept alongside `keyCounts` so the chip beside the filter and the rows under it
+   * are one fact and not two computations that can disagree.
+   */
+  hits: Classified[];
+  /** How many lines per address are still in the buffer. */
+  keyCounts: Map<string, number>;
+  counts: { milestones: number; errors: number };
+};
+
+const emptyStore: Store = {
+  lines: [],
+  hits: [],
+  keyCounts: new Map(),
+  counts: { milestones: 0, errors: 0 },
+};
+
+function classify(entry: LogEntry): Classified {
+  const hitKey = hitKeyOf(entry);
+  return {
+    entry,
+    hitKey,
+    isHit: hitKey !== null,
+    isMilestone: isMilestone(entry),
+    isError: isError(entry),
+  };
+}
+
+/**
+ * Append one line and move the derived answers forward.
+ *
+ * Pure in `store` (a fresh object is returned; nothing is mutated), so React may
+ * call it twice under StrictMode. A hit is an endpoint, not a line that mentioned
+ * one: the engine writes both a structured `scan_hit` and a human "candidate ok"
+ * line for the same address, and counting lines counted one endpoint two and three
+ * times. When the counted line ages out of the buffer the next surviving line for
+ * that address takes its place, so trimming cannot silently lose an endpoint.
+ */
+export function appendToStore(store: Store, entry: LogEntry): Store {
+  const line = classify(entry);
+  const lines = [...store.lines, line];
+  const evicted = lines.length > MAX_LOGS ? lines.splice(0, lines.length - MAX_LOGS) : [];
+
+  const counts = {
+    milestones: store.counts.milestones + (line.isMilestone ? 1 : 0),
+    errors: store.counts.errors + (line.isError ? 1 : 0),
+  };
+  const keyCounts = new Map(store.keyCounts);
+  const key = line.hitKey;
+  // The first line for an address is the one that stands for it.
+  const firstOfItsKind = key !== null && !keyCounts.has(key);
+  if (key !== null) keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+  let hits = firstOfItsKind ? [...store.hits, line] : store.hits;
+
+  for (const gone of evicted) {
+    if (gone.isMilestone) counts.milestones -= 1;
+    if (gone.isError) counts.errors -= 1;
+    const key = gone.hitKey;
+    if (key === null) continue;
+    const remaining = (keyCounts.get(key) ?? 1) - 1;
+    if (remaining <= 0) keyCounts.delete(key);
+    else keyCounts.set(key, remaining);
+    if (!hits.includes(gone)) continue;
+    // The counted line left; promote the next one for the same address, which is
+    // the only case that can cost more than O(1). The order is the buffer's, so
+    // the Hits list reads top-to-bottom like the console under it.
+    const successor = lines.find((l) => l.hitKey === key);
+    hits = successor
+      ? [...hits.filter((h) => h !== gone), successor].sort((a, b) => a.entry.id - b.entry.id)
+      : hits.filter((h) => h !== gone);
+  }
+
+  return { lines, hits, keyCounts, counts };
+}
+
 export function useLogs() {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [store, setStore] = useState<Store>(emptyStore);
   const [logFilter, setLogFilter] = useState<LogFilter>("milestones");
   const logEndRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -117,24 +188,31 @@ export function useLogs() {
   const appendLog = useCallback((entry: LogInput) => {
     // Build the entry outside the updater — updaters must stay pure
     // (StrictMode double-invokes them).
-    const full: LogEntry = { ...entry, id: nextIdRef.current++, ts: Date.now() };
-    setLogs((current) => [...current.slice(-(MAX_LOGS - 1)), full]);
+    const ts = Date.now();
+    const full: LogEntry = { ...entry, id: nextIdRef.current++, ts, time: formatLogTime(ts) };
+    setStore((current) => appendToStore(current, full));
   }, []);
 
-  const hits = useMemo(() => uniqueHits(logs), [logs]);
-  const filteredLogs = useMemo(
-    () => (logFilter === "hits" ? hits : logs.filter(predicates[logFilter])),
-    [logs, logFilter, hits],
-  );
+  const lines = store.lines;
+
+  const logs = useMemo(() => lines.map((l) => l.entry), [lines]);
+
+  const filteredLogs = useMemo(() => {
+    const source = logFilter === "hits" ? store.hits : lines;
+    const keep = logFilter === "milestones" || logFilter === "errors"
+      ? (l: Classified) => (logFilter === "milestones" ? l.isMilestone : l.isError)
+      : null;
+    return (keep ? source.filter(keep) : source).map((l) => l.entry);
+  }, [lines, store.hits, logFilter]);
 
   const filterCounts = useMemo(
     () => ({
-      milestones: logs.filter(isMilestone).length,
-      hits: hits.length,
-      errors: logs.filter(isError).length,
-      raw: logs.length,
+      milestones: store.counts.milestones,
+      hits: store.hits.length,
+      errors: store.counts.errors,
+      raw: lines.length,
     }),
-    [logs, hits],
+    [store.counts, store.hits.length, lines.length],
   );
 
   const visibleLogs = useMemo(() => {
@@ -143,15 +221,15 @@ export function useLogs() {
   }, [filteredLogs]);
 
   const clearLogs = useCallback(() => {
-    setLogs([]);
-    nextIdRef.current = 0;
+    // The id counter is *not* reset: ids are React keys, and a cleared-then-
+    // refilled buffer must not hand a new line the key of a line still mounted.
+    setStore(emptyStore);
   }, []);
 
   const hasMore = filteredLogs.length > RENDER_CAP;
 
   return {
     logs,
-    setLogs,
     clearLogs,
     logFilter,
     setLogFilter,

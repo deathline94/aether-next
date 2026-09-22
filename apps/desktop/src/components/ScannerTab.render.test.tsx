@@ -1,0 +1,98 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { ScannerTab } from "./ScannerTab";
+import { SCAN_MAX_CONCURRENCY } from "../../../../packages/ui/src";
+import { initialScanState } from "../types";
+import type { DiscoveredEndpoint } from "../types";
+
+afterEach(() => cleanup());
+
+function renderTab(over: Partial<Parameters<typeof ScannerTab>[0]> = {}) {
+  const props = {
+    protocol: "masque-h3" as const,
+    setProtocol: vi.fn(),
+    ipScan: "v4" as const,
+    setIpScan: vi.fn(),
+    concurrency: 250,
+    setConcurrency: vi.fn(),
+    timeoutMs: 6000,
+    setTimeoutMs: vi.fn(),
+    noize: "medium" as const,
+    setNoize: vi.fn(),
+    endpoints: [] as DiscoveredEndpoint[],
+    active: false,
+    scanState: { ...initialScanState, bestRtt: null },
+    busy: false,
+    startScan: vi.fn(),
+    stopScan: vi.fn(),
+    connectDirect: vi.fn(),
+    connectBusy: false,
+    ...over,
+  };
+  render(<ScannerTab {...props} />);
+  return props;
+}
+
+describe("ScannerTab probe parameters", () => {
+  it("offers the concurrency the shell will actually run", () => {
+    // The field allowed 2000 while the engine clamps to 500, so the "Workers
+    // Active" chip contradicted the number that was typed.
+    renderTab();
+    const field = screen.getByRole("spinbutton", { name: /scan concurrency/i });
+    expect(field.getAttribute("max")).toBe(String(SCAN_MAX_CONCURRENCY));
+    expect(field.getAttribute("min")).toBe("1");
+    expect(screen.getByText(/1\u2013500 active/i)).toBeTruthy();
+  });
+
+  it("shows the noise profile that is really being sent", () => {
+    // H2 probes are TCP: UDP junk frames cannot be sent. `useScanner` resolves the
+    // profile the scan will run and hands *that* here, so the panel shows it verbatim
+    // — the select used to substitute "off" in the label while `startScan` still
+    // forwarded the stored profile. The parity is asserted in `useScanner.test.ts`.
+    const select = () => screen.getByRole("combobox", { name: /obfuscation noise profile/i });
+    renderTab({ protocol: "masque-h2", noize: "off" });
+    expect(select()).toHaveProperty("value", "off");
+    // ...and it cannot be changed into a value the run would ignore.
+    expect(select().hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/not applicable for h2/i)).toBeTruthy();
+
+    cleanup();
+    renderTab({ protocol: "masque-h3", noize: "medium" });
+    expect(select()).toHaveProperty("value", "medium");
+    expect(select().hasAttribute("disabled")).toBe(false);
+  });
+
+  it("labels the protocol filter tabs with the panel they control", () => {
+    renderTab({
+      endpoints: [
+        { addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h3" },
+        { addr: "188.114.96.1:443", rtt: "", rttMs: 0, protocol: "wireguard" },
+      ],
+    });
+    const tabs = screen.getAllByRole("tab");
+    const panel = screen.getByRole("tabpanel");
+    for (const tab of tabs) {
+      const controls = tab.getAttribute("aria-controls");
+      expect(controls).toBeTruthy();
+      expect(panel.id).toBe(controls);
+      // A `radiogroup`/`tablist` without a roving tabindex leaves the inactive
+      // options in the tab order; only the selected one may be reached.
+      expect(tab.getAttribute("tabindex")).toBe(
+        tab.getAttribute("aria-selected") === "true" ? "0" : "-1",
+      );
+    }
+    fireEvent.keyDown(tabs[0], { key: "ArrowRight" });
+    expect(screen.getAllByRole("tab")[1].getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("prints an unmeasured round-trip as such, not as a blank HIGH LATENCY row", () => {
+    renderTab({
+      endpoints: [
+        { addr: "104.16.0.1:443", rtt: "", rttMs: 0, protocol: "wireguard" },
+      ],
+    });
+    expect(screen.getByText("not measured")).toBeTruthy();
+    expect(screen.queryByText("HIGH LATENCY")).toBeNull();
+  });
+});
