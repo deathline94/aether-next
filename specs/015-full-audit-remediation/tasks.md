@@ -567,7 +567,17 @@
   identifier and echoes none, so neither layer can drop a late event from a previous run. That needs
   T020's typed event pipeline on the engine side first, which cannot be compiled on this machine (see
   the toolchain note), so it stays open rather than being half-implemented in the shells.
-- [ ] T176 [US6] Clear `endpoints`, counters and `bestRtt` unconditionally in `apps/desktop/src/hooks/useScanner.ts:startScan` and key rows on `addr + protocol` (fixes T166).
+- [x] T176 [US6] Clear `endpoints`, counters and `bestRtt` unconditionally in `apps/desktop/src/hooks/useScanner.ts:startScan` and key rows on `addr + protocol` (fixes T166).
+  Done in both UIs. `startScan` now clears the list outright — it used to keep every endpoint whose
+  protocol did not match the one about to be scanned, while the counters and `bestRtt` restart, so the
+  table showed nine rows under "3 working". The hit dedupe and the React `key` both went from
+  `addr` alone to `addr + protocol`: the same IP:port answering on h2 and on h3 was silently dropped
+  as a duplicate of the first, and where both did appear the two rows shared a key.
+  Tests: `apps/desktop/src/hooks/useScanner.test.ts` (2) — two protocols on one address stay separate,
+  a genuine same-address/same-protocol repeat still folds, and a new scan starts empty. Reverting
+  either fix reddens its test (verified by mutation, file restored from a backup afterwards). The
+  matcher `isProtocolMatch` lost its last caller and was deleted rather than left as dead code that
+  `noUnusedLocals` would fail on.
 - [ ] T177 [US6] Delete `apps/desktop/src/types.ts:111-112`'s `scan_failed`/`scan_done.working` **or** emit them — with the generated type as arbiter (fixes the dead arm at `useScanner.ts:88-91`) — and carry `best_rtt_ms: Option<u32>` so completion stops logging `best: 1.1.1.1:443 ()` (`aether/src/session.rs:187,203,254,261,297` emit `rtt: String::new()`).
 - [ ] T178 [US6] Add `saveSeqRef` ordering to `apps/desktop/src/hooks/useRuntime.ts:123-135` so a slow older write cannot land last and flip "Synchronized" for the wrong payload; serialise persistence through one owner.
 - [ ] T179 [US6] Roll back optimistic commits on rejection in `apps/desktop/src/hooks/useRuntime.ts:188-194`: "Connect Direct" persists protocol/transport/pinned peer through the settings effect **and** `lib.rs:1340`, so a failed attempt permanently rewrites the user's carrier protocol and shows "Targeting forced endpoint" for a tunnel that never came up.

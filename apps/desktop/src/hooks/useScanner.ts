@@ -5,14 +5,6 @@ import { initialScanState } from "../types";
 import type { DiscoveredEndpoint, ScanEvent, ScanState } from "../types";
 import { errorMessage } from "../ipcError";
 
-function isProtocolMatch(endpointProtocol: string, scanProtocol: string): boolean {
-  const norm = (endpointProtocol || "").toLowerCase();
-  if (scanProtocol === "masque-h3") return norm.includes("h3");
-  if (scanProtocol === "masque-h2") return norm.includes("h2");
-  if (scanProtocol === "wireguard") return norm.includes("wireguard") || norm.includes("wg");
-  return false;
-}
-
 export function useScanner(
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void,
   running: boolean,
@@ -66,7 +58,9 @@ export function useScanner(
             bestRtt: ev.rtt || prev.bestRtt,
           }));
           setEndpoints((prev) => {
-            if (prev.some((e) => e.addr === ev.addr)) return prev;
+            // One IP:port can answer on h2 and on h3; keyed on the address alone the
+            // second protocol's hit was discarded as a duplicate of the first.
+            if (prev.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) return prev;
             return [...prev, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
               (a, b) => a.rttMs - b.rttMs,
             );
@@ -104,7 +98,9 @@ export function useScanner(
     if (busy || active) return;
     clearLogs?.();
     setBusy(true);
-    setEndpoints((prev) => prev.filter((e) => !isProtocolMatch(e.protocol, protocol)));
+    // The counters and `bestRtt` restart with the run, so the list has to as well:
+    // keeping earlier protocols' rows meant a table of nine under "3 working".
+    setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     appendLog({
       level: "info",

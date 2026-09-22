@@ -354,7 +354,7 @@ export function ScannerTab({
             {filteredEndpoints.map((item) => {
               const { tierClass, badgeText } = getRttTier(item.rttMs);
               return (
-                <div className="discovered-row" key={item.addr}>
+                <div className="discovered-row" key={`${item.addr}|${item.protocol}`}>
                   <div className="discovered-info">
                     <CopyIpButton addr={item.addr} />
                     <code className="tabular-nums">{item.addr}</code>
