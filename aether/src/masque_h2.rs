@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -816,7 +815,7 @@ async fn drain_capsules(
             }
             Ok(Some(Capsule::AddressAssign(addrs))) => {
                 for a in addrs {
-                    if let Some(ip) = bytes_to_ip(a.ip_version, &a.address) {
+                    if let Some(ip) = crate::tunnel::bytes_to_ip(a.ip_version, &a.address) {
                         log::info!("[h2] edge assigned {}/{}", ip, a.prefix_len);
                         if let Some(tx) = addr_tx {
                             let _ = tx.try_send(AssignedAddr {
@@ -845,18 +844,6 @@ async fn drain_capsules(
                 break;
             }
         }
-    }
-}
-
-fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
-    match version {
-        4 if bytes.len() == 4 => Some(IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into())),
-        6 if bytes.len() == 16 => {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(bytes);
-            Some(IpAddr::V6(b.into()))
-        }
-        _ => None,
     }
 }
 

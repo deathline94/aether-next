@@ -729,12 +729,12 @@ fn parse_dns_answer_id(
     let mut pos = 12;
 
     for _ in 0..qd {
-        pos = skip_name(resp, pos)?;
+        pos = crate::dns::skip_name(resp, pos)?;
         pos = pos.checked_add(4)?;
     }
 
     for _ in 0..an {
-        pos = skip_name(resp, pos)?;
+        pos = crate::dns::skip_name(resp, pos)?;
         if pos + 10 > resp.len() {
             return None;
         }
@@ -760,19 +760,6 @@ fn parse_dns_answer_id(
         pos += rdlen;
     }
     None
-}
-
-fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
-    loop {
-        let len = *buf.get(pos)?;
-        if len & 0xc0 == 0xc0 {
-            return Some(pos + 2);
-        }
-        if len == 0 {
-            return Some(pos + 1);
-        }
-        pos += 1 + len as usize;
-    }
 }
 
 /// Decode a DNS name starting at `pos`, following compression pointers (bounded).

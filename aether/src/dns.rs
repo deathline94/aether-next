@@ -200,7 +200,7 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<String> {
     Some(labels.join("."))
 }
 
-fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
+pub(crate) fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *buf.get(pos)?;
         if len & 0xc0 == 0xc0 {
