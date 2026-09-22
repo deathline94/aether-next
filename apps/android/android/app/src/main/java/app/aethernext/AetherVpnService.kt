@@ -448,6 +448,12 @@ class AetherVpnService : VpnService() {
     }
 
     private fun restartTunnel(delayMs: Long, attempt: Int) {
+        // The port this session's engine is actually listening on, deliberately not
+        // re-read from settings: `establishTun` writes the userspace tunnel's SOCKS
+        // target, so a restart has to point at the running listener. Loading the
+        // current settings instead would re-point the tunnel at a port nothing is
+        // bound to the moment a save changed it, and a supervised restart would turn
+        // a dead path into a blackhole with a green badge.
         val port = tunSocksPort
         if (port !in 1024..65535) {
             SessionController.getOrNull()?.onVpnFailed(RECONNECT_REQUIRED)
