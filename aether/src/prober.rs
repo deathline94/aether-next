@@ -1422,7 +1422,55 @@ pub struct WgProbe {
 
 /// Cache of handshakes established by the scanner, shared with the tunnel runner.
 #[derive(Clone)]
-pub struct WgSessionCache(Arc<parking_lot::Mutex<HashMap<SocketAddr, crate::wireguard::EstablishedSession>>>);
+pub struct WgSessionCache(
+    Arc<parking_lot::Mutex<HashMap<SocketAddr, (crate::wireguard::EstablishedSession, Instant)>>>,
+);
+
+/// A cached handshake is only a shortcut while both ends still hold the keys:
+/// boringtun rejects a packet older than `REJECT_AFTER_TIME` (180 s) and starts
+/// rekeying `REKEY_TIMEOUT` (5 s) before that, so past 175 s a cached session is a
+/// handshake that will be dropped — and handing it out turns that into a timeout
+/// with no reason attached.
+pub const WG_SESSION_TTL: Duration = Duration::from_secs(175);
+/// How many peers keep a live handshake. Hitting the cap used to `clear()` the map,
+/// so a hunt that found five endpoints discarded all four established sessions and
+/// every later reconnect paid a fresh commitment plus a fresh race.
+pub const WG_SESSION_CAPACITY: usize = 4;
+
+fn wg_session_fresh(inserted_at: Instant, now: Instant, ttl: Duration) -> bool {
+    match now.checked_sub(inserted_at) {
+        Some(age) => age < ttl,
+        // The clock moved backwards. Keep the session rather than deleting live
+        // state over a jump nobody asked for.
+        None => true,
+    }
+}
+
+/// Which peers to drop before making room for one more: everything expired, then the
+/// oldest live sessions until `capacity - 1` remain. Oldest-first is the point — a
+/// reconnect wants the handshake it used most recently, not the first one found.
+fn wg_evictions(
+    entries: &[(SocketAddr, Instant)],
+    now: Instant,
+    ttl: Duration,
+    capacity: usize,
+) -> Vec<SocketAddr> {
+    let mut drop: Vec<SocketAddr> = entries
+        .iter()
+        .filter(|(_, at)| !wg_session_fresh(*at, now, ttl))
+        .map(|(addr, _)| *addr)
+        .collect();
+    let mut alive: Vec<(SocketAddr, Instant)> = entries
+        .iter()
+        .filter(|(_, at)| wg_session_fresh(*at, now, ttl))
+        .copied()
+        .collect();
+    alive.sort_by_key(|(_, at)| *at);
+    let room = capacity.saturating_sub(1);
+    let overflow = alive.len().saturating_sub(room);
+    drop.extend(alive.into_iter().take(overflow).map(|(addr, _)| addr));
+    drop
+}
 
 impl WgSessionCache {
     pub fn new() -> Self {
@@ -1435,16 +1483,103 @@ impl WgSessionCache {
         session: crate::wireguard::EstablishedSession,
     ) {
         let mut map = self.0.lock();
-        if map.len() >= 4 {
-            map.clear();
+        let now = Instant::now();
+        let entries: Vec<(SocketAddr, Instant)> =
+            map.iter().map(|(k, (_, at))| (*k, *at)).collect();
+        for key in wg_evictions(&entries, now, WG_SESSION_TTL, WG_SESSION_CAPACITY) {
+            map.remove(&key);
         }
-        map.insert(peer, session);
+        map.insert(peer, (session, now));
     }
 
     pub fn take(&self, peer: &SocketAddr) -> Option<crate::wireguard::EstablishedSession> {
-        self.0.lock().remove(peer)
+        let (session, inserted_at) = self.0.lock().remove(peer)?;
+        wg_session_fresh(inserted_at, Instant::now(), WG_SESSION_TTL).then_some(session)
+    }
+
+    /// Held sessions, including any not yet reaped.
+    pub fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
+
+impl Default for WgSessionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod wg_cache_tests {
+    use super::*;
+
+    fn peer(i: u8) -> SocketAddr {
+        format!("10.0.0.{i}:51820").parse().expect("test address")
+    }
+
+    #[test]
+    fn an_expired_session_is_never_handed_out() {
+        assert!(wg_session_fresh(
+            Instant::now() - Duration::from_secs(174),
+            Instant::now(),
+            WG_SESSION_TTL
+        ));
+        assert!(!wg_session_fresh(
+            Instant::now() - Duration::from_secs(176),
+            Instant::now(),
+            WG_SESSION_TTL
+        ));
+    }
+
+    /// The old rule dropped *every* cached handshake once a fourth peer arrived, so
+    /// a five-endpoint hunt left nothing reusable at all.
+    #[test]
+    fn a_full_cache_loses_the_oldest_session_not_all_of_them() {
+        let now = Instant::now();
+        let entries = vec![
+            (peer(1), now - Duration::from_secs(6)),
+            (peer(2), now - Duration::from_secs(5)),
+            (peer(3), now - Duration::from_secs(4)),
+            (peer(4), now - Duration::from_secs(3)),
+        ];
+        let dropped = wg_evictions(&entries, now, WG_SESSION_TTL, WG_SESSION_CAPACITY);
+        assert_eq!(dropped, vec![peer(1)], "only the oldest makes room");
+    }
+
+    #[test]
+    fn expired_sessions_make_room_without_evicting_live_ones() {
+        let now = Instant::now();
+        let stale = Duration::from_secs(200);
+        let entries = vec![
+            (peer(1), now - stale),
+            (peer(2), now - stale),
+            (peer(3), now - Duration::from_secs(2)),
+            (peer(4), now - Duration::from_secs(1)),
+        ];
+        let dropped = wg_evictions(&entries, now, WG_SESSION_TTL, WG_SESSION_CAPACITY);
+        assert_eq!(dropped.len(), 2, "the two expired ones and nothing else");
+        assert!(dropped.contains(&peer(1)) && dropped.contains(&peer(2)));
+    }
+
+    #[test]
+    fn nothing_is_dropped_while_there_is_room() {
+        let now = Instant::now();
+        let entries = vec![(peer(1), now), (peer(2), now - Duration::from_secs(1))];
+        assert!(wg_evictions(&entries, now, WG_SESSION_TTL, WG_SESSION_CAPACITY).is_empty());
+    }
+
+    #[test]
+    fn a_zero_capacity_cache_does_not_underflow() {
+        let now = Instant::now();
+        let entries = vec![(peer(1), now)];
+        assert_eq!(wg_evictions(&entries, now, WG_SESSION_TTL, 0), vec![peer(1)]);
+    }
+}
+
 
 impl WgProbe {
     /// Build a [`ProbeConfig`] for WireGuard scanning.
