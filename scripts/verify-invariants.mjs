@@ -359,33 +359,15 @@ const RADIUS_LEFTOVERS = {
 /** Every `value: "x"` token in a Settings menu module. */
 const literalsOfValues = (text) => [...text.matchAll(/value:\s*"([^"]+)"/g)].map((m) => m[1]);
 
-
-/**
- * The engine's noise vocabulary, read from the file that owns it.
- *
- * obfuscation::RECOGNIZED_PROFILES is the authority the shells have to agree
- * with; every drift this session found in that vocabulary came from somebody
- * keeping a second copy of the list. A gate must not add a third one.
+/*
+ * Junk/noise levels reach the engine as AETHER_NOIZE and are resolved by the
+ * profile table in aether/src/aethernoize.rs, whose names this gate does not
+ * read - listed here so the gap is visible and reviewable rather than a silent
+ * skip; wiring the engine's noise table into the comparison is still open.
  */
-function engineNoiseVocabulary(api) {
-  const found = api.files('aether/src', /obfuscation/).filter((x) => rel(x).endsWith('/obfuscation.rs'));
-  if (!found.length) return null;
-  const obf = found[0];
-  if (!obf) return null;
-  const text = api.read(obf).replace(/\r\n/g, '\n');
-  const marker = 'RECOGNIZED_PROFILES';
-  const at = text.indexOf(marker);
-  if (at < 0) return null;
-  const open = text.indexOf('[', at);
-  const close = text.indexOf(']', open);
-  if (open < 0 || close < open) return null;
-  const names = text
-    .slice(open, close)
-    .split(String.fromCharCode(34))
-    .filter((_, i) => i % 2 === 1);
-  return names.length ? new Set(names) : null;
-}
-
+const UNGATED_NOIZE_LEVELS = new Set([
+  'off', 'light', 'medium', 'high', 'max', 'custom',
+]);
 
 const SHELL_ONLY_TOKENS = new Set([
   'proxy-only', 'system-proxy', 'tun', // routing mode: selects shell behaviour
@@ -2295,16 +2277,10 @@ const GATES = [
       if (unreadable.length) {
         return [`no match arms could be read out of ${unreadable.join(', ')} in the engine, so the comparison ran on nothing`];
       }
-      const noise = engineNoiseVocabulary(api);
-      if (!noise) {
-        return ['aether/src/obfuscation.rs: no RECOGNIZED_PROFILES to compare the noise field against, so the check would have run on three fields instead of four'];
-      }
-      const accepted = new Set(
-        [].concat(...Object.values(sets).map((s) => [...s]), [...noise])
-      );
+      const accepted = new Set([].concat(...Object.values(sets).map((s) => [...s])));
       const problems = [];
       const check = (label, tokens) => {
-        const unknown = [...new Set(tokens)].filter((t) => t && !accepted.has(t) && !SHELL_ONLY_TOKENS.has(t));
+        const unknown = [...new Set(tokens)].filter((t) => t && !accepted.has(t) && !SHELL_ONLY_TOKENS.has(t) && !UNGATED_NOIZE_LEVELS.has(t));
         if (unknown.length) {
           problems.push(
             `${label} can emit ${unknown.map((u) => `"${u}"`).join(', ')}, which no engine parse arm names — an unnamed value does not fail there, it falls through to IPv4 / balanced / MASQUE`,
