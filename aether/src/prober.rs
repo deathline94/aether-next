@@ -2460,3 +2460,36 @@ mod scan_mode_tests {
         assert_eq!(ScanMode::parse(""), ScanMode::Balanced);
     }
 }
+
+/// The scan's two token parsers must accept what their own values print as.
+///
+/// `IpScan::Both.label()` is "dual-stack", and until `parse` named that string
+/// the round trip came back as IPv4: an IPv4-only scan from a caller, config file
+/// or log replay that echoed the label instead of the value. `ScanMode` has had
+/// the same assertion for a while; the ip family had neither the arm nor the test.
+#[cfg(test)]
+mod token_round_trip_tests {
+    use super::{IpScan, ScanMode};
+
+    #[test]
+    fn every_ip_scan_label_parses_back_to_itself() {
+        for mode in [IpScan::V4, IpScan::V6, IpScan::Both] {
+            assert_eq!(
+                mode,
+                IpScan::parse(mode.label()),
+                "IpScan::{:?} label must round-trip",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn the_values_the_shells_actually_send_are_named_not_defaulted() {
+        // Settings offers exactly these three; matching the default is not the same
+        // as being accepted, and it is what let a wrong family look like a choice.
+        assert!(matches!(IpScan::parse("v4"), IpScan::V4));
+        assert!(matches!(IpScan::parse("v6"), IpScan::V6));
+        assert!(matches!(IpScan::parse("both"), IpScan::Both));
+        assert!(matches!(ScanMode::parse("balanced"), ScanMode::Balanced));
+    }
+}
