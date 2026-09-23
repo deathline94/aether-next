@@ -377,7 +377,6 @@ code, kbd, pre {
  * components, re-declared against our own tokens so the sheet stands alone.
  */
 .font-mono { font-family: var(--font-mono); }
-.text-red-400 { color: var(--coral); } /* error/warning glyph → sheet red #ff5c5c (was #f87171) */
 
 /* ─── App Shell & Layout ───────────────────────────────────────────────────── */
 .app-shell {
@@ -766,7 +765,7 @@ code, kbd, pre {
   box-shadow: 0 0 10px var(--coral);
 }
 
-.home-view, .settings-view, .logs-view {
+.home-view, .settings-view {
   width: min(100%, 1080px);
   margin: 0 auto;
   padding: 32px clamp(20px, 3.5vw, 44px) 48px;
@@ -3344,7 +3343,6 @@ code, kbd, pre {
      desktop had no equivalent. */
   .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-
 
 
 /* ─── Declared-in-markup class layer (spec 015 / BC-10) ───────────────────

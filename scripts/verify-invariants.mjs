@@ -2085,6 +2085,63 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'no-orphaned-class-rules',
+    invariant: 'BC-11',
+    summary: 'no rule in an app sheet styles an element no source mentions',
+    scan(api) {
+      // The mirror of `css-class-resolution`. That gate asks "does this element get
+      // styled"; nothing asked "does this rule ever style anything", which is how a
+      // pre-rewrite sheet kept `.activity-view`, `.power-button`, `.save-bar` and
+      // friends long after the markup stopped carrying those classes — dead rules
+      // that read as live design constraints to the next person (and to a model).
+      //
+      // Deliberately loose on purpose: a name counts as used if it appears
+      // *anywhere* in the app's sources, including as a fragment of a composed
+      // class (`'stat-' + tone`). A gate that over-reports gets silenced; this one
+      // reports only what no file mentions at all.
+      const ORPHAN_BUDGET = { 'apps/desktop': 0, 'apps/android': 0 };
+      const v = [];
+      for (const app of ['apps/desktop', 'apps/android']) {
+        const sheetFile = api.files(app, /App\.css$/).find((f) => rel(f).endsWith(`${app}/src/App.css`));
+        if (!sheetFile) {
+          v.push(`${app}: no App.css to audit`);
+          continue;
+        }
+        const sheet = blankComments(api.read(sheetFile));
+        const defined = new Set();
+        for (const line of sheet.split(/\r?\n/)) {
+          const brace = line.indexOf('{');
+          if (brace < 0) continue;
+          for (const m of line.slice(0, brace).matchAll(/\.([A-Za-z][\w-]*)/g)) defined.add(m[1]);
+        }
+        const corpus = api
+          .files(app, /\.(tsx|ts|jsx|js|html)$/)
+          .map((f) => api.read(f))
+          .join('\n');
+        const dead = [...defined].filter((c) => !corpus.includes(c)).sort();
+        const budget = ORPHAN_BUDGET[app] ?? 0;
+        if (dead.length > budget) {
+          v.push(
+            `${app}/src/App.css: ${dead.length} class rule(s) name nothing any source mentions — ${dead.slice(0, 14).join(', ')}${dead.length > 14 ? `, … (+${dead.length - 14})` : ''}`,
+          );
+        }
+        if (dead.length < budget) {
+          v.push(
+            `${app}/src/App.css: only ${dead.length} orphan(s) left against a budget of ${budget} — lower it in the same commit so the number stays a measurement`,
+          );
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/App.css',
+        content:
+          '/*==AETHER-TOKENS-START==*/\n/*==AETHER-TOKENS-END==*/\n.zzq-orphaned-pre-rewrite-widget-qx {\n  color: red;\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */
