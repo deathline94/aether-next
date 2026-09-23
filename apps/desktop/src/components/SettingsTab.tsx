@@ -272,7 +272,7 @@ export function SettingsTab({
                 <label>
                   <span>Junk Packet Count</span>
                   <NumberField
-                    label="Junk count"
+                    label="Junk packet count"
                     min={0}
                     max={64}
                     step={1}
@@ -288,7 +288,7 @@ export function SettingsTab({
                 <label>
                   <span>Min Payload Size</span>
                   <NumberField
-                    label="Junk minimum size in bytes"
+                    label="Min payload size (bytes)"
                     min={0}
                     max={2048}
                     step={16}
@@ -309,7 +309,7 @@ export function SettingsTab({
                 <label>
                   <span>Max Payload Size</span>
                   <NumberField
-                    label="Junk maximum size in bytes"
+                    label="Max payload size (bytes)"
                     min={0}
                     max={2048}
                     step={16}
@@ -330,7 +330,7 @@ export function SettingsTab({
                 <label>
                   <span>Burst Interval</span>
                   <NumberField
-                    label="Junk interval in milliseconds"
+                    label="Burst interval (ms)"
                     min={0}
                     max={5000}
                     step={10}

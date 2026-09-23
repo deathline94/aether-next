@@ -100,6 +100,6 @@ describe("SettingsTab save feedback", () => {
       />,
     );
     expect(screen.getByText(/CUSTOM NOISE PARAMETERS/i)).toBeTruthy();
-    expect(screen.getByRole("spinbutton", { name: /junk count/i })).toBeTruthy();
+    expect(screen.getByRole("spinbutton", { name: /junk packet count/i })).toBeTruthy();
   });
 });

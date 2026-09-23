@@ -49,7 +49,10 @@ describe("ScannerTab probe parameters", () => {
     // The field allowed 2000 while the engine clamps to 500, so the "Workers
     // Active" chip contradicted the number that was typed.
     renderTab();
-    const field = screen.getByRole("spinbutton", { name: /scan concurrency/i });
+    // The name asserted here is the *visible* label text on purpose: an accessible
+    // name that drops the words on screen is a WCAG 2.5.3 failure for speech-input
+    // users, and this is what catches it.
+    const field = screen.getByRole("spinbutton", { name: /concurrency \(workers\)/i });
     expect(field.getAttribute("max")).toBe(String(SCAN_MAX_CONCURRENCY));
     expect(field.getAttribute("min")).toBe("1");
     expect(screen.getByText(/1\u2013500 active/i)).toBeTruthy();

@@ -319,7 +319,7 @@ export function ScannerTab({
                 </span>
               </div>
               <NumberField
-                label="Scan concurrency"
+                label="Concurrency (workers)"
                 min={SCAN_MIN_CONCURRENCY}
                 max={SCAN_MAX_CONCURRENCY}
                 step={10}
@@ -336,7 +336,7 @@ export function ScannerTab({
                 <span className="field-hint">{SCAN_MIN_TIMEOUT_MS}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
               <NumberField
-                label="Per-probe timeout in milliseconds"
+                label="Timeout (ms)"
                 min={SCAN_MIN_TIMEOUT_MS}
                 max={SCAN_MAX_TIMEOUT_MS}
                 step={100}

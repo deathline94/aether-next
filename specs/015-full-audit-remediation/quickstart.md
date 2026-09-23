@@ -206,7 +206,7 @@ scripts/verify-invariants --ui
 | Contrast from measured pixels at 100/125/150 % | ≥4.5:1 text, ≥3:1 state edges | fails: 2.4-2.6:1 informational tier, 1.05-1.47:1 borders |
 | Zero non-`ipc:`/`localhost` network requests from the packaged build | pass | fails: Google Fonts blocked by CSP at best, exfiltrated in dev at worst |
 | `.spin` animates while connecting; `prefers-reduced-motion` kills all 7 loops | pass | fails: spinners only defined inside the reduced-motion block |
-| 2 000 rows ⇒ per-event frame < 16 ms p95 | pass | fails: unvirtualised list re-sorts and re-renders per event |
+| 2 000 rows ⇒ per-event frame < 16 ms p95 | **manual (T201)**: the suite proves the list is virtualised — `ScannerTab.render.test.tsx:116,132,136` assert the rendered node count against viewport+overscan at 2 000 rows — and nothing more. jsdom has no compositor, so no assertion here can produce a frame time; the p95 has to be read off a real renderer and the row left unchecked until someone does | fails: unvirtualised list re-sorts and re-renders per event (fixed for the render count; the timing has still never been measured) |
 | Keyboard: focus visible, log console scrollable, no mouse-only steppers | pass | fails |
 | axe per tab, 0 role violations | pass | fails: chips as `role="tab"`, `role="radio"` per-Tab-stop |
 

@@ -917,6 +917,39 @@ Checked each part against the current tree rather than assuming the task text wa
        children, so the 36 px notch is gone; the dock now says it scrolls with a
        trailing fade. -->
 
+  <!-- Progress measured, not claimed. One clause advanced, and one of the task's
+       own rationales corrected:
+       DONE — the numeric steppers' accessible names now contain their visible
+       label text (WCAG 2.5.3, which the "one control two accessible names" clause
+       is really about). Six `NumberField label=` strings in each frontend said
+       something the screen did not show — "Scan concurrency" beside a visible
+       "Concurrency (Workers)", "Per-probe timeout in milliseconds" beside
+       "Timeout (ms)", "Junk minimum size in bytes" beside "Min Payload Size" — so
+       a speech-input user saying what they could see could not address the field.
+       Renamed in all 12 places, and the tests now assert the *visible* wording
+       through `getByRole("spinbutton", { name: /concurrency \(workers\)/i })`,
+       which is the check that fails if a future rename drops the on-screen words
+       again (the two assertions that had to change to pass are the proof the old
+       names were what the suite was locking in). `npx tsc -b` clean, 102 desktop +
+       48 android tests green.
+       NOT DONE — the structural half: the `<label>` still *wraps* the compound
+       control (the two −/+ buttons and the input) at 16 sites instead of carrying
+       an `htmlFor`. The task's stated blocker is inaccurate: there is no
+       `.label > *` rule anywhere in either sheet, and the three rules that do
+       apply (`App.css:1850`, `:1864-1865`, android `:1828`, `:1842-1843`) keep
+       matching if the `<label>` stays inside the block, so converting the wrapper
+       is 16 JSX moves plus one `id`/`htmlFor` pair per field and no CSS work. The
+       attempt here stalled on a CRLF-blind regex (both apps' sources are CRLF and
+       the rewrite matched nothing across three tries) and was abandoned rather
+       than half-applied; the fields are named correctly in the meantime, so the
+       residual defect is click-to-focus behaviour on a label that contains
+       buttons, not an unnamed control.
+       NOT TOUCHED — the other ten clauses of this task (APG radio group for the
+       filter chips, `tabIndex={-1}` on the steppers, the `App.tsx` modifier-key
+       filter, scrollable-region focus, `aria-live` on hero/save dock, `:active`
+       feedback, the raw `DISCONNECTED` enum beside a "Standby" beacon, colour-only
+       state, the disabled dim over `.profile-card.active`) and T198's forked JSX.
+  -->
 - [ ] T195 [US6] Fix control semantics in `apps/desktop/src/components/{ui.tsx,ScannerTab.tsx,SettingsTab.tsx,App.tsx}`: filter chips become an APG radio group (`role="radiogroup"`/`radio`, `aria-checked`, roving `tabIndex`, arrow-key cycling) instead of a `role="tablist"` misuse with no `aria-controls`; `role="tablist"` is reserved for the real tab strip with `aria-controls`/`aria-selected`/`role="tabpanel"`; remove `tabIndex={-1}` from the −/+ steppers (mouse-only today); stop a wrapped `<label>` + `aria-label` giving one control two accessible names; ignore `ctrlKey/metaKey/altKey` in `App.tsx:40-52`; add `tabIndex={0}` + `aria-label` to `.tactical-terminal-screen` and `.discovered-list` (keyboard users cannot scroll them today); add `aria-live="polite"`/`role="status"` on the hero and save dock and transfer focus on tab switch; define `:active` press feedback (only 3 of ~20 controls have it); stop printing the raw `DISCONNECTED` enum beside a "Standby" beacon; make state never colour-only (the 7 px dot at 1.96:1 is currently the sole signal) and exclude `.profile-card.active` from the disabled dim so the ACTIVE profile stays identifiable while connected.
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
 - [x] T197 [US6] Fix Android visual parity in `apps/android/android/app/src/main/res/values/`: add `values-night/themes.xml` (today `Theme.MaterialComponents.DayNight` with a hardcoded `#0D1113` bar paints dark icons on dark in light mode), align `colorPrimary #66E3A4` with `--emerald #00f08a`, and unify the three near-black chrome colours (`#07090b` / `#0D1113` / `#101517`).
