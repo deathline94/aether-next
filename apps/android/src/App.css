@@ -3648,3 +3648,26 @@ code, kbd, pre {
   border-radius: var(--radius-card);
   cursor: pointer;
 }
+
+/* Press feedback.
+   Thirteen controls in this sheet declared a hover state and no `:active` at
+   all, so the only reply to a tap came from a device with no cursor to hover
+   with. One scale step, taken from the rules that already do this correctly
+   (`.master-toggle-btn`, `.profile-card`, `.stepper-btn`) rather than invented
+   here. Cards and rows are deliberately absent: they are surfaces a pointer
+   highlights, not things a press acts on. */
+.banner-dismiss:active:not(:disabled),
+.connect-direct-btn:active:not(:disabled),
+.endpoint-row button:active:not(:disabled),
+.error-banner-dismiss:active:not(:disabled),
+.filter-chip:active:not(:disabled),
+.nav-pill:active:not(:disabled),
+.pinned-peer-clear-btn:active:not(:disabled),
+.proto-tab:active:not(:disabled),
+.segmented button:active:not(:disabled),
+.tactile-copy-btn:active:not(:disabled),
+.tactile-terminal-btn:active:not(:disabled),
+.tactile-toggle:active:not(:disabled),
+.test-row button:active:not(:disabled) {
+  transform: scale(0.98);
+}

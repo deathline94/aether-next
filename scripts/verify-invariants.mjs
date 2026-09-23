@@ -1938,6 +1938,52 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'press-feedback-on-controls',
+    invariant: 'BC-14',
+    summary: 'a control that answers the cursor also answers the press',
+    scan(api) {
+      // WCAG 2.5.2 (pointer down/up cancellation) is the letter of it; the reason
+      // is plainer. A control that only lightens under a hovering cursor never
+      // tells anyone that the tap landed — and on a phone there is no cursor to
+      // hover with. The criterion is mechanical on purpose: whichever selector
+      // family declares `:hover` has to declare `:active` too, so this cannot
+      // slide into a argument about taste, and cards/rows that are not pressable
+      // are not named by the pattern at all.
+      const CONTROL = /(?:^|[\w-])(btn|button|chip|tab|pill|toggle|dismiss|copy|stepper|link)$/;
+      const baseOf = (sel) =>
+        sel
+          .replace(/:(hover|active|focus|focus-visible|focus-within|disabled)/g, '')
+          .replace(/:not\([^)]*\)/g, '')
+          .trim();
+      const v = [];
+      for (const f of api.files('apps', /\.css$/)) {
+        const text = blankComments(api.read(f));
+        const hovered = new Set();
+        const pressed = new Set();
+        for (const m of text.matchAll(/(^|[,\n{])\s*([^{}\n,]+):hover/g)) {
+          const base = baseOf(m[2].trim());
+          if (CONTROL.test(base.split(/[\s>]+/).pop() ?? '')) hovered.add(base);
+        }
+        for (const m of text.matchAll(/(^|[,\n{])\s*([^{}\n,]+):active/g)) {
+          pressed.add(baseOf(m[2].trim()));
+        }
+        const missing = [...hovered].filter((b) => !pressed.has(b)).sort();
+        if (missing.length) {
+          v.push(
+            `${rel(f)}: ${missing.length} control selector(s) light up for a hovering cursor and give nothing back on press: ${missing.join(', ')}`,
+          );
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__press.css',
+        content: '.probe-btn:hover{color:red}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */
