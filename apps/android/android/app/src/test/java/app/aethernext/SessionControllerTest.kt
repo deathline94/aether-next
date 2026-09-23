@@ -12,7 +12,6 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
@@ -105,6 +104,21 @@ class SessionControllerTest {
         return Harness(fakeContext, controller, emitted, { feedLine(it) })
     }
 
+    /**
+     * A feed that is guaranteed to reach every sink exactly once.
+     *
+     * Not a lifecycle event: a second `connected` while already connected publishes
+     * nothing, and log lines are batched, so either would make a fan-out test fail
+     * for a reason that has nothing to do with the registry it claims to check. An
+     * endpoint choice publishes unconditionally.
+     */
+    private val probeEvent =
+        """AETHER_EVENT {"type":"endpoint_selected","addr":"162.159.198.1:443","protocol":"MASQUE H3"}"""
+
+    /** Scan events are the ungated channel; see [probeEvent]. */
+    private fun delivered(sink: List<Pair<String, JSONObject>>): Int =
+        sink.count { it.first == "scan://event" }
+
     @Before
     fun resetSharedTunnelState() {
         // VpnTunnel is process-wide state owned by the service; tests must not
@@ -113,6 +127,61 @@ class SessionControllerTest {
     }
 
     // ─── T110 / T129: structured events, fail-closed default ───────────────────
+
+    // ─── T213: the owner-keyed emitter registry, asserted ───────────────────
+
+    @Test
+    fun aSecondActivityKeepsReceivingEventsAfterTheFirstOneDies() {
+        // The controller is a process singleton and the registry is keyed by owner,
+        // which is what stops a task swipe on activity A from silencing the session
+        // that B is still showing. Until this test, nothing proved the property —
+        // the code could regress to a single reassigned slot and every other test
+        // would stay green, because each harness only ever attaches one sink.
+        val h = harness()
+        val a = mutableListOf<Pair<String, JSONObject>>()
+        val b = mutableListOf<Pair<String, JSONObject>>()
+        h.controller.attachUi("activity-A") { event, payload -> a.add(event to payload) }
+        h.controller.attachUi("activity-B") { event, payload -> b.add(event to payload) }
+
+        h.feed(probeEvent)
+        assertEquals("A was attached and must receive the event", 1, delivered(a))
+        assertEquals("B was attached too, not instead", 1, delivered(b))
+
+        val seenByA = delivered(a)
+        val seenByB = delivered(b)
+        assertFalse(
+            "one sink left is not a headless session, so it must not be torn down",
+            h.controller.detachUi("activity-A"),
+        )
+        assertTrue(h.controller.hasUi())
+
+        h.feed(probeEvent)
+        assertEquals("A is detached: it may not be called again", seenByA, delivered(a))
+        assertEquals("B must keep receiving after A's destroy", seenByB + 1, delivered(b))
+
+        assertTrue(
+            "the last sink leaving is the caller's cue to shut a headless tunnel down",
+            h.controller.detachUi("activity-B"),
+        )
+        assertFalse(h.controller.hasUi())
+    }
+
+    @Test
+    fun attachingTheSameOwnerTwiceReplacesItsSinkInsteadOfStackingIt() {
+        // `onResume` re-attaches after `onStop` did not detach. If the registry
+        // stacked, one event would be delivered to two WebViews — the leak this
+        // whole change replaced is a stale sink, not a missing one.
+        val h = harness()
+        val first = mutableListOf<Pair<String, JSONObject>>()
+        val second = mutableListOf<Pair<String, JSONObject>>()
+        h.controller.attachUi("activity-A") { event, payload -> first.add(event to payload) }
+        h.controller.attachUi("activity-A") { event, payload -> second.add(event to payload) }
+
+        h.feed(probeEvent)
+        assertEquals(0, delivered(first))
+        assertEquals(1, delivered(second))
+        assertTrue(h.controller.detachUi("activity-A"))
+    }
 
     @Test
     fun defaultStateIsDisconnectedNotInferred() {
