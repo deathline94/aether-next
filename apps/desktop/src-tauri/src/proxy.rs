@@ -163,6 +163,226 @@ pub mod windows_proxy {
         read_snapshot(&key()?)
     }
 
+    /// A connection's own proxy settings, decoded far enough to *detect* a
+    /// conflict with the per-user proxy this module owns.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PerConnectionProxy {
+        pub connection: String,
+        /// The proxy server, or the PAC URL when the connection is script-driven.
+        pub effective: String,
+        pub via_script: bool,
+    }
+
+    const DEFAULT_CONNECTION_SETTINGS: &str = "DefaultConnectionSettings";
+    /// `ProxySettingsFlag`: bit 0 use a proxy server, bit 1 auto-detect, bit 2 use
+    /// a script. Any of the three takes the connection out of "direct" and puts it
+    /// ahead of the per-user values.
+    const FLAG_USE_PROXY: u32 = 0x1;
+    const FLAG_AUTO_DETECT: u32 = 0x2;
+    const FLAG_USE_SCRIPT: u32 = 0x4;
+    /// The string area begins at 1000; the header holds 4-byte version, 4 reserved,
+    /// 4-byte flags, then u16 offsets for ProxyServer / ProxyBypass / ProxyPAC.
+    const STRING_AREA: usize = 1000;
+    const SERVER_AT: usize = 12;
+    const PAC_AT: usize = 16;
+
+    /// Decode the proxy-relevant head of a `DefaultConnectionSettings` blob.
+    ///
+    /// `Ok(None)` means the connection is direct, so it cannot outrank anything.
+    /// `Err` means the blob is not one this decoder can read, and the caller must
+    /// report that rather than treat it as clean: a conflict it cannot see is a
+    /// conflict it will deny.
+    pub fn decode_connection_proxy(
+        blob: &[u8],
+        connection: &str,
+    ) -> Result<Option<PerConnectionProxy>, String> {
+        if blob.len() < 18 {
+            return Err(format!(
+                "{connection}: {DEFAULT_CONNECTION_SETTINGS} is {} bytes, too short to hold a proxy header",
+                blob.len()
+            ));
+        }
+        let head = |at: usize, width: usize| -> usize {
+            if width == 4 {
+                u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes")) as usize
+            } else {
+                u16::from_le_bytes(blob[at..at + 2].try_into().expect("2 bytes")) as usize
+            }
+        };
+        let version = head(0, 4);
+        // 5 (XP SP3) through 8 (Windows 10/11) share this header. Anything else is
+        // a layout this decoder would be guessing at.
+        if !(5..=8).contains(&version) {
+            return Err(format!(
+                "{connection}: {DEFAULT_CONNECTION_SETTINGS} version {version} is not one this decoder knows"
+            ));
+        }
+        let flags = head(8, 4) as u32;
+        let use_proxy = flags & FLAG_USE_PROXY != 0;
+        let use_script = flags & FLAG_USE_SCRIPT != 0;
+        let auto_detect = flags & FLAG_AUTO_DETECT != 0;
+        if !use_proxy && !use_script && !auto_detect {
+            return Ok(None);
+        }
+        // A script wins over a server in WinINet's own order of precedence, and
+        // deleting our per-user proxy has no effect on either.
+        let (slot, what) = if use_script {
+            (PAC_AT, "PAC script")
+        } else if use_proxy {
+            (SERVER_AT, "proxy server")
+        } else {
+            // Auto-detect alone resolves through WPAD rather than a server the
+            // caller can name. It is still a connection deciding its own route
+            // while Aether claims to own it, so it is reported, not reasoned away.
+            return Ok(Some(PerConnectionProxy {
+                connection: connection.to_string(),
+                effective: "auto-detect (WPAD)".to_string(),
+                via_script: false,
+            }));
+        };
+        let offset = head(slot, 2);
+        if offset < STRING_AREA || offset >= blob.len() {
+            return Err(format!(
+                "{connection}: flags claim a {what} but its offset {offset} lies outside the blob's string area"
+            ));
+        }
+        let end = blob[offset..]
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| format!("{connection}: the {what} string is not terminated"))?;
+        let value = String::from_utf8_lossy(&blob[offset..offset + end]).into_owned();
+        if value.trim().is_empty() {
+            return Err(format!(
+                "{connection}: flags claim a {what} but the string is empty — the connection's route cannot be told"
+            ));
+        }
+        Ok(Some(PerConnectionProxy {
+            connection: connection.to_string(),
+            effective: value,
+            via_script: use_script,
+        }))
+    }
+
+    /// Which of this user's connections would ignore the proxy Aether just wrote.
+    ///
+    /// `HKCU\...\Internet Settings\Connections` is per-user, so this needs no
+    /// elevation; it reads only.
+    pub fn per_connection_conflicts() -> Result<Vec<PerConnectionProxy>, String> {
+        let root = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections",
+            winreg::enums::KEY_READ,
+        ) {
+            Ok(root) => root,
+            // No Connections key is a real state: nothing is configured
+            // per-connection, so nothing can outrank the per-user values.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("open the Connections key: {e}")),
+        };
+        let mut out = Vec::new();
+        for name in root.enum_keys().flatten() {
+            // `get_raw_value`, not `get_value::<Vec<u8>>`: winreg has no
+            // `FromRegValue` for bytes because a byte vector could be any of
+            // REG_BINARY or REG_MULTI_SZ, and guessing which is exactly what this
+            // read must not do.
+            let value = match root
+                .open_subkey(&name)
+                .and_then(|k| k.get_raw_value(DEFAULT_CONNECTION_SETTINGS))
+            {
+                Ok(value) => value,
+                // A connection folder without the value has no per-connection proxy
+                // to conflict with; a folder we cannot open is a different matter.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{name}: read {DEFAULT_CONNECTION_SETTINGS}: {e}")),
+            };
+            if value.vtype != winreg::enums::RegType::REG_BINARY {
+                return Err(format!(
+                    "{name}: {DEFAULT_CONNECTION_SETTINGS} is {:?}, not REG_BINARY",
+                    value.vtype
+                ));
+            }
+            match decode_connection_proxy(&value.bytes, &name) {
+                Ok(Some(conflict)) => out.push(conflict),
+                Ok(None) => {}
+                Err(why) => return Err(why),
+            }
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod per_connection_tests {
+        use super::*;
+
+        /// A `DefaultConnectionSettings` blob laid out the way a real one is: a
+        /// 1000-byte header, then the NUL-terminated ANSI strings the offsets in
+        /// that header point at.
+        fn blob(version: u32, flags: u32, server: Option<&str>, pac: Option<&str>) -> Vec<u8> {
+            let mut head = vec![0u8; STRING_AREA];
+            head[0..4].copy_from_slice(&version.to_le_bytes());
+            head[8..12].copy_from_slice(&flags.to_le_bytes());
+            let mut at = STRING_AREA;
+            for (slot, value) in [(SERVER_AT, server), (PAC_AT, pac)] {
+                let Some(value) = value else { continue };
+                head[slot..slot + 2].copy_from_slice(&(at as u16).to_le_bytes());
+                head.extend_from_slice(value.as_bytes());
+                head.push(0);
+                at += value.len() + 1;
+            }
+            head
+        }
+
+        #[test]
+        fn a_connection_with_its_own_proxy_outranks_ours() {
+            let b = blob(8, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            let found = decode_connection_proxy(&b, "Ethernet").unwrap();
+            assert_eq!(
+                Some(PerConnectionProxy {
+                    connection: "Ethernet".into(),
+                    effective: "10.0.0.9:3128".into(),
+                    via_script: false,
+                }),
+                found
+            );
+        }
+
+        #[test]
+        fn a_connection_script_outranks_ours_too_and_is_named_as_one() {
+            let b = blob(
+                7,
+                FLAG_USE_SCRIPT,
+                Some("ignored:80"),
+                Some("http://corp/pac.js"),
+            );
+            let found = decode_connection_proxy(&b, "VPN").unwrap().unwrap();
+            assert!(found.via_script, "a PAC is not a proxy server");
+            assert_eq!("http://corp/pac.js", found.effective);
+        }
+
+        #[test]
+        fn a_direct_connection_is_not_a_conflict() {
+            let b = blob(8, 0, Some("stale:1"), None);
+            assert_eq!(None, decode_connection_proxy(&b, "WiFi").unwrap());
+        }
+
+        #[test]
+        fn a_layout_this_decoder_does_not_know_is_a_problem_not_an_all_clear() {
+            // Failing closed here is the point: "cannot tell" must not become
+            // "nothing conflicts", which is what a default-on decode gave back.
+            let b = blob(9, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            assert!(decode_connection_proxy(&b, "WiFi").is_err());
+            assert!(decode_connection_proxy(&b[..12], "WiFi").is_err());
+        }
+
+        #[test]
+        fn flags_that_claim_a_value_the_blob_does_not_carry_are_a_problem() {
+            let mut b = blob(8, FLAG_USE_PROXY, None, None);
+            // offset 12 left zeroed: inside the header, not the string area.
+            assert!(decode_connection_proxy(&b, "WiFi").is_err());
+            b = blob(8, FLAG_USE_PROXY, Some("   "), None);
+            assert!(decode_connection_proxy(&b, "WiFi").is_err());
+        }
+    }
+
     /// Write `want` over the current values and confirm it stuck. Used when a third
     /// party (another VPN client, a login script, GPO) has changed the proxy out
     /// from under a session that still claims to own it.

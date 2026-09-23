@@ -394,7 +394,52 @@ fn check_proxy_coherence(app: &AppHandle, state: &AppState) {
         windows_proxy::verify_readback_values(&want, &current)?;
         Ok(current)
     }) {
-        Ok(_) => {}
+        Ok(_) => {
+            // The read-back above is a complete check of the values Aether writes
+            // and an incomplete check of the route traffic takes: Windows consults
+            // a connection's own `DefaultConnectionSettings` ahead of the per-user
+            // values, so a machine with a per-connection proxy can satisfy every
+            // read while that connection's traffic goes elsewhere. Detecting it is
+            // cheap; owning it (writing the blob back) is still T048b.
+            static REPORTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let telling = || !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst);
+            match windows_proxy::per_connection_conflicts() {
+                Ok(conflicts) if conflicts.is_empty() => {}
+                Ok(conflicts) => {
+                    let listed = conflicts
+                        .iter()
+                        .map(|c| format!("{} → {}", c.connection, c.effective))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!("[proxy] a per-connection proxy outranks the system proxy: {listed}");
+                    if telling() {
+                        emit_log(
+                            app,
+                            format!(
+                                "A per-connection proxy setting on this machine ({listed}) takes \
+                                 precedence over the system proxy Aether sets, so traffic on that \
+                                 connection may not be routed through it. Full-device (tun) mode \
+                                 does not depend on the system proxy."
+                            ),
+                        );
+                    }
+                }
+                Err(why) => {
+                    eprintln!("[proxy] per-connection proxy settings cannot be checked: {why}");
+                    if telling() {
+                        emit_log(
+                            app,
+                            format!(
+                                "Aether cannot read this machine's per-connection proxy settings \
+                                 ({why}), so it cannot promise that every connection follows the \
+                                 proxy it set. Full-device (tun) mode does not depend on them."
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         // Something else wrote over our values. Re-asserting is the only honest
         // response: leaving it means the user thinks their traffic is tunneled
         // while it is going out raw.

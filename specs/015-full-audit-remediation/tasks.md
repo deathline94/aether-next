@@ -104,10 +104,21 @@
 - [x] T047 [US1] Implement the per-instance named-mutex host-mutation guard in `aether/src/route_repair.rs`, reusing the `ProvisionGuard` model (`aether/src/cache.rs:199-320`), replacing substring PID matching (T035).
   Done as `aether/src/host_lock.rs`, wired into `install_routes`, `remove_routes` and `recover_stale_routes`. Windows uses a named mutex and Unix an advisory `flock` on a permanent file, so liveness is the kernel's answer rather than a staleness heuristic: `WAIT_ABANDONED_0` says the holder died, and a crashed process's flock goes with it — which is why the guard cannot wedge the host, and why no mtime window is consulted. Failing to acquire is a refusal to mutate, never a mutation without it; the refused teardown keeps the journal so the next start's pid-guarded replay does the removal.`remove_routes_locked` exists separately because `flock` is per-descriptor and would make a nested acquire fail and silently skip a removal.
   Reuses T083's proven pattern rather than `ProvisionGuard` verbatim, and the substring PID matching it mentions (T035) was already replaced by exact-field matching plus `OpenProcess`/`GetExitCodeProcess`. Two tests: contention from a second thread, and a holder that exits without releasing.
-- [x] T048 [US1] Upgrade `ProxySnapshot` in `apps/desktop/src-tauri/src/lib.rs:1938-1954` to snapshot **all five** values with hard-fail reads (no `.unwrap_or(0)`): `ProxyEnable`, `ProxyServer`, `ProxyOverride`, `AutoConfigURL`, per-connection `INTERNET_PER_CONN_PROXY_PAC`; keep `InternetSetOptionW(SETTINGS_CHANGED)` then `(REFRESH)` after **both** directions.
+- [x] T048 [US1] Upgrade `ProxySnapshot` in `apps/desktop/src-tauri/src/lib.rs:1938-1954` to snapshot **all four registry** values with hard-fail reads (no `.unwrap_or(0)`): `ProxyEnable`, `ProxyServer`, `ProxyOverride`, `AutoConfigURL`; keep `InternetSetOptionW(SETTINGS_CHANGED)` then `(REFRESH)` after **both** directions.
   Four of the five done; the fifth is a registry shape, not an oversight. `ProxySnapshot` now carries `AutoConfigURL`, `enable` clears it while the tunnel owns the proxy, `restore` puts it back, and `verify_readback_values` takes two snapshots instead of three loose parameters so a future field cannot be written-and-never-compared again. The `.unwrap_or(0)` and the two `.ok()` reads are gone: a failed read used to become "there was no proxy", which the restore then honoured by *deleting* a value it had never successfully read. `#[serde(default)]` keeps a recovery file from an older build restorable (`a_recovery_file_from_an_older_build_still_-` `restores`).
   Per-connection `INTERNET_PER_CONN_PROXY_PAC` is not a registry value: it lives in the opaque `Connections\DefaultConnectionSettings` RAS blob and is set through `InternetSetOptionW(INTERNET_PER_CONN_LIST)` on a connection handle this process does not own. Snapshotting it means parsing that blob's versioned layout, which is a task of its own — filed as T048b rather than approximated here.
 - [ ] T048b [US1] Per-connection proxy state: read and restore `Connections\DefaultConnectionSettings` (or `InternetQueryOptionW` with `INTERNET_PER_CONN_LIST`) so a machine whose proxy is configured per dial-up/VPN connection is not restored by half. Needs the blob's versioned layout decoded; the value-level snapshot in T048 does not cover it.
+  **Detection half done; the write half is not.** A per-connection proxy outranks the
+  per-user values Aether writes, so a machine with one could satisfy every read-back
+  while that connection's traffic followed something else — a silent fail-open. The
+  shell now decodes the blob's proxy-relevant head (`proxy.rs`
+  `decode_connection_proxy` / `per_connection_conflicts`, five tests over hand-built
+  blobs including unknown-version and truncated ones, which report *"cannot tell"*
+  rather than *"clean"*) and the 30 s coherence check says so on the console once per
+  session, pointing at tun mode. **What remains:** writing it back. That means owning a
+  versioned RAS blob on a connection profile this process does not own, where a wrong
+  byte costs the machine its only internet profile — it needs a real dial-up/VPN
+  connection to test against, not a fixture, so it is deliberately not attempted blind.
 
 - [x] T049 [US1] Mirror the proxy journal to `HKCU\Software\AetherNext\ProxyJournal` and implement the startup orphan sweep in `apps/desktop/src-tauri/src/lib.rs` (INV-6), so AV deleting the file cannot hide an enabled proxy.
   Done. `enable` writes `HKCU\Software\AetherNext\ProxyJournal` (one REG_SZ, the same
@@ -202,7 +213,18 @@
 
 - [x] T053 [P] [US2] Failing test in `apps/desktop/src-tauri/tests/elevation_trust_test.rs`: verification must run for the resource-dir, portable-loop and repo-build resolutions in **non-TUN** modes. Fails today: `verify_elevated_binary` is called only at `apps/desktop/src-tauri/src/lib.rs:1373-1379` inside `if routing_mode == "tun"`, and `engine_path` (`:1046-1094`) returns unchecked paths.
   Done. `verify_engine_or_refuse(&executable)` now runs immediately before every `Command::new(&executable)` — connect in any routing mode and the scan child — so the resource-dir, portable-loop and repo-build resolutions of `engine_path` are all checked instead of only the TUN branch. A mode cannot opt out by accident any more: gate 12 (`engine-verified-before-every-spawn` [BC-02]) counts spawn sites against verify calls and also fails if a `verify_elevated_binary(&executable` reappears inside a `routing_mode == "tun"` branch, and it carries a self-test injection that does exactly that. Consequence to know about: a release build with an unpublished anchor now refuses in proxy mode too, not just TUN — which is the 'no bypass compiled in' posture, and the reason T075b's committed-witness gap matters.
-- [ ] T054 [P] [US2] Failing test in `aether/tests/trust_anchor_independent.rs`: delete the shipped engine's `EMBEDDED_RELEASE_HASHES` entry and assert verification **fails**. Fails on two counts today: `apps/desktop/src-tauri/build.rs:38-53` hashes the file it ships (always matches), and `resources/*.exe` is gitignored so a clean checkout hashes nothing and emits no entry — the "missing digest is an error" guard is unreachable.
+- [x] T054 [P] [US2] Failing test in `aether/tests/trust_anchor_independent.rs`: delete the shipped engine's `EMBEDDED_RELEASE_HASHES` entry and assert verification **fails**. Fails on two counts today: `apps/desktop/src-tauri/build.rs:38-53` hashes the file it ships (always matches), and `resources/*.exe` is gitignored so a clean checkout hashes nothing and emits no entry — the "missing digest is an error" guard is unreachable.
+  **Both premises are gone, and the test lives where the digests are.** `build.rs`
+  no longer hashes shipped bytes: it reads `packaging/trust/engine-trust.json`, and
+  `die()`s on a missing, stub or placeholder anchor (`build.rs:5-10,150-160`) and on a
+  missing entry for either artifact (`:131-138`), so deleting the shipped entry is now
+  a build failure rather than a silent pass. The runtime half — an empty digest table
+  must refuse, not wave through — is asserted in
+  `apps/desktop/src-tauri/tests/elevation_trust_test.rs:261` (`embedded_hashes: &[]` →
+  `BinaryTrustError::MissingHash`) beside `:132`
+  `embedded_hashes_are_sourced_from_the_reviewed_anchor_not_from_the_artifact`. An
+  `aether/tests/` file would test nothing: the engine's `trust.rs` is MASQUE SPKI
+  pinning and never consults `EMBEDDED_RELEASE_HASHES`.
 - [x] T055 [P] [US2] Failing test in `aether/tests/wintun_resolution.rs`: `AETHER_WINTUN` pointing at a foreign DLL ⇒ connect fails and the DLL marker file is never created. Fails today: `aether/src/tun_win.rs:25-47` reads the env var and a CWD-relative path in an **elevated** process.
   Test written and green: `tun_win::wintun_resolution_tests` (3 cases) — an
       `AETHER_WINTUN` plant in a temp directory is never resolved, the candidate is never read
@@ -836,6 +858,20 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T190 [US6] Restore motion correctness in `apps/desktop/src/App.css`: define `.spin`/`.spin-icon` keyframes **outside** the `prefers-reduced-motion` block (they currently appear **only** inside it, so both "working" spinners are frozen and a healthy engine looks hung), and make the reduced-motion block cover the 7 animations that actually loop (`radar-sweep-spin`, `ping-ring-pulse`, `breathing-glow`, `sparkline-jitter`, `pulse`, `save-sync-pulse`) instead of naming two non-existent selectors.
 - [x] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
 - [ ] T192 [US6] Complete the CSS integrity pass in `apps/desktop/src/App.css` + `packages/ui/tokens.css`: add the missing rendered classes (`.metric-icon` + `.blue/.coral/.green/.yellow`, `.btn-secondary`, `.retry-btn`, `.status-text`, `.tactile-badge`); delete ~9 orphaned pre-rewrite selectors (`.activity-view`, `.log-line`, `.metrics-grid`, `.status-chip`, `.power-button`, `.save-bar`, …); delete the duplicate `.tactile-copy-btn` block at `:2277` whose equal-specificity position silently kills the emerald hover on all five copy buttons; collapse 8 panel definitions into one `.panel` + modifiers and un-double-class the 6 elements carrying two conflicting panel classes; replace 17 `transition: all`; raise `--muted-dark` `#47535e` (2.40–2.60:1) to ≥4.5:1 and floor labels at 11 px (`.stat-label` is 8.5 px today); unify 6 disabled opacities / 12 radii / 15 border alphas; add `scrollbar-gutter: stable`; make `.sparkline-bar` animate `transform: scaleY()`.
+  **Done so far, and measured:** the 12 radii and 6 disabled opacities are one scale
+  now — 191 declarations across both sheets re-pointed at `--radius-*` /
+  `--opacity-disabled`, which `packages/ui/tokens.css` defines inside the fenced block
+  (`sync-tokens --check` clean). The new `radius-scale-ratchet` gate counts the
+  untokenised values that survived that pass — `0, 1px, 3px, 4px, 5px, 9px, 18px,
+  20px`, eight in each sheet, identically — and fails if the number rises *or* if it
+  falls without the budget being re-measured, so the leftover cannot quietly become the
+  new normal. It also fails any new app sheet that starts with an untokenised radius,
+  and refuses a `--*radius*` token that nothing references. **Left open on purpose:**
+  collapsing those eight onto the scale is a visual judgement (a 1px hairline corner and
+  a 999px pill are not scale steps), and this environment has no screen to make it on.
+  The panel de-duplication, the orphaned-selector deletions and the `.metric-icon`
+  variants are likewise still open — `css-class-resolution` reports them rather than
+  this note guessing.
   <!-- Re-measured against the tree, 2026-09-22, item by item.
        Closed: every named orphan is gone or was only ever a comment
        (`.power-button` survives solely inside the T190 note explaining that it
@@ -1062,6 +1098,22 @@ Checked each part against the current tree rather than assuming the task text wa
 - [ ] T211 [US7] Convert the bridge to async in `apps/android/.../AetherBridge.kt` + `apps/android/src/bridge.ts`: `invoke(cmd, argsJson, requestId)` returns immediately, work dispatches onto `SessionController.scope`, results resolve via `evaluateJavascript("__aetherResolve(<id>,<json>)")`, JS holds a `Map<id, resolver>` with a 30 s timeout (fixes T204). Rejected: Capacitor's plugin runtime (a whole runtime + config for one bridge) and `WebMessageListener` (needs a JS port handshake, unusable before page load).
 - [ ] T212 [US7] Adopt coroutines as the module's single concurrency model in `apps/android/.../{SessionController,AetherVpnService,EngineRunner}.kt`: `SupervisorJob() + Dispatchers.IO`; make `disconnect()`/`testConnection` `suspend`; delete `Thread.sleep` poll loops. `kotlinx-coroutines-android` is already declared and unused — this is the decision that consumes it rather than dropping it.
 - [ ] T213 [US7] Fix the activity lifecycle in `apps/android/.../{MainActivity,SessionController.kt}`: `@Volatile` emitter plus a `CopyOnWriteArrayList` listener registry added in `onStart`/removed in `onStop`, `launchMode="singleTask"` in `AndroidManifest.xml`, `registerForActivityResult` for consent, `pendingConnectAfterVpn` made `@Volatile` and reset inside the posted block, and `onRevoke` only setting flags + posting to the scope (AOSP documents that `onRevoke` "may not happen on the main thread" and requires closing the fd; note `stopProtected()` does **not** exist in AOSP and must not be planned around) (fixes T205).
+  **The registry is done and, for the first time, asserted.** Sinks are keyed by owner
+  in a `LinkedHashMap` under `emitterLock` (`attachUi`/`detachUi`/`hasUi`,
+  `SessionController.kt:60-99`) and `fanOut` copies the map rather than reading a
+  reassigned slot, so one activity's `onDestroy` cannot silence another's session;
+  `shutdownHeadless` only fires when the last sink leaves. Until this commit nothing
+  proved any of it — every harness attached one sink, so collapsing the registry back
+  to a single field left the whole suite green. `SessionControllerTest` now carries
+  `aSecondActivityKeepsReceivingEventsAfterTheFirstOneDies` (A and B both attached, A
+  detached mid-session, B keeps its delivery count climbing, `detachUi` returns false
+  then true) and `attachingTheSameOwnerTwiceReplacesItsSinkInsteadOfStackingIt`. Both
+  feed an endpoint-selection event, not a second `connected`: the state machine
+  correctly publishes nothing when the status does not change and log lines are
+  batched, so a lifecycle event would have tested that instead. **Still open here:**
+  `launchMode="singleTask"`, the deprecated `startActivityForResult` consent path, the
+  `@Volatile`/reset discipline on `pendingConnectAfterVpn`, and `onTaskRemoved`'s wake
+  lock (T217).
   <!-- Checked item by item, 2026-09-22. Four of the five are satisfied, two of
        them by a different mechanism than this text names. The registry is not a
        `CopyOnWriteArrayList` attached in `onStart`: `SessionController` keeps an
