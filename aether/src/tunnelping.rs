@@ -10,19 +10,12 @@ use crate::netstack;
 use crate::noize::NoizeConfig;
 use crate::quic;
 use crate::socks;
+use crate::tunnel::AbortOnDrop;
 use crate::wireguard;
 
 const PING_MTU: usize = 1280;
 const HTTP_PROBE_HOST: &str = "www.gstatic.com";
 const HTTP_PROBE_PATH: &str = "/generate_204";
-
-struct AbortGuard<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortGuard<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 fn http_probe_port() -> u16 {
     crate::runtime_env::u16_or("AETHER_IRONCLAD_PORT", 80)
@@ -121,7 +114,7 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 key_pem: p.key_pem.clone(),
                 probe_src: Some(p.local_ipv4),
             };
-            AbortGuard(tokio::spawn(masque_h2::run(
+            AbortOnDrop(tokio::spawn(masque_h2::run(
                 h2cfg, internals, None, ready_tx,
             )))
         } else {
@@ -136,7 +129,7 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 ech_config_list: None,
                 noize: p.noize.clone(),
             };
-            AbortGuard(tokio::spawn(quic::run(cfg, internals, None, ready_tx)))
+            AbortOnDrop(tokio::spawn(quic::run(cfg, internals, None, ready_tx)))
         };
 
         if ready_rx.await.is_err() {
@@ -190,7 +183,7 @@ pub async fn wg_http_ping_established(
             outbound_tx,
         )?;
 
-        let tunnel_task = AbortGuard(tokio::spawn(tunnel.run(outbound_rx)));
+        let tunnel_task = AbortOnDrop(tokio::spawn(tunnel.run(outbound_rx)));
 
         let start = Instant::now();
         let result = http_probe(&stack).await.map(|()| start.elapsed());

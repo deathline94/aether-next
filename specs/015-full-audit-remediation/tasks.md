@@ -1059,7 +1059,35 @@ Checked each part against the current tree rather than assuming the task text wa
   registry that replaced its job), and the port-tier comment, whose tiers are now
   `T1 = [443]` / `T2 = [500, 1701, 4500]`.
 - [ ] T243 [P] Propagate instead of substituting remaining identity/config parse errors in `aether/src/session.rs`: `parse().unwrap_or(Ipv4Addr::new(172,16,0,2))` at `:471-474,589-592,689-692` (a malformed tunnel address becomes a **wrong source address**, then fails as "network blocking QUIC"), `.parse().ok()` at `:756`, and `Protocol::parse` at `:92-98` mapping any typo to MASQUE; plus `account.rs:411-422` silently zeroing a corrupt `client_id`.
-- [ ] T244 [P] Fix remaining engine leaks in `aether/src/`: bind and abort the H2 connection driver task (`masque_h2.rs:478-482`, today spawned with no handle while `send_task`/`recv_task` are correctly aborted at `:637-638`); cap the unbounded `while let Ok(more) = try_recv()` batch (`quic.rs:492-508`) at 128 as `masque_h2.rs:561` already does; use `base.saturating_add(off)` at `prober.rs:1028` mirroring `enumerate_cidr_v4` at `:1004`.
+- [x] T244 [P] Fix remaining engine leaks in `aether/src/`: bind and abort the H2 connection driver task (`masque_h2.rs:478-482`, today spawned with no handle while `send_task`/`recv_task` are correctly aborted at `:637-638`); cap the unbounded `while let Ok(more) = try_recv()` batch (`quic.rs:492-508`) at 128 as `masque_h2.rs:561` already does; use `base.saturating_add(off)` at `prober.rs:1028` mirroring `enumerate_cidr_v4` at `:1004`.
+  **Landed, item by item.** (1) The driver is now `let _driver =
+  AbortOnDrop(tokio::spawn(..))` in both `masque_h2::run` and `masque_h2::verify_h2`.
+  `verify_h2` was the worse half: it did call `driver.abort()`, but only on the one
+  path that reached it, so a failed `ready`/`send_request`/`await response` — and
+  every probe that the wrapping `tokio::time::timeout` cancels, which is the normal
+  outcome for a dead edge — dropped the future and left the task polling a live TLS
+  session forever. The guard is a local of that future, so cancellation unwinds it.
+  (2) Already satisfied before this task: `c151591` capped that batch at
+  `MAX_EGRESS_PER_TICK = 32`, tighter than the 128 asked for, with the reasoning in
+  the constant's own doc comment. Verified, not re-done. (3) `saturating_add` alone
+  would have hidden the real defect, so the root is fixed instead:
+  `parse_cidr_v4`/`parse_cidr_v6` now clear the host bits and clamp `prefix` to the
+  address space, which is what makes every `base + off` provably in range and stops
+  `10.0.0.5/24` from walking over `10.0.1.x`. Two tests pin it
+  (`cidr_parsing_yields_the_network_not_the_typed_address`,
+  `cidr_candidates_stay_inside_their_network`); run against the pre-fix code on a
+  standalone `rustc -C debug-assertions=on` harness they are red — the sampler
+  panics with `attempt to add with overflow` on `255.255.254.200/22` — and green
+  after, with the shipped CIDR lists unaffected (all already network-aligned, so this
+  is a latent trap, not a live misprobe). Followed through while there: the crate
+  hand-rolled this same abort-on-drop guard three times (`session.rs`,
+  `tunnelping.rs`, `quic.rs`'s `ReaderGuard`) and not at all in `masque_h2.rs`; it is
+  now one type, `tunnel::AbortOnDrop`, kept in that module because adding a new one
+  means editing `lib.rs`, and CI's `fmt` job runs `rustfmt --check` on each touched
+  file *including its submodules* — so any commit that touches `lib.rs` is red until
+  the whole tree is rustfmt-clean (measured: `consts.rs`, `masque.rs`,
+  `routing_plane.rs` and `lib.rs`'s own mod order all drift today).
+
 - [ ] T245 [P] Add obfuscation-layer bounds in `aether/src/{aethernoize.rs,obfuscation.rs}`: clamp `jmin/jmax` to `[0,512]` (an unbounded `AETHER_NOIZE_JMIN=1e8` allocates 100 MB per packet today), keep totals under the path MTU, replace the constant `0x00` emitted for a `(0,0)` pair (a worse fingerprint than sending nothing) with random 1-4-byte filler, remap the decoy first byte so the `+0x40` collision fix does not re-enter WG's 1-4 type range (`aethernoize.rs:281-284`), and `u16::try_from` the IKEv2 `sa_payload_length` (`:134`) instead of `as u16` truncation that makes the header lie.
 - [ ] T246 [P] Make `client_id` injection a per-tunnel random 3-byte tag, **default off** (`aether/src/wireguard.rs:19-37`): `mac1` is computed over the packet with reserved bytes zeroed, so against any standards-strict WG peer every injected packet fails authentication (undialable, no diagnostic), and against Cloudflare it emits a stable cleartext per-account identifier on every packet including thousands of probe packets.
 - [ ] T247 [P] Fix the two `let _ =` TLS no-ops in `aether/src/tls.rs:87-94`: `set_cipher_list` governs only pre-1.3 suites so the "rotate ClientHello profile per-session" control changes nothing while its error is discarded — use `set_ciphers13`/signature-algorithm permutation and propagate failure; raise the H2 floor from TLS 1.2 to 1.3 in `aether/src/masque_h2.rs:70-74`.

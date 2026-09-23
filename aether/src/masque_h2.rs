@@ -14,6 +14,7 @@ use crate::consts;
 use crate::error::{AetherError, Result};
 use crate::masque::{self, Capsule, CapsuleParser};
 use crate::quic::{AssignedAddr, Internals};
+use crate::tunnel::AbortOnDrop;
 
 // OpenSSL wire format: length-prefixed protocol list.
 const H2_ALPN: &[u8] = b"\x02h2";
@@ -424,9 +425,14 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         let (h2, connection) = h2::client::handshake(tls)
             .await
             .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
-        let driver = tokio::spawn(async move {
+        // The driver is the only thing polling this socket: without it `h2` never
+        // reads a frame and `resp_fut` never resolves. As a bare handle it also
+        // outlived every exit below — including the `timeout()` that wraps this
+        // block and drops the future mid-await — so each probe of a dead edge
+        // leaked a live TLS session. Guarded, it dies with the attempt.
+        let _driver = AbortOnDrop(tokio::spawn(async move {
             let _ = connection.await;
-        });
+        }));
         let mut h2 = h2
             .ready()
             .await
@@ -438,7 +444,6 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         let response = resp_fut
             .await
             .map_err(|e| AetherError::Masque(format!("await response: {e}")))?;
-        driver.abort();
         let status = response.status();
         if !status.is_success() {
             return Err(AetherError::Masque(format!(
@@ -495,11 +500,15 @@ pub async fn run(
         .handshake(tls)
         .await
         .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
-    tokio::spawn(async move {
+    // Same reasoning as in `verify_h2`, at tunnel scale: everything below — the
+    // `h2` handle, both stream tasks — is inert unless this driver is polled, and
+    // every exit between here and the select (`ready`, `send_request`, a non-200,
+    // a failed dataplane probe) used to abandon it holding an open TLS session.
+    let _driver = AbortOnDrop(tokio::spawn(async move {
         if let Err(e) = connection.await {
             log::debug!("[h2] connection driver ended: {e}");
         }
-    });
+    }));
 
     let mut h2 = h2
         .ready()

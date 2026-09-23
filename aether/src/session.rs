@@ -26,7 +26,7 @@ use crate::runtime_env;
 use crate::session_event::{self, SessionEvent};
 use crate::socks;
 use crate::tls;
-use crate::tunnel;
+use crate::tunnel::{self, AbortOnDrop};
 use crate::wireguard;
 
 // ─── MTU helpers ────────────────────────────────────────────────────────────
@@ -78,28 +78,8 @@ async fn wireguard_mtu(ipv6_configured: bool) -> usize {
     crate::mtu::clamp_for_ip_families(capped, ipv6_configured)
 }
 
-/// Detached-task guard (M12 fix): aborts its task on drop so leaked tunnels stop
-/// pinging the edge after their owner fails or unwinds.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-impl<T> AbortOnDrop<T> {
-    /// Resolve when the wrapped task does, without consuming the guard — the
-    /// supervision select needs to await it while every other exit path still has
-    /// to abort it. A guard whose task nobody can wait on is how a dead inner
-    /// tunnel turned into a hung session.
-    async fn done(&mut self) -> std::result::Result<T, tokio::task::JoinError> {
-        (&mut self.0).await
-    }
-}
-
 /// Active readiness gate (M12 fix): replaces the blind 1.5s sleep before the
-/// gool inner tunnel. Any completed open_tcp outcome — success OR fast refusal —
+/// inner tunnel. Any completed open_tcp outcome — success OR fast refusal —
 /// proves the data plane round-trips; only a timeout means the handshake never
 /// came up. Retries give boringtun time to finish under slow links.
 async fn wait_stack_alive(stack: &netstack::StackHandle, label: &str) -> Result<()> {

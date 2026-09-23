@@ -1291,12 +1291,23 @@ fn cap_and_order(
 // CIDR utilities (shared, single copy)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// `a.b.c.d/nn` as the network's base address — host bits cleared — and prefix.
+///
+/// Clearing the host bits is the contract, not a nicety: every caller adds a
+/// host offset below `2^host_bits` to this base, so an unmasked address either
+/// probes hosts outside the network the CIDR names (`10.0.0.5/24` walking over
+/// `10.0.1.x`) or overflows `u32` in that addition — panic in a debug build,
+/// silent wrap in release (`255.255.254.200/22` + 1022). Clamping the prefix
+/// keeps the same promise for `prefix`: a caller's `32 - prefix` can then never
+/// shift by a negative or an over-wide amount. The shipped lists are all
+/// network-aligned, so this is a latent trap rather than a live misprobe.
 fn parse_cidr_v4(cidr: &str) -> Option<(u32, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u32::from(ip.parse::<Ipv4Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
+    let prefix = prefix.parse::<u8>().ok()?.min(32);
+    let addr = u32::from(ip.parse::<Ipv4Addr>().ok()?);
+    // /0 masks everything away; `checked_shl` because `u32::MAX << 32` panics.
+    let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+    Some((addr & mask, prefix))
 }
 
 fn enumerate_cidr_v4(cidr: &str) -> Vec<Ipv4Addr> {
@@ -1349,19 +1360,22 @@ fn sample_cidr_v4(cidr: &str, n: usize) -> Vec<Ipv4Addr> {
     while (out.len() as u32) < want {
         let off = 1 + rng.gen_range(0..usable);
         if chosen.insert(off) {
-            out.push(Ipv4Addr::from(base + off));
+            out.push(Ipv4Addr::from(base.saturating_add(off)));
         }
     }
 
     out
 }
 
+/// v6 twin of [`parse_cidr_v4`]: network base plus clamped prefix. The base is
+/// what `sample_cidr_v6` ORs an embedded v4/host value into, so unmasked host
+/// bits here would leak into every candidate it produces.
 fn parse_cidr_v6(cidr: &str) -> Option<(u128, u8)> {
     let (ip, prefix) = cidr.split_once('/')?;
-    Some((
-        u128::from(ip.parse::<Ipv6Addr>().ok()?),
-        prefix.parse().ok()?,
-    ))
+    let prefix = prefix.parse::<u8>().ok()?.min(128);
+    let addr = u128::from(ip.parse::<Ipv6Addr>().ok()?);
+    let mask = u128::MAX.checked_shl(128 - u32::from(prefix)).unwrap_or(0);
+    Some((addr & mask, prefix))
 }
 
 fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
@@ -2040,6 +2054,60 @@ mod candidate_tests {
         assert!(big.len() <= 4096, "enumeration must be capped");
         // A small CIDR still enumerates fully (excludes network + broadcast).
         assert_eq!(enumerate_cidr_v4("10.9.9.0/30").len(), 2);
+    }
+
+    #[test]
+    fn cidr_parsing_yields_the_network_not_the_typed_address() {
+        let v4 = |s: &str| u32::from(s.parse::<std::net::Ipv4Addr>().unwrap());
+        let v6 = |s: &str| u128::from(s.parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(parse_cidr_v4("10.0.0.5/24"), Some((v4("10.0.0.0"), 24)));
+        assert_eq!(
+            parse_cidr_v4("255.255.254.200/22"),
+            Some((v4("255.255.252.0"), 22))
+        );
+        assert_eq!(parse_cidr_v4("0.0.0.5/0"), Some((v4("0.0.0.0"), 0)));
+        assert_eq!(parse_cidr_v4("10.0.0.1/32"), Some((v4("10.0.0.1"), 32)));
+        // A prefix the v4 space cannot hold reads as a host route rather than
+        // reaching a caller as `32 - 33`.
+        assert_eq!(parse_cidr_v4("10.0.0.1/33"), Some((v4("10.0.0.1"), 32)));
+        assert_eq!(parse_cidr_v4("10.0.0.1"), None);
+        assert_eq!(parse_cidr_v4("10.0.0.256/24"), None);
+        assert_eq!(
+            parse_cidr_v6("2606:4700:d1::a29f:c602/48"),
+            Some((v6("2606:4700:d1::"), 48))
+        );
+        assert_eq!(parse_cidr_v6("::1/129"), Some((v6("::1"), 128)));
+        assert_eq!(parse_cidr_v6("fe80::1/64"), Some((v6("fe80::"), 64)));
+    }
+
+    #[test]
+    fn cidr_candidates_stay_inside_their_network() {
+        // Both samplers add offsets in `1..=size-2` to the parsed base. With the
+        // base unmasked that addition left the stated network — and, for a
+        // top-of-space CIDR, `u32` itself, which panics a debug build.
+        for cidr in ["10.0.0.5/24", "192.168.7.130/25", "255.255.254.200/22"] {
+            let (base, prefix) = parse_cidr_v4(cidr).unwrap();
+            let size = u64::from(1u32 << (32 - u32::from(prefix)));
+            let network_end = u64::from(base) + size;
+            for a in sample_cidr_v4(cidr, 64) {
+                let n = u64::from(u32::from(a));
+                assert!(
+                    n > u64::from(base) && n < network_end,
+                    "{cidr} sampled {a}, which is not in /{prefix}"
+                );
+            }
+            for a in enumerate_cidr_v4(cidr) {
+                let n = u64::from(u32::from(a));
+                assert!(
+                    n > u64::from(base) && n < network_end,
+                    "{cidr} enumerated {a}, which is not in /{prefix}"
+                );
+            }
+            assert!(
+                !sample_cidr_v4(cidr, 64).is_empty(),
+                "{cidr} sampled nothing"
+            );
+        }
     }
 
     // QA-1 verification: a scan cancelled mid-flight (e.g. the user pressing Stop)

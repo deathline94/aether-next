@@ -267,9 +267,10 @@ type NetPacket = (SocketAddr, SocketAddr, Vec<u8>);
 /// the connection that started it - through reconnect, tunnel close, or a panic
 /// unwinding the scope. Without this, a long-lived session that reconnects many
 /// times accumulates orphaned tokio tasks each holding a read buffer
-/// (>=64KB x N leaks).
+/// (>=64KB x N leaks). The aborting itself is `tunnel::AbortOnDrop`, the one
+/// copy in the crate.
 struct ReaderGuard {
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    handles: Vec<crate::tunnel::AbortOnDrop<()>>,
 }
 
 impl ReaderGuard {
@@ -279,15 +280,7 @@ impl ReaderGuard {
         }
     }
     fn push(&mut self, h: tokio::task::JoinHandle<()>) {
-        self.handles.push(h);
-    }
-}
-
-impl Drop for ReaderGuard {
-    fn drop(&mut self) {
-        for h in self.handles.drain(..) {
-            h.abort();
-        }
+        self.handles.push(crate::tunnel::AbortOnDrop(h));
     }
 }
 
