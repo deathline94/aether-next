@@ -4,10 +4,14 @@ package app.aethernext
  * The noise-profile vocabulary the shell may put on the engine's command line, and
  * the scan limits it may enforce (T2xx).
  *
- * Two homes for one fact was the bug: the UI offered `medium`/`high`/`max` while the
- * engine maps only `off|light|aggressive|heavy`, so what the app sent for `high` was
- * whatever the engine's own fallback happened to be — a silent downgrade the user
- * could not see. The table below *is* the contract now: [forEngine] returns null for
+ * Two homes for one fact was the bug, and this table was the second home. It claimed
+ * the engine knew only `off|light|aggressive|heavy` and mapped the app's `high` and
+ * `max` both onto `heavy` — which the engine's own `obfuscation::normalize` folds to
+ * `max`. So the phone had one rung fewer than desktop, and choosing "High" sent the
+ * loudest profile the user did not ask for. The engine's vocabulary is
+ * `obfuscation::RECOGNIZED_PROFILES`, whose ladder is off < light < medium < high <
+ * max (plus aliases and `custom`); every value below is one of those names, and the
+ * app's four settings stay four distinct rungs. [forEngine] still returns null for
  * anything it does not know, and validation rejects a setting it cannot translate
  * rather than passing a guess downstream.
  *
@@ -19,7 +23,7 @@ package app.aethernext
 internal object NoizeProfiles {
 
     /** The names the engine understands. Anything else is a shell-side invention. */
-    val engineValues: Set<String> = setOf("off", "light", "aggressive", "heavy")
+    val engineValues: Set<String> = setOf("off", "light", "medium", "high", "max", "custom")
 
     /** The names the app may send: its canonical set plus the legacy aliases it still reads back from a saved profile. */
     val appValues: Set<String> = setOf(
@@ -33,16 +37,21 @@ internal object NoizeProfiles {
         "on" to "light",
         "random" to "light",
         "m1" to "light",
-        "medium" to "aggressive",
-        "balanced" to "aggressive",
-        "firewall" to "aggressive",
-        "custom" to "aggressive",
-        "aggressive" to "aggressive",
-        "high" to "heavy",
-        "max" to "heavy",
-        "heavy" to "heavy",
-        "gfw" to "heavy",
-        "m2" to "heavy",
+        // The app's own ladder, kept distinct: folding high and max together onto
+        // one engine name is what made "High" mean the loudest setting.
+        "medium" to "medium",
+        "balanced" to "medium",
+        "firewall" to "medium",
+        "high" to "high",
+        "gfw" to "high",
+        "max" to "max",
+        "heavy" to "max",
+        "aggressive" to "max",
+        "m2" to "max",
+        // The user's own junk sizes (AETHER_NOIZE_JC/JMIN/JMAX) decide the traffic;
+        // the named profile only has to switch injection on, and the engine knows
+        // `custom` by name.
+        "custom" to "custom",
     )
 
     init {

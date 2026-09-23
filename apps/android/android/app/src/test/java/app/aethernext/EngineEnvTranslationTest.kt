@@ -51,4 +51,29 @@ class EngineEnvTranslationTest {
             thrown is IllegalArgumentException,
         );
     }
+
+    /**
+     * The ladder the Settings menu shows is four rungs, and the phone must send four
+     * distinct engine names for them. Both "High" and "Max" used to arrive as
+     * `heavy`, which the engine's own normalize() folds to `max` — so a user who
+     * picked the second-loudest setting got the loudest one, and desktop and the
+     * phone disagreed about what the same choice meant.
+     */
+    @Test
+    fun theFourNoiseRungsStayFourDistinctEngineNames() {
+        val ladder = listOf("light", "medium", "high", "max").map { EngineRunner.noizeEnv(it) }
+        assertEquals("off|light|medium|high|max", (listOf("off") + ladder).joinToString("|"));
+        assertEquals("each rung must reach the engine as itself", 4, ladder.toSet().size);
+    }
+
+    @Test
+    fun legacyProfileNamesLandOnTheRungTheEngineGivesThem() {
+        // obfuscation::normalize folds aggressive|heavy into max and gfw into high;
+        // a saved setting carrying an old name has to mean the same thing here.
+        assertEquals("max", EngineRunner.noizeEnv("aggressive"));
+        assertEquals("max", EngineRunner.noizeEnv("heavy"));
+        assertEquals("high", EngineRunner.noizeEnv("gfw"));
+        assertEquals("medium", EngineRunner.noizeEnv("balanced"));
+        assertEquals("custom", EngineRunner.noizeEnv("custom"));
+    }
 }
