@@ -688,6 +688,114 @@ const GATES = [
     },
   },
   {
+    name: 'numeric-limits-cross-layer',
+    invariant: 'BC-13',
+    summary: 'one value per scan limit across engine, both shells and the web layer',
+    scan(api) {
+      /**
+       * FR-026: "numeric limits MUST be enums/typed constants shared with the
+       * engine, not string allowlists". Four languages hold these numbers and there
+       * is no code generator yet (that is T019), so the sharing is enforced by
+       * agreement rather than by import. This gate is the difference between a
+       * drift being a red build and being a bug report six months later: the same
+       * knob was last found reading 500 on desktop, 2000 on Android, 1000 in the
+       * engine's absolute ceiling and 16 for an H3 scan, with the field that
+       * offered 2000 promising lanes nothing could ever run.
+       */
+      const num = (file, rx, label) => {
+        const src = api.read(file);
+        const m = src.match(rx);
+        if (!m) return { missing: `${label} not found in ${file}` };
+        return { value: m[1] };
+      };
+      // A digit separator in a literal is the same number without it. `String.raw`
+      // because in an ordinary string literal `"\d"` is just `d`, which turned every
+      // one of these captures into a single digit and every comparison into noise.
+      const NUM = String.raw`(\d[\d_]*)`;
+      const want = (n) => (typeof n === "number" ? n : Number(String(n).replace(/_/g, "")));
+      const specs = [
+        // The engine's own ladder, in prober.rs.
+        ['aether/src/prober.rs', new RegExp(`EXPENSIVE_MAX_CONCURRENCY: usize = ${NUM}`), 'engineH3Lanes'],
+        ['aether/src/prober.rs', new RegExp(`SCAN_CONCURRENCY_CEILING: usize = ${NUM}`), 'engineLanes'],
+        ['aether/src/prober.rs', /EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis\((\d[\d_]*)\)/, 'engineMasqueFloor'],
+        // The web layer's shared copy.
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MAX_CONCURRENCY = ${NUM}`), 'uiLanes'],
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MAX_CONCURRENCY_H3 = ${NUM}`), 'uiH3Lanes'],
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MASQUE_MIN_TIMEOUT_MS = ${NUM}`), 'uiMasqueFloor'],
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MIN_TIMEOUT_MS = ${NUM}`), 'uiFloor'],
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MAX_TIMEOUT_MS = ${NUM}`), 'uiCeiling'],
+        ['packages/ui/src/index.ts', new RegExp(`SCAN_MIN_CONCURRENCY = ${NUM}`), 'uiMinLanes'],
+        // The two shells that clamp what the web layer sends. The Tauri side is a
+        // directory scan rather than one named file so that a *second* clamp added
+        // somewhere else in the shell is caught as drift instead of ignored.
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MAX_CONCURRENCY = ${NUM}`), 'kotlinLanes'],
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MIN_CONCURRENCY = ${NUM}`), 'kotlinMinLanes'],
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MASQUE_MIN_TIMEOUT_MS = ${NUM}`), 'kotlinMasqueFloor'],
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp('MIN_TIMEOUT_MS = ' + NUM), 'kotlinFloor'],
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MAX_TIMEOUT_MS = ${NUM}`), 'kotlinCeiling'],
+      ];
+      const v = [];
+      const found = {};
+      const raw = {};
+      for (const [file, rx, label] of specs) {
+        const r = num(file, rx, label);
+        if (r.missing) v.push(r.missing);
+        else {
+          found[label] = want(r.value);
+          raw[label] = `${file} = "${r.value}"`;
+        }
+      }
+      if (v.length) return v;
+      const shellClamps = [];
+      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
+        const src = api.read(f);
+        for (const m of src.matchAll(/concurrency\.clamp\(\s*([\d_]+)\s*,\s*([\d_]+)\s*\)/g)) {
+          shellClamps.push({ file: f, min: want(m[1]), max: want(m[2]) });
+        }
+      }
+      if (!shellClamps.length) {
+        v.push('the Tauri shell clamps scan concurrency nowhere, so nothing was compared');
+      }
+      for (const c of shellClamps) {
+        if (c.max !== found.uiLanes) {
+          v.push(`${c.file}: shell clamps lanes to ${c.max}, the web layer offers ${found.uiLanes}`);
+        }
+        if (c.min !== found.uiMinLanes) {
+          v.push(`${c.file}: shell minimum lanes ${c.min} vs the shared ${found.uiMinLanes}`);
+        }
+      }
+      const eq = (label, ...keys) => {
+        const vals = keys.map((k) => found[k]);
+        if (vals.some((x, i) => !Number.isFinite(x) || x !== vals[0])) {
+          const where = keys.map((k) => `${k}=${vals[keys.indexOf(k)]}`).join(' vs ');
+          const from = keys.map((k) => raw[k] ?? 'not read').join(', ');
+          v.push(`${label}: ${where} — one limit, several numbers (${from})`);
+        }
+      };
+      eq('H3 lane ceiling', 'engineH3Lanes', 'uiH3Lanes');
+      eq('MASQUE/QUIC timeout floor', 'engineMasqueFloor', 'uiMasqueFloor', 'kotlinMasqueFloor');
+      eq('timeout floor', 'uiFloor', 'kotlinFloor');
+      eq('timeout ceiling', 'uiCeiling', 'kotlinCeiling');
+      eq('minimum lanes', 'uiMinLanes', 'kotlinMinLanes');
+      // The shells clamp to the number the web layer offers; the engine's absolute
+      // ceiling only has to be >= it (it is the crash guard, not the product rule).
+      eq('shell lane ceiling', 'uiLanes', 'kotlinLanes');
+      if (found.engineLanes < found.uiLanes) {
+        v.push(`engine ceiling ${found.engineLanes} is below the offered ${found.uiLanes}`);
+      }
+      if (found.uiH3Lanes > found.uiLanes) {
+        v.push(`the H3 ceiling ${found.uiH3Lanes} cannot exceed the generic ${found.uiLanes}`);
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/__selftest__.rs',
+        content: 'fn f(concurrency: u32) -> u32 {\n  concurrency.clamp(1, 9999)\n}\n',
+      };
+    },
+  },
+  {
     name: 'tls-floor-is-1-3',
     invariant: 'BC-03',
     summary: 'every engine TLS context sets its floor to 1.3; no 1.2-or-below constant',

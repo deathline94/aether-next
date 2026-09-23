@@ -17,19 +17,69 @@ export const DESIGN_TOKENS_VERSION = 1;
  * while the shell clamped to 500, so the user could pick 2000 workers and
  * silently get 500 with no explanation. Generated bindings (T019) become the
  * authoritative source for these; this constant is the interim single home.
+ *
+ * The ladder the frontends have to describe is three deep, which is why all
+ * three numbers live here rather than the one that happens to bind the slider:
+ * 500 is what a shell will accept, 1000 is the engine's absolute ceiling for a
+ * cheap verify (`SCAN_CONCURRENCY_CEILING` in `aether/src/prober.rs`), and 16 is
+ * what an H3 scan actually runs because more concurrent BoringSSL handshakes
+ * abort the process (`EXPENSIVE_MAX_CONCURRENCY`). The strictest of those is the
+ * one the field has to stop at, or the UI is advertising lanes that never exist.
  */
 export const SCAN_MAX_CONCURRENCY = 500;
 export const SCAN_MIN_CONCURRENCY = 1;
 
+/** Lanes an H3/QUIC scan will really run: the engine's handshake-safety ceiling. */
+export const SCAN_MAX_CONCURRENCY_H3 = 16;
+
+/**
+ * Whether a scan's probes are QUIC handshakes — the only condition under which
+ * `hunt_best` raises the per-probe floor to 6 s and narrows the run to 16 lanes
+ * (`VerifyCost::Expensive`, `aether/src/prober.rs`).
+ *
+ * `masque-h2` is deliberately *not* in here: its probes are TCP+TLS handshakes
+ * the engine classifies as cheap, so the desktop was raising their floor for a
+ * reason the engine does not have — and offering a slower scan than the phone
+ * offers for the same protocol (`EngineProfiles.kt:99` and the Android web layer
+ * both already excluded it, `startsWith("masque")` did not). One predicate now
+ * decides expense for the floor, the lane ceiling, and both frontends.
+ */
+export function isExpensiveVerifyProtocol(protocol: string): boolean {
+  const p = (protocol ?? "").toLowerCase();
+  return p.includes("h3") || p === "masque";
+}
+
+/** The ceiling that applies to a given scan protocol. */
+export function scanConcurrencyCeiling(protocol: string): number {
+  return isExpensiveVerifyProtocol(protocol) ? SCAN_MAX_CONCURRENCY_H3 : SCAN_MAX_CONCURRENCY;
+}
+
+/**
+ * Workers the engine will actually run for this protocol.
+ *
+ * Both front-ends used to keep their own clamp (the desktop's was protocol-blind,
+ * the Android hook sent the raw number), which is the same rule written twice and
+ * disagreed about the one thing that matters: the number printed in the "starting
+ * scan" log is the number the engine will not honour for an H3 run.
+ */
+export function clampConcurrency(value: number, protocol = ""): number {
+  if (!Number.isFinite(value)) return SCAN_MIN_CONCURRENCY;
+  return Math.min(
+    scanConcurrencyCeiling(protocol),
+    Math.max(SCAN_MIN_CONCURRENCY, Math.round(value)),
+  );
+}
+
 /**
  * Per-probe timeout bounds, in milliseconds.
  *
- * The floor is not a UI preference: a probe under 3 s cannot finish a
- * handshake, and MASQUE cannot finish one in 3 s, so the native layer and the
- * shell both raise whatever arrives. The Android scanner offered 100-30000 while
- * the bridge coerced to >=3000 (>=6000 for MASQUE): a user typing 500 got 3000
- * with no feedback and no explanation of the difference. One home for the three
- * numbers, referenced by `ScanLimits` on the Kotlin side and by both front-ends.
+ * The floor is not a UI preference: a probe under 3 s cannot finish a handshake,
+ * and a QUIC handshake cannot finish in 3 s, so the native layer and the shell
+ * both raise whatever arrives. The Android scanner offered 100-30000 while the
+ * bridge coerced to >=3000 (>=6000 for MASQUE-over-QUIC): a user typing 500 got
+ * 3000 with no feedback and no explanation of the difference. One home for the
+ * three numbers, referenced by `ScanLimits` on the Kotlin side and by both
+ * front-ends, and one predicate deciding which protocol gets which floor.
  */
 export const SCAN_MIN_TIMEOUT_MS = 3_000;
 export const SCAN_MASQUE_MIN_TIMEOUT_MS = 6_000;
@@ -37,7 +87,9 @@ export const SCAN_MAX_TIMEOUT_MS = 30_000;
 
 /** The floor that applies to a given scan protocol. */
 export function scanTimeoutFloor(protocol: string): number {
-  return protocol.startsWith("masque") ? SCAN_MASQUE_MIN_TIMEOUT_MS : SCAN_MIN_TIMEOUT_MS;
+  return isExpensiveVerifyProtocol(protocol)
+    ? SCAN_MASQUE_MIN_TIMEOUT_MS
+    : SCAN_MIN_TIMEOUT_MS;
 }
 
 /** Raise a requested timeout into the range the engine will actually honour. */

@@ -6,10 +6,10 @@ import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
 import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
 import {
   nextOptionIndex,
-  SCAN_MAX_CONCURRENCY,
   SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
-  SCAN_MIN_TIMEOUT_MS,
+  scanConcurrencyCeiling,
+  scanTimeoutFloor,
 } from "../../../../packages/ui/src";
 import { rttLike } from "../hooks/useScanner";
 import { NumberField, Segmented } from "./ui";
@@ -315,13 +315,13 @@ export function ScannerTab({
               <div className="field-meta">
                 <strong>Concurrency (Workers)</strong>
                 <span className="field-hint">
-                  {SCAN_MIN_CONCURRENCY}&ndash;{SCAN_MAX_CONCURRENCY} active
+                  {SCAN_MIN_CONCURRENCY}&ndash;{scanConcurrencyCeiling(protocol)} lanes
                 </span>
               </div>
               <NumberField
                 label="Concurrency (workers)"
                 min={SCAN_MIN_CONCURRENCY}
-                max={SCAN_MAX_CONCURRENCY}
+                max={scanConcurrencyCeiling(protocol)}
                 step={10}
                 value={concurrency}
                 disabled={active}
@@ -333,11 +333,11 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Timeout (ms)</strong>
-                <span className="field-hint">{SCAN_MIN_TIMEOUT_MS}–{SCAN_MAX_TIMEOUT_MS} ms</span>
+                <span className="field-hint">{scanTimeoutFloor(protocol)}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
               <NumberField
                 label="Timeout (ms)"
-                min={SCAN_MIN_TIMEOUT_MS}
+                min={scanTimeoutFloor(protocol)}
                 max={SCAN_MAX_TIMEOUT_MS}
                 step={100}
                 value={timeoutMs}

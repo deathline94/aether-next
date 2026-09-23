@@ -13,8 +13,7 @@ import type {
 import { errorMessage } from "../ipcError";
 import { hitAddressKey } from "../../../../packages/ui/src/logs";
 import {
-  SCAN_MAX_CONCURRENCY,
-  SCAN_MIN_CONCURRENCY,
+  clampConcurrency,
   effectiveScanTimeout,
   scanVerdict,
 } from "../../../../packages/ui/src";
@@ -37,11 +36,12 @@ export function scanNoizeFor(protocol: ScanProtocol, noize: NoizeProfile): Noize
   return oneOf(noize, NOIZE_PROFILES, "off");
 }
 
-/** Workers the engine will run, which is the only range worth offering. */
-export function clampConcurrency(value: number): number {
-  if (!Number.isFinite(value)) return SCAN_MIN_CONCURRENCY;
-  return Math.min(SCAN_MAX_CONCURRENCY, Math.max(SCAN_MIN_CONCURRENCY, Math.round(value)));
-}
+/**
+ * The clamp itself lives in `packages/ui`, beside the ladder it reads, so both
+ * front-ends resolve a protocol to the same number of lanes. Re-exported here
+ * because the tests and callers of this module reach for it by this path.
+ */
+export { clampConcurrency };
 
 /**
  * A round-trip that can be shown: the engine's own text, or a measured number
@@ -231,7 +231,7 @@ export function useScanner(
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     // The two values are clamped before they are both announced and sent, so the
     // log line describes the run the engine will actually perform.
-    const workers = clampConcurrency(concurrency);
+    const workers = clampConcurrency(concurrency, protocol);
     const timeout = effectiveScanTimeout(protocol, timeoutMs);
     const noiseProfile = scanNoizeFor(protocol, noize);
     appendLog({

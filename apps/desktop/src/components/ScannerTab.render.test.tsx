@@ -2,7 +2,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ScannerTab } from "./ScannerTab";
-import { SCAN_MAX_CONCURRENCY } from "../../../../packages/ui/src";
+import {
+  SCAN_MAX_CONCURRENCY,
+  SCAN_MAX_CONCURRENCY_H3,
+  SCAN_MASQUE_MIN_TIMEOUT_MS,
+  SCAN_MIN_TIMEOUT_MS,
+} from "../../../../packages/ui/src";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint } from "../types";
 import { stubViewport } from "../testing/viewport";
@@ -45,17 +50,33 @@ function renderTab(over: Partial<Parameters<typeof ScannerTab>[0]> = {}) {
 }
 
 describe("ScannerTab probe parameters", () => {
-  it("offers the concurrency the shell will actually run", () => {
-    // The field allowed 2000 while the engine clamps to 500, so the "Workers
-    // Active" chip contradicted the number that was typed.
-    renderTab();
-    // The name asserted here is the *visible* label text on purpose: an accessible
-    // name that drops the words on screen is a WCAG 2.5.3 failure for speech-input
-    // users, and this is what catches it.
-    const field = screen.getByRole("spinbutton", { name: /concurrency \(workers\)/i });
-    expect(field.getAttribute("max")).toBe(String(SCAN_MAX_CONCURRENCY));
-    expect(field.getAttribute("min")).toBe("1");
-    expect(screen.getByText(/1\u2013500 active/i)).toBeTruthy();
+  it("offers only the lanes and the timeout the engine will honour, per protocol", () => {
+    // Two drifts, both closed by reading the ladder from one place: the field used
+    // to allow 2000 while the shells clamp to 500, and an H3 scan never runs more
+    // than `SCAN_MAX_CONCURRENCY_H3` lanes because more concurrent BoringSSL
+    // handshakes abort the engine. The names asserted here are the *visible* label
+    // text on purpose \u2014 an accessible name that drops the words on screen is a
+    // WCAG 2.5.3 failure for a speech-input user.
+    renderTab({ protocol: "masque-h3" });
+    expect(
+      screen.getByRole("spinbutton", { name: /concurrency \(workers\)/i }).getAttribute("max"),
+    ).toBe(String(SCAN_MAX_CONCURRENCY_H3));
+    expect(
+      screen.getByRole("spinbutton", { name: /timeout \(ms\)/i }).getAttribute("min"),
+    ).toBe(String(SCAN_MASQUE_MIN_TIMEOUT_MS));
+    cleanup();
+
+    renderTab({ protocol: "masque-h2" });
+    const lanes = screen.getByRole("spinbutton", { name: /concurrency \(workers\)/i });
+    expect(lanes.getAttribute("max")).toBe(String(SCAN_MAX_CONCURRENCY));
+    expect(lanes.getAttribute("min")).toBe("1");
+    // An H2 probe is a TCP+TLS handshake the engine classifies as cheap, so the QUIC
+    // floor must not be applied here: `startsWith("masque")` used to give the desktop
+    // a 6 s minimum for a protocol the phone happily probes at 3 s.
+    expect(
+      screen.getByRole("spinbutton", { name: /timeout \(ms\)/i }).getAttribute("min"),
+    ).toBe(String(SCAN_MIN_TIMEOUT_MS));
+    expect(screen.getByText(/1\u2013500 lanes/)).toBeTruthy();
   });
 
   it("shows the noise profile that is really being sent", () => {

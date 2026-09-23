@@ -1,4 +1,11 @@
 import { parseRuntimeCore } from "../../../packages/ui/src";
+import {
+  SCAN_MAX_CONCURRENCY,
+  SCAN_MAX_TIMEOUT_MS,
+  SCAN_MASQUE_MIN_TIMEOUT_MS,
+  SCAN_MIN_CONCURRENCY,
+  SCAN_MIN_TIMEOUT_MS,
+} from "../../../packages/ui/src";
 import type { RuntimeStatus } from "../../../packages/ui/src";
 import type { LogLevel } from "../../../packages/ui/src/enums";
 import { SPEED_PROFILES, speedProfileHint } from "../../../packages/ui/src/enums";
@@ -192,23 +199,27 @@ export type ScanEvent =
  * the floor instead of silently rewriting what was typed.
  */
 export const SCAN_LIMITS = {
-  minTimeoutMs: 3000,
-  masqueMinTimeoutMs: 6000,
-  maxTimeoutMs: 30000,
-  minConcurrency: 1,
-  maxConcurrency: 2000,
+  minTimeoutMs: SCAN_MIN_TIMEOUT_MS,
+  masqueMinTimeoutMs: SCAN_MASQUE_MIN_TIMEOUT_MS,
+  maxTimeoutMs: SCAN_MAX_TIMEOUT_MS,
+  minConcurrency: SCAN_MIN_CONCURRENCY,
+  maxConcurrency: SCAN_MAX_CONCURRENCY,
 } as const;
 
-/** The floor that applies to a given protocol, mirroring the shell's `clampTimeout`. */
-export function scanTimeoutFloor(protocol: string): number {
-  const p = protocol.toLowerCase();
-  return p.includes("h3") || p === "masque" ? SCAN_LIMITS.masqueMinTimeoutMs : SCAN_LIMITS.minTimeoutMs;
-}
-
-/** The value actually sent for `timeoutMs`, after the shell's clamp. */
-export function effectiveScanTimeout(protocol: string, timeoutMs: number): number {
-  return Math.min(SCAN_LIMITS.maxTimeoutMs, Math.max(scanTimeoutFloor(protocol), timeoutMs));
-}
+/**
+ * The floor/ceiling predicates live in `packages/ui`, because the rule they
+ * encode — which protocol's probes are QUIC handshakes — is the engine's, not
+ * this app's. `scanTimeoutFloor` used to be rewritten here (correctly, as it
+ * happened) while the desktop's copy said `startsWith("masque")` and therefore
+ * gave an H2 scan a 6 s floor the engine never asks for; two spellings of one
+ * rule is how they part ways, so this file re-exports instead.
+ */
+export {
+  scanTimeoutFloor,
+  effectiveScanTimeout,
+  scanConcurrencyCeiling,
+  clampConcurrency,
+} from "../../../packages/ui/src";
 
 /** One-click speed presets, shared by Connection tab. */
 export const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({

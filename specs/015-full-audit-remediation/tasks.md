@@ -1297,6 +1297,45 @@ Checked each part against the current tree rather than assuming the task text wa
   if any shell source deletes `config_key.dpapi` or the `key_file` binding, and
   which `--selftest-fail` proves can fail.
 
+- [x] T256 [US6] FR-026: settings, transport options and numeric limits as enums/typed constants shared with the engine, not string allowlists.
+  **The ladder this found was worse than the task assumed.** One knob — scan
+  concurrency — read 500 on desktop (`scan.rs:49`, `packages/ui`), **2000** on
+  Android (`EngineProfiles.kt`, mirrored in `apps/android/src/types.ts`), 1000 as
+  the engine's absolute ceiling and 16 for an H3 scan (`prober.rs`
+  `EXPENSIVE_MAX_CONCURRENCY`, because more concurrent BoringSSL handshakes abort
+  the process with 0xC0000409). `packages/ui`'s own comment said the 2000-vs-500
+  drift had been replaced; it had been replaced on one platform, and the phone was
+  still offering 2000 lanes that nothing could ever run. Same shape on the timeout
+  floor: `scanTimeoutFloor` on desktop read `startsWith("masque")`, so an H2 scan —
+  which the engine classifies `VerifyCost::Cheap` and probes at 3 s — silently got
+  a 6 s floor the Android app and Kotlin both correctly declined to apply: the
+  desktop ran slower than the phone for the same protocol, with no explanation.
+  Now: one predicate (`isExpensiveVerifyProtocol`) decides expense and feeds both
+  the floor and the lane ceiling; `clampConcurrency` moved into `packages/ui` and is
+  protocol-aware, with Android's hook using it *before* announcing and sending
+  (it used to log and send the raw number while the shell clamped it — "starting
+  scan concurrency=2000" next to a run of 500); the Android web layer's `SCAN_LIMITS`
+  is derived from the shared constants instead of restating them; Kotlin's
+  `MAX_CONCURRENCY` is 500; both Scanner tabs offer only the lanes and the floor the
+  engine honours (`1–16 lanes` for H3, `1–500` otherwise), and `prober.rs` logs the
+  adjustment it makes so a clamped request is visible in the record instead of
+  inferred. The engine's own magic `min(1000)` is now `SCAN_CONCURRENCY_CEILING`.
+  **Enforcement:** the 31st gate, `numeric-limits-cross-layer` (BC-13), reads all
+  four languages and fails on drift, on a missing definition (the Tauri clamp is
+  found by directory scan, so a *second* clamp elsewhere is caught too, and finding
+  none is itself a violation), and on a product ceiling above the engine's.
+  `--selftest-fail` proves it detects its injected defect. Writing it caught two
+  bugs in the gate itself, both recorded in its comments: `"\d"` in an ordinary
+  string literal is just `d` (every capture degenerated to one digit), and
+  `Number("3_000")` is `NaN`, so the separator has to be stripped before the
+  conversion — a gate that "passes" while comparing NaN to NaN is precisely the
+  green-that-measures-nothing failure this feature exists to remove.
+  Verified locally: `npx tsc -b` clean in both frontends, 102 desktop + 48 Android
+  web tests green (two assertions updated because they had encoded the old numbers —
+  the H3 expectation is now `SCAN_MAX_CONCURRENCY_H3`, and the render test asserts
+  the H2 floor is 3000), gradle `testDebugUnitTest` green after the Kotlin change,
+  `rustfmt --check` clean on `prober.rs`. Not verified: the engine changes cannot be
+  compiled here (boring-sys), so the new log line and constant are CI's to build.
 - [ ] T255 [US3] FR-014's remaining clause: "key material MUST be dual-wrapped for recovery". Needs a decision, not a patch. `config_key.dpapi` holds one DPAPI user-scope blob; if the Windows profile's DPAPI master key is lost (reimage, domain trust break, corrupt `%APPDATA%\Microsoft\Protect`), every identity on disk is unrecoverable and the only remedy is a fresh enroll. A second wrap is only worth having if it lives in a *different* failure domain, and the three candidates are not equivalent: (a) a user-chosen recovery passphrase (real recovery, but it is a feature — onboarding prompt, forgotten-passphrase path, `argon2` KDF, verifier, UI strings in three frontends); (b) `CRYPTPROTECT_LOCAL_MACHINE` (no new UX, but any local administrator and any elevated process can then unwrap the master key, which is a weaker promise than the user scope the whole envelope design is built on); (c) rely on the domain backup key if the machine already has one (no code, no guarantee, silent on home PCs). Chosen here: none, and the file is never destroyed on a crypto failure, which removes the *accidental* loss path and leaves only the profile-loss path.
 
 

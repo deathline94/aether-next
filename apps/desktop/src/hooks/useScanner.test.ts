@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { initialScanState } from "../types";
-import { SCAN_MAX_CONCURRENCY } from "../../../../packages/ui/src";
+import { SCAN_MAX_CONCURRENCY, SCAN_MAX_CONCURRENCY_H3 } from "../../../../packages/ui/src";
 import { scanNoizeFor } from "./useScanner";
 
 type Listener = (event: { payload: unknown }) => void;
@@ -251,7 +251,11 @@ describe("desktop useScanner", () => {
     await act(async () => {
       await result.current.startScan();
     });
-    expect(Number(lastScanArgs().concurrency)).toBe(SCAN_MAX_CONCURRENCY);
+    // The ceiling is the protocol's: this hook defaults to an H3 scan, which the
+    // engine narrows to 16 lanes because more concurrent BoringSSL handshakes
+    // abort the process. Asserting the generic 500 here would have been the test
+    // protecting the number the engine never runs.
+    expect(Number(lastScanArgs().concurrency)).toBe(SCAN_MAX_CONCURRENCY_H3);
   });
 
   it("derives the Best chip from the rows, which are its only owner", () => {

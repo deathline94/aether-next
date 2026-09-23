@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
-import { initialScanState, effectiveScanTimeout } from "../types";
+import { initialScanState, effectiveScanTimeout, clampConcurrency } from "../types";
 import { errorMessage } from "../ipcError";
 import { scanVerdict } from "../../../../packages/ui/src";
 import { hitAddressKey } from "../../../../packages/ui/src/logs";
@@ -135,20 +135,25 @@ export function useScanner(
     setEndpoints([]);
     endpointsRef.current = [];
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
+    // Both values are resolved *before* anything is announced, so the log line
+    // describes the run the engine will perform rather than the numbers the fields
+    // happened to hold: `concurrency` used to be printed and sent raw while the
+    // shell clamped it, which is how "concurrency=1500" could end up as 500 lanes.
+    const workers = clampConcurrency(concurrency, protocol);
+    // Same clamp the shell applies (`ScanLimits.clampTimeout`), so what the field
+    // shows and what the engine runs are one number.
+    const effectiveTimeout = effectiveScanTimeout(protocol, timeoutMs);
     appendLog({
       level: "info",
-      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${concurrency}, timeout=${timeoutMs}ms)`,
+      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${workers}, timeout=${effectiveTimeout}ms)`,
     });
     try {
       if (running) {
         await invoke("disconnect");
       }
-      // Same clamp the shell applies (`ScanLimits.clampTimeout`), so what the field
-      // shows and what the engine runs are one number.
-      const effectiveTimeout = effectiveScanTimeout(protocol, timeoutMs);
       const runId = crypto.randomUUID();
       runIdRef.current = runId;
-      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency, timeoutMs: effectiveTimeout, noize });
+      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency: workers, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));

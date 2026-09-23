@@ -195,6 +195,11 @@ const MAX_SCAN_DEADLINE: Duration = Duration::from_secs(300);
 const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis(6000);
 const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
 const EXPENSIVE_MAX_CONCURRENCY: usize = 16;
+/// Absolute ceiling on scan lanes, whatever the caller or the environment asks
+/// for. Named because the frontends have to state it: an unlabelled `min(1000)`
+/// buried in `hunt_best` is how the UIs ended up advertising 500 on one platform
+/// and 2000 on another against a number neither could see.
+const SCAN_CONCURRENCY_CEILING: usize = 1000;
 
 /// Static configuration describing the IP pool and cache behavior for a scan.
 pub struct ProbeConfig {
@@ -615,13 +620,34 @@ pub async fn hunt_best(
     // concurrency ceiling already worked. Previously only concurrency was
     // re-clamped, so a GUI timeout of e.g. 3000ms silently pushed every H3 probe
     // BELOW its 5s handshake floor and scans failed mid-handshake everywhere.
-    st.concurrency = st.concurrency.min(1000);
+    let requested_concurrency = st.concurrency;
+    let requested_timeout = st.per_probe_timeout;
+    st.concurrency = st.concurrency.min(SCAN_CONCURRENCY_CEILING);
     if config.verify_cost == VerifyCost::Expensive {
         st.per_probe_timeout = st.per_probe_timeout.max(EXPENSIVE_MIN_TIMEOUT);
         // Hard safety ceiling for expensive verifies: many concurrent BoringSSL
         // handshakes abort the process (0xC0000409). Enforced AFTER env overrides so
         // no user/GUI setting can crash an H3 scan.
         st.concurrency = st.concurrency.min(EXPENSIVE_MAX_CONCURRENCY);
+    }
+    // Say out loud when the number that will run is not the number that was asked
+    // for. Every frontend's range is wider than these ceilings — Android still
+    // offers 1..2000 lanes against the 1000 here and 16 for an H3 scan — and a
+    // silent rewrite is what made the old 2000-vs-500 drift impossible to
+    // diagnose from a log: the user typed 2000, the chip said 2000, sixteen probes
+    // were in flight.
+    if st.concurrency != requested_concurrency || st.per_probe_timeout != requested_timeout {
+        log::info!(
+            "[scan] limits adjusted: concurrency {requested_concurrency} -> {}, timeout {} ms -> {} ms ({})",
+            st.concurrency,
+            requested_timeout.as_millis(),
+            st.per_probe_timeout.as_millis(),
+            if config.verify_cost == VerifyCost::Expensive {
+                "QUIC handshake ceilings"
+            } else {
+                "scan ceiling"
+            }
+        );
     }
     // Exhaustive mode: standalone scanner runs until stopped or pool exhausted.
     // No target_successes limit, no early exit, unbounded deadline (user stops via UI).

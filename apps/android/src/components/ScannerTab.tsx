@@ -8,10 +8,10 @@ import { NumberField, Segmented } from "./ui";
 // Active" chip contradicted the input the user had just filled in.
 import {
   nextOptionIndex,
-  SCAN_MAX_CONCURRENCY,
   SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
-  SCAN_MIN_TIMEOUT_MS,
+  scanConcurrencyCeiling,
+  scanTimeoutFloor,
 } from "../../../../packages/ui/src";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
@@ -293,12 +293,12 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Concurrency (Workers)</strong>
-                <span className="field-hint">{SCAN_MIN_CONCURRENCY}–{SCAN_MAX_CONCURRENCY} active</span>
+                <span className="field-hint">{SCAN_MIN_CONCURRENCY}–{scanConcurrencyCeiling(protocol)} lanes</span>
               </div>
               <NumberField
                 label="Concurrency (workers)"
                 min={SCAN_MIN_CONCURRENCY}
-                max={SCAN_MAX_CONCURRENCY}
+                max={scanConcurrencyCeiling(protocol)}
                 step={10}
                 value={concurrency}
                 disabled={active}
@@ -310,11 +310,11 @@ export function ScannerTab({
             <label>
               <div className="field-meta">
                 <strong>Timeout (ms)</strong>
-                <span className="field-hint">{SCAN_MIN_TIMEOUT_MS}–{SCAN_MAX_TIMEOUT_MS} ms</span>
+                <span className="field-hint">{scanTimeoutFloor(protocol)}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
               <NumberField
                 label="Timeout (ms)"
-                min={SCAN_MIN_TIMEOUT_MS}
+                min={scanTimeoutFloor(protocol)}
                 max={SCAN_MAX_TIMEOUT_MS}
                 step={100}
                 value={timeoutMs}

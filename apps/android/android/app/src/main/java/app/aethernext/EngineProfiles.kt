@@ -75,7 +75,17 @@ internal object ScanLimits {
     const val MASQUE_MIN_TIMEOUT_MS = 6_000
     const val MAX_TIMEOUT_MS = 30_000
     const val MIN_CONCURRENCY = 1
-    const val MAX_CONCURRENCY = 2_000
+
+    /**
+     * 500, not the 2000 this used to carry. The desktop shell clamps the same
+     * knob to 500 (`src-tauri/src/scan.rs`) and the engine's own absolute ceiling
+     * is 1000 with 16 lanes for an H3 scan (`aether/src/prober.rs`), so a phone
+     * offering 2000 promised a number nothing could deliver — and
+     * `scripts/verify-invariants.mjs` (`numeric-limits-cross-layer`) now fails if
+     * this, `SCAN_MAX_CONCURRENCY` in `packages/ui/src/index.ts` and the shell
+     * clamp drift apart again.
+     */
+    const val MAX_CONCURRENCY = 500
 
     /** The timeout actually sent to the engine, for the protocol the user picked. */
     fun clampTimeout(timeoutMs: Int, protocol: String): Int {
