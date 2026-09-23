@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -44,6 +45,7 @@ class AetherVpnService : VpnService() {
     // every decision that combines two of them reads them inside the lock.
     @Volatile
     private var tun: ParcelFileDescriptor? = null
+    private var tunnelWakeLock: PowerManager.WakeLock? = null
 
     @Volatile
     private var hevStarted = false
@@ -324,6 +326,7 @@ class AetherVpnService : VpnService() {
             }
             tun = established
             VpnTunnel.established(true, socksPort)
+            acquireTunnelWakeLock()
 
             registerUnderlyingNetworkCallbacks()
 
@@ -545,7 +548,37 @@ class AetherVpnService : VpnService() {
      * session's fail-closed reconciliation stop claiming a tunnel right away; only
      * the descriptor close moves to the worker.
      */
+    /**
+     * Hold the CPU while the tunnel carries traffic.
+     *
+     * QUIC's idle and keep-alive deadlines are clock readings compared on a timer
+     * this process does not control. Under doze the timer stops firing, the peer
+     * ages the connection out, and the session is gone while the interface still
+     * says connected — the same lie the tunnel-coherence check exists to catch on
+     * the desktop. A partial wake lock keeps the CPU and not the screen, is taken
+     * only with a live tun and released the moment it comes down, and carries a
+     * 12 h cap so a code path that leaks it cannot drain a phone overnight.
+     */
+    private fun acquireTunnelWakeLock() {
+        if (tunnelWakeLock?.isHeld == true) return
+        val manager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        tunnelWakeLock = manager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "aether:tunnel",
+        ).apply {
+            setReferenceCounted(false)
+            acquire(12L * 60 * 60 * 1000)
+        }
+    }
+
+    private fun releaseTunnelWakeLock() {
+        val lock = tunnelWakeLock
+        tunnelWakeLock = null
+        if (lock?.isHeld == true) lock.release()
+    }
+
     private fun stopTunnel(blocking: Boolean = true) {
+        releaseTunnelWakeLock()
         val fd: ParcelFileDescriptor?
         val mustStopHev: Boolean
         synchronized(lifecycleLock) {
@@ -629,6 +662,7 @@ class AetherVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        releaseTunnelWakeLock()
         val unexpected = !stopRequested && hevStarted
         stopTunnel()
         if (current === this) current = null

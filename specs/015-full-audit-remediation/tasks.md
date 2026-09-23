@@ -1150,6 +1150,26 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T215 [US7] Make cross-thread state actually volatile in `AetherVpnService.kt:36-39,65,73` and `SessionController.kt:33`: `tun`, `stopRequested`, `hevStarted`, `settings`, `emit`; read them **inside** `lifecycleLock`; have `getState()` return a snapshot copy (today `toJson()` can serialise `status="connected"` with a previous session's `pid`).
 - [x] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
 - [ ] T217 [US7] Add supervision policy in `apps/android/.../{EngineService,AetherVpnService}.kt`: `START_STICKY` + `onTaskRemoved { stopSelf() }`, a partial wake lock only while `status == connected`, a `WorkManager` periodic keep-alive, and `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` offered with an eligibility explanation. Both services are currently `START_NOT_STICKY` with no retry, so a LowMemoryKiller kill ends everything silently and doze can stall QUIC timers.
+  **Two of the four clauses are in, one is refused on purpose, one needs a
+  dependency.** `EngineService.onTaskRemoved` now defers to
+  `SessionController.shutdownHeadless` rather than calling `stopSelf()` blind — a bare
+  `stopSelf()` strands the controller believing it is connected while the process that
+  carried the traffic is gone, and the headless rule no-ops when a UI is still attached
+  (covered by `aSessionSomeoneCanStillSeeIsNeverTornDownHeadlessly`).
+  `AetherVpnService` takes a `PARTIAL_WAKE_LOCK` with the tun and releases it on every
+  path that brings the tun down, with a 12 h cap so a leak cannot drain a phone
+  overnight — that is the "doze can stall QUIC timers" half, and it needed the
+  `WAKE_LOCK` permission the manifest did not have.
+  **`START_STICKY` is deliberately not adopted.** A service the system restarts after a
+  LowMemoryKiller kill re-establishes routing that nobody asked for, on a device whose
+  UI may come back to STANDBY; the tree's answer to that moment is
+  `SessionLedger`, which reports *this session did not end because you asked* on next
+  launch, plus the explicit "resume after reboot" setting the user can switch on. An
+  automatic keep-alive would be a second, undocumented version of that switch. **Left
+  open:** the `WorkManager` keep-alive (a new androidx dependency, so a choice to make
+  with the network on) and the battery-optimisation prompt — a VPN service is one of the
+  categories Play allows `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` for, but it needs bridge,
+  UI and eligibility copy across three layers, not a one-liner.
   <!-- The "silently" half is closed (`bc2682e`) and the task's `START_STICKY`
        half is argued against rather than implemented: `EngineService` only keeps
        the process of a live session alive, and the tunnel, the engine child and
