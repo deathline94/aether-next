@@ -1017,7 +1017,19 @@ Checked each part against the current tree rather than assuming the task text wa
        dependency to the workspace root plus `resolve.dedupe` in both Vite
        configs would clear it; that is a dependency-layout change to verify on a
        running build, not a blind one. Until then `frontend-fork-parity` keeps
-       the remaining thirteen pairs from drifting further. -->
+       the remaining thirteen pairs from drifting further.
+       Two more pairs merged this round, and the first was a live bug rather than
+       tidying. `ipcError.ts` had drifted in behaviour: Android wraps a structured
+       rejection in `IpcRejection` and reads the detail back out of the
+       `instanceof Error` branch, while the desktop's same branch discarded it and
+       reported `code: "unknown"` — one failure, one wrapper, a code lost on one
+       platform only. The superset now lives in `packages/ui/src/ipcError.ts` and
+       each app re-exports it; `main.tsx` gained the `label` the desktop's
+       last-resort boundary had and the phone's did not. Both pairs are byte
+       identical, and `frontend-fork-parity`'s recorded drift for them is
+       `63 -> 0` and `67 -> 0`, so neither can silently separate again: the
+       ratchet that used to permit 63 lines of difference between the two error
+       mappings now permits none. -->
 
 - [x] T199 [US6] Reconcile the Android fork's known divergences while porting: `apps/android/src/hooks/useScanner.ts` sets `phase: "Verified"` unconditionally so an empty scan reads "Verified" (desktop's `hasHits` fix was never back-ported); the `.catch()` on `listen` was dropped; `startScan` calls `clearLogs?.()` but omits `clearLogs` from the deps array (stale closure); `defaults.routingMode` differs (`tun` vs `system-proxy` — intended, keep as a prop).
 - [x] T200 [US6] Remove the `/vite.svg` favicon reference from `apps/desktop/index.html` and `apps/android/index.html` (an absolute path the Android asset host blocks, 403-spamming the WebView log via `MainActivity.kt:104`) and add a real `assets/www/` icon.

@@ -1600,8 +1600,8 @@ const GATES = [
         ['hooks/useLogs.ts', 100],
         ['hooks/useRuntime.ts', 60],
         ['hooks/useScanner.ts', 56],
-        ['ipcError.ts', 63],
-        ['main.tsx', 67],
+        ['ipcError.ts', 0],
+        ['main.tsx', 0],
         ['types.ts', 52],
         // Test plumbing, not shipped surface: `packages/ui` deliberately carries
         // no stubs (see the header of either copy), so this pair stays copied -
