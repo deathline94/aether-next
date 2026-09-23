@@ -961,6 +961,23 @@ Checked each part against the current tree rather than assuming the task text wa
        filter, scrollable-region focus, `aria-live` on hero/save dock, `:active`
        feedback, the raw `DISCONNECTED` enum beside a "Standby" beacon, colour-only
        state, the disabled dim over `.profile-card.active`) and T198's forked JSX.
+       Re-checked against source this round, and several are already satisfied, so
+       they are closed here rather than left to be re-audited: the −/+ steppers carry
+       no `tabIndex` at all (the only roving `tabIndex={-1}` left in `ui.tsx:48` is
+       the correct one, inside the segmented control's radiogroup); `App.tsx:55`
+       returns early on `ctrlKey || altKey || metaKey`; both scroll regions —
+       `.tactical-terminal-screen` (desktop `ActivityTab.tsx:293`, android `:278`)
+       and `.discovered-list` (desktop `ScannerTab.tsx:425`, android `:400`) — are
+       `tabIndex={0}` with an `aria-label`/`aria-labelledby`, and the panel has
+       `role="tabpanel"` with its id referenced by the strip; the beacon is
+       `role="status" aria-live="polite"` in both apps (desktop `App.tsx:188`,
+       android `:133`) and the save bar too (`SettingsTab.tsx:572`); no component
+       prints the raw status enum beside the beacon (0 matches for an upper-cased
+       status render); and the active profile card is excluded from the disabled
+       dim. Still open, and both are design work rather than a fix: the filter chips
+       as a proper APG radiogroup instead of a `role="tablist"` with no panel
+       relationship, and `:active` press feedback, which exists on 3 selectors per
+       sheet against ~20 interactive controls.
   -->
 - [ ] T195 [US6] Fix control semantics in `apps/desktop/src/components/{ui.tsx,ScannerTab.tsx,SettingsTab.tsx,App.tsx}`: filter chips become an APG radio group (`role="radiogroup"`/`radio`, `aria-checked`, roving `tabIndex`, arrow-key cycling) instead of a `role="tablist"` misuse with no `aria-controls`; `role="tablist"` is reserved for the real tab strip with `aria-controls`/`aria-selected`/`role="tabpanel"`; remove `tabIndex={-1}` from the −/+ steppers (mouse-only today); stop a wrapped `<label>` + `aria-label` giving one control two accessible names; ignore `ctrlKey/metaKey/altKey` in `App.tsx:40-52`; add `tabIndex={0}` + `aria-label` to `.tactical-terminal-screen` and `.discovered-list` (keyboard users cannot scroll them today); add `aria-live="polite"`/`role="status"` on the hero and save dock and transfer focus on tab switch; define `:active` press feedback (only 3 of ~20 controls have it); stop printing the raw `DISCONNECTED` enum beside a "Standby" beacon; make state never colour-only (the 7 px dot at 1.96:1 is currently the sole signal) and exclude `.profile-card.active` from the disabled dim so the ACTIVE profile stays identifiable while connected.
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
