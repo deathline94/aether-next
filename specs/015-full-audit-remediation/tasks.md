@@ -865,9 +865,9 @@ Checked each part against the current tree rather than assuming the task text wa
        inside the ≤680 band and sets properties its sibling does not, so nothing
        is silently overridden - it is untidy, not wrong. -->
 
-- [ ] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
-  **The ping-ring half is closed, with the numbers measured rather than assumed; the
-  glow half turned out not to be a defect; three items remain.** In a live render of
+- [x] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
+  **All five clauses resolve, three of them on measurement rather than on reading
+  the sheet.** In a live render of
   the built sheet with the stage pinned to its 290 px floor, the ring's centre sits
   106 px above the card's bottom edge and 184 px below its top, so `scale(2.2)` put
   the ring's rect at `top 139, bottom 386` against a stage ending at 369 — 17 px of
@@ -881,9 +881,22 @@ Checked each part against the current tree rather than assuming the task text wa
   `.profiles-panel` claim does not survive measurement: its grid pads 18 px
   vertically and the active-card shadow is `0 0 18px`, so the blur ends where the
   clip begins rather than being cut — equal extents, no visible slice, nothing
-  changed. Still open here: the `min-width: 0` on the real flex child behind the
-  bento chip, the 64 px log time track with `hour12: false`, and `overflow-wrap` for
-  IPv6/PEM blobs.
+  changed. The bento trap is already shut and the task text's coordinates are the
+  reason it looked open: `.bento-title-group` carries `min-width: 0` (`App.css:1141`)
+  and `.bento-chip` carries `flex-shrink: 0` (`:1172`), and in the live render the
+  451 px header holds the group at computed `min-width: 0px` with the chip inside it;
+  `ConnectionTab.tsx:261` is no longer even the right line (the group renders at
+  `:376`). The time column measures 64 px scrollWidth for an injected
+  `<time>02:15:33</time>` in its 64 px track, and `formatLogTime` already passes
+  `hour12: false` in both frontends, so the `02:15:33 PM` string that needed the
+  widening is never produced. `overflow-wrap` is on all five surfaces that carry
+  unbounded text — `.log-message-body` (`anywhere`), `.test-result` (`anywhere`),
+  `.crash-screen code` (`anywhere`), `.profile-card span` and
+  `.error-banner-content span` — and raw addresses reach the UI only through the
+  console, which is the first of those. The PEM half of the clause names a surface
+  that does not exist: 0 matches for any certificate or key text in either
+  frontend's components, and adding a rule to wrap a blob nothing renders is
+  activity, not a fix.
 
 - [x] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
   <!-- Closed 2026-09-22 (`8eaec25`, `72a0886`), with one deliberate deviation.
