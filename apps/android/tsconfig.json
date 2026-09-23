@@ -5,6 +5,20 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "skipLibCheck": true,
+    /*
+     * The shared package is a sibling directory and deliberately not an npm
+     * workspace (see the root package.json: each frontend installs and pins on its
+     * own, and a workspace root without its own lockfile breaks npm ci for both
+     * apps). Naming it here lets a component import @aether/ui/enums instead of
+     * climbing out of the app, so moving a file is a move rather than a rewire of
+     * every import inside it. vite.config.ts repeats the mapping, because the
+     * bundler does not read compilerOptions.paths.
+     */
+    "baseUrl": ".",
+    "paths": {
+      "@aether/ui": ["../../packages/ui/src/index.ts"],
+      "@aether/ui/*": ["../../packages/ui/src/*"]
+    },
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "isolatedModules": true,

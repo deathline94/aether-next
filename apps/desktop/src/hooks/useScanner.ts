@@ -11,14 +11,14 @@ import type {
   ScanState,
 } from "../types";
 import { errorMessage } from "../ipcError";
-import { hitAddressKey } from "../../../../packages/ui/src/logs";
+import { hitAddressKey } from "@aether/ui/logs";
 import {
   clampConcurrency,
   effectiveScanTimeout,
   scanVerdict,
-} from "../../../../packages/ui/src";
-import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
-import type { ScanProtocol } from "../../../../packages/ui/src/enums";
+} from "@aether/ui";
+import { NOIZE_PROFILES, oneOf } from "@aether/ui/enums";
+import type { ScanProtocol } from "@aether/ui/enums";
 
 /**
  * The noise profile a scan will actually run, which is the one the panel may show.

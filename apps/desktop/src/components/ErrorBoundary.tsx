@@ -1,5 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
-import { resetKeysChanged } from "../../../../packages/ui/src";
+import { resetKeysChanged } from "@aether/ui";
 
 // `resetKeysChanged` lives in the shared package with the other rule both UIs
 // need: the boundary's fallback cannot be rendered in jsdom (React 19 rethrows a

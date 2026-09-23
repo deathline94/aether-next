@@ -1,6 +1,6 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
+import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Self-hosted faces: Vite hashes the woff2 into dist/ so the UI loads them
 // same-origin under `font-src 'self'` and never asks a third party pre-tunnel.
 import "@fontsource-variable/geist";

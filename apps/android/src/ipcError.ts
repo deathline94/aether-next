@@ -10,5 +10,5 @@ export {
   errorCode,
   errorField,
   IpcRejection,
-} from "../../../packages/ui/src/ipcError";
-export type { IpcError } from "../../../packages/ui/src/ipcError";
+} from "@aether/ui/ipcError";
+export type { IpcError } from "@aether/ui/ipcError";

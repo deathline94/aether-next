@@ -6,8 +6,8 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { RuntimeState, Settings } from "../types";
-import { noiseIsInert } from "../../../../packages/ui/src";
-import { SPEED_PROFILES, speedProfileHint } from "../../../../packages/ui/src/enums";
+import { noiseIsInert } from "@aether/ui";
+import { SPEED_PROFILES, speedProfileHint } from "@aether/ui/enums";
 
 const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({
   id: profile.id,

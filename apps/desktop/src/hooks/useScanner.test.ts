@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { initialScanState } from "../types";
-import { SCAN_MAX_CONCURRENCY, SCAN_MAX_CONCURRENCY_H3 } from "../../../../packages/ui/src";
+import { SCAN_MAX_CONCURRENCY, SCAN_MAX_CONCURRENCY_H3 } from "@aether/ui";
 import { scanNoizeFor } from "./useScanner";
 
 type Listener = (event: { payload: unknown }) => void;

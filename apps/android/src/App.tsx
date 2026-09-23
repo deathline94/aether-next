@@ -1,6 +1,6 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useState } from "react";
-import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
+import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Same self-hosted faces as the desktop app (T187): Vite hashes the woff2
 // into the bundled assets, so the WebView never reaches a third party.
 import "@fontsource-variable/geist";

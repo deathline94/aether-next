@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { nextOptionIndex } from "../../../../packages/ui/src";
+import { nextOptionIndex } from "@aether/ui";
 
 /**
  * Same radiogroup contract as the desktop control: one stop in the tab order,

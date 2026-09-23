@@ -52,7 +52,7 @@ vi.mock("./components/ErrorBoundary", () => ({
 }));
 
 import App from "./App";
-import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
+import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 
 // jsdom has no scrolling model; the Activity tab autoscrolls its end marker.
 beforeAll(() => { Element.prototype.scrollIntoView = () => {}; });

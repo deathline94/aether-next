@@ -11,7 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useRef, useState } from "react";
 import { RENDER_CAP } from "../hooks/useLogs";
 import type { DisplayedScanState, LogEntry, LogFilter } from "../types";
-import { nextOptionIndex } from "../../../../packages/ui/src";
+import { nextOptionIndex } from "@aether/ui";
 
 interface ActivityTabProps {
   visibleLogs: LogEntry[];

@@ -12,7 +12,7 @@ import {
   SCAN_MAX_TIMEOUT_MS,
   scanConcurrencyCeiling,
   scanTimeoutFloor,
-} from "../../../../packages/ui/src";
+} from "@aether/ui";
 
 type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
 

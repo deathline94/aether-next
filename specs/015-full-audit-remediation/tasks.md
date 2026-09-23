@@ -57,7 +57,24 @@
 - [x] T026 [P] Confirm `panic = "unwind"` stays in `aether/Cargo.toml:53-59` (it is load-bearing for R11's `catch_unwind` containment) and add a comment tying the setting to the tests relying on it.
 - [x] T027 Add the **both-direction** IPC parity gate to `scripts/verify-invariants.*`: extract `generate_handler![…]` (`apps/desktop/src-tauri/src/lib.rs:2234-2245`) and every `invoke("…")` string from both frontends; fail on missing **and** on unused-unlisted. **Fails today**: `get_settings`, `get_state`, `is_admin`, `app_info`, `test_connection` are registered and never invoked.
 - [x] T028 Enforce the anti-tautology rule in `scripts/verify-invariants.*`: every gate must register an injection handler so `--selftest-fail` can prove it fires. The repo's three precedent failures: `build.yml:194` verifies the wrong artifact; `build.rs` pins a hash of the file it ships; `AetherVpnServiceTest` asserts on an `AtomicLong`.
-- [ ] T029 [P] Migrate `apps/desktop/src/components/*.tsx` and `apps/android/src/components/*.tsx` imports onto `@aether/ui` paths without moving code yet (alias-only in `apps/desktop/vite.config.ts` + `apps/android/vite.config.ts`), so T198 moves files rather than rewiring imports twice.
+- [x] T029 [P] Migrate `apps/desktop/src/components/*.tsx` and `apps/android/src/components/*.tsx` imports onto `@aether/ui` paths without moving code yet (alias-only in `apps/desktop/vite.config.ts` + `apps/android/vite.config.ts`), so T198 moves files rather than rewiring imports twice.
+  **Done, 51 specifiers across 30 files, and proven to be a rename rather than a
+  change:** `baseUrl` + `"@aether/ui"` / `"@aether/ui/*"` `paths` in both apps'
+  tsconfig, `resolve.alias` in both vite configs (the configs are ESM and
+  `@types/node` is deliberately absent, so the mapping derives the path from
+  `import.meta.url` for both the `file:///C:/…` and the POSIX spelling), then
+  `../../../../packages/ui/src/enums` → `@aether/ui/enums` everywhere. Nothing is
+  installed and no lockfile is touched — the root `package.json` explains why this
+  is an alias and not an npm workspace (each frontend pins independently, and a
+  workspace root without its own lockfile fails `npm ci` for both apps).
+  `tsc -b` clean in both apps, both vitest suites pass (103 + 49), and **the two
+  production bundles came out with the same content hashes they had before the
+  change** (`index-Det5sArh.js` / `index-DUXydvCL.css`, `index-alS-CxYO.js` /
+  `index-BqU9SiFY.css`) — the same module graph, reached by a shorter name.
+  `shared-package-addressed-by-name` keeps it that way: a source file climbing back
+  out to `packages/ui/src`, a tsconfig missing the `paths` entry, or a vite config
+  missing the alias each fail the run (the config files themselves are exempt, since
+  that is where the mapping is defined).
 - [ ] T030 **Checkpoint gate**: run `cargo test -p aether`, `cargo test -p aether-desktop`, `npm test` in both apps, `npx tsc --noEmit` in both, and `scripts/verify-invariants` — the deliberate failures (T013, T027) must be the **only** reds.
 
 **Checkpoint**: One config store, one typed contract, one gate harness, one counter substrate. US1–US8 can now proceed, several in parallel.

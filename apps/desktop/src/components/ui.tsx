@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { nextOptionIndex } from "../../../../packages/ui/src";
+import { nextOptionIndex } from "@aether/ui";
 
 export function Segmented<T extends string>({
   value,

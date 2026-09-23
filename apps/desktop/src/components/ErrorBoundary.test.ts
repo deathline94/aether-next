@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { resetKeysChanged } from "../../../../packages/ui/src";
+import { resetKeysChanged } from "@aether/ui";
 
 /*
  * The half of T186 that jsdom can actually observe. A boundary's fallback cannot

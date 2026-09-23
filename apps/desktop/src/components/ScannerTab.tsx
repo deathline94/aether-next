@@ -2,15 +2,15 @@ import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
-import { NOIZE_PROFILES, oneOf } from "../../../../packages/ui/src/enums";
-import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "../../../../packages/ui/src/enums";
+import { NOIZE_PROFILES, oneOf } from "@aether/ui/enums";
+import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "@aether/ui/enums";
 import {
   nextOptionIndex,
   SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
   scanConcurrencyCeiling,
   scanTimeoutFloor,
-} from "../../../../packages/ui/src";
+} from "@aether/ui";
 import { rttLike } from "../hooks/useScanner";
 import { NumberField, Segmented } from "./ui";
 

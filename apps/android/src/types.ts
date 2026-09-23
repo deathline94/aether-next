@@ -1,14 +1,14 @@
-import { parseRuntimeCore } from "../../../packages/ui/src";
+import { parseRuntimeCore } from "@aether/ui";
 import {
   SCAN_MAX_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
   SCAN_MASQUE_MIN_TIMEOUT_MS,
   SCAN_MIN_CONCURRENCY,
   SCAN_MIN_TIMEOUT_MS,
-} from "../../../packages/ui/src";
-import type { RuntimeStatus } from "../../../packages/ui/src";
-import type { LogLevel } from "../../../packages/ui/src/enums";
-import { SPEED_PROFILES, speedProfileHint } from "../../../packages/ui/src/enums";
+} from "@aether/ui";
+import type { RuntimeStatus } from "@aether/ui";
+import type { LogLevel } from "@aether/ui/enums";
+import { SPEED_PROFILES, speedProfileHint } from "@aether/ui/enums";
 
 export type View = "home" | "scanner" | "settings" | "logs";
 /** The four statuses the shell has copy, colours and a beacon for — one list, in `packages/ui`. */
@@ -219,7 +219,7 @@ export {
   effectiveScanTimeout,
   scanConcurrencyCeiling,
   clampConcurrency,
-} from "../../../packages/ui/src";
+} from "@aether/ui";
 
 /** One-click speed presets, shared by Connection tab. */
 export const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({

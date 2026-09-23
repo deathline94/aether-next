@@ -4,7 +4,7 @@ import {
   parseRuntimeState,
   parseSettings,
 } from "./types";
-import { isRuntimeStatus } from "../../../packages/ui/src";
+import { isRuntimeStatus } from "@aether/ui";
 
 /** Every field the shell's `RuntimeState` serialises, camelCase. */
 const shellPayload = {

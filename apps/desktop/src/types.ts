@@ -13,7 +13,7 @@ import {
   TRANSPORTS,
   TUNNEL_PROTOCOLS,
   oneOf,
-} from "../../../packages/ui/src/enums";
+} from "@aether/ui/enums";
 import type {
   IpFamily,
   NoizeProfile,
@@ -21,10 +21,10 @@ import type {
   ScanMode,
   TunnelProtocol,
   Transport,
-} from "../../../packages/ui/src/enums";
-import { parseRuntimeCore } from "../../../packages/ui/src";
-import type { RuntimeStatus } from "../../../packages/ui/src";
-import type { LogLevel } from "../../../packages/ui/src/enums";
+} from "@aether/ui/enums";
+import { parseRuntimeCore } from "@aether/ui";
+import type { RuntimeStatus } from "@aether/ui";
+import type { LogLevel } from "@aether/ui/enums";
 
 export type { IpFamily, NoizeProfile, RoutingMode, ScanMode, TunnelProtocol, Transport };
 

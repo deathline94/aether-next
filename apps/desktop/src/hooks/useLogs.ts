@@ -7,8 +7,8 @@ import {
   emptyStore,
   hitKeyOf,
   visibleWindow,
-} from "../../../../packages/ui/src/logs";
-import type { Classified, Store } from "../../../../packages/ui/src/logs";
+} from "@aether/ui/logs";
+import type { Classified, Store } from "@aether/ui/logs";
 
 /*
  * What is left here is React. The facts - whether a line is a hit, which

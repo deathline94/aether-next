@@ -8,7 +8,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { nextOptionIndex } from "../../../../packages/ui/src";
+import { nextOptionIndex } from "@aether/ui";
 import { RENDER_CAP } from "../hooks/useLogs";
 import type { LogEntry, LogFilter, ScanState } from "../types";
 

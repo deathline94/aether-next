@@ -7,7 +7,7 @@ import {
   SCAN_MAX_CONCURRENCY_H3,
   SCAN_MASQUE_MIN_TIMEOUT_MS,
   SCAN_MIN_TIMEOUT_MS,
-} from "../../../../packages/ui/src";
+} from "@aether/ui";
 import { initialScanState } from "../types";
 import type { DiscoveredEndpoint } from "../types";
 import { stubViewport } from "../testing/viewport";

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { nextOptionIndex } from "../../../../packages/ui/src";
+import { nextOptionIndex } from "@aether/ui";
 import { NumberField, Segmented, draftNumber } from "./ui";
 
 // vitest runs without `globals: true`, which disables testing-library's automatic

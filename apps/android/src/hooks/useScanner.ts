@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
 import { initialScanState, effectiveScanTimeout, clampConcurrency } from "../types";
 import { errorMessage } from "../ipcError";
-import { scanVerdict } from "../../../../packages/ui/src";
-import { hitAddressKey } from "../../../../packages/ui/src/logs";
+import { scanVerdict } from "@aether/ui";
+import { hitAddressKey } from "@aether/ui/logs";
 import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
 
 /**

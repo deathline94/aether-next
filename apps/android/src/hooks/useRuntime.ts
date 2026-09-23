@@ -4,7 +4,7 @@ import { defaults, initialRuntime, parseRuntimeState } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
-import { describeRejectedState } from "../../../../packages/ui/src";
+import { describeRejectedState } from "@aether/ui";
 
 /**
  * What a connectivity check actually knows.

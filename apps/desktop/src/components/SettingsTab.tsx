@@ -12,8 +12,8 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { NoizeProfile, Settings } from "../types";
-import { NOIZE_OPTIONS, NOIZE_PROFILES, SCAN_MODE_OPTIONS, oneOf } from "../../../../packages/ui/src/enums";
-import { noiseIsInert } from "../../../../packages/ui/src";
+import { NOIZE_OPTIONS, NOIZE_PROFILES, SCAN_MODE_OPTIONS, oneOf } from "@aether/ui/enums";
+import { noiseIsInert } from "@aether/ui";
 import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
 

@@ -2142,6 +2142,55 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'shared-package-addressed-by-name',
+    invariant: 'BC-13',
+    summary: 'both apps reach packages/ui by name, with the mapping declared in both tools',
+    scan(api) {
+      // The relative form worked, which is why nothing forced the issue: 51 imports
+      // climbed two or three directories out of the app to reach the shared package,
+      // so moving a component meant rewiring every import in it, and the two
+      // frontends spelled the same dependency differently. An alias is only a
+      // convention when all three places agree — tsconfig (type-check), the vite
+      // config (bundle) and the imports themselves — so a half-declared mapping is a
+      // finding here rather than a surprise for the first build that trips over it.
+      const v = [];
+      const relative = /"(?:\.\.?\/)+packages\/ui\/src/;
+      for (const f of api.files('apps', /\.(tsx|ts)$/)) {
+        // Only the apps' own sources: vite.config.ts is where the mapping is
+        // defined, and a path relative to `import.meta.url` there is the point.
+        if (!/^apps\/[^/]+\/src\//.test(rel(f))) continue;
+        const lines = api.read(f).split(/\r?\n/);
+        lines.forEach((line, i) => {
+          if (relative.test(line)) {
+            v.push(
+              `${rel(f)}:${i + 1} reaches the shared package by climbing out of the app — import it as "@aether/ui" instead`,
+            );
+          }
+        });
+      }
+      for (const app of ['apps/desktop', 'apps/android']) {
+        const tsconfig = api.files(app, /tsconfig\.json$/).find((f) => rel(f) === `${app}/tsconfig.json`);
+        const vite = api.files(app, /vite\.config\.ts$/).find((f) => rel(f) === `${app}/vite.config.ts`);
+        if (!tsconfig) v.push(`${app}: no tsconfig.json to check the mapping against`);
+        else if (!api.read(tsconfig).includes('"@aether/ui/*"')) {
+          v.push(`${app}/tsconfig.json: no "@aether/ui/*" path mapping, so the name does not type-check`);
+        }
+        if (!vite) v.push(`${app}: no vite.config.ts to check the mapping against`);
+        else if (!api.read(vite).includes('"@aether/ui"')) {
+          v.push(`${app}/vite.config.ts: no "@aether/ui" resolve.alias, so the name does not bundle`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest___relative_import.ts',
+        content:
+          'import { SCAN_MAX_CONCURRENCY } from "../../../packages/ui/src/index.ts";\nexport const x = SCAN_MAX_CONCURRENCY;\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import App from "./App";
-import { RUNTIME_STATUS_TAGS } from "../../../packages/ui/src";
+import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 import type { Settings } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));

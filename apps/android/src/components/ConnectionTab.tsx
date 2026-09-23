@@ -8,7 +8,7 @@ import { platformLabel } from "../bridge";
 import { profileActive, speedProfiles } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import type { TestOutcome } from "../hooks/useRuntime";
-import { noiseIsInert } from "../../../../packages/ui/src";
+import { noiseIsInert } from "@aether/ui";
 
 /**
  * Carrier and transport wording, exhaustive by construction.
