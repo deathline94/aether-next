@@ -235,6 +235,121 @@ function ruleBlocks(maskedSrc) {
 
 const blankComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, (c) => c.replace(/[^\n]/g, ' '));
 
+// ── Spawn-site extraction ───────────────────────────────────────────────
+//
+// Both spawn gates used to count the literal text `Command::new(&executable)`. A
+// spawn written `Command::new(&exe)`, `Command::new(path.clone())`, or simply
+// re-flowed across lines was invisible to them: zero spawns found, zero checks
+// required, green. These match on the call and compare the *argument*, so
+// renaming a variable no longer disables the rule — and a spawn that cannot be
+// recognised is a finding rather than a miss.
+
+function isComment(text, index) {
+  const lineStart = text.lastIndexOf('\n', index) + 1;
+  return /^\s*(\/\/|\/\*|\*)/.test(text.slice(lineStart, index));
+}
+
+/** Every call site of `calleeRe` in `text`, with its first argument extracted. */
+function callSites(text, calleeRe) {
+  const re = new RegExp(calleeRe, 'g');
+  const sites = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (isComment(text, m.index)) continue;
+    // A definition is not a call: `pub fn verify_engine_or_refuse(path: &Path)`
+    // would otherwise hand every spawn of a variable named `path` a free pass.
+    if (/\bfn\s+$/.test(text.slice(Math.max(0, m.index - 24), m.index))) continue;
+    const open = m.index + m[0].length - 1;
+    let depth = 1;
+    let j = open + 1;
+    while (j < text.length && depth > 0) {
+      if (text[j] === '(') depth += 1;
+      else if (text[j] === ')') depth -= 1;
+      j += 1;
+    }
+    sites.push({ raw: text.slice(open + 1, j - 1), index: m.index });
+  }
+  return sites;
+}
+
+/** `&mut command`, `executable.clone()`, `& path` — all name one thing. */
+function argName(raw) {
+  return raw
+    .replace(/\/\/[^\n]*/g, '')
+    .replace(/\s+/g, '')
+    .replace(/^&mut/, '')
+    .replace(/^&/, '')
+    .replace(/\.clone\(\)$/, '');
+}
+
+const spawnSites = (t) => callSites(t, 'Command::new\\s*\\(').map((s) => ({ arg: argName(s.raw), index: s.index }));
+const verifySites = (t) => callSites(t, 'verify_engine_or_refuse\\s*\\(').map((s) => ({ arg: argName(s.raw.split(',')[0]), index: s.index }));
+const scrubSites = (t) => callSites(t, 'scrub_ambient_engine_env\\s*\\(').map((s) => ({ arg: argName(s.raw), index: s.index }));
+
+/** The builder a spawn was bound to, which is what the env scrub takes. */
+function spawnBinding(text, index) {
+  const head = text.slice(Math.max(0, index - 120), index);
+  const m = /let\s+(?:mut\s+)?(\w+)\s*=\s*$/.exec(head);
+  return m ? m[1] : null;
+}
+
+/** Start of the `fn` containing `index`, so a check must live in the same one. */
+function enclosingFn(text, index) {
+  const re = /\bfn\s+(\w+)/g;
+  let m;
+  let seen = { name: '<top level>', start: -1 };
+  while ((m = re.exec(text)) !== null) {
+    if (isComment(text, m.index)) continue;
+    if (m.index > index) break;
+    seen = { name: m[1], start: m.index };
+  }
+  return seen;
+}
+
+/**
+ * Children the shell starts that are not the engine, by file and argument name.
+ *
+ * The gate cannot tell an engine spawn from any other child by looking at the
+ * call, so every spawn has to land here or carry its own verification. Adding a
+ * system tool then means editing this list in review — the alternative is a rule
+ * that quietly ignores whatever it does not recognise.
+ */
+const NON_ENGINE_SPAWNS = [
+  ['apps/desktop/src-tauri/src/acl.rs', 'icacls', 'edits the DACL on a path the shell owns; resolved from a full system path, see the search-order note at acl.rs:10'],
+  ['apps/desktop/src-tauri/src/trust.rs', 'shell', 'PowerShell, used to read a certificate; it is consulted, never trusted as the payload'],
+];
+
+/**
+ * Literal corner values in a sheet: a `*radius:` declaration whose value holds no
+ * `var(`. Token definitions (`--radius-md: 8px`) are not uses, so they do not
+ * count here — the scale itself is allowed to spell out its own steps.
+ */
+function rawRadiusValues(text) {
+  const out = new Set();
+  for (const m of text.matchAll(/\bborder[a-z-]*radius\s*:\s*([^;}]+)/g)) {
+    if (m[1].includes('var(')) continue;
+    for (const v of m[1].matchAll(/[\d.]+(?:px|%|rem|em)?\b/g)) out.add(v[0]);
+  }
+  return [...out].sort();
+}
+
+/**
+ * Measured, untokenised radius values per sheet (T192): 0, 1px, 3px, 4px, 5px,
+ * 9px, 18px, 20px, identically in both.
+ *
+ * A budget, not a fact about good design. The 191-declaration pass put every
+ * corner that had a scale step onto the scale; these are hairline corners, a
+ * four-value shorthand and two panel radii that no side-by-side comparison has
+ * justified yet, and collapsing them by eye is not something this repo can check
+ * without a screen. Counting them is what can be checked: the number may only
+ * fall, and when it does the budget has to be re-measured in the same commit. A
+ * new app sheet gets 0.
+ */
+const RADIUS_LEFTOVERS = {
+  'apps/desktop/src/App.css': 8,
+  'apps/android/src/App.css': 8,
+};
+
 const GATES = [
   {
     name: 'config-single-reader',
@@ -894,10 +1009,16 @@ const GATES = [
       const v = [];
       for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
         const t = api.read(f);
-        const spawns = [...t.matchAll(/Command::new\(&executable\)/g)].length;
-        const scrubs = [...t.matchAll(/scrub_ambient_engine_env\(&mut command\)/g)].length;
-        if (spawns > scrubs) {
-          v.push(`${rel(f)}: ${spawns - scrubs} of ${spawns} spawn sites inherit AETHER_* untouched — a session variable then outranks the handoff the shell promised`);
+        const engineArgs = new Set(verifySites(t).map((s) => s.arg));
+        for (const site of spawnSites(t)) {
+          // BC-02 owns unrecognised spawns; this gate is about the engine's own.
+          if (!engineArgs.has(site.arg)) continue;
+          const binding = spawnBinding(t, site.index);
+          if (!scrubSites(t).some((s) => s.arg === binding)) {
+            v.push(
+              `${rel(f)}: Command::new(&${site.arg})${binding ? ` bound as \`${binding}\`` : ' with no named builder'} never calls scrub_ambient_engine_env — a leftover AETHER_* in the launcher's environment outranks the handoff the shell promises, which is how a stale profile silently survived a settings change`,
+            );
+          }
         }
       }
       return v;
@@ -905,26 +1026,33 @@ const GATES = [
     inject() {
       return {
         file: 'apps/desktop/src-tauri/src/lib.rs',
-        content: 'fn a() {\n  let mut command = Command::new(&executable);\n  command.env("AETHER_TUN", "1");\n}\n',
+        content: 'fn run_it() {\n  verify_engine_or_refuse(&exe).unwrap();\n  let mut command = Command::new(&exe);\n  command.spawn().unwrap();\n}\n',
       };
     },
   },
   {
     name: 'engine-verified-before-every-spawn',
     invariant: 'BC-02',
-    summary: 'every engine spawn site verifies the binary first, in every routing mode',
+    summary: 'every child the shell starts is the verified engine or a named system tool',
     scan(api) {
       const v = [];
       for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
         const t = api.read(f);
-        const spawns = [...t.matchAll(/Command::new\(&executable\)/g)].length;
-        const verified = [...t.matchAll(/verify_engine_or_refuse\(&executable\)/g)].length;
-        if (verified < spawns) {
-          v.push(`${rel(f)}: ${spawns - verified} spawn site(s) reach Command::new without the signature/digest check — verification used to be gated on routing_mode == "tun", so proxy mode spawned an unchecked binary`);
+        const checks = verifySites(t);
+        const file = rel(f);
+        for (const site of spawnSites(t)) {
+          if (NON_ENGINE_SPAWNS.some((e) => e[0] === file && e[1] === site.arg)) continue;
+          const fnStart = enclosingFn(t, site.index).start;
+          const inScope = checks.some((c) => c.arg === site.arg && c.index >= fnStart && c.index < site.index);
+          if (!inScope) {
+            v.push(
+              `${file}: Command::new(&${site.arg}) in ${enclosingFn(t, site.index).name}() is not preceded by verify_engine_or_refuse(&${site.arg}) in the same function, and is not listed as a non-engine spawn — verification used to be gated on routing_mode == "tun", so proxy mode spawned an unchecked binary`,
+            );
+          }
         }
         const modeGatedTrust = /routing_mode\s*==\s*"tun"[\s\S]{0,400}?verify_elevated_binary\(&executable/.test(t);
         if (modeGatedTrust) {
-          v.push(`${rel(f)}: an engine trust check sits inside a routing-mode branch again`);
+          v.push(`${file}: an engine trust check sits inside a routing-mode branch again`);
         }
       }
       return v;
@@ -1725,6 +1853,48 @@ const GATES = [
       return {
         file: 'packages/ui/__selftest__.tokens.css',
         content: ':root{--emerald:#00f08a;--emerald-a25:rgba(56, 189, 248, 0.25);}\n',
+      };
+    },
+  },
+  {
+    name: 'radius-scale-ratchet',
+    invariant: 'BC-11',
+    summary: 'corner radii come from the --radius-* scale, and the measured leftovers only shrink',
+    scan(api) {
+      const v = [];
+      const sheets = api.files('apps', /\.css$/);
+      const defined = new Set();
+      const used = new Set();
+      for (const f of sheets) {
+        const file = rel(f);
+        const text = blankComments(api.read(f));
+        const raw = rawRadiusValues(text);
+        const budget = RADIUS_LEFTOVERS[file] ?? 0;
+        if (raw.length > budget) {
+          v.push(
+            `${file}: ${raw.length} untokenised radius value(s) — ${raw.join(', ')} — against a budget of ${budget}. Take the corner onto --radius-*, or land the reason it cannot be a token in this commit and raise the number here`,
+          );
+        }
+        if (raw.length < budget) {
+          v.push(
+            `${file}: ${raw.length} untokenised radius value(s) left but the budget still says ${budget} — lower it in the same commit; a number nobody re-measured is a wish, not a ratchet`,
+          );
+        }
+        for (const line of text.split(/\r?\n/)) {
+          for (const m of line.matchAll(/(--[\w-]*radius[\w-]*)\s*:/g)) defined.add(m[1]);
+          for (const m of line.matchAll(/var\(\s*(--[\w-]*radius[\w-]*)/g)) used.add(m[1]);
+        }
+      }
+      const dead = [...defined].filter((t) => !used.has(t)).sort();
+      if (dead.length) {
+        v.push(`a scale nothing uses is a scale that drifts: ${dead.join(', ')} defined in an app sheet with no var() reference anywhere in apps/`);
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src/__selftest__radius.css',
+        content: '.a{border-radius: 41px;}\n.b{border-top-left-radius: 42px;}\n',
       };
     },
   },

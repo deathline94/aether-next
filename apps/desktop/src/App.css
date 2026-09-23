@@ -117,124 +117,154 @@
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
   --duration-fast: 150ms;
-
-  /* Inks. --fg is body text, --fg-bright the emphasis step; the rest are the
-   per-context greys the log stream and the mono layers use. */
-  --fg: #edf2f5;
-  --fg-bright: #ffffff;
-  --fg-cyan: #e0f2fe;
-  --fg-debug: #94a3b8;
-  --fg-hover: #dce4e8;
-  --fg-info: #d8e2ec;
-  --fg-lock: #ebd887;
-  --fg-mono: #d1dde5;
-  --fg-mono-dim: #cbd8e1;
-  --fg-on-emerald-bright: #05140d;
-  --fg-on-emerald-face: #e2faee;
-  --fg-violet: #c4b5fd;
-  --fg-warn: #fef08a;
-
-  /* Substrates: the faces a control or a stage is drawn on. Named after
-   the thing they are the face *of*, because that is the only reason each
-   value exists and the only thing a reader can check it against. */
-  --brand-mark-bottom: #0c1b14;
-  --brand-mark-top: #153324;
-  --btn-emerald-face: #143525;
-  --btn-emerald-face-hover: #1c4933;
-  --card-active-hover: #101a22;
-  --card-hover: #131c26;
-  --chassis-mid: #0d1217;
-  --chassis-top: #1a222c;
-  --chrome-bg: #0a0e13;
-  --cta-connect-bottom: #0d2319;
-  --cta-connect-hover-bottom: #102d20;
-  --cta-connect-hover-top: #1a4730;
-  --cta-connect-top: #143825;
-  --cta-disconnect-bottom: #25110f;
-  --cta-disconnect-hover-bottom: #2f1513;
-  --cta-disconnect-hover-top: #4d221e;
-  --cta-disconnect-top: #3d1b18;
-  --dock-bg: #070a0e;
-  --emerald-mid: #00ab60;
-  --face-connected-bottom: #0d2116;
-  --face-connected-top: #163625;
-  --face-stop-bottom: #240e0c;
-  --face-stop-top: #3c1916;
-  --knob-idle: #64748b;
-  --scope-bg: #06090c;
-  --screen-bg: #040608;
-  --stage-bottom: #050709;
-  --stage-mid: #090c10;
-  --stage-mid-connected: #090e0c;
-  --stage-mid-connecting: #0d0c08;
-  --stage-mid-error: #0f0a09;
-  --stage-top: #0e1319;
-  --stage-top-connected: #0f1814;
-  --stage-top-connecting: #16150e;
-  --stage-top-error: #1b0f0e;
-  --toggle-off-face: #090d12;
-  --toggle-on-face: #113622;
-
-  /* Surfaces with transparency, for floating chrome (topbar, save dock). */
-  --bg-app-a82: rgba(7, 9, 11, 0.82);
-  --bg-sidebar-a92: rgba(9, 12, 15, 0.92);
-  --bg-sidebar-a94: rgba(9, 12, 15, 0.94);
-  --bg-sidebar-a96: rgba(9, 12, 15, 0.96);
-  --panel-a85: rgba(13, 17, 22, 0.85);
-
-  /* Alpha ladder per palette hue: every translucent accent the UI
-   * paints, spelled once so a hue change touches one line. The
-   * `token-alpha-triples` gate keeps each one on its hue. */
-  --blue-a08: rgba(92, 200, 255, 0.08);
-  --blue-a12: rgba(92, 200, 255, 0.12);
-  --blue-a25: rgba(92, 200, 255, 0.25);
-  --blue-a28: rgba(92, 200, 255, 0.28);
-  --blue-a30: rgba(92, 200, 255, 0.3);
-  --blue-a35: rgba(92, 200, 255, 0.35);
-  --coral-a02: rgba(255, 92, 92, 0.02);
-  --coral-a05: rgba(255, 92, 92, 0.05);
-  --coral-a06: rgba(255, 92, 92, 0.06);
-  --coral-a08: rgba(255, 92, 92, 0.08);
-  --coral-a140: rgba(255, 92, 92, 0.14);
-  --coral-a18: rgba(255, 92, 92, 0.18);
-  --coral-a20: rgba(255, 92, 92, 0.2);
-  --coral-a25: rgba(255, 92, 92, 0.25);
-  --coral-a30: rgba(255, 92, 92, 0.3);
-  --emerald-a04: rgba(0, 240, 138, 0.04);
-  --emerald-a05: rgba(0, 240, 138, 0.05);
-  --emerald-a06: rgba(0, 240, 138, 0.06);
-  --emerald-a070: rgba(0, 240, 138, 0.07);
-  --emerald-a08: rgba(0, 240, 138, 0.08);
-  --emerald-a09: rgba(0, 240, 138, 0.09);
-  --emerald-a10: rgba(0, 240, 138, 0.1);
-  --emerald-a15: rgba(0, 240, 138, 0.15);
-  --emerald-a16: rgba(0, 240, 138, 0.16);
-  --emerald-a18: rgba(0, 240, 138, 0.18);
-  --emerald-a20: rgba(0, 240, 138, 0.2);
-  --emerald-a22: rgba(0, 240, 138, 0.22);
-  --emerald-a25: rgba(0, 240, 138, 0.25);
-  --emerald-a280: rgba(0, 240, 138, 0.28);
-  --emerald-a30: rgba(0, 240, 138, 0.3);
-  --emerald-a35: rgba(0, 240, 138, 0.35);
-  --emerald-a40: rgba(0, 240, 138, 0.4);
-  --emerald-a50: rgba(0, 240, 138, 0.5);
-  --emerald-a60: rgba(0, 240, 138, 0.6);
-  --emerald-a70: rgba(0, 240, 138, 0.7);
-  --violet-a140: rgba(167, 139, 250, 0.14);
-  --violet-a30: rgba(167, 139, 250, 0.3);
-  --yellow-a02: rgba(250, 204, 21, 0.02);
-  --yellow-a06: rgba(250, 204, 21, 0.06);
-  --yellow-a070: rgba(250, 204, 21, 0.07);
-  --yellow-a08: rgba(250, 204, 21, 0.08);
-  --yellow-a10: rgba(250, 204, 21, 0.1);
-  --yellow-a140: rgba(250, 204, 21, 0.14);
-  --yellow-a15: rgba(250, 204, 21, 0.15);
-  --yellow-a20: rgba(250, 204, 21, 0.2);
-  --yellow-a25: rgba(250, 204, 21, 0.25);
-  --yellow-a30: rgba(250, 204, 21, 0.3);
-  --yellow-a35: rgba(250, 204, 21, 0.35);
-  --yellow-a40: rgba(250, 204, 21, 0.4);
-  --yellow-a50: rgba(250, 204, 21, 0.5);
+
+  /*
+   * Radii (contract U-D2, T192). Both sheets together carried 15 distinct
+   * `border-radius` values across ~97 declarations, of which nine values account
+   * for 92 of them — so the scale below is those nine, named by role, and each
+   * token is the value the sheet already used at those sites. That is the point of
+   * this first step: naming what is already painted, identically, is what lets the
+   * collapse (does a chip need 7px or 6px?) be a decision taken once, in a render,
+   * instead of 97 places where nobody was asked. The values that appear only once
+   * or twice (1/3/5/9/18/20px and one four-corner shorthand) are deliberately not
+   * tokenised yet; `radius-scale-ratchet` counts them and only lets the number
+   * fall.
+   */
+  --radius-circle: 50%;     /* 22 uses: round avatars, LEDs, the ping rings */
+  --radius-control: 7px;    /* 12 uses: buttons, chips, inputs — the working control */
+  --radius-inset: 4px;      /* 12 uses: nested fills inside a larger face */
+  --radius-card: 6px;       /* 10 uses: list rows and small panels */
+  --radius-panel: 8px;      /* 8 uses: panels */
+  --radius-field: 10px;     /* 5 uses: input wells */
+  --radius-sheet: 12px;     /* 5 uses: cards */
+  --radius-hero: 14px;      /* 8 uses: the big surfaces */
+  --radius-pill: 999px;     /* 6 uses: fully round regardless of height */
+
+  /*
+   * The disabled dim. `0.45` is what five separate rules converged on, so it is
+   * the token; the other five values in that family (0.35/0.4/0.5/0.55/0.65) are
+   * per-control decisions that a render has to arbitrate, and the same ratchet
+   * counts them.
+   */
+  --opacity-disabled: 0.45;
+
+  /* Inks. --fg is body text, --fg-bright the emphasis step; the rest are the
+   per-context greys the log stream and the mono layers use. */
+  --fg: #edf2f5;
+  --fg-bright: #ffffff;
+  --fg-cyan: #e0f2fe;
+  --fg-debug: #94a3b8;
+  --fg-hover: #dce4e8;
+  --fg-info: #d8e2ec;
+  --fg-lock: #ebd887;
+  --fg-mono: #d1dde5;
+  --fg-mono-dim: #cbd8e1;
+  --fg-on-emerald-bright: #05140d;
+  --fg-on-emerald-face: #e2faee;
+  --fg-violet: #c4b5fd;
+  --fg-warn: #fef08a;
+
+  /* Substrates: the faces a control or a stage is drawn on. Named after
+   the thing they are the face *of*, because that is the only reason each
+   value exists and the only thing a reader can check it against. */
+  --brand-mark-bottom: #0c1b14;
+  --brand-mark-top: #153324;
+  --btn-emerald-face: #143525;
+  --btn-emerald-face-hover: #1c4933;
+  --card-active-hover: #101a22;
+  --card-hover: #131c26;
+  --chassis-mid: #0d1217;
+  --chassis-top: #1a222c;
+  --chrome-bg: #0a0e13;
+  --cta-connect-bottom: #0d2319;
+  --cta-connect-hover-bottom: #102d20;
+  --cta-connect-hover-top: #1a4730;
+  --cta-connect-top: #143825;
+  --cta-disconnect-bottom: #25110f;
+  --cta-disconnect-hover-bottom: #2f1513;
+  --cta-disconnect-hover-top: #4d221e;
+  --cta-disconnect-top: #3d1b18;
+  --dock-bg: #070a0e;
+  --emerald-mid: #00ab60;
+  --face-connected-bottom: #0d2116;
+  --face-connected-top: #163625;
+  --face-stop-bottom: #240e0c;
+  --face-stop-top: #3c1916;
+  --knob-idle: #64748b;
+  --scope-bg: #06090c;
+  --screen-bg: #040608;
+  --stage-bottom: #050709;
+  --stage-mid: #090c10;
+  --stage-mid-connected: #090e0c;
+  --stage-mid-connecting: #0d0c08;
+  --stage-mid-error: #0f0a09;
+  --stage-top: #0e1319;
+  --stage-top-connected: #0f1814;
+  --stage-top-connecting: #16150e;
+  --stage-top-error: #1b0f0e;
+  --toggle-off-face: #090d12;
+  --toggle-on-face: #113622;
+
+  /* Surfaces with transparency, for floating chrome (topbar, save dock). */
+  --bg-app-a82: rgba(7, 9, 11, 0.82);
+  --bg-sidebar-a92: rgba(9, 12, 15, 0.92);
+  --bg-sidebar-a94: rgba(9, 12, 15, 0.94);
+  --bg-sidebar-a96: rgba(9, 12, 15, 0.96);
+  --panel-a85: rgba(13, 17, 22, 0.85);
+
+  /* Alpha ladder per palette hue: every translucent accent the UI
+   * paints, spelled once so a hue change touches one line. The
+   * `token-alpha-triples` gate keeps each one on its hue. */
+  --blue-a08: rgba(92, 200, 255, 0.08);
+  --blue-a12: rgba(92, 200, 255, 0.12);
+  --blue-a25: rgba(92, 200, 255, 0.25);
+  --blue-a28: rgba(92, 200, 255, 0.28);
+  --blue-a30: rgba(92, 200, 255, 0.3);
+  --blue-a35: rgba(92, 200, 255, 0.35);
+  --coral-a02: rgba(255, 92, 92, 0.02);
+  --coral-a05: rgba(255, 92, 92, 0.05);
+  --coral-a06: rgba(255, 92, 92, 0.06);
+  --coral-a08: rgba(255, 92, 92, 0.08);
+  --coral-a140: rgba(255, 92, 92, 0.14);
+  --coral-a18: rgba(255, 92, 92, 0.18);
+  --coral-a20: rgba(255, 92, 92, 0.2);
+  --coral-a25: rgba(255, 92, 92, 0.25);
+  --coral-a30: rgba(255, 92, 92, 0.3);
+  --emerald-a04: rgba(0, 240, 138, 0.04);
+  --emerald-a05: rgba(0, 240, 138, 0.05);
+  --emerald-a06: rgba(0, 240, 138, 0.06);
+  --emerald-a070: rgba(0, 240, 138, 0.07);
+  --emerald-a08: rgba(0, 240, 138, 0.08);
+  --emerald-a09: rgba(0, 240, 138, 0.09);
+  --emerald-a10: rgba(0, 240, 138, 0.1);
+  --emerald-a15: rgba(0, 240, 138, 0.15);
+  --emerald-a16: rgba(0, 240, 138, 0.16);
+  --emerald-a18: rgba(0, 240, 138, 0.18);
+  --emerald-a20: rgba(0, 240, 138, 0.2);
+  --emerald-a22: rgba(0, 240, 138, 0.22);
+  --emerald-a25: rgba(0, 240, 138, 0.25);
+  --emerald-a280: rgba(0, 240, 138, 0.28);
+  --emerald-a30: rgba(0, 240, 138, 0.3);
+  --emerald-a35: rgba(0, 240, 138, 0.35);
+  --emerald-a40: rgba(0, 240, 138, 0.4);
+  --emerald-a50: rgba(0, 240, 138, 0.5);
+  --emerald-a60: rgba(0, 240, 138, 0.6);
+  --emerald-a70: rgba(0, 240, 138, 0.7);
+  --violet-a140: rgba(167, 139, 250, 0.14);
+  --violet-a30: rgba(167, 139, 250, 0.3);
+  --yellow-a02: rgba(250, 204, 21, 0.02);
+  --yellow-a06: rgba(250, 204, 21, 0.06);
+  --yellow-a070: rgba(250, 204, 21, 0.07);
+  --yellow-a08: rgba(250, 204, 21, 0.08);
+  --yellow-a10: rgba(250, 204, 21, 0.1);
+  --yellow-a140: rgba(250, 204, 21, 0.14);
+  --yellow-a15: rgba(250, 204, 21, 0.15);
+  --yellow-a20: rgba(250, 204, 21, 0.2);
+  --yellow-a25: rgba(250, 204, 21, 0.25);
+  --yellow-a30: rgba(250, 204, 21, 0.3);
+  --yellow-a35: rgba(250, 204, 21, 0.35);
+  --yellow-a40: rgba(250, 204, 21, 0.4);
+  --yellow-a50: rgba(250, 204, 21, 0.5);
 }
 
 /*
@@ -290,7 +320,7 @@ html, body, #root {
 
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--edge-interactive); border-radius: 999px; }@media (hover: hover) and (pointer: fine){
+::-webkit-scrollbar-thumb { background: var(--edge-interactive); border-radius: var(--radius-pill); }@media (hover: hover) and (pointer: fine){
 ::-webkit-scrollbar-thumb:hover { background: var(--edge-strong); }}
 
 button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
@@ -388,14 +418,14 @@ code, kbd, pre {
   border: 1px solid var(--emerald-a280);
   background: radial-gradient(circle at 50% 0%, var(--brand-mark-top) 0%, var(--brand-mark-bottom) 100%);
   color: var(--emerald);
-  border-radius: 10px;
+  border-radius: var(--radius-field);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15);
   flex-shrink: 0;
 }
 .brand-ambient-glow {
   position: absolute;
   inset: -4px;
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: radial-gradient(circle, var(--emerald-a30) 0%, transparent 70%);
   opacity: 0.6;
   filter: blur(6px);
@@ -426,7 +456,7 @@ code, kbd, pre {
   height: 40px;
   padding: 0 12px;
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: var(--radius-field);
   background: transparent;
   color: var(--muted);
   display: flex;
@@ -477,7 +507,7 @@ code, kbd, pre {
   justify-content: center;
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--emerald);
   font-size: var(--text-micro);
   font-weight: 600;
@@ -490,7 +520,7 @@ code, kbd, pre {
   justify-content: center;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--edge);
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   /* --muted-dark measured 4.33:1 here: the 3% white chip sits on --panel-active
      while its pill is active, and the composite lifts the surface luminance
      enough to drop the 11px key letter below AA. --muted is the darkest grey
@@ -534,7 +564,7 @@ code, kbd, pre {
   align-items: center;
   padding: 12px 14px;
   border: 1px solid var(--border-card);
-  border-radius: 12px;
+  border-radius: var(--radius-sheet);
   background: var(--panel);
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35), var(--inner-highlight);
   overflow: hidden;
@@ -564,7 +594,7 @@ code, kbd, pre {
 .beacon-core {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--muted);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
   transition: color 0.3s var(--ease-spring), background-color 0.3s var(--ease-spring), border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), transform 0.3s var(--ease-spring), opacity 0.3s var(--ease-spring);
@@ -584,7 +614,7 @@ code, kbd, pre {
 .beacon-ring {
   position: absolute;
   inset: 0;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   border: 1px solid transparent;
   pointer-events: none;
 }
@@ -621,7 +651,7 @@ code, kbd, pre {
   font-size: var(--text-micro);
   font-weight: 700;
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   letter-spacing: 0.04em;
   background: rgba(255, 255, 255, 0.05);
   color: var(--muted);
@@ -702,7 +732,7 @@ code, kbd, pre {
 .header-status {
   padding: 6px 12px;
   border: 1px solid var(--border-card);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--panel-a85);
   box-shadow: var(--inner-highlight);
   display: flex;
@@ -717,7 +747,7 @@ code, kbd, pre {
 .status-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--muted);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08);
   flex-shrink: 0;
@@ -795,7 +825,7 @@ code, kbd, pre {
   width: 480px;
   height: 480px;
   transform: translateY(-50%);
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   pointer-events: none;
 }
 .signal-field span {
@@ -805,7 +835,7 @@ code, kbd, pre {
   height: 120px;
   transform: translate(-50%, -50%);
   border: 1px solid var(--edge);
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   transition: border-color 0.4s;
 }
 .signal-field span:nth-child(2) {
@@ -884,7 +914,7 @@ code, kbd, pre {
 .ping-ring {
   position: absolute;
   inset: 0;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   pointer-events: none;
 }
 .ping-ring.ring-primary.connected {
@@ -923,7 +953,7 @@ code, kbd, pre {
   z-index: var(--z-chassis);
   width: 114px;
   height: 114px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   display: grid;
   place-items: center;
   background: radial-gradient(circle at 50% 32%, var(--chassis-top) 0%, var(--chassis-mid) 65%, var(--bg-app) 100%);
@@ -963,7 +993,7 @@ code, kbd, pre {
 .switch-radial-glow {
   position: absolute;
   inset: -16px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.4s;
@@ -979,7 +1009,7 @@ code, kbd, pre {
   animation: breathing-glow 1.8s ease-in-out infinite alternate;
 }
 @keyframes breathing-glow {
-  0% { transform: scale(0.92); opacity: 0.45; }
+  0% { transform: scale(0.92); opacity: var(--opacity-disabled); }
   100% { transform: scale(1.18); opacity: 0.85; }
 }
 
@@ -988,7 +1018,7 @@ code, kbd, pre {
   position: relative;
   width: 90px;
   height: 90px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   border: 1px solid var(--emerald-border);
   background: radial-gradient(circle at 50% 28%, var(--face-connected-top) 0%, var(--face-connected-bottom) 100%);
   color: var(--emerald);
@@ -1036,7 +1066,7 @@ code, kbd, pre {
   place-items: center;
   width: 100%;
   height: 100%;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
 }
 .master-icon {
   filter: drop-shadow(0 0 8px currentColor);
@@ -1058,7 +1088,7 @@ code, kbd, pre {
   align-items: center;
   gap: 6px;
   padding: 3px 9px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -1086,7 +1116,7 @@ code, kbd, pre {
 .pulse-led {
   width: 5px;
   height: 5px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: currentColor;
   box-shadow: 0 0 6px currentColor;
 }
@@ -1113,7 +1143,7 @@ code, kbd, pre {
 .bento-card {
   position: relative;
   padding: 20px 22px;
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   border: 1px solid var(--border-card);
   background: var(--panel);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.28), var(--inner-highlight);
@@ -1163,7 +1193,7 @@ code, kbd, pre {
 
 .bento-chip, .bento-chip-cyan {
   padding: 3px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   font-size: var(--text-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -1200,7 +1230,7 @@ code, kbd, pre {
   grid-template-columns: repeat(3, 1fr);
   gap: 10px;
   padding: 10px 14px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
 }
@@ -1252,7 +1282,7 @@ code, kbd, pre {
 }
 .spec-badge {
   padding: 8px 11px;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
   display: flex;
@@ -1282,7 +1312,7 @@ code, kbd, pre {
 }
 .topology-detail-row {
   padding: 8px 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
   display: flex;
@@ -1307,7 +1337,7 @@ code, kbd, pre {
 
 .daemon-heartbeat-row {
   padding: 9px 12px;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
 }
@@ -1319,7 +1349,7 @@ code, kbd, pre {
 .heartbeat-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--muted-dark);
   flex-shrink: 0;
 }
@@ -1344,7 +1374,7 @@ code, kbd, pre {
 }
 .daemon-tag {
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: var(--panel-nested);
   border: 1px solid var(--border-subtle);
   font-size: var(--text-micro);
@@ -1360,7 +1390,7 @@ code, kbd, pre {
   width: 28px;
   height: 28px;
   border: 1px solid var(--edge-interactive);
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: var(--panel-2);
   color: var(--muted);
   display: grid;
@@ -1379,7 +1409,7 @@ code, kbd, pre {
 .profiles-panel {
   margin-top: 16px;
   border: 1px solid var(--border-card);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: var(--panel);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25), var(--inner-highlight);
   overflow: hidden;
@@ -1400,7 +1430,7 @@ code, kbd, pre {
   gap: 6px;
   min-height: 84px;
   padding: 14px 16px;
-  border-radius: 10px;
+  border-radius: var(--radius-field);
   /* Boundary is the only selection affordance on an actionable card: opaque
      inset ring, never a 1px translucent border (U-E1). */
   border: 0;
@@ -1471,7 +1501,7 @@ code, kbd, pre {
 
 .profile-active-tag {
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
@@ -1511,7 +1541,7 @@ code, kbd, pre {
 .proxy-panel, .settings-section, .test-panel, .profiles-panel {
   margin-top: 16px;
   border: 1px solid var(--border-card);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: var(--panel);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3), var(--inner-highlight);
   overflow: hidden;
@@ -1574,7 +1604,7 @@ code, kbd, pre {
   max-width: 230px;
   padding: 8px 12px;
   border: 1px solid var(--border-card);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--panel-nested);
   color: var(--fg-mono);
   font-size: 11.5px;
@@ -1587,7 +1617,7 @@ code, kbd, pre {
   width: 34px;
   height: 34px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   box-shadow: inset 0 0 0 1px var(--edge-interactive);
   background: var(--panel-2);
   color: var(--muted);
@@ -1619,7 +1649,7 @@ code, kbd, pre {
   height: 36px;
   padding: 0 16px;
   border: 1px solid var(--emerald-border);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--btn-emerald-face);
   color: var(--fg-on-emerald-face);
   font-size: 11.5px;
@@ -1632,7 +1662,7 @@ code, kbd, pre {
   box-shadow: 0 0 16px var(--emerald-a25);
 }}
 .test-row button:disabled {
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 .test-result {
@@ -1640,7 +1670,7 @@ code, kbd, pre {
   margin: 0 22px 18px;
   padding: 11px 14px;
   border: 1px solid var(--border-card);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--panel-nested);
   color: var(--fg-mono-dim);
   font-size: 11px;
@@ -1663,7 +1693,7 @@ code, kbd, pre {
   min-height: 78px;
   padding: 18px 22px;
   border: 1px solid var(--border-card);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: linear-gradient(135deg, var(--emerald-a04) 0%, var(--panel) 100%);
   display: flex;
   align-items: center;
@@ -1697,7 +1727,7 @@ code, kbd, pre {
 .about-panel code {
   padding: 6px 12px;
   border: 1px solid var(--emerald-border);
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: var(--emerald-dim);
   color: var(--emerald);
   font-size: 11px;
@@ -1719,7 +1749,7 @@ code, kbd, pre {
   align-items: center;
   gap: 14px;
   padding: 14px 18px;
-  border-radius: 12px;
+  border-radius: var(--radius-sheet);
   background: var(--yellow-a070);
   border: 1px solid var(--yellow-a35);
   backdrop-filter: blur(14px);
@@ -1729,7 +1759,7 @@ code, kbd, pre {
 .lock-banner-icon {
   width: 32px;
   height: 32px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--yellow-a15);
   border: 1px solid var(--yellow-a30);
   display: grid;
@@ -1805,7 +1835,7 @@ code, kbd, pre {
   font-size: var(--text-micro);
   font-weight: 700;
   padding: 1px 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   background: rgba(255, 255, 255, 0.06);
   /* Opaque, >=3:1. Stays a border because the .cyan/.emerald/.amber/.coral
      tone modifiers recolour it via border-color (U-B1 colour coding). */
@@ -1840,7 +1870,7 @@ code, kbd, pre {
 .custom-noise-matrix {
   margin: 12px 22px 18px;
   padding: 16px 18px;
-  border-radius: 10px;
+  border-radius: var(--radius-field);
   background: var(--scope-bg);
   border: 1px solid var(--edge);
   box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
@@ -1907,7 +1937,7 @@ code, kbd, pre {
   gap: 10px;
   margin: 10px 22px;
   padding: 12px 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--coral-dim);
   border: 1px solid var(--coral-border);
   color: var(--coral);
@@ -1938,7 +1968,7 @@ code, kbd, pre {
   height: 36px;
   padding: 0 12px 0 34px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   box-shadow: inset 0 0 0 1px var(--edge-interactive); /* U-E1: sole affordance, >=3:1 opaque */
   background: var(--bg-app);
   color: var(--fg);
@@ -1957,7 +1987,7 @@ code, kbd, pre {
   min-width: 180px;
   padding: 0 32px 0 12px;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   box-shadow: inset 0 0 0 1px var(--edge-interactive); /* U-E1: sole affordance, >=3:1 opaque */
   background: var(--bg-app);
   color: var(--fg);
@@ -1975,7 +2005,7 @@ code, kbd, pre {
 .tactical-select:focus {
   box-shadow: inset 0 0 0 1px var(--emerald), 0 0 0 3px var(--emerald-dim);
 }
-.tactical-select:disabled { opacity: 0.45; cursor: not-allowed; }
+.tactical-select:disabled { opacity: var(--opacity-disabled); cursor: not-allowed; }
 
 /* Sticky Tactical Save Dock */
 .tactical-save-dock {
@@ -1983,7 +2013,7 @@ code, kbd, pre {
   bottom: 0;
   min-height: 60px;
   padding: 12px 20px;
-  border-radius: 12px;
+  border-radius: var(--radius-sheet);
   background: var(--bg-sidebar-a92);
   border: 1px solid var(--border-card);
   backdrop-filter: blur(20px);
@@ -2004,7 +2034,7 @@ code, kbd, pre {
 .save-status-indicator-dot {
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--emerald);
   box-shadow: 0 0 8px var(--emerald);
   flex-shrink: 0;
@@ -2020,7 +2050,7 @@ code, kbd, pre {
 .save-sync-pulse {
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   border: 1.5px solid var(--emerald);
   border-top-color: transparent;
   animation: spin 0.8s linear infinite;
@@ -2032,7 +2062,7 @@ code, kbd, pre {
 .save-idle-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--muted-dark);
   flex-shrink: 0;
 }
@@ -2043,7 +2073,7 @@ code, kbd, pre {
   height: 36px;
   padding: 0 16px;
   border: 1px solid var(--emerald-border);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--emerald-dim);
   color: var(--emerald);
   font-size: 11.5px;
@@ -2063,7 +2093,7 @@ code, kbd, pre {
   justify-content: space-between;
   background: var(--bg-app);
   border: 1px solid var(--edge-interactive);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   overflow: hidden;
   height: 36px;
   width: 140px;
@@ -2075,7 +2105,7 @@ code, kbd, pre {
   box-shadow: 0 0 0 1px var(--emerald-dim);
 }
 .stepper-input-wrapper.disabled {
-  opacity: 0.45;
+  opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 .stepper-btn {
@@ -2138,7 +2168,7 @@ code, kbd, pre {
   position: relative;
   width: 44px;
   height: 24px;
-  border-radius: 12px;
+  border-radius: var(--radius-sheet);
   border: 0;
   box-shadow: inset 0 0 0 1px var(--edge-interactive);
   background: var(--toggle-off-face);
@@ -2158,7 +2188,7 @@ code, kbd, pre {
   display: block;
   width: 18px;
   height: 18px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--knob-idle);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
   transition: transform 0.2s var(--ease-spring), background 0.2s, box-shadow 0.2s;
@@ -2177,7 +2207,7 @@ code, kbd, pre {
 .segmented {
   padding: 3px;
   border: 1px solid var(--border-card);
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--panel-nested);
   display: flex;
   flex-wrap: wrap;
@@ -2188,7 +2218,7 @@ code, kbd, pre {
   height: 30px;
   padding: 0 12px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: transparent;
   color: var(--muted);
   font-size: 11px;
@@ -2204,7 +2234,7 @@ code, kbd, pre {
   background: var(--panel-2);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35), inset 0 0 0 1px var(--edge-interactive);
 }
-.segmented.disabled { opacity: 0.45; pointer-events: none; }
+.segmented.disabled { opacity: var(--opacity-disabled); pointer-events: none; }
 
 /* ─── Scanner Tab ─────────────────────────────────────────────────────────── */
 .scanner-view {
@@ -2218,7 +2248,7 @@ code, kbd, pre {
 /* Radar Engine HUD Card */
 .radar-hud-container {
   border: 1px solid var(--border-card);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: var(--panel);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3), var(--inner-highlight);
   overflow: hidden;
@@ -2238,7 +2268,7 @@ code, kbd, pre {
   position: relative;
   width: 84px;
   height: 84px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   border: 1px solid var(--emerald-a30);
   background: radial-gradient(circle, var(--emerald-a070) 0%, var(--scope-bg) 70%);
   display: grid;
@@ -2271,7 +2301,7 @@ code, kbd, pre {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   border: 1px dashed var(--emerald-a20);
 }
 .circle-1 { width: 34px; height: 34px; }
@@ -2280,7 +2310,7 @@ code, kbd, pre {
   position: absolute;
   inset: 0;
   background: conic-gradient(from 0deg, var(--emerald-a50) 0deg, transparent 55deg);
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   animation: radar-sweep-spin 2.2s linear infinite;
 }
 @keyframes radar-sweep-spin {
@@ -2297,7 +2327,7 @@ code, kbd, pre {
 .scope-led {
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--knob-idle);
 }
 .scope-led.active {
@@ -2313,7 +2343,7 @@ code, kbd, pre {
 }
 .scope-phase-tag {
   padding: 1px 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   font-size: var(--text-micro);
   font-weight: 700;
   font-family: var(--font-mono);
@@ -2333,7 +2363,7 @@ code, kbd, pre {
   width: 100%;
   justify-content: center;
   height: 46px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   display: flex;
   align-items: center;
   gap: 10px;
@@ -2416,7 +2446,7 @@ code, kbd, pre {
 }
 .stat-chip-pill {
   padding: 3px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   font-size: var(--text-micro);
   font-weight: 600;
   font-family: var(--font-mono);
@@ -2438,7 +2468,7 @@ code, kbd, pre {
 /* Discovered Endpoints Panel */
 .discovered-panel {
   border: 1px solid var(--border-card);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: var(--panel);
   overflow: hidden;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25), var(--inner-highlight);
@@ -2490,7 +2520,7 @@ code, kbd, pre {
 }
 .proto-tab .chip-count {
   padding: 1px 6px;
-  border-radius: 10px;
+  border-radius: var(--radius-field);
   background: rgba(255, 255, 255, 0.08);
   color: var(--muted-light);
   font-size: var(--text-micro);
@@ -2514,7 +2544,7 @@ code, kbd, pre {
 }
 .discovered-row {
   padding: 12px 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--panel-nested);
   border: 1px solid var(--border-card);
   display: flex;
@@ -2546,7 +2576,7 @@ code, kbd, pre {
 .discovered-proto {
   font-size: var(--text-micro);
   padding: 2px 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
@@ -2570,7 +2600,7 @@ code, kbd, pre {
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 600;
@@ -2579,7 +2609,7 @@ code, kbd, pre {
 .rtt-dot {
   width: 5px;
   height: 5px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: currentColor;
 }
 .rtt-ultra-green {
@@ -2608,7 +2638,7 @@ code, kbd, pre {
   height: 32px;
   padding: 0 14px;
   border: 1px solid var(--emerald-border);
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   background: var(--btn-emerald-face);
   color: var(--fg-on-emerald-face);
   font-size: 11.5px;
@@ -2620,7 +2650,7 @@ code, kbd, pre {
   background: var(--btn-emerald-face-hover);
   box-shadow: 0 0 14px var(--emerald-a25);
 }}
-.connect-direct-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.connect-direct-btn:disabled { opacity: var(--opacity-disabled); cursor: not-allowed; }
 
 /* ─── Connection Banners ─────────────────────────────────────────────────── */
 .error-banner {
@@ -2661,7 +2691,7 @@ code, kbd, pre {
   padding: 4px;
   display: grid;
   place-items: center;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   opacity: 0.75;
   flex-shrink: 0;
   transition: opacity 0.15s, background 0.15s;
@@ -2702,7 +2732,7 @@ code, kbd, pre {
   font-size: 11.5px;
   font-weight: 600;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   background: rgba(0, 0, 0, 0.5);
   border: 1px solid var(--blue-a25);
   color: var(--blue);
@@ -2778,7 +2808,7 @@ code, kbd, pre {
   margin-bottom: 0;
   padding: 14px 18px;
   border: 1px solid var(--emerald-border);
-  border-radius: 12px;
+  border-radius: var(--radius-sheet);
   background: linear-gradient(135deg, var(--emerald-a08) 0%, var(--panel) 100%);
   display: flex;
   flex-direction: column;
@@ -2809,7 +2839,7 @@ code, kbd, pre {
 
 .phase-pill {
   padding: 2px 7px;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
   color: var(--emerald);
@@ -2829,7 +2859,7 @@ code, kbd, pre {
 
 .scan-badges .badge {
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   border: 1px solid var(--border-card);
   background: var(--panel-nested);
   color: var(--muted-light);
@@ -2872,7 +2902,7 @@ code, kbd, pre {
   display: flex;
   flex-direction: column;
   border: 1px solid var(--edge-interactive);
-  border-radius: 14px;
+  border-radius: var(--radius-hero);
   background: var(--bg-app);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), var(--inner-highlight);
   overflow: hidden;
@@ -2896,7 +2926,7 @@ code, kbd, pre {
 .win-dot {
   width: 9px;
   height: 9px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   display: inline-block;
 }
 .win-dot.red { background: var(--coral); }
@@ -2941,7 +2971,7 @@ code, kbd, pre {
   gap: 6px;
   height: 28px;
   padding: 0 11px;
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   border: 1px solid var(--edge-interactive);
   background: rgba(255, 255, 255, 0.04);
   color: var(--muted-light);
@@ -2991,7 +3021,7 @@ code, kbd, pre {
   height: 26px;
   padding: 0 10px;
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   box-shadow: inset 0 0 0 1px var(--edge-interactive);
   background: var(--panel-nested);
   color: var(--muted);
@@ -3012,7 +3042,7 @@ code, kbd, pre {
 .chip-count {
   min-width: 18px;
   padding: 1px 6px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: rgba(255, 255, 255, 0.05);
   color: var(--muted);
   font-size: var(--text-micro);
@@ -3029,7 +3059,7 @@ code, kbd, pre {
   color: var(--emerald);
   background: var(--emerald-dim);
   border: 1px solid var(--emerald-border);
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   padding: 2px 7px;
   letter-spacing: 0.08em;
 }
@@ -3072,7 +3102,7 @@ code, kbd, pre {
 .gutter-dot {
   width: 7px;
   height: 7px;
-  border-radius: 50%;
+  border-radius: var(--radius-circle);
   background: var(--edge);
   display: inline-block;
 }
@@ -3080,7 +3110,7 @@ code, kbd, pre {
   font-size: var(--text-micro);
   font-weight: 700;
   text-align: center;
-  border-radius: 4px;
+  border-radius: var(--radius-inset);
   padding: 0 4px;
   letter-spacing: 0.04em;
   font-family: var(--font-mono);
@@ -3277,7 +3307,7 @@ code, kbd, pre {
   max-width: 560px;
   padding: 12px 14px;
   border: 1px solid var(--coral-border);
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: var(--coral-dim);
   color: var(--coral);
   font-size: 11.5px;
@@ -3287,7 +3317,7 @@ code, kbd, pre {
   height: 38px;
   padding: 0 20px;
   border: 1px solid var(--emerald-border);
-  border-radius: 7px;
+  border-radius: var(--radius-control);
   background: var(--btn-emerald-face);
   color: var(--fg-bright);
   font-size: 12px;
@@ -3337,7 +3367,7 @@ code, kbd, pre {
   place-items: center;
   width: 26px;
   height: 26px;
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   background: rgba(255, 255, 255, 0.04);
 }
 
@@ -3377,6 +3407,6 @@ code, kbd, pre {
   color: var(--coral);
   background: var(--coral-dim);
   border: 1px solid var(--coral-border);
-  border-radius: 6px;
+  border-radius: var(--radius-card);
   cursor: pointer;
 }

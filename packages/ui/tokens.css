@@ -140,6 +140,36 @@
   --ease-fluid: cubic-bezier(0.32, 0.72, 0, 1);
   --duration-fast: 150ms;
 
+  /*
+   * Radii (contract U-D2, T192). Both sheets together carried 15 distinct
+   * `border-radius` values across ~97 declarations, of which nine values account
+   * for 92 of them — so the scale below is those nine, named by role, and each
+   * token is the value the sheet already used at those sites. That is the point of
+   * this first step: naming what is already painted, identically, is what lets the
+   * collapse (does a chip need 7px or 6px?) be a decision taken once, in a render,
+   * instead of 97 places where nobody was asked. The values that appear only once
+   * or twice (1/3/5/9/18/20px and one four-corner shorthand) are deliberately not
+   * tokenised yet; `radius-scale-ratchet` counts them and only lets the number
+   * fall.
+   */
+  --radius-circle: 50%;     /* 22 uses: round avatars, LEDs, the ping rings */
+  --radius-control: 7px;    /* 12 uses: buttons, chips, inputs — the working control */
+  --radius-inset: 4px;      /* 12 uses: nested fills inside a larger face */
+  --radius-card: 6px;       /* 10 uses: list rows and small panels */
+  --radius-panel: 8px;      /* 8 uses: panels */
+  --radius-field: 10px;     /* 5 uses: input wells */
+  --radius-sheet: 12px;     /* 5 uses: cards */
+  --radius-hero: 14px;      /* 8 uses: the big surfaces */
+  --radius-pill: 999px;     /* 6 uses: fully round regardless of height */
+
+  /*
+   * The disabled dim. `0.45` is what five separate rules converged on, so it is
+   * the token; the other five values in that family (0.35/0.4/0.5/0.55/0.65) are
+   * per-control decisions that a render has to arbitrate, and the same ratchet
+   * counts them.
+   */
+  --opacity-disabled: 0.45;
+
   /* Inks. --fg is body text, --fg-bright the emphasis step; the rest are the
    per-context greys the log stream and the mono layers use. */
   --fg: #edf2f5;
