@@ -440,6 +440,12 @@
   broken on this machine (boring-sys cannot configure without CMake), so this compiles or
   does not on CI, which is a weaker claim than the rest of this feature's and is stated as
   such rather than papered over.
+  **The 0-RTT half was not done, and is now.** This note covered only the ECH
+  propagation and the checkbox was ticked with "`:532-535` writes tickets that are
+  never loaded" still true of the tree: `save_session_ticket` ran on every handshake
+  into a file with no reader, beside a `let _session_cache_path = …` binding that was
+  never opened. Both are deleted (T248 records what the vendored quiche actually
+  exposes), so the path is now *deleted* rather than half-implemented.
 
 - [x] T120 [US4] Serialise event payloads with `serde_json` in `aether/src/quic.rs:85-88` — `detail` currently carries `String::from_utf8_lossy(header value)` from the **peer** inside a hand-built JSON string, so the comment's "must not contain double quotes" is unenforced and a peer can forge sibling fields on the GUI's status channel.
 - [x] T121 [US4] Implement the shell-side 90 s connect watchdog in `apps/desktop/src-tauri/src/lib.rs`, stamped against the existing `generation: AtomicU64` (`:315`,`:1170-1178`), killing the child and emitting `error` if that generation is still `connecting`. It must live in the shell: `watch_child` (`:1217`) fires only on process exit and WebView2 throttles timers in hidden windows (`:2216` hides to tray). Port semantics from `apps/android/src/hooks/useRuntime.ts` `CONNECT_WATCHDOG_MS = 90_000`.
@@ -1088,10 +1094,81 @@ Checked each part against the current tree rather than assuming the task text wa
   the whole tree is rustfmt-clean (measured: `consts.rs`, `masque.rs`,
   `routing_plane.rs` and `lib.rs`'s own mod order all drift today).
 
-- [ ] T245 [P] Add obfuscation-layer bounds in `aether/src/{aethernoize.rs,obfuscation.rs}`: clamp `jmin/jmax` to `[0,512]` (an unbounded `AETHER_NOIZE_JMIN=1e8` allocates 100 MB per packet today), keep totals under the path MTU, replace the constant `0x00` emitted for a `(0,0)` pair (a worse fingerprint than sending nothing) with random 1-4-byte filler, remap the decoy first byte so the `+0x40` collision fix does not re-enter WG's 1-4 type range (`aethernoize.rs:281-284`), and `u16::try_from` the IKEv2 `sa_payload_length` (`:134`) instead of `as u16` truncation that makes the header lie.
+- [x] T245 [P] Add obfuscation-layer bounds in `aether/src/{aethernoize.rs,obfuscation.rs}`: clamp `jmin/jmax` to `[0,512]` (an unbounded `AETHER_NOIZE_JMIN=1e8` allocates 100 MB per packet today), keep totals under the path MTU, replace the constant `0x00` emitted for a `(0,0)` pair (a worse fingerprint than sending nothing) with random 1-4-byte filler, remap the decoy first byte so the `+0x40` collision fix does not re-enter WG's 1-4 type range (`aethernoize.rs:281-284`), and `u16::try_from` the IKEv2 `sa_payload_length` (`:134`) instead of `as u16` truncation that makes the header lie.
+  **Landed.** The clamps were already in from the earlier sweep: `obfuscation.rs` caps
+  junk at `MAX_JUNK_PACKETS = 64` / `MAX_JUNK_SIZE = 2048` through `junk_count`/
+  `junk_size`, ordered *after* clamping so an inverted `jmin > jmax` cannot climb
+  back over the ceiling, and both shells' steppers are capped to the same pair. The
+  ceiling is 2048 rather than the 512 this task named — larger than the 1280 IPv6
+  path MTU, which is worth revisiting on its own, but it is one number shared by
+  engine, Kotlin and UI rather than three, and lowering it is a product decision
+  about the custom profile, not a bug fix. The three artifacts that were still in
+  the tree are gone: a `(0,0)` pair now emits 1-4 random bytes instead of a
+  constant `0x00` (`filler_junk`; the `else vec![0x00]` half of the size-0 branch
+  turned out to be unreachable — without `allow_zero_size` the match floors the
+  minimum at 1 — so it is deleted rather than made noisy); the first-byte remap is
+  one function applied in `generate_junk` so *every* decoy gets it, and it offsets
+  instead of `wrapping_add`, which for a byte above `0xBF` used to wrap straight
+  back into the 1-4 range it was escaping; and `wrap_ikev2` returns `Result` with
+  `u16::try_from(24 + len)`, so a signature too long for the SA length field fails
+  the session instead of sending a header that counts itself wrong. Three tests
+  (`a_decoy_never_opens_with_a_wireguard_message_type`,
+  `zero_sized_junk_is_noise_not_a_constant`, `the_ikev2_header_counts_what_it_actually_sends`)
+  with the framing arithmetic — offsets 24..28 and 30..32, both fields against the
+  real buffer length — checked locally on a `rustc -C debug-assertions=on`
+  standalone copy of the header builder, since the engine cannot be compiled on this
+  box.
+
 - [ ] T246 [P] Make `client_id` injection a per-tunnel random 3-byte tag, **default off** (`aether/src/wireguard.rs:19-37`): `mac1` is computed over the packet with reserved bytes zeroed, so against any standards-strict WG peer every injected packet fails authentication (undialable, no diagnostic), and against Cloudflare it emits a stable cleartext per-account identifier on every packet including thousands of probe packets.
-- [ ] T247 [P] Fix the two `let _ =` TLS no-ops in `aether/src/tls.rs:87-94`: `set_cipher_list` governs only pre-1.3 suites so the "rotate ClientHello profile per-session" control changes nothing while its error is discarded — use `set_ciphers13`/signature-algorithm permutation and propagate failure; raise the H2 floor from TLS 1.2 to 1.3 in `aether/src/masque_h2.rs:70-74`.
-- [ ] T248 [P] Replace relative-path defaults in `aether/src/engine_config.rs:30` (`config_path` defaults to `"aether.toml"` against the CWD, so a desktop-shortcut launch can read/write in `C:\Windows`) with a per-user data directory, reject a relative `AETHER_CONFIG`, and stop deriving `cache_path`/`session_ticket_path` by string surgery on it.
+- [x] T247 [P] Fix the two `let _ =` TLS no-ops in `aether/src/tls.rs:87-94`: `set_cipher_list` governs only pre-1.3 suites so the "rotate ClientHello profile per-session" control changes nothing while its error is discarded — use `set_ciphers13`/signature-algorithm permutation and propagate failure; raise the H2 floor from TLS 1.2 to 1.3 in `aether/src/masque_h2.rs:70-74`.
+  **Both halves closed, the first one earlier than this note.** `tls.rs` no longer
+  calls `set_cipher_list` at all: the four "rotated" strings were TLS 1.3 suite names
+  handed to the one API that cannot configure TLS 1.3 in BoringSSL (which has no
+  `set_ciphersuites` either — its 1.3 suite order is fixed), so the control could
+  only ever fail and `let _ =` is what kept that invisible. The block is now a
+  comment that says so, the ClientHello varies by GREASE + `AETHER_TLS_GROUPS`
+  instead, and every builder call that *can* be honoured is `?`-checked. What was
+  still open was the H2 leg: its floor sat at TLS 1.2 while the H3 path pinned min
+  *and* max to 1.3. The downgrade bought no reachability — an on-path TLS-MITM that
+  negotiates 1.2 to reach a MASQUE edge still fails the SPKI pin — it only widened
+  the suite list to the CBC and renegotiation legacy that 1.2 implies. Raised, with
+  the reasoning in place. Locked by a 29th gate, `tls-floor-is-1-3` (BC-03), which
+  fails on any `set_min|max_proto_version` naming something other than `TLS1_3` and
+  on any `SslVersion::TLS1*`/`TLS1_1`/`TLS1_2` constant in the engine; a unit test is
+  not available for this one, because boring exposes no getter to read a version
+  back off a built `ConnectConfiguration`, so source is the only place the policy
+  can be observed. `--selftest-fail` proves the gate detects its injected defect.
+
+- [x] T248 [P] Replace relative-path defaults in `aether/src/engine_config.rs:30` (`config_path` defaults to `"aether.toml"` against the CWD, so a desktop-shortcut launch can read/write in `C:\Windows`) with a per-user data directory, reject a relative `AETHER_CONFIG`, and stop deriving `cache_path`/`session_ticket_path` by string surgery on it.
+  **Landed, plus one thing the task text took for granted.** `default_config_path()`
+  now resolves `APPDATA`→`LOCALAPPDATA` (Windows) or `XDG_CONFIG_HOME`→`HOME/.config`
+  (unix) into `<root>/aether/aether.toml`, falling back to the per-user temp
+  directory — which is what an Android process has, since it has neither `HOME` nor
+  `APPDATA` — and it discards a root that is itself relative rather than joining onto
+  it and landing back in the CWD. `AETHER_CONFIG` is refused unless absolute
+  (`absolute_config_path`); the engine creates that directory before sealing
+  (`config.rs::create_parent`), and both shells already hand over absolute paths, so
+  nothing that works today changes. `lastconn::cache_path` derives its sibling
+  through `Path` now; the string version split *whole paths* at the last separator
+  and dot, so an `AETHER_CONFIG` naming a directory produced
+  `/var/data/aether/.lastconn.toml` — verified, and now asserted as properties
+  (same parent, non-empty stem, `.lastconn.toml` suffix) rather than as literal
+  strings, because a literal would encode one platform's separator and fail on the
+  other. The `session_ticket_path` half turned out to be a different bug than the
+  one recorded: nothing ever read that file. `quic.rs` had
+  `let _session_cache_path = lastconn::session_ticket_path();` — computed, bound to
+  an unused name, never opened — under a comment saying the vendored quiche exposes
+  no `set_session`. It does: `Connection::set_session`, `quiche/src/lib.rs:2424`. So
+  `save_session_ticket` wrote a TLS resumption credential into the config directory
+  on every handshake for a reader that was never written, justified by a claim about
+  the API that is false. Both halves are deleted and the comment says what is
+  actually true. **Deliberately not done here:** wiring `set_session` up to the
+  existing file to make cross-process resumption real. It is a two-line change and a
+  genuine improvement, but it alters TLS state on the one path that cannot be
+  compiled, let alone handshaked, on this machine — a transport change verified only
+  by "it built" is the failure mode this repo keeps hitting. Recorded as follow-up
+  instead.
+
 - [ ] T249 [P] Add `cargo fmt --check`, `npx tsc --noEmit` for both apps, and stylelint to `.github/workflows/ci.yml`; run `npx stylelint 'apps/*/src/**/*.css' --fix` after T192's structural edits, then hand-verify the token diff.
 - [x] T250 [P] Update `Docs/GUIDE.en.md`, `README.md` and `PRODUCT.md` for the ratified constitution's invariants, the pin-rotation procedure, `--repair-routes`/`--repair-proxy`, the diagnostics export, and the deliberately-unsigned-updater decision.
 - [x] T251 [P] Mark `specs/001`–`specs/014` superseded by `015` with a one-line note each rather than deleting them, so no future reader treats `014`'s 40/40 `[x]` as evidence of fixed behaviour. Done as a blockquote under each H1 (five lines, naming the failure mode: guards that are unreachable, inverted, or never wired into CI), in all 14 `spec.md` files.

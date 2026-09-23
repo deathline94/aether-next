@@ -127,9 +127,9 @@ pub fn from_profile(name: &str) -> AetherNoizeConfig {
     crate::obfuscation::aethernoize_from_name(name)
 }
 
-fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
+fn wrap_ikev2(payload: &[u8]) -> Result<Vec<u8>> {
     if payload.is_empty() {
-        return payload.to_vec();
+        return Ok(payload.to_vec());
     }
 
     let mut initiator_spi = [0u8; 8];
@@ -143,7 +143,16 @@ fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     rand::thread_rng().fill_bytes(&mut responder_spi);
 
     let total_length = 28u32 + 24 + payload.len() as u32;
-    let sa_payload_length = 24u16 + payload.len() as u16;
+    // The SA payload's own 16-bit length field. `24u16 + payload.len() as u16`
+    // truncated twice over: a payload over 65511 B wrapped the sum past `u16`, so
+    // the header announced a length the packet does not have. A packet that lies
+    // about its own framing is not obfuscation, it is a signature.
+    let sa_payload_length = u16::try_from(24 + payload.len()).map_err(|_| {
+        AetherError::Other(format!(
+            "aethernoize: {} B signature does not fit the IKEv2 SA length field",
+            payload.len()
+        ))
+    })?;
 
     let mut header = Vec::with_capacity(total_length as usize);
 
@@ -166,13 +175,44 @@ fn wrap_ikev2(payload: &[u8]) -> Vec<u8> {
     ]);
 
     header.extend_from_slice(payload);
-    header
+    Ok(header)
+}
+
+/// Move a packet's first byte out of WireGuard's message-type range (1-4).
+///
+/// A decoy that opens with `01` advertises itself as a handshake record, which is
+/// the opposite of what it is for. The offset used to be
+/// `first.wrapping_add(0x40)`, and wrapping is the wrong verb here: applied to a
+/// byte above `0xBF` it lands back inside 1-4, so the fix could re-create the
+/// signature it exists to remove. Offsetting is exact and total for the guarded
+/// domain, and everything outside 1-4 is left alone.
+fn avoid_wg_message_type(bytes: &mut [u8]) {
+    if let Some(first) = bytes.first_mut() {
+        if (1..=4).contains(first) {
+            *first += 0x40;
+        }
+    }
+}
+
+/// Junk for a profile that asked for none.
+///
+/// A fixed `0x00` byte is worse than sending nothing at all: it is the same
+/// one-byte packet in the same slot of every sequence, i.e. its own tell. One to
+/// four random bytes keeps the size distribution noisy without inventing a
+/// constant.
+fn filler_junk() -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let n = rng.gen_range(1..=4usize);
+    let mut junk = vec![0u8; n];
+    rng.fill_bytes(&mut junk);
+    avoid_wg_message_type(&mut junk);
+    junk
 }
 
 fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     let (min_size, max_size) = match (cfg.jmin, cfg.jmax) {
         (0, 0) if cfg.allow_zero_size => return vec![],
-        (0, 0) => return vec![0x00],
+        (0, 0) => return filler_junk(),
         (min, 0) if !cfg.allow_zero_size => (min.max(1), min.max(1)),
         (min, max) if !cfg.allow_zero_size => (min.max(1), max.max(min)),
         (min, max) => (min, max.max(min)),
@@ -185,15 +225,18 @@ fn generate_junk(cfg: &AetherNoizeConfig) -> Vec<u8> {
     };
 
     if size == 0 {
-        return if cfg.allow_zero_size {
-            vec![]
-        } else {
-            vec![0x00]
-        };
+        // Only the `allow_zero_size` arms above can get here: without that flag
+        // the match floors the minimum at 1, so the old `else vec![0x00]` branch
+        // was unreachable and the constant it emitted never left the function.
+        return vec![];
     }
 
     let mut junk = vec![0u8; size];
     rand::thread_rng().fill_bytes(&mut junk);
+    // Applied here rather than at one call site: the keepalive decoys did this to
+    // themselves while the handshake-path junk went out unremapped, which is a
+    // 4-in-256 chance of a decoy opening with a WireGuard message type.
+    avoid_wg_message_type(&mut junk);
     junk
 }
 
@@ -256,7 +299,7 @@ pub async fn apply_obfuscation(
     if let Some(ref i1) = cfg.i1 {
         let payload = parse_cps(i1);
         if !payload.is_empty() {
-            let framed = wrap_ikev2(&payload);
+            let framed = wrap_ikev2(&payload)?;
             send_intro(sock, peer, &framed, "signature i1").await?;
             jitter(2, 8).await;
         }
@@ -323,13 +366,9 @@ pub async fn send_keepalive_junk(sock: &UdpSocket, cfg: &AetherNoizeConfig) {
     let count = base + extra;
 
     for _ in 0..count {
-        let mut junk = generate_junk(cfg);
-        // Avoid first byte matching WireGuard message types (1-4).
-        if let Some(first) = junk.first_mut() {
-            if *first >= 1 && *first <= 4 {
-                *first = first.wrapping_add(0x40);
-            }
-        }
+        let junk = generate_junk(cfg);
+        // The first byte is already out of WireGuard's message-type range:
+        // `generate_junk` guarantees it for every decoy, not just these.
         if let Err(e) = sock.send(&junk).await {
             crate::counters::bump(&crate::counters::DATAGRAM_SEND_DROPPED);
             log::error!(
@@ -407,6 +446,67 @@ mod tests {
                 junk.len()
             );
         }
+    }
+
+    #[test]
+    fn a_decoy_never_opens_with_a_wireguard_message_type() {
+        // The remap used to be `wrapping_add(0x40)` at one call site, which both
+        // left the handshake-path junk unguarded and, for a byte above `0xBF`,
+        // wrapped straight back into the 1-4 range it was meant to escape.
+        for (input, want) in [
+            (1u8, 0x41u8),
+            (2, 0x42),
+            (3, 0x43),
+            (4, 0x44),
+            (0, 0),
+            (5, 5),
+            (0x40, 0x40),
+            (0xC0, 0xC0),
+            (0xFF, 0xFF),
+        ] {
+            let mut buf = [input, 0x11, 0x22];
+            avoid_wg_message_type(&mut buf);
+            assert_eq!(buf[0], want, "first byte {input:#04x}");
+            assert_eq!(buf[1..], [0x11, 0x22], "only the first byte moves");
+        }
+        avoid_wg_message_type(&mut []);
+    }
+
+    #[test]
+    fn zero_sized_junk_is_noise_not_a_constant() {
+        let mut cfg = AetherNoizeConfig::off();
+        cfg.allow_zero_size = false;
+        for _ in 0..50 {
+            let junk = generate_junk(&cfg);
+            assert!(
+                (1..=4).contains(&junk.len()),
+                "filler was {} bytes, expected 1-4",
+                junk.len()
+            );
+            assert!(!matches!(junk[0], 1..=4), "filler opens as a WG type");
+        }
+        cfg.allow_zero_size = true;
+        assert!(generate_junk(&cfg).is_empty(), "zero-size means zero");
+    }
+
+    #[test]
+    fn the_ikev2_header_counts_what_it_actually_sends() {
+        let payload = vec![0xABu8; 148];
+        let framed = wrap_ikev2(&payload).expect("148 B fits the SA length field");
+        assert_eq!(framed.len(), 28 + 24 + payload.len());
+        assert_eq!(
+            &framed[24..28],
+            &u32::try_from(framed.len()).unwrap().to_be_bytes(),
+            "the IKE header's total length must match the datagram"
+        );
+        assert_eq!(
+            &framed[30..32],
+            &u16::try_from(24 + payload.len()).unwrap().to_be_bytes(),
+            "the SA payload length must match the payload"
+        );
+        // `24u16 + len as u16` wrapped here and emitted a header that lied about
+        // the packet it was attached to.
+        assert!(wrap_ikev2(&vec![0u8; 100_000]).is_err());
     }
 
     /// A signature that never left the socket has to be an error, not a `let _ =`.

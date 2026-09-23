@@ -465,11 +465,16 @@ pub async fn run(
         policy: crate::trust::VerifyPolicy::Pinned(crate::trust::masque_pin_sets()),
     })?;
 
-    // #1: Load cached session ticket for 0-RTT resumption (faster reconnect).
-    // Note: quiche fork doesn't expose set_session; 0-RTT relies on enable_early_data()
-    // in tls.rs and quiche's internal session caching.
-    let _session_cache_path = crate::lastconn::session_ticket_path();
-
+    // No session-ticket file on either side of this handshake. This used to bind
+    // `let _session_cache_path = lastconn::session_ticket_path()` — a path
+    // computed, named and never opened — beside a comment saying the vendored quiche
+    // "doesn't expose set_session". It does: `Connection::set_session`, at
+    // `quiche/src/lib.rs:2424` of the vendored copy. So `save_session_ticket`, run
+    // on every successful handshake, wrote a TLS resumption credential into the
+    // config directory for a reader that was never written, under a justification
+    // that is not true. Deleting the writer is the fix available without a live
+    // edge to test against; loading the ticket through `set_session` and making
+    // cross-process resumption real is the better follow-up — see T248.
     let mut current_ech = cfg.ech_config_list.clone();
 
     let scid_bytes = random_scid();
@@ -679,10 +684,6 @@ pub async fn run(
                 "quic_established",
                 &format!("alpn={}", String::from_utf8_lossy(conn.application_proto())),
             );
-            // #1: Cache session ticket for 0-RTT on next connect.
-            if let Some(session) = conn.session() {
-                crate::lastconn::save_session_ticket(session);
-            }
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&cfg.authority, &cfg.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;

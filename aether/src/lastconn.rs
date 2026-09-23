@@ -46,29 +46,58 @@ pub fn cache_path(base_config: &str) -> String {
     if let Some(p) = crate::runtime_env::var("AETHER_LASTCONN_PATH") {
         return p;
     }
-    let dir_end = base_config.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
-    let (dir, file) = base_config.split_at(dir_end);
-    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    format!("{dir}{stem}.lastconn.toml")
+    sibling_of(base_config, "lastconn.toml")
 }
 
-/// Path for the QUIC session ticket cache (0-RTT resumption).
-pub fn session_ticket_path() -> String {
-    let base = crate::runtime_env::var("AETHER_CONFIG").unwrap_or_else(|| "aether.toml".into());
-    let dir_end = base.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
-    let (dir, file) = base.split_at(dir_end);
-    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    format!("{dir}{stem}.session")
+/// `<dir>/<name>` beside the config file, through `Path` rather than by hunting
+/// for the last `.` in the whole string: with `AETHER_CONFIG` set to a directory
+/// (`/var/data/aether/`) the string version split at that trailing separator,
+/// found an empty file name, and produced `/var/data/aether/.lastconn.toml`.
+fn sibling_of(base_config: &str, extra: &str) -> String {
+    let base = std::path::Path::new(base_config);
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("aether");
+    base.parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .join(format!("{stem}.{extra}"))
+        .to_string_lossy()
+        .into_owned()
 }
 
-/// Save a QUIC session ticket for 0-RTT resumption on next connect.
-/// A session ticket is a resumption credential, so it goes through the same
-/// locked-down atomic writer as the identity file (was: plain fs::write with
-/// default ACLs/perms).
-pub fn save_session_ticket(data: &[u8]) {
-    let path = session_ticket_path();
-    match crate::config::write_private_file(&path, data) {
-        Ok(()) => log::debug!("[lastconn] cached session ticket ({} bytes)", data.len()),
-        Err(e) => log::debug!("[lastconn] failed to cache session ticket: {e}"),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sibling path used to be string surgery on the whole value. Handed a
+    /// directory (`AETHER_CONFIG=/var/data/aether/`) it split at the trailing
+    /// separator, found an empty file name, and wrote
+    /// `/var/data/aether/.lastconn.toml` — a dot-prefixed file nothing reads and
+    /// the reconnect log reports as "no cache".
+    #[test]
+    fn the_lastconn_file_is_a_sibling_of_the_config() {
+        crate::runtime_env::remove("AETHER_LASTCONN_PATH");
+        for base in [
+            "/home/u/.config/aether/aether.toml",
+            "C:/Users/o.brien/aether/aether.toml",
+            "/var/data/aether/",
+            "aether.toml",
+        ] {
+            let got = cache_path(base);
+            let p = std::path::Path::new(&got);
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            assert!(name.ends_with(".lastconn.toml"), "{base} -> {got}");
+            assert!(
+                !name.starts_with('.'),
+                "{base} -> {got}: an empty stem means the config name was lost"
+            );
+            assert_eq!(
+                p.parent(),
+                std::path::Path::new(base).parent(),
+                "{base} -> {got} is not beside the config"
+            );
+        }
     }
 }

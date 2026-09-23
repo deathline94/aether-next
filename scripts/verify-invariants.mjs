@@ -656,6 +656,42 @@ const GATES = [
     },
   },
   {
+    name: 'tls-floor-is-1-3',
+    invariant: 'BC-03',
+    summary: 'every engine TLS context sets its floor to 1.3; no 1.2-or-below constant',
+    scan(api) {
+      // Both transports now pin the floor and the ceiling to TLS 1.3. The H2 leg
+      // used to leave the floor at 1.2, which bought no reachability — a MITM
+      // that negotiates 1.2 to get in still fails the SPKI pin — and only widened
+      // the suite list to the CBC-and-renegotiation legacy 1.2 implies. A static
+      // rule rather than a unit test because reading the version back off a
+      // built `ConnectConfiguration` is not part of boring's API surface, so the
+      // only check that can actually observe this is the source itself.
+      const v = [];
+      for (const f of api.files('aether/src', /\.rs$/)) {
+        const t = api.read(f);
+        t.split('\n').forEach((line, i) => {
+          const s = line.trim();
+          if (s.startsWith('//') || s.startsWith('//!') || s.startsWith('*')) return;
+          const m = s.match(/set_(?:min|max)_proto_version\(\s*Some\(\s*SslVersion::(\w+)/);
+          if (m && m[1] !== 'TLS1_3') {
+            v.push(`${locate(f, t, t.indexOf(line))} proto version set to ${m[1]}`);
+          }
+          if (/SslVersion::(TLS1|TLS1_1|TLS1_2)\b/.test(s)) {
+            v.push(`${locate(f, t, t.indexOf(line))} names a downgraded protocol version`);
+          }
+        });
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'aether/src/__selftest__.rs',
+        content: 'fn f(builder: &mut SslContextBuilder) {\n  builder.set_min_proto_version(Some(SslVersion::TLS1_2));\n}\n',
+      };
+    },
+  },
+  {
     name: 'no-fabricated-metrics',
     invariant: 'BC-14',
     summary: 'no invented telemetry in shipped UI',

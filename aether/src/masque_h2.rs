@@ -66,8 +66,14 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
 
+    // TLS 1.3 only, matching the H3 path in `tls.rs` (which pins min and max to
+    // 1.3). The floor used to be 1.2, which bought nothing: an on-path TLS-MITM
+    // that negotiates 1.2 to reach a MASQUE edge also fails the SPKI pin, so the
+    // downgrade did not preserve reachability — it only widened the suite list to
+    // the CBC and renegotiation legacy 1.2 implies, and let a session fall into it
+    // quietly. A path that cannot reach 1.3 now fails with a TLS error instead.
     builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
         .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
         .set_max_proto_version(Some(SslVersion::TLS1_3))
