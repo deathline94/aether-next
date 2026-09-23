@@ -1110,10 +1110,18 @@ Checked each part against the current tree rather than assuming the task text wa
   then true) and `attachingTheSameOwnerTwiceReplacesItsSinkInsteadOfStackingIt`. Both
   feed an endpoint-selection event, not a second `connected`: the state machine
   correctly publishes nothing when the status does not change and log lines are
-  batched, so a lifecycle event would have tested that instead. **Still open here:**
-  `launchMode="singleTask"`, the deprecated `startActivityForResult` consent path, the
-  `@Volatile`/reset discipline on `pendingConnectAfterVpn`, and `onTaskRemoved`'s wake
-  lock (T217).
+  **The rest of this item's clauses were already true, and two of them ask for
+  decoration:** `launchMode="singleTask"` is in `AndroidManifest.xml:35` beside a
+  `configChanges` list; the consent result *is* handled (`MainActivity.kt:326`
+  `onActivityResult` -> `retryConnect`, flag cleared at `:342`, the whole
+  `requestVpnPermission` body posted to the UI thread); `pendingConnectAfterVpn`
+  needs no `@Volatile` because it is main-thread-confined - every read and write
+  sits inside a `runOnUiThread` or an `onActivityResult`, so annotating it would
+  only suggest a race that is not there. `onRevoke` (`AetherVpnService.kt:623`) sets
+  a flag, calls the non-blocking `stopTunnel`, notifies the controller and
+  `stopSelf()`s, which is the shape this task asks for. **Genuinely left:** the
+  `startActivityForResult` -> `registerForActivityResult` modernisation (deprecated
+  API, correct behaviour), and `onTaskRemoved`/wake-lock handling, which is T217.
   <!-- Checked item by item, 2026-09-22. Four of the five are satisfied, two of
        them by a different mechanism than this text names. The registry is not a
        `CopyOnWriteArrayList` attached in `onStart`: `SessionController` keeps an
