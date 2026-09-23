@@ -1,10 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
-import { initialScanState, effectiveScanTimeout, clampConcurrency } from "../types";
+import { initialScanState } from "../types";
+import { parseScanEvent } from "../scanEventPayload";
 import { errorMessage } from "../ipcError";
-import { scanVerdict } from "@aether/ui";
+// One home for the ladder and for the rule that reads it: this pair of front-ends
+// used to keep their own clamps, and this one had none on its send path at all.
+import {
+  clampConcurrency,
+  effectiveScanTimeout,
+  scanVerdict,
+  SCAN_DEFAULT_CONCURRENCY,
+} from "@aether/ui";
 import { hitAddressKey } from "@aether/ui/logs";
-import type { DiscoveredEndpoint, LogInput, ScanEvent, ScanState } from "../types";
+import type { DiscoveredEndpoint, LogInput, ScanState } from "../types";
 
 /**
  * Owns standalone-scanner state. Progress/hits arrive as structured
@@ -18,7 +26,20 @@ export function useScanner(
 ) {
   const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
-  const [concurrency, setConcurrency] = useState(250);
+  // What the user asked for, which is not necessarily what this protocol can run.
+  // The field used to open at 250 — a cheap H2/WireGuard width — on a scan that
+  // opens on H3 and stops at 16, so the control advertised lanes the engine would
+  // never put on the wire, and the first `scan_start` frame contradicted the number
+  // still printed in the box.
+  const [requestedConcurrency, setRequestedConcurrency] = useState(SCAN_DEFAULT_CONCURRENCY);
+  // One resolution, shown and sent: the panel gets *this* as `concurrency`, the log
+  // line prints it and the request carries it, so no path can name a lane count the
+  // others do not run. Re-clamping an already clamped number is a no-op, which is
+  // what makes the three safe to read from the same value.
+  const effectiveConcurrency = useMemo(
+    () => clampConcurrency(requestedConcurrency, protocol),
+    [requestedConcurrency, protocol],
+  );
   const [timeoutMs, setTimeoutMs] = useState(6000);
   const [noize, setNoize] = useState("off");
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
@@ -36,14 +57,37 @@ export function useScanner(
    * render that installed it.
    */
   const endpointsRef = useRef<DiscoveredEndpoint[]>([]);
+  /**
+   * One log line per distinct unreadable frame, not one per frame: the shell re-emits
+   * on every tick of a run, and a console full of the same complaint hides the scan.
+   * The same rule `useRuntime` applies to a rejected `session://state`.
+   */
+  const rejectedEvents = useRef(new Set<string>());
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
 
   useEffect(() => {
     let disposed = false;
-    listen<ScanEvent>("scan://event", (event) => {
+    // `unknown`, not `ScanEvent`: the cast was the whole lie of this subscription — it
+    // asserted a shape nobody checked and let a frame with a string `rttMs` into the
+    // sort that orders the hit list, and the progress card, by that number.
+    listen<unknown>("scan://event", (event) => {
       if (disposed) return;
-      const ev = event.payload;
+      const parsed = parseScanEvent(event.payload);
+      if (!parsed.ok) {
+        // The recoverable path, the one `parseRuntimeState` already takes: say it once
+        // per distinct shape and keep showing the last event that could be read. A
+        // malformed frame is not evidence that the run ended, so state is untouched.
+        if (!rejectedEvents.current.has(parsed.reason)) {
+          rejectedEvents.current.add(parsed.reason);
+          appendLog({
+            level: "error",
+            message: `Ignored a scan event the interface cannot read (${parsed.reason}); showing the last one it could.`,
+          });
+        }
+        return;
+      }
+      const ev = parsed.event;
       if (ev.runId && ev.runId !== runIdRef.current) return;
       switch (ev.type) {
         case "scan_start":
@@ -139,7 +183,9 @@ export function useScanner(
     // describes the run the engine will perform rather than the numbers the fields
     // happened to hold: `concurrency` used to be printed and sent raw while the
     // shell clamped it, which is how "concurrency=1500" could end up as 500 lanes.
-    const workers = clampConcurrency(concurrency, protocol);
+    // They are the resolved values the fields above show, not a second clamp that
+    // could disagree with the first.
+    const workers = effectiveConcurrency;
     // Same clamp the shell applies (`ScanLimits.clampTimeout`), so what the field
     // shows and what the engine runs are one number.
     const effectiveTimeout = effectiveScanTimeout(protocol, timeoutMs);
@@ -160,7 +206,7 @@ export function useScanner(
     } finally {
       setBusy(false);
     }
-  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog, clearLogs]);
+  }, [busy, active, protocol, ipScan, effectiveConcurrency, timeoutMs, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
     // Ask the engine first; report "Stopped" regardless so the UI never sticks.
@@ -177,7 +223,9 @@ export function useScanner(
   return {
     protocol, setProtocol,
     ipScan, setIpScan,
-    concurrency, setConcurrency,
+    // The lanes this protocol runs, which is the number the field shows; the setter
+    // still takes what the user asks for, so a wider transport can carry it.
+    concurrency: effectiveConcurrency, setConcurrency: setRequestedConcurrency,
     timeoutMs, setTimeoutMs,
     noize, setNoize,
     endpoints, active, scanState, busy,

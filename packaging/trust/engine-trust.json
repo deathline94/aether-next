@@ -23,10 +23,23 @@
     "",
     "Field meanings: file_sha256 is sha256 over the artifact's bytes; cert_sha256 is",
     "sha256 over the signing leaf certificate's DER (NOT the SHA-1 store thumbprint);",
-    "issued_cn is the subject's CN as Authenticode reports it. All three are produced by",
+    "issued_cn is the subject's CN as Authenticode reports it. The first three are produced by",
     "scripts/publish-engine-trust.mjs, never by hand. An all-zero file_sha256 means no",
     "witness has been published yet: a release build then refuses that artifact with",
-    "anchor_not_published rather than pretending the comparison succeeded."
+    "anchor_not_published rather than pretending the comparison succeeded.",
+    "",
+    "Three further fields describe provenance rather than content, and scripts/package-policy.mjs",
+    "reads them before any package is called distributable. signing_profile is trusted-ca when",
+    "the pinned leaf chains to a root a clean machine already trusts, ephemeral-dev when it is",
+    "the certificate one CI run minted for itself (nothing outside that run can verify such a",
+    "signature, so its package is a development artifact), and unwitnessed before either is",
+    "recorded. witnessed_run and witnessed_artifact name the prepare-anchor run whose bytes",
+    "file_sha256 describes - the release job downloads exactly that artifact and never rebuilds",
+    "or re-signs the engine, because a second signing of a second compilation cannot produce",
+    "the same bytes and the hash check would then be a formality that only ever fails.",
+    "",
+    "Entries stay FLAT objects: scripts/publish-engine-trust.mjs locates an entry with a",
+    "no-braces regex, so a nested object in here silently becomes an entry it cannot find."
   ],
   "version": 1,
   "generated_unix": 1790031700,
@@ -36,13 +49,17 @@
       "name": "aether.exe",
       "file_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "issued_cn": "CN=deathline94"
+      "issued_cn": "CN=deathline94",
+      "signing_profile": "unwitnessed",
+      "witnessed_run": "",
+      "witnessed_artifact": ""
     },
     {
       "name": "wintun.dll",
       "file_sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
       "cert_sha256": "c9e1b3127c2f1312056d49a93ac4bd700393fd323d2bf3b2235aff52bea8d136",
-      "issued_cn": "CN=WireGuard LLC"
+      "issued_cn": "CN=WireGuard LLC",
+      "signing_profile": "trusted-ca"
     }
   ]
 }

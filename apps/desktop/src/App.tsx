@@ -143,7 +143,19 @@ function App() {
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
-  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Standby";
+  // The beacon reports what the tunnel is doing, not how safe the user is. "Protected"
+  // was a blanket claim in every connected mode, while a local-proxy connection only
+  // carries apps pointed at Aether's own ports. `routingMode` is the same value the
+  // Connection panel resolves its copy from, so the two surfaces cannot disagree.
+  const statusText = connected
+    ? settings.routingMode === "tun"
+      ? "Routed"
+      : "Local proxy"
+    : running
+      ? "Connecting"
+      : runtime.status === "error"
+        ? "Error"
+        : "Standby";
 
   return (
     <main className="app-shell">

@@ -241,7 +241,7 @@ fn start_heartbeat_in(interval: std::time::Duration) -> Heartbeat {
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_progress, progress_stamp, Phase, PulseGate, HEARTBEAT_INTERVAL};
+    use super::{mark_progress, progress_stamp, pulse_count, Phase, PulseGate, HEARTBEAT_INTERVAL};
 
     /// The progress stamp is process-global, so the tests that reason about it
     /// cannot run concurrently with each other.

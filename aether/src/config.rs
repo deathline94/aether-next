@@ -805,7 +805,9 @@ mod tests {
             );
             std::fs::write(&path, &plain).expect("plant plaintext");
 
-            let err = load(&path).expect_err("plaintext must not be adopted silently");
+            let err = load(&path)
+                .err()
+                .expect("plaintext must not be adopted silently");
             assert!(
                 err.to_string().contains(MIGRATE_PLAINTEXT_SIGNAL),
                 "the error must name the way out: {err}"
@@ -845,7 +847,9 @@ mod tests {
             blob.resize(MAX_CONFIG_BYTES as usize + 8, b'x');
             std::fs::write(&path, &blob).expect("write");
 
-            let err = load(&path).expect_err("an over-long file must be refused");
+            let err = load(&path)
+                .err()
+                .expect("an over-long file must be refused");
             assert!(
                 err.to_string().contains("too large"),
                 "expected the size refusal, got {err}"

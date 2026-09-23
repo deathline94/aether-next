@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use aether::route_repair::{
-    self, adapter_reset_commands, lifetime_refresh_commands, powershell_script,
-    teardown_commands, teardown_plan, RouteIntent, RouteJournal,
+    self, adapter_reset_commands, lifetime_refresh_commands, powershell_script, teardown_commands,
+    teardown_plan, RouteIntent, RouteJournal,
 };
 
 const ADAPTER: &str = "Aether";
@@ -78,7 +78,10 @@ fn the_whole_teardown_is_one_command_list_for_one_process() {
     assert!(!script.contains("route delete"), "{script}");
     assert!(!script.contains("netsh"), "{script}");
     assert_eq!(
-        script.lines().filter(|l| l.contains("Remove-NetRoute")).count(),
+        script
+            .lines()
+            .filter(|l| l.contains("Remove-NetRoute"))
+            .count(),
         plan.removals
     );
 }
@@ -106,10 +109,7 @@ fn an_unkeyed_journal_resets_the_adapter_but_deletes_nothing() {
     };
     let plan = teardown_plan(&unkeyed, ADAPTER);
     assert_eq!(plan.removals, 0);
-    assert!(!plan
-        .commands
-        .iter()
-        .any(|c| c.contains("Remove-NetRoute")));
+    assert!(!plan.commands.iter().any(|c| c.contains("Remove-NetRoute")));
     // The adapter cleanup is *not* journal-scoped, so it still runs: a lingering
     // NIC with a dead tunnel's resolver is a host fault in its own right.
     assert_eq!(plan.commands, adapter_reset_commands(ADAPTER));
@@ -120,7 +120,10 @@ fn an_unsafe_adapter_alias_renders_no_reset_but_still_removes_our_routes() {
     let hostile = "Aether'; Set-DnsClientServerAddress -InterfaceAlias 'evil";
     assert!(adapter_reset_commands(hostile).is_empty());
     let plan = teardown_plan(&journal(), hostile);
-    assert_eq!(plan.removals, 4, "route scoping does not depend on the alias");
+    assert_eq!(
+        plan.removals, 4,
+        "route scoping does not depend on the alias"
+    );
     assert!(!plan.commands.iter().any(|c| c.contains(hostile)));
 }
 
@@ -158,7 +161,10 @@ fn the_refresh_arms_only_scoped_entries_and_never_deletes() {
         assert!(command.contains("Set-NetRoute"), "{command}");
         assert!(command.contains("Where-Object"), "{command}");
         assert!(command.contains(&wants), "lifetime missing: {command}");
-        assert!(command.contains(&prefers), "preferred lifetime missing: {command}");
+        assert!(
+            command.contains(&prefers),
+            "preferred lifetime missing: {command}"
+        );
         assert!(
             !command.contains("Remove-NetRoute"),
             "the refresh must never delete: {command}"

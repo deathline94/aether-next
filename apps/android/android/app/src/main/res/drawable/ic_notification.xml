@@ -1,27 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Status-bar icon (T223).
+  Status-bar icon (T223), carrying the same mark as every other surface (item 23).
 
   Android renders a notification small icon as a *silhouette*: every opaque pixel
-  becomes solid white and the rest transparent. `R.mipmap.ic_launcher` was used
-  here before, and the launcher mark is a filled rounded square, so the status bar
-  showed an unreadable white blob.
+  becomes solid white and the rest transparent. `R.mipmap.ic_launcher` was used here
+  before, and the launcher mark is a filled rounded square, so the status bar showed
+  an unreadable white blob.
 
-  This is a monochrome 24dp vector — a tunnel arch with traffic passing through it
-  — built only from outlines, with no background plate and nothing that depends on
-  colour, so it survives the silhouette pass. The system tints it.
+  The mark needs no simplification for that pass, which is the reason it is drawn as
+  two round-capped strokes rather than filled artwork: a stroke stays a stroke when
+  the system flattens it. Geometry is byte-identical to
+  `packages/ui/brand/aether-launcher-monochrome.xml` — same two `pathData` strings,
+  at the 24-unit grid the launcher layer scales from — and nothing here depends on
+  colour, so the tint the system applies is the only paint.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
-    <!-- Tunnel arch: a single closed outline, so no fill-rule tricks are needed. -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M4,21 L4,11 A8,8 0 0 1 20,11 L20,21 L16,21 L16,11 A4,4 0 0 0 8,11 L8,21 Z" />
-    <!-- Traffic leaving through the opening. -->
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M4.6,20 L10.1,6.2 Q12,2.2 13.9,6.2 L19.4,20" />
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M10,15 L13,15 L13,13 L17.5,16.5 L13,20 L13,18 L10,18 Z" />
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M2.9,16 H21.1" />
 </vector>

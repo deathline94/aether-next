@@ -88,6 +88,10 @@ pub(crate) struct AppState {
     pub(crate) operation: Mutex<()>,
     #[cfg(windows)]
     pub(crate) job: Mutex<Option<engine_job::Job>>,
+    /// Keep the verified driver file locked against replacement while the child
+    /// may still load it. The launch path moves its verification handle here.
+    #[cfg(windows)]
+    pub(crate) wintun_guard: Mutex<Option<std::fs::File>>,
     /// The settings and driver behind the running session, for the tray path and
     /// for any later "what was I running?" question.
     pub(crate) session_origin: Mutex<Option<SessionOrigin>>,
@@ -128,6 +132,8 @@ impl Default for AppState {
             operation: Mutex::new(()),
             #[cfg(windows)]
             job: Mutex::new(None),
+            #[cfg(windows)]
+            wintun_guard: Mutex::new(None),
             session_origin: Mutex::new(None),
             pending_logs: Mutex::new(Vec::new()),
             log_ready: AtomicBool::new(false),

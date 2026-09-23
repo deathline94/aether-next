@@ -2328,7 +2328,8 @@ mod tier0_tests {
         .await;
         assert!(matches!(out, Tier0Outcome::Winner(_)), "{out:?}");
 
-        let entry = crate::cache::load_endpoints(&base)
+        let cached = crate::cache::load_endpoints(&base);
+        let entry = cached
             .masque
             .iter()
             .find(|e| e.addr == gw)
@@ -2356,7 +2357,8 @@ mod tier0_tests {
         )
         .await;
         assert!(matches!(out, Tier0Outcome::Winner(_)), "{out:?}");
-        let entry = crate::cache::load_endpoints(&base2)
+        let cached = crate::cache::load_endpoints(&base2);
+        let entry = cached
             .masque
             .iter()
             .find(|e| e.addr == gw)

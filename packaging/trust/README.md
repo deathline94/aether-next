@@ -149,19 +149,39 @@ this host is expired" as a hard error and warns below two unexpired pins, so
 rotation is a planned edit rather than a surprise outage. Expiry is capped at
 180 days by policy (`trust::MAX_PIN_VALIDITY_SECS`).
 
-The digests are carried over from `aether/src/consts.rs::MASQUE_PINS` unchanged.
-Two deliberate non-changes are recorded inline in the file, because guessing at
-them would trade a fixed bug for an outage:
+Each active pin carries a `MEASURED <date> …` note and the digest of the leaf
+it was measured from. `trust::active_pins()` refuses an unmeasured key, and
+`node scripts/verify-masque-pins.mjs` checks the committed file. The old
+`UNMEASURED FALLBACK` key was removed after the local measurement failed to
+find it; its earlier presence would have allowed an unaudited key to authenticate
+a peer. The standalone gate also refuses `require_chain`/
+`require_hostname` set to `true` without a note recording a verifying chain or a
+covering SAN).
 
-1. both digests remain listed under both hostnames — which digest belongs to
-   which SNI must be observed from a live handshake, not inferred;
-2. `require_hostname` stays `false` — the peer is dialled by IP address, so
-   tightening it needs the same live pass.
+The digests are no longer carried over blind. Measured on 2026-09-23 with
+`openssl s_client -connect <ip>:443 -servername <sni> -showcerts` (TCP and
+`-quic -alpn h3`) against the MASQUE VIPs `162.159.198.2` / `162.159.199.2` and
+eight generic Cloudflare anycast edges. The findings, exact per-host result and
+instructions for a second-vantage check are recorded in the file:
+
+1. Both hostnames now have the measured key seen on both transports. The
+   unmeasured second digest was removed; adding it back requires a real leaf
+   measurement from the region that serves it.
+2. `require_hostname` stays `false` on evidence — the live edge's SAN is
+   `masque.cloudflareclient.com`, which names neither dialled SNI — and
+   `require_chain` stays `false` on evidence too: that peer sends one
+   certificate, issued by a Cloudflare-private self-signed root, so chain
+   building cannot succeed. The earlier plan ("flip `require_chain` once the
+   per-host split has moved the self-signed digest away") is now known to be
+   unachievable by splitting: the leaf a peer presents is chosen by the IP
+   dialled, not by the SNI. Turning either check on needs an endpoint-keyed
+   policy, which is a code change, not a line in this file.
 
 ## Rotation procedure
 
 1. Obtain the new leaf's SPKI: `openssl x509 -in leaf.pem -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256`.
-2. Add it alongside the outgoing pin. Do not remove the old one yet.
+2. Add it alongside the outgoing pin, with `note` starting `MEASURED <date>` and
+   `cert_sha256` set to the leaf it was read from. Do not remove the old one yet.
 3. Ship. Wait for the fleet to pass the boundary.
 4. Delete the old pin, and only then bump `expires_unix` on the survivor.
 

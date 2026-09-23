@@ -8,6 +8,7 @@
   "types": "src/index.ts",
   "exports": {
     "./tokens.css": "./tokens.css",
+    "./shared.css": "./src/shared.css",
     ".": "./src/index.ts",
     "./components/*": "./src/components/*.tsx"
   },

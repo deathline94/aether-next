@@ -106,7 +106,14 @@ packaging/trust/engine-trust.json        (committed, human-reviewable, release-t
     anchors: [ { name, der_sha256 } ] }
 
 packaging/trust/masque-pins.json         (per-host SPKI pins with expiry)
-  { hosts: [ { host, require_hostname, pins: [ { spki_sha256, expires_unix } ] } ] }
+  { hosts: [ { host, require_hostname, require_chain,
+               pins: [ { spki_sha256, expires_unix, cert_sha256, note } ] } ] }
+    # require_chain has no serde default: an omitted key is a load error, because a
+    #   missing field used to decode to "discard BoringSSL's chain verdict".
+    # note is provenance, not a comment: "MEASURED <date> …" (with the leaf digest it
+    #   was read from) or "UNMEASURED FALLBACK …" naming the sweep that may delete it.
+    #   active_pins() warns on a pin that is neither; trust.rs's committed-file test
+    #   makes that a build failure for what ships.
 ```
 
 **Provenance rule**: these files are written by the **release job after signing** and reviewed as a diff. `build.rs` embeds the *bytes and hash of the anchor file*; it never hashes `resources/aether.exe`. This is the fix for the self-referential pin — today `build.rs:38-53` hashes the shipped file, so the runtime check can never fail, and `resources/*.exe` is gitignored so on a clean checkout it hashes **nothing** and emits no entry, meaning the "missing digest is an error" guard is unreachable.

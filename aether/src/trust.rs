@@ -48,6 +48,10 @@ pub const ANCHOR_SCHEMA: u32 = 1;
 pub const MAX_PIN_VALIDITY_SECS: u64 = 180 * 24 * 60 * 60;
 /// Clocks ahead of us by more than this are treated as hostile, not skewed.
 pub const CLOCK_SLACK_SECS: u64 = 300;
+/// A measured pin is active; the legacy unmeasured label is retained only so
+/// tests can prove it is refused.
+pub const PIN_MEASURED: &str = "MEASURED";
+pub const PIN_UNMEASURED: &str = "UNMEASURED FALLBACK";
 
 /// One Subject Public Key Info pin, bound to a host and an expiry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +63,15 @@ pub struct Pin {
     /// Optional leaf certificate SHA-256, for diagnostics and key rotation.
     #[serde(default)]
     pub cert_sha256: Option<String>,
+    /// Where this digest came from: `MEASURED <date> …` for a key observed on
+    /// the wire. An unmeasured fallback cannot authenticate a peer.
+    ///
+    /// It is data rather than a JSON comment because the audit's finding was a
+    /// file whose *prose* claimed both hosts pinned both keys and nobody had
+    /// looked: an unlabelled digest and a measured one decoded identically. See
+    /// [`active_pins`] and the test that guards the committed file.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Pins for one identity.
@@ -229,6 +242,20 @@ pub fn active_pins(sets: &[PinSet], now_unix: u64) -> Result<()> {
                     s.host
                 )));
             }
+            let note = p.note.as_deref().unwrap_or("");
+            if !note.starts_with("MEASURED ") {
+                return Err(AetherError::Tls(format!(
+                    "host {} has an unmeasured SPKI pin {}…; refusing an unaudited trust key",
+                    s.host,
+                    &p.spki_sha256[..12.min(p.spki_sha256.len())]
+                )));
+            }
+            if !p.cert_sha256.as_deref().is_some_and(is_hex_sha256) {
+                return Err(AetherError::Tls(format!(
+                    "host {} has a measured SPKI pin without a valid leaf certificate digest",
+                    s.host
+                )));
+            }
         }
         // An expired pin is normal mid-rotation; *no* live pins is fatal.
         let live = s.pins.iter().filter(|p| p.expires_unix > now_unix).count();
@@ -318,7 +345,8 @@ mod tests {
         Pin {
             spki_sha256: spki.into(),
             expires_unix: expires,
-            cert_sha256: None,
+            cert_sha256: Some(A.into()),
+            note: Some(format!("{PIN_MEASURED} 2026-09-23 unit-test fixture")),
         }
     }
 
@@ -381,6 +409,9 @@ mod tests {
         let spoken = silent.replace(
             "\"require_hostname\":false,",
             "\"require_hostname\":false,\"require_chain\":true,",
+        ).replace(
+            "\"expires_unix\":1805500800}",
+            "\"expires_unix\":1805500800,\"cert_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"note\":\"MEASURED 2026-09-23 issuer SAN\"}",
         );
         let sets = load_pins(&spoken, 1).expect("the same file with the field present");
         assert!(sets[0].require_chain);
@@ -411,6 +442,54 @@ mod tests {
         let anchors = include_str!("../../packaging/trust/engine-trust.json");
         let set = load_anchors(anchors).expect("engine-trust.json must parse");
         assert!(!set.files.is_empty());
+    }
+
+    /// The state this file replaced was two digests listed under two hosts with a
+    /// comment saying nobody had looked: a pin measured on the wire and a pin
+    /// carried over from a byte literal decoded to exactly the same struct, so
+    /// "narrow the pins" and "guess the pins" were indistinguishable to the
+    /// loader, the reviewer and the diff. Provenance is a field now, so this
+    /// catches the regression rather than re-reviewing prose.
+    #[test]
+    fn every_committed_pin_declares_its_provenance() {
+        let sets = load_pins(MASQUE_PINS_JSON, now_unix()).expect("masque-pins.json must load");
+        assert_eq!(
+            sets.len(),
+            2,
+            "both MASQUE SNIs are dialled by something; neither may lose its entry"
+        );
+        for s in &sets {
+            for p in &s.pins {
+                let note = p.note.as_deref().unwrap_or("");
+                assert!(
+                    note.starts_with(PIN_MEASURED),
+                    "{} pins {}… without a measured provenance: {note:?}",
+                    s.host,
+                    &p.spki_sha256[..8]
+                );
+                assert!(
+                    note.contains("SAN") || note.contains("issuer"),
+                    "a MEASURED pin must name what was measured: {note}"
+                );
+                assert!(
+                    p.cert_sha256.as_deref().is_some_and(is_hex_sha256),
+                    "a MEASURED pin must carry the leaf digest it was measured from"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_pin_is_not_a_trust_key() {
+        let mut candidate = pin(A, 1805500800);
+        candidate.note = Some(format!("{PIN_UNMEASURED} old guess"));
+        let sets = vec![PinSet {
+            host: "edge.example".into(),
+            require_hostname: false,
+            require_chain: false,
+            pins: vec![candidate],
+        }];
+        assert!(active_pins(&sets, 1).is_err());
     }
 
     #[test]

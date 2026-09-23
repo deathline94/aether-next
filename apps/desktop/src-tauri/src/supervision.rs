@@ -170,6 +170,10 @@ pub(crate) fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> 
     #[cfg(windows)]
     {
         state.job.lock().take();
+        // Every caller reaches this after the child was killed or reaped. Only
+        // now may an updater replace the driver bytes that were authenticated
+        // before launch; the engine could have loaded them at any earlier point.
+        state.wintun_guard.lock().take();
     }
     problems
 }
@@ -645,7 +649,7 @@ pub(crate) fn watch_child(app: AppHandle) {
         // Reap. `try_wait` is non-blocking, so it needs no lifecycle lock; taking
         // the child out of the slot is the claim, and the same three-line retirement
         // every other teardown path performs follows it.
-        let reaped = {
+        let (reaped, uncertain_child) = {
             let mut child_slot = state.child.lock();
             match child_slot.as_mut() {
                 None => continue,
@@ -653,20 +657,26 @@ pub(crate) fn watch_child(app: AppHandle) {
                     Ok(Some(status)) => {
                         *child_slot = None;
                         if status.success() {
-                            Reaped::Clean
+                            (Reaped::Clean, None)
                         } else {
-                            Reaped::Failed(status.code())
+                            (Reaped::Failed(status.code()), None)
                         }
                     }
                     // Still running: nothing else here is interesting this tick.
                     Ok(None) => continue,
                     Err(error) => {
-                        *child_slot = None;
-                        Reaped::Lost(error.to_string())
+                        // An unreadable exit status does not mean the process
+                        // exited. Keep the verified driver locked until we have
+                        // tried to terminate and wait for this child.
+                        (Reaped::Lost(error.to_string()), child_slot.take())
                     }
                 },
             }
         };
+        if let Some(mut child) = uncertain_child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         state.connecting.store(false, Ordering::SeqCst);
         state.generation.fetch_add(1, Ordering::SeqCst);
         *state.connect_since.lock() = None;
@@ -796,6 +806,8 @@ pub(crate) fn connect_blocking(
         // precisely in the case that matters: the packaged DLL missing, silently
         // renamed, or shadowed by one the user dropped next to the exe.
         let mut wintun_for_handoff: Option<PathBuf> = None;
+        #[cfg(windows)]
+        let mut wintun_guard: Option<fs::File> = None;
         if settings.routing_mode == RoutingMode::Tun {
             let wintun = wintun_path(&app).ok_or_else(|| {
                 CommandError::new(
@@ -805,7 +817,7 @@ pub(crate) fn connect_blocking(
                 )
             })?;
             let wintun_policy = TrustedBinaryPolicy::for_wintun();
-            verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
+            let verified_driver = verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
                 .map_err(CommandError::from)?;
             // Optional pin: set AETHER_WINTUN_SHA256 to require an exact file
             // hash. Read from the ambient environment on purpose, and note
@@ -826,10 +838,14 @@ pub(crate) fn connect_blocking(
                 }
             }
             wintun_for_handoff = Some(wintun);
+            #[cfg(windows)]
+            {
+                wintun_guard = Some(verified_driver);
+            }
         }
 
         let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
-        verify_engine_or_refuse(&executable)?;
+        let engine_guard = verify_engine_or_refuse(&executable)?;
         let mut command = Command::new(&executable);
         scrub_ambient_engine_env(&mut command);
         command
@@ -926,6 +942,7 @@ pub(crate) fn connect_blocking(
             dpapi_key.zeroize();
             format!("Could not start aether.exe: {e}")
         })?;
+        drop(engine_guard);
         #[cfg(windows)]
         if let Err(error) = job.assign_child(&child) {
             let _ = child.kill();
@@ -974,6 +991,13 @@ pub(crate) fn connect_blocking(
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        #[cfg(windows)]
+        {
+            // The supervisor may reap a fast-failing child as soon as it sees
+            // the slot. Publish its driver guard first, so that cleanup cannot
+            // run between child publication and guard publication.
+            *state.wintun_guard.lock() = wintun_guard;
+        }
         *state.child.lock() = Some(child);
         emit_state(
             &app,
@@ -1111,9 +1135,10 @@ pub(crate) fn spawn_route_repair(app: &AppHandle) {
     let Ok(executable) = engine_path(app, &settings) else {
         return; // No resolvable engine yet; connect will report the real reason.
     };
-    if verify_engine_or_refuse(&executable).is_err() {
-        return;
-    }
+    let engine_guard = match verify_engine_or_refuse(&executable) {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
     let mut command = Command::new(&executable);
     scrub_ambient_engine_env(&mut command);
     command
@@ -1125,4 +1150,5 @@ pub(crate) fn spawn_route_repair(app: &AppHandle) {
     if let Err(e) = command.spawn() {
         emit_log(app, format!("Could not start the route repair: {e}"));
     }
+    drop(engine_guard);
 }

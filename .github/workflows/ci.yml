@@ -366,6 +366,16 @@ jobs:
           node scripts/verify-hev-lock.mjs
           node scripts/verify-hev-lock.mjs --selftest-fail
 
+      - name: MASQUE pins are measured, labelled and per-host
+        # Item 12's removal gate: a pin may only be dropped on a measurement, so the
+        # file that says which pins are still unmeasured fallbacks has to be checked
+        # on every change to it rather than at release time. The selftest injects an
+        # unlabelled pin and expects red — the same control the other gates carry.
+        run: |
+          set -euo pipefail
+          node scripts/verify-masque-pins.mjs
+          node scripts/verify-masque-pins.mjs --selftest-fail
+
   android-unit-tests:
     name: Android unit tests
     runs-on: ubuntu-latest

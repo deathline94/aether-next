@@ -54,10 +54,16 @@ fn test_atomic_write_and_overwrite() {
     let file_path = dir.join("secret.bin").to_string_lossy().to_string();
 
     write_private_file(&file_path, b"initial secret payload").expect("initial write");
-    assert_eq!(fs::read_to_string(&file_path).unwrap(), "initial secret payload");
+    assert_eq!(
+        fs::read_to_string(&file_path).unwrap(),
+        "initial secret payload"
+    );
 
     write_private_file(&file_path, b"updated secret payload").expect("overwrite");
-    assert_eq!(fs::read_to_string(&file_path).unwrap(), "updated secret payload");
+    assert_eq!(
+        fs::read_to_string(&file_path).unwrap(),
+        "updated secret payload"
+    );
 
     // Every temp file must have been consumed, and the name must be unique
     // enough that two writers in one process cannot collide on it.
@@ -67,7 +73,10 @@ fn test_atomic_write_and_overwrite() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.ends_with(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -89,7 +98,10 @@ fn test_unauthenticated_backup_is_never_restored() {
         Ok(Some(id)) => panic!("load adopted a backup identity: {}", id.device_id),
         Err(e) => panic!("load must report no config, not fail: {e}"),
     }
-    assert!(!std::path::Path::new(&bak_path).exists(), "the stray backup must be moved");
+    assert!(
+        !std::path::Path::new(&bak_path).exists(),
+        "the stray backup must be moved"
+    );
     assert!(
         std::path::Path::new(&format!("{config_path}.quarantined")).exists(),
         "and preserved for inspection rather than deleted"
@@ -150,7 +162,10 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     }
 
     set_key();
-    assert!(load(&config_path).is_err(), "Migration must fail fatally if the re-save fails");
+    assert!(
+        load(&config_path).is_err(),
+        "Migration must fail fatally if the re-save fails"
+    );
 
     #[cfg(unix)]
     {
@@ -178,15 +193,24 @@ fn test_write_private_file_fails_closed_on_acl_failure() {
     let res = write_private_file(&file_path, b"super secret data");
     aether::config::ACL_FAIL_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    assert!(res.is_err(), "write_private_file must fail when ACL restriction fails");
-    assert!(!std::path::Path::new(&file_path).exists(), "target secret file must not be created");
+    assert!(
+        res.is_err(),
+        "write_private_file must fail when ACL restriction fails"
+    );
+    assert!(
+        !std::path::Path::new(&file_path).exists(),
+        "target secret file must not be created"
+    );
     let leftovers: Vec<String> = fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| n.ends_with(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "the temp file must be removed on failure: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "the temp file must be removed on failure: {leftovers:?}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

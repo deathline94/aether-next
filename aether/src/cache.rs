@@ -1234,18 +1234,17 @@ mod tests {
     #[test]
     fn an_incomparable_measurement_contributes_no_rtt_term() {
         let fast_probe = ep("1.1.1.1:443", 3, 0, 0, 5);
-        let mut slow_http = ep("2.2.2.2:443", 3, 0, 0, 400);
-        slow_http.measurement = Measurement::HttpRoundTrip;
+        let slow_probe = ep("2.2.2.2:443", 3, 0, 0, 400);
 
         // Same kind: the 400 ms entry really is behind the 5 ms one.
         assert!(
             fast_probe.trust_score_for(Measurement::HandshakeProbe)
-                > slow_http.trust_score_for(Measurement::HandshakeProbe)
+                > slow_probe.trust_score_for(Measurement::HandshakeProbe)
         );
         // Different kind: the RTT term is dropped, so history alone decides and
         // the two tie rather than the probe pulling ahead on latency.
         let probe_as_http = fast_probe.trust_score_for(Measurement::HttpRoundTrip);
-        let tied = slow_http.trust_score_for(Measurement::HttpRoundTrip);
+        let tied = slow_probe.trust_score_for(Measurement::HttpRoundTrip);
         assert!(
             (probe_as_http - tied).abs() < f64::EPSILON,
             "expected {probe_as_http} == {tied}"

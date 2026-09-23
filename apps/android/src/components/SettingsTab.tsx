@@ -10,6 +10,9 @@ import {
   X,
 } from "lucide-react";
 import type { Settings } from "../types";
+import { normalizeNoize } from "../settingsPayload";
+import { saveDockCopy, saveStateOf } from "../saveState";
+import type { SaveState } from "../saveState";
 import { NumberField, Segmented, Toggle } from "./ui";
 import type { IpcError } from "../ipcError";
 
@@ -19,22 +22,26 @@ interface SettingsTabProps {
   settingsLoaded: boolean;
   settingsLoadError?: boolean;
   retrySettings?: () => void | Promise<void>;
-  saved: boolean;
+  /**
+   * The save lifecycle, as the runtime hook reports it. A boolean is the shape a
+   * call site that predates it can pass, and `saveStateOf` reads it for the only two
+   * things it can honestly mean — never for "saving", which is a claim only a write
+   * the app has actually started may make.
+   */
+  saved: SaveState | boolean;
   /** The last save the shell refused, if one is still outstanding. */
   saveError?: IpcError | null;
+  /**
+   * The stored profile is corrupt or unreadable (ITEM 10), as the shell reported it:
+   * the sentence that says so and the one action that clears it. `App.tsx` renders the
+   * same pair as the workspace banner, because the refused write also stops `connect()`
+   * — the panel has to agree with it, or the screen a user comes to in order to fix the
+   * profile is the one screen that says nothing is wrong. Markup only: the copy is
+   * `describeSettingsReport`'s and the action is `resetSettings`, both from the hook.
+   */
+  corrupt?: { notice: string; busy: boolean; onReset: () => void };
   admin: boolean;
   patchSettings: (patch: Partial<Settings>) => void;
-}
-
-const KNOWN_NOIZE = ["off", "light", "medium", "high", "max", "custom"];
-
-/** Map legacy engine profile names onto the UI's canonical set. */
-function noizeValue(raw: string): string {
-  if (KNOWN_NOIZE.includes(raw)) return raw;
-  if (raw === "firewall" || raw === "balanced") return "medium";
-  if (raw === "gfw") return "high";
-  if (raw === "aggressive" || raw === "heavy") return "max";
-  return "medium";
 }
 
 export function SettingsTab({
@@ -45,10 +52,12 @@ export function SettingsTab({
   retrySettings,
   saved,
   saveError,
+  corrupt,
   admin,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
+  const dock = saveDockCopy(saveStateOf(saved));
   // Which input the shell complained about, so the field itself can say so.
   const rejected = (field: string) => saveError?.field === field;
 
@@ -60,7 +69,10 @@ export function SettingsTab({
             <AlertTriangle size={18} aria-hidden="true" />
             <div>
               <strong>SETTINGS HYDRATION FAILED</strong>
-              <span>Could not load configuration from disk. Defaults are active.</span>
+              <span>
+                Could not read the configuration from disk. What is on screen is not
+                confirmed against it, and nothing here has been saved.
+              </span>
             </div>
           </div>
           {retrySettings && (
@@ -72,6 +84,26 @@ export function SettingsTab({
               Retry
             </button>
           )}
+        </div>
+      )}
+      {/* ITEM 10's last visible piece: the panel agrees with the app-level banner. */}
+      {corrupt && (
+        <div className="error-banner" role="alert">
+          <div className="error-banner-content">
+            <AlertTriangle size={18} aria-hidden="true" />
+            <div>
+              <strong>SAVED SETTINGS CORRUPT</strong>
+              <span>{corrupt.notice}</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => void corrupt.onReset()}
+            className="banner-action"
+            disabled={corrupt.busy}
+          >
+            {corrupt.busy ? "Resetting…" : "Reset settings"}
+          </button>
         </div>
       )}
       {settingsLocked && (
@@ -199,7 +231,7 @@ export function SettingsTab({
             disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")}
             aria-label="Obfuscation noise profile"
             className="tactical-select"
-            value={noizeValue(settings.noize)}
+            value={normalizeNoize(settings.noize) ?? settings.noize}
             onChange={(e) => patchSettings({ noize: e.target.value })}
           >
             <option value="off">Off — Zero Noise</option>
@@ -329,6 +361,11 @@ export function SettingsTab({
             <option value="balanced">Balanced (Optimal speed and route fidelity)</option>
             <option value="thorough">Thorough (Deep probe across extensive pools)</option>
             <option value="stealth">Stealth (Low rate to minimize traffic anomaly)</option>
+            {/* The fifth rung of the shared `ScanMode`: the shell's own
+                `validateSettings` accepts `ironclad`, so a profile that carries it
+                is readable — and a select with no option for the stored value shows
+                a blank where the user's own setting should be. */}
+            <option value="ironclad">Ironclad (Verify every candidate endpoint)</option>
           </select>
         </div>
 
@@ -514,13 +551,15 @@ export function SettingsTab({
               ? "Save blocked — resolve HTTP/SOCKS port collision"
               : saveError
               ? "Last save was rejected — see the message above"
-              : saved
-              ? "All parameters synchronized with runtime daemon"
-              : "Synchronizing changes…"}
+              : dock.text}
           </span>
         </div>
 
-        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : ""}`}>
+        {/* Four states, and the pulse only on the one that is pulsing: this branch
+            used to be `!saved`, so "Auto-Saving" spun from first paint until the
+            first 1.2 s "Synchronized" flash — an indicator claiming a write nobody
+            had asked for. `saveDockCopy` owns the sentence; the icon is this file's. */}
+        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : dock.icon === "pulse" ? "" : "idle"}`}>
           {portsCollide ? (
             <>
               <X size={15} aria-hidden="true" />
@@ -531,15 +570,25 @@ export function SettingsTab({
               <X size={15} aria-hidden="true" />
               <span>Save Rejected</span>
             </>
-          ) : saved ? (
+          ) : dock.icon === "check" ? (
             <>
               <Check size={15} aria-hidden="true" />
               <span>Synchronized</span>
             </>
-          ) : (
+          ) : dock.icon === "pulse" ? (
             <>
               <div className="save-sync-pulse" aria-hidden="true" />
               <span>Auto-Saving</span>
+            </>
+          ) : dock.icon === "pending" ? (
+            <>
+              <span className="save-pending-dot" aria-hidden="true" />
+              <span>Write pending</span>
+            </>
+          ) : (
+            <>
+              <span className="save-idle-dot" aria-hidden="true" />
+              <span>Idle</span>
             </>
           )}
         </div>

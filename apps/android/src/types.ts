@@ -7,8 +7,12 @@ import {
   SCAN_MIN_TIMEOUT_MS,
 } from "@aether/ui";
 import type { RuntimeStatus } from "@aether/ui";
+import type { ScanMode } from "@aether/ui/enums";
 import type { LogLevel } from "@aether/ui/enums";
 import { SPEED_PROFILES, speedProfileHint } from "@aether/ui/enums";
+// The cycle with `settingsPayload` (which reads `defaults` for its own fallbacks) is
+// inert: neither module touches the other's exports while it is being evaluated.
+import { parseSettingsError, type SettingsReport } from "./settingsPayload";
 
 export type View = "home" | "scanner" | "settings" | "logs";
 /** The four statuses the shell has copy, colours and a beacon for — one list, in `packages/ui`. */
@@ -47,7 +51,12 @@ export const initialScanState: ScanState = {
 export type Settings = {
   protocol: "masque" | "wireguard" | "gool";
   transport: "h2" | "h3";
-  scanMode: "turbo" | "balanced" | "thorough" | "stealth";
+  /**
+   * The shared `ScanMode`, not a private four-arm copy: `validateSettings` in the
+   * Kotlin shell accepts `ironclad`, so a profile that carries it is a valid
+   * profile the loader must be able to read rather than refuse.
+   */
+  scanMode: ScanMode;
   ipVersion: "v4" | "v6" | "both";
   noize: string;
   noizeJc: number;
@@ -87,6 +96,22 @@ export type RuntimeState = {
  */
 export function parseRuntimeState(payload: unknown): RuntimeState | null {
   return parseRuntimeCore(payload);
+}
+
+/**
+ * The other half of a `session://state` frame, read off the same payload.
+ *
+ * `parseRuntimeCore` keeps the four fields both shells render and drops everything
+ * else, which is right for the tunnel and wrong for the settings: the Android shell
+ * publishes the state of the *stored profile* on this very frame as `settingsError`
+ * (`SettingsStore.kt:108`). Narrowing the frame is what made a corrupt profile
+ * undetectable, so the report is taken from the payload beside the narrowing, here,
+ * where the Android frame guard lives. `packages/ui` must not learn the key — the
+ * desktop's `get_state` carries no such field.
+ */
+export function settingsReportOf(payload: unknown): SettingsReport {
+  const frame = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : null;
+  return parseSettingsError(frame ? frame.settingsError : undefined);
 }
 
 export type LogEntry = {
@@ -158,6 +183,7 @@ export const initialRuntime: RuntimeState = {
   pid: null,
   endpoint: null,
 };
+
 
 /** Structured scan event forwarded by the native bridge (scan://event). */
 /**

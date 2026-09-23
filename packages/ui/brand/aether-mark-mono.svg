@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 24 24" role="img" aria-label="Aether">
+  <!--
+    The Aether mark, bare: no plate, no background, one flat colour. This is the
+    form to inline in the UI, to tint for a themed surface, or to set in a single
+    ink for print — the geometry is the contract recorded in aether-mark.svg:
+
+      portal   M4.6 20 L10.1 6.2 Q12 2.2 13.9 6.2 L19.4 20
+      line     M2.9 16 H21.1
+
+    stroke-width 3.3, round caps and joins, full grid (the mark's own bounds are
+    1.29..22.71 x 2.55..21.65, so it fills the canvas and needs no scale).
+
+    The stroke below is the mint the launcher and the themes already use
+    (#66E3A4, `ic_launcher_foreground`). On a light surface the mark is a
+    monochrome recolour, not a redraw: swap the single stroke value for the
+    emerald ink #0b5c3a, or for `currentColor` when this file is inlined rather
+    than referenced. Contrast is a colour decision and is checked separately by
+    the contrast gates in scripts/verify-invariants.mjs; nothing about the shape
+    changes between backgrounds.
+  -->
+  <g fill="none" stroke="#66e3a4" stroke-width="3.3"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.6 20 L10.1 6.2 Q12 2.2 13.9 6.2 L19.4 20"/>
+    <path d="M2.9 16 H21.1"/>
+  </g>
+</svg>

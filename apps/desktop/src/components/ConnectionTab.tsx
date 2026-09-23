@@ -6,8 +6,47 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { RuntimeState, Settings } from "../types";
-import { noiseIsInert } from "@aether/ui";
-import { SPEED_PROFILES, speedProfileHint } from "@aether/ui/enums";
+import { SPEED_PROFILES, ipFamilyLabel, speedProfileHint } from "@aether/ui/enums";
+import {
+  cipherSettingCopy,
+  connectionTestCopy,
+  connectedCopy,
+  carrierChip,
+  endpointClaim,
+  engineStateCopy,
+  fragSettingCopy,
+  heroCopy,
+  noiseSettingCopy,
+  PINNED_PEER_CLEAR_LABEL,
+  PINNED_PEER_LABEL,
+  portStateCopy,
+  powerControlLabel,
+  powerHint,
+  processStateCopy,
+  protocolHeadline,
+  roundTripLabel,
+  startHint,
+  trafficChip,
+  transportName,
+} from "@aether/ui/statusCopy";
+import type { PlatformCapabilities } from "@aether/ui/statusCopy";
+
+/**
+ * What this platform may do, which is what the shared copy needs to say the truth.
+ *
+ * Windows can be pointed at a system proxy — `src-tauri/src/proxy.rs` writes it, so
+ * the saved `system-proxy` mode is honoured here and the copy may say so, which it
+ * may not on Android. The route is the wintun adapter, and the surface is clicked.
+ */
+export const PLATFORM: PlatformCapabilities = {
+  canSetSystemProxy: true,
+  routeName: "the tunnel device",
+  routeSubject: "The tunnel device",
+  actionVerb: "Click",
+};
+
+/** What the hero says before anything has run, in the verb this surface uses. */
+export const START_HINT = startHint(PLATFORM);
 
 const speedProfiles: { id: string; label: string; hint: string; patch: Partial<Settings> }[] = SPEED_PROFILES.map((profile) => ({
   id: profile.id,
@@ -25,112 +64,6 @@ const speedProfiles: { id: string; label: string; hint: string; patch: Partial<S
 
 function profileActive(settings: Settings, patch: Partial<Settings>) {
   return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);
-}
-
-/**
- * The measured round-trip, or the honest absence.
- *
- * This tile used to be `testResult.match(/(\d+)\s*ms/i)` — prose scraped for a
- * number. `test_connection` answers with sentences that contain no `ms` at all, so
- * the tile was permanently "not measured" while the shell sent a real
- * `handshakeRttMs` on every `session://state` that nothing read; and on a *failed*
- * test the same regex could catch a timeout figure and print it as latency. Read
- * the typed field, or say nothing.
- */
-export function formatRttMs(rttMs: number | null): string {
-  return typeof rttMs === "number" && Number.isFinite(rttMs) ? `${Math.round(rttMs)} ms` : "not measured";
-}
-
-/** Every carrier the shell can report, keyed so a new arm fails to compile. */
-type CarrierCopy = {
-  chip: (t: Settings["transport"]) => string;
-  transport: (t: Settings["transport"]) => string;
-};
-
-const CARRIER_CHIP: Record<Settings["protocol"], CarrierCopy> = {
-  masque: {
-    chip: (t) => (t === "h3" ? "QUIC/UDP" : "H2/TLS"),
-    transport: (t) => (t === "h3" ? "HTTP/3" : "HTTP/2"),
-  },
-  wireguard: { chip: () => "WIREGUARD/UDP", transport: () => "UDP WireGuard" },
-  gool: { chip: () => "WARP-IN-WARP", transport: () => "WireGuard (in WARP)" },
-};
-
-export function carrierChip(settings: Settings): string {
-  // Two arms only, so a Gool session advertised WIREGUARD.
-  return CARRIER_CHIP[settings.protocol].chip(settings.transport);
-}
-
-export function transportChip(settings: Settings): string {
-  return CARRIER_CHIP[settings.protocol].transport(settings.transport);
-}
-
-/** Exhaustive by construction: adding an `IpVersion` arm breaks the build here. */
-const IP_STACK_COPY: Record<Settings["ipVersion"], string> = {
-  v4: "IPv4",
-  v6: "IPv6",
-  both: "IPv4 + IPv6",
-};
-
-export function ipStackCopy(ipVersion: Settings["ipVersion"]): string {
-  return IP_STACK_COPY[ipVersion];
-}
-
-/**
- * What the two listener tiles may claim.
- *
- * Both were keyed on `status === "connected"` and shouted "HTTP proxy configured"
- * in every routing mode, which contradicts `connectedCopy` a few pixels away: in
- * `proxy-only` nothing is configured system-wide until an application points at
- * the listeners, and in `tun` the route is the tunnel device, not the proxy.
- */
-export function portStateCopy(
-  connected: boolean,
-  routingMode: Settings["routingMode"],
-): { http: string; socks: string } {
-  if (!connected) return { http: "idle", socks: "idle" };
-  switch (routingMode) {
-    case "system-proxy":
-      return { http: "HTTP proxy configured", socks: "SOCKS5 configured" };
-    case "proxy-only":
-      return { http: "HTTP listener open", socks: "SOCKS5 listener open" };
-    case "tun":
-      return { http: "HTTP listener available (TUN routes)", socks: "SOCKS5 listener available (TUN routes)" };
-  }
-}
-
-const heroCopy: Record<RuntimeState["status"], { eyebrow: string; title: string; badge: string }> = {
-  disconnected: { eyebrow: "LOCAL LISTENERS CLOSED", title: "Not Connected", badge: "STANDBY // CLICK TO ENGAGE" },
-  connecting: { eyebrow: "NEGOTIATING // EDGE HANDSHAKE", title: "Establishing Edge Path", badge: "CONNECTING" },
-  connected: { eyebrow: "SESSION ACTIVE", title: "Connected", badge: "ACTIVE" },
-  error: { eyebrow: "CONNECTION FAILED", title: "Route Unavailable", badge: "ERROR" },
-};
-
-/**
- * What "connected" covers depends on the routing mode, and the copy used to claim
- * the widest version of it in all three: "routing Windows traffic" is false in
- * `proxy-only`, where an application has to point at the local listener itself,
- * and the early-data claim the badge made is not something the engine reports at
- * all, so it was never a measurement — it was decoration on a security claim.
- */
-function connectedCopy(routingMode: Settings["routingMode"]): { badge: string; body: string } {
-  switch (routingMode) {
-    case "tun":
-      return {
-        badge: "ACTIVE // TUN ROUTE",
-        body: "Aether Next is routing Windows traffic through the tunnel device.",
-      };
-    case "system-proxy":
-      return {
-        badge: "ACTIVE // SYSTEM PROXY",
-        body: "Windows is set to the local proxies, so applications that follow the system proxy are covered.",
-      };
-    default:
-      return {
-        badge: "ACTIVE // LOCAL PROXIES",
-        body: "The local listeners are open. Nothing is routed until an application points at them.",
-      };
-  }
 }
 
 interface ConnectionTabProps {
@@ -191,15 +124,17 @@ export function ConnectionTab({
   admin, testResult, appVersion, updateAvailable, dismissUpdate,
   toggleConnection, patchSettings, runTest, dismissError, appendLog,
 }: ConnectionTabProps) {
-  const hero = heroCopy[runtime.status];
-  const active = connectedCopy(settings.routingMode);
+  const hero = heroCopy(runtime.status);
+  const active = connectedCopy(settings.routingMode, PLATFORM);
   const badge = runtime.status === "connected" ? active.badge : hero.badge;
+  const listeners = portStateCopy(connected, settings.routingMode, PLATFORM);
+  const test = connectionTestCopy(connected, testBusy);
 
   // The only latency this app has is the shell's measurement of the probe that
   // proved the endpoint; `testResult` is a sentence, not a reading.
-  const displayLatency = formatRttMs(runtime.handshakeRttMs);
+  const displayLatency = roundTripLabel(runtime.handshakeRttMs);
   const displayLoss = "not measured";
-  const listeners = portStateCopy(connected, settings.routingMode);
+  const engine = processStateCopy(runtime.pid);
 
   return (
     <div className="home-view">
@@ -230,7 +165,7 @@ export function ConnectionTab({
               ? `${active.body}${runtime.endpoint ? ` Edge: ${runtime.endpoint}.` : ""}`
               : running || runtime.status === "error"
                 ? runtime.detail
-                : "Connect to raise the local listeners and negotiate the edge."}
+                : START_HINT}
           </p>
         </div>
 
@@ -253,7 +188,7 @@ export function ConnectionTab({
               className={`master-toggle-btn ${running ? "stop" : ""}`}
               onClick={toggleConnection}
               disabled={busy}
-              aria-label={running ? "Disconnect tunnel" : "Engage tunnel connection"}
+              aria-label={powerControlLabel(running)}
             >
               <div className="btn-surface">
                 {busy ? (
@@ -271,7 +206,7 @@ export function ConnectionTab({
               {badge}
             </span>
             <span className="switch-action-hint">
-              {running ? "CLICK TO DISCONNECT" : "CLICK TO ENGAGE"}
+              {powerHint(running, PLATFORM)}
             </span>
           </div>
         </div>
@@ -312,7 +247,7 @@ export function ConnectionTab({
         <div className="pinned-peer-bar">
           <div className="pinned-peer-info">
             <Sparkles size={15} aria-hidden="true" />
-            <span>Targeting forced endpoint:</span>
+            <span>{PINNED_PEER_LABEL}</span>
             <code>{settings.peer}</code>
           </div>
           <button
@@ -325,7 +260,7 @@ export function ConnectionTab({
             disabled={settingsLocked}
             title={settingsLocked ? "Disconnect the tunnel to change the target endpoint" : "Stop targeting this endpoint"}
           >
-            Clear (Scan dynamically)
+            {PINNED_PEER_CLEAR_LABEL}
           </button>
         </div>
       )}
@@ -378,12 +313,12 @@ export function ConnectionTab({
               <div>
                 <span className="bento-category">GATEWAY EDGE ROUTE</span>
                 <strong className="bento-headline" title={runtime.endpoint ?? undefined}>
-                  {runtime.endpoint || (running ? "Scanning Edge Pool…" : "Dynamic Edge Discovery")}
+                  {endpointClaim(runtime.endpoint, running).answer}
                 </strong>
               </div>
             </div>
             <span className={`bento-chip ${connected ? "active" : ""}`}>
-              {connected ? "ROUTE ARMED" : running ? "PROBING" : "IDLE"}
+              {trafficChip(connected, running, settings.routingMode)}
             </span>
           </div>
 
@@ -401,7 +336,7 @@ export function ConnectionTab({
               </div>
               <div className="stat-unit">
                 <span className="stat-label">IP STACK</span>
-                <span className="stat-value tabular-nums">{ipStackCopy(settings.ipVersion)}</span>
+                <span className="stat-value tabular-nums">{ipFamilyLabel(settings.ipVersion)}</span>
               </div>
             </div>
 
@@ -429,9 +364,7 @@ export function ConnectionTab({
               <div className="metric-icon coral"><Route size={18} aria-hidden="true" /></div>
               <div>
                 <span className="bento-category">CARRIER &amp; CIPHER</span>
-                <strong className="bento-headline">
-                  {settings.protocol === "gool" ? "WARP-in-WARP" : `${settings.protocol.toUpperCase()} ${settings.transport.toUpperCase()}`}
-                </strong>
+                <strong className="bento-headline">{protocolHeadline(settings)}</strong>
               </div>
             </div>
             <span className="bento-chip-cyan">{carrierChip(settings)}</span>
@@ -440,22 +373,19 @@ export function ConnectionTab({
           <div className="cipher-specs-grid">
             <div className="spec-badge">
               <span>TRANSPORT</span>
-              <strong>{transportChip(settings)}</strong>
+              <strong>{transportName(settings)}</strong>
             </div>
             <div className="spec-badge">
               <span>OBFUSCATION</span>
               {/* On MASQUE/H2 there is no QUIC Initial to hide and no handshake for
                   junk frames to precede, so the stored profile does nothing: naming
-                  it as if it were active was a claim about an inert setting. */}
-              <strong>
-                {noiseIsInert(settings.protocol, settings.transport)
-                  ? "INACTIVE (H2 tunnel)"
-                  : `NOISE: ${settings.noize.toUpperCase()}`}
-              </strong>
+                  it as if it were active was a claim about an inert setting. One
+                  rule and one wording, both surfaces. */}
+              <strong>{noiseSettingCopy(settings)}</strong>
             </div>
             <div className="spec-badge">
               <span>ANTI-DPI FRAG</span>
-              <strong>{settings.quicInitialFrag ? `SPLIT (${settings.quicInitialFragSize}B)` : "OFF"}</strong>
+              <strong>{fragSettingCopy(settings)}</strong>
             </div>
             <div className="spec-badge">
               <span>SECURITY CIPHER</span>
@@ -463,7 +393,7 @@ export function ConnectionTab({
                   TLS 1.3 suite with the peer and nothing here observes which one,
                   so naming ChaCha20-Poly1305 was a claim about an unmeasured
                   property. Identical text lived in the Android sheet's twin. */}
-              <strong>{settings.protocol === "masque" ? "NEGOTIATED (not observed)" : "CHACHA20-POLY1305"}</strong>
+              <strong>{cipherSettingCopy(settings.protocol)}</strong>
             </div>
           </div>
 
@@ -518,13 +448,11 @@ export function ConnectionTab({
               <div className="metric-icon yellow"><Cpu size={18} aria-hidden="true" /></div>
               <div>
                 <span className="bento-category">CORE DAEMON SUBSYSTEM</span>
-                <strong className="bento-headline">
-                  {runtime.pid ? `Process PID ${runtime.pid}` : "Standby Engine"}
-                </strong>
+                <strong className="bento-headline">{engine.headline}</strong>
               </div>
             </div>
             <span className={`bento-chip ${runtime.pid ? "active" : ""}`}>
-              {runtime.pid ? "PROCESS ACTIVE" : "DORMANT"}
+              {engine.chip}
             </span>
           </div>
 
@@ -532,9 +460,7 @@ export function ConnectionTab({
             <div className="daemon-heartbeat-row">
               <div className="daemon-led-group">
                 <span className={`heartbeat-dot ${connected ? "active" : running ? "starting" : ""}`} />
-                <span className="daemon-state-text">
-                  {connected ? "Tunnel subsystem armed and processing sockets" : running ? "Handshaking with Cloudflare edge" : "Awaiting user connect trigger"}
-                </span>
+                <span className="daemon-state-text">{engineStateCopy(connected, running)}</span>
               </div>
             </div>
             <div className="daemon-metrics-row">
@@ -580,9 +506,9 @@ export function ConnectionTab({
           <FlaskConical size={20} aria-hidden="true" />
         </div>
         <div className="test-row">
-          <span>{connected ? "Hits Cloudflare trace via local proxy to measure end-to-end RTT" : "Connect first, then verify the path"}</span>
+          <span>{test.prompt}</span>
           <button onClick={runTest} disabled={testBusy || busy || !connected}>
-            {testBusy ? "Probing Path…" : "Test Connection"}
+            {test.button}
           </button>
         </div>
         {testResult && (

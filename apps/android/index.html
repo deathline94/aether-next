@@ -14,8 +14,17 @@
       requested from no origin, so it cannot be blocked, and it survives a rebuild
       (the packaged copy in android/app/src/main/assets/www points at the real
       aether.svg that sync-www ships next to index.html).
+
+      Inlining is why this icon used to disagree with every other Aether icon: it
+      carried its own tunnel-arrow drawing while the file beside it was a padlock.
+      The `d` attributes below are now the canonical mark geometry, copied out of
+      packages/ui/brand/aether-mark.svg verbatim - the portal and the line, on the
+      same 24-unit grid, at the same 3.3 stroke. Only the framing differs, and it
+      differs on purpose: the browser tab is 16px, so the mark is scaled 0.8 inside
+      its plate rather than the 0.62 an app icon uses. Change the mark and change
+      it in the master first; everything else is copied from there.
     -->
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Crect%20width='24'%20height='24'%20rx='5'%20fill='%230D1113'/%3E%3Cpath%20fill='%2366E3A4'%20d='M4%2021V11a8%208%200%200%201%2016%200v10h-4V11a4%204%200%200%200-8%200v10z'/%3E%3Cpath%20fill='%2366E3A4'%20d='M10%2015h3v-2l4.5%203.5L13%2020v-2h-3z'/%3E%3C/svg%3E" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Crect%20width='24'%20height='24'%20rx='5.25'%20fill='%230b0f11'/%3E%3Cg%20transform='translate(12%2012)%20scale(0.8)%20translate(-12%20-12)'%20fill='none'%20stroke='%2366e3a4'%20stroke-width='3.3'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Cpath%20d='M4.6%2020%20L10.1%206.2%20Q12%202.2%2013.9%206.2%20L19.4%2020'/%3E%3Cpath%20d='M2.9%2016%20H21.1'/%3E%3C/g%3E%3C/svg%3E" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#07090b" />
     <title>Aether Next</title>

@@ -16,17 +16,33 @@ const MAX_PACKET: usize = 65536;
 const WG_MSG_TYPE_MIN: u8 = 1;
 const WG_MSG_TYPE_MAX: u8 = 4;
 
-fn inject_client_id(pkt: &mut [u8], client_id: &[u8; 3]) {
-    if pkt.len() < 4 {
-        return;
-    }
-    if pkt[0] < WG_MSG_TYPE_MIN || pkt[0] > WG_MSG_TYPE_MAX {
-        return;
-    }
-    pkt[1..4].copy_from_slice(client_id);
-}
-
-fn strip_client_id(pkt: &mut [u8]) {
+/// WireGuard's first four bytes are one little-endian u32: the message type in
+/// byte 0 and three *reserved* bytes in `1..4`. RFC 8718 §2 requires the reserved
+/// field to be zero on transmission, and nothing in this module writes it (T246).
+///
+/// That is not a policy preference but the only ordering available through
+/// `boringtun`, which this crate does not own:
+///
+/// * the library fills the whole 4-byte word itself *as part of sealing* —
+///   `message_type.copy_from_slice(&HANDSHAKE_INIT.to_le_bytes())`
+///   (`noise/handshake.rs:736`, and `:821` for the response,
+///   `noise/session.rs:207` for a data packet) — so a caller has no moment
+///   before the seal in which to plant a value;
+/// * `append_mac1_and_mac2` keys `mac1` over `&dst[..mac1_off]` verbatim
+///   (`noise/handshake.rs:688-694`), i.e. over a header whose reserved bytes are
+///   zero;
+/// * and on the way in, `Tunn::parse_incoming_packet` classifies a packet by
+///   `u32::from_le_bytes(src[0..4])` and answers any other value with
+///   `InvalidPacket` (`noise/mod.rs:133-161`).
+///
+/// So a tag written after `encapsulate` returns is covered by neither `mac1` nor
+/// the AEAD, and a standards-faithful peer cannot even classify the packet. What
+/// this used to do — copy a stable per-account `client_id` into `1..4` of every
+/// outgoing packet, thousands of probe packets included — was therefore both a
+/// cleartext correlation handle and a packet only a tolerant, non-standard
+/// receiver accepts. Re-introducing a tag needs `reserved` support in
+/// `boringtun` (written before `append_mac1_and_mac2`), not an overwrite here.
+fn clear_reserved_field(pkt: &mut [u8]) {
     if pkt.len() < 4 {
         return;
     }
@@ -41,6 +57,8 @@ pub struct WgConfig {
     pub local_private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub peer_endpoint: SocketAddr,
+    /// Carried from the profile because the callers that build this config still
+    /// resolve it; never written to the wire — see [`clear_reserved_field`].
     pub client_id: [u8; 3],
     pub persistent_keepalive: Option<u16>,
     pub aethernoize: Arc<AetherNoizeConfig>,
@@ -53,6 +71,8 @@ pub struct WgTunnel {
     inbound_tx: mpsc::Sender<Vec<u8>>,
     pub obf_sent: Arc<Mutex<bool>>,
     pub aethernoize: Arc<AetherNoizeConfig>,
+    /// See [`WgConfig::client_id`]: kept for the API's shape, not used on any
+    /// send path.
     pub client_id: [u8; 3],
 }
 
@@ -60,6 +80,7 @@ pub struct EstablishedSession {
     tunn: Arc<Mutex<Box<Tunn>>>,
     sock: Arc<UdpSocket>,
     peer: SocketAddr,
+    /// See [`WgConfig::client_id`].
     client_id: [u8; 3],
 }
 
@@ -142,7 +163,6 @@ impl WgTunnel {
         let obf_sent = self.obf_sent.clone();
         let aethernoize = self.aethernoize.clone();
         let aethernoize_t = self.aethernoize.clone();
-        let client_id = self.client_id;
         let peer = self.peer;
 
         let mut recv_task = tokio::spawn(async move {
@@ -151,7 +171,7 @@ impl WgTunnel {
             loop {
                 match sock_r.recv(&mut buf).await {
                     Ok(n) => {
-                        strip_client_id(&mut buf[..n]);
+                        clear_reserved_field(&mut buf[..n]);
                         let mut tunn = tunn_r.lock().await;
                         match tunn.decapsulate(None, &buf[..n], &mut tmp) {
                             TunnResult::Done => {}
@@ -159,10 +179,8 @@ impl WgTunnel {
                                 log::debug!("decapsulate error: {e:?}");
                             }
                             TunnResult::WriteToNetwork(pkt) => {
-                                let mut pkt_vec = pkt.to_vec();
-                                inject_client_id(&mut pkt_vec, &client_id);
-                                let (extra, extra_tun) =
-                                    drain_tunn(&mut tunn, &mut tmp, &client_id);
+                                let pkt_vec = pkt.to_vec();
+                                let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp);
                                 drop(tunn);
                                 let _ = sock_r.send(&pkt_vec).await;
                                 for p in extra {
@@ -175,8 +193,7 @@ impl WgTunnel {
                             TunnResult::WriteToTunnelV4(pkt, _)
                             | TunnResult::WriteToTunnelV6(pkt, _) => {
                                 let pkt_vec = pkt.to_vec();
-                                let (extra, extra_tun) =
-                                    drain_tunn(&mut tunn, &mut tmp, &client_id);
+                                let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp);
                                 drop(tunn);
                                 let _ = inbound_tx_r.send(pkt_vec).await;
                                 for p in extra {
@@ -207,9 +224,8 @@ impl WgTunnel {
                         log::debug!("encapsulate error: {e:?}");
                     }
                     TunnResult::WriteToNetwork(pkt) => {
-                        let mut pkt_vec = pkt.to_vec();
-                        inject_client_id(&mut pkt_vec, &client_id);
-                        let (extra, extra_tun) = drain_tunn(&mut tunn, &mut out_buf, &client_id);
+                        let pkt_vec = pkt.to_vec();
+                        let (extra, extra_tun) = drain_tunn(&mut tunn, &mut out_buf);
                         drop(tunn);
 
                         {
@@ -217,7 +233,12 @@ impl WgTunnel {
                             if !*sent && aethernoize.is_enabled() {
                                 *sent = true;
                                 drop(sent);
-                                aethernoize::apply_obfuscation(&sock_w, peer, &aethernoize).await;
+                                if let Err(err) =
+                                    aethernoize::apply_obfuscation(&sock_w, peer, &aethernoize)
+                                        .await
+                                {
+                                    log::warn!("WireGuard obfuscation failed: {err}");
+                                }
                             }
                         }
 
@@ -233,12 +254,15 @@ impl WgTunnel {
                             let sock_clone = sock_w.clone();
                             let cfg_clone = aethernoize.clone();
                             tokio::spawn(async move {
-                                aethernoize::send_post_handshake_junk(
+                                if let Err(err) = aethernoize::send_post_handshake_junk(
                                     &sock_clone,
                                     peer,
                                     &cfg_clone,
                                 )
-                                .await;
+                                .await
+                                {
+                                    log::warn!("WireGuard post-handshake junk failed: {err}");
+                                }
                             });
                         }
                     }
@@ -262,9 +286,8 @@ impl WgTunnel {
                 if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
                     last_activity = Instant::now();
                     extra_keepalive_sent = false;
-                    let mut pkt_vec = pkt.to_vec();
-                    inject_client_id(&mut pkt_vec, &client_id);
-                    let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp, &client_id);
+                    let pkt_vec = pkt.to_vec();
+                    let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp);
                     drop(tunn);
 
                     if aethernoize_t.is_enabled() {
@@ -299,8 +322,7 @@ impl WgTunnel {
                         extra_keepalive_sent = true;
                         let mut tunn = tunn_t.lock().await;
                         if let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], &mut tmp) {
-                            let mut pkt_vec = pkt.to_vec();
-                            inject_client_id(&mut pkt_vec, &client_id);
+                            let pkt_vec = pkt.to_vec();
                             let _ = sock_t.send(&pkt_vec).await;
                             log::debug!(
                                 "[wg] adaptive keepalive: idle {}s, sent empty keepalive",
@@ -332,19 +354,13 @@ impl WgTunnel {
 
 /// Bound tunnel draining to avoid infinite allocation loops while ensuring
 /// handshake packets and queued data are flushed.
-fn drain_tunn(
-    tunn: &mut Tunn,
-    out_buf: &mut [u8],
-    client_id: &[u8; 3],
-) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+fn drain_tunn(tunn: &mut Tunn, out_buf: &mut [u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut wire = Vec::new();
     let mut tun_pkts = Vec::new();
     for _ in 0..32 {
         match tunn.decapsulate(None, &[], out_buf) {
             TunnResult::WriteToNetwork(pkt) => {
-                let mut v = pkt.to_vec();
-                inject_client_id(&mut v, client_id);
-                wire.push(v);
+                wire.push(pkt.to_vec());
             }
             TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
                 tun_pkts.push(pkt.to_vec());
@@ -358,15 +374,12 @@ fn drain_tunn(
 async fn send_dataplane_probe(
     sock: &UdpSocket,
     tunn: &mut Tunn,
-    client_id: &[u8; 3],
     probe: &[u8],
     out_buf: &mut [u8],
 ) -> Result<()> {
     match tunn.encapsulate(probe, out_buf) {
         TunnResult::WriteToNetwork(pkt) => {
-            let mut v = pkt.to_vec();
-            inject_client_id(&mut v, client_id);
-            sock.send(&v).await?;
+            sock.send(pkt).await?;
         }
         TunnResult::Err(e) => {
             return Err(AetherError::Other(format!("dataplane encap: {e:?}")));
@@ -382,7 +395,6 @@ const DATAPLANE_PROBE_GAP: Duration = Duration::from_millis(250);
 async fn verify_dataplane(
     sock: &UdpSocket,
     tunn: &mut Tunn,
-    client_id: &[u8; 3],
     local_ipv4: Ipv4Addr,
     start: Instant,
     deadline: Instant,
@@ -394,7 +406,7 @@ async fn verify_dataplane(
 
     let mut successes: u32 = 0;
     let mut last_probe_at = Instant::now();
-    send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await?;
+    send_dataplane_probe(sock, tunn, &probe, &mut out_buf).await?;
     let mut resend_at = last_probe_at + Duration::from_millis(700);
 
     loop {
@@ -408,8 +420,7 @@ async fn verify_dataplane(
             return Err(AetherError::Other("dataplane timeout".into()));
         }
         if now >= resend_at {
-            if let Err(e) = send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await
-            {
+            if let Err(e) = send_dataplane_probe(sock, tunn, &probe, &mut out_buf).await {
                 // A failed resend is the reason the "dataplane timeout" below is
                 // about to fire; swallowing it left the reader with a timeout and
                 // no indication that the socket itself was the problem.
@@ -425,7 +436,7 @@ async fn verify_dataplane(
         tokio::select! {
             r = sock.recv(&mut recv_buf) => {
                 let n = r?;
-                strip_client_id(&mut recv_buf[..n]);
+                clear_reserved_field(&mut recv_buf[..n]);
                 match tunn.decapsulate(None, &recv_buf[..n], &mut tmp_buf) {
                     TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
                         successes += 1;
@@ -440,7 +451,7 @@ async fn verify_dataplane(
                         }
                         let next_at = Instant::now().max(last_probe_at + DATAPLANE_PROBE_GAP);
                         if let Err(e) =
-                            send_dataplane_probe(sock, tunn, client_id, &probe, &mut out_buf).await
+                            send_dataplane_probe(sock, tunn, &probe, &mut out_buf).await
                         {
                             log::warn!("[wg] next dataplane probe could not be sent: {e}");
                         }
@@ -448,12 +459,10 @@ async fn verify_dataplane(
                         resend_at = next_at + Duration::from_millis(700);
                     }
                     TunnResult::WriteToNetwork(pkt) => {
-                        let mut v = pkt.to_vec();
-                        inject_client_id(&mut v, client_id);
                         // Handshake bytes on the verification path: if they do
                         // not leave, the handshake cannot complete, and "silent"
                         // is what made this loop look like a peer problem.
-                        if let Err(e) = sock.send(&v).await {
+                        if let Err(e) = sock.send(pkt).await {
                             log::warn!("[wg] handshake packet send failed during verification: {e}");
                         }
                     }
@@ -465,6 +474,12 @@ async fn verify_dataplane(
     }
 }
 
+/// Probes one endpoint and hands back a live session for reuse.
+///
+/// `client_id` is accepted because the callers resolve it from the profile, and
+/// it is carried into [`EstablishedSession`] unchanged so the signature — and
+/// every call site — stays as it is. It is never written into a packet: see
+/// [`clear_reserved_field`].
 pub async fn verify_endpoint_keep_session(
     peer: SocketAddr,
     private_key: [u8; 32],
@@ -494,7 +509,7 @@ pub async fn verify_endpoint_keep_session(
     let deadline = start + timeout;
 
     if aethernoize.is_enabled() {
-        aethernoize::apply_obfuscation(&sock, peer, aethernoize).await;
+        aethernoize::apply_obfuscation(&sock, peer, aethernoize).await?;
     }
 
     let local_secret = StaticSecret::from(private_key);
@@ -516,10 +531,8 @@ pub async fn verify_endpoint_keep_session(
 
     match tunn.encapsulate(&[], &mut out_buf) {
         TunnResult::WriteToNetwork(pkt) => {
-            let mut pkt_vec = pkt.to_vec();
-            inject_client_id(&mut pkt_vec, &client_id);
-            log::debug!("[wg] sending init {} bytes to {}", pkt_vec.len(), peer);
-            sock.send(&pkt_vec).await?;
+            log::debug!("[wg] sending init {} bytes to {}", pkt.len(), peer);
+            sock.send(pkt).await?;
         }
         other => {
             log::warn!("[wg] unexpected encap result: {:?}", other);
@@ -540,10 +553,8 @@ pub async fn verify_endpoint_keep_session(
         if !retransmitted && Instant::now() >= retransmit_at && attempts == 0 {
             retransmitted = true;
             if let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], &mut out_buf) {
-                let mut pkt_vec = pkt.to_vec();
-                inject_client_id(&mut pkt_vec, &client_id);
-                log::debug!("[wg] retransmit init {} bytes to {}", pkt_vec.len(), peer);
-                if let Err(e) = sock.send(&pkt_vec).await {
+                log::debug!("[wg] retransmit init {} bytes to {}", pkt.len(), peer);
+                if let Err(e) = sock.send(pkt).await {
                     // The retransmit is insurance against a lost original, so a
                     // failure here is not fatal — but it is the last chance this
                     // handshake gets before the deadline.
@@ -560,11 +571,11 @@ pub async fn verify_endpoint_keep_session(
                 attempts += 1;
                 let n = r?;
                 log::debug!("[wg] recv {} bytes (attempt {})", n, attempts);
-                strip_client_id(&mut recv_buf[..n]);
+                clear_reserved_field(&mut recv_buf[..n]);
 
                 match tunn.decapsulate(None, &recv_buf[..n], &mut tmp_buf) {
                     TunnResult::Done => {
-                        let (extra, _) = drain_tunn(&mut tunn, &mut out_buf, &client_id);
+                        let (extra, _) = drain_tunn(&mut tunn, &mut out_buf);
                         for pkt in extra {
                             // Handshake packets the state machine still owed the
                             // peer. If one of these cannot leave, the session is
@@ -575,7 +586,9 @@ pub async fn verify_endpoint_keep_session(
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake done in {:?}", elapsed);
                         if data_check {
-                            let dp_elapsed = verify_dataplane(&sock, &mut tunn, &client_id, local_ipv4, start, deadline).await?;
+                            let dp_elapsed =
+                                verify_dataplane(&sock, &mut tunn, local_ipv4, start, deadline)
+                                    .await?;
                             return Ok((dp_elapsed, EstablishedSession {
                                 tunn: Arc::new(Mutex::new(Box::new(tunn))),
                                 sock: Arc::new(sock),
@@ -591,11 +604,9 @@ pub async fn verify_endpoint_keep_session(
                         }));
                     }
                     TunnResult::WriteToNetwork(pkt) => {
-                        let mut pkt_vec = pkt.to_vec();
-                        inject_client_id(&mut pkt_vec, &client_id);
-                        log::debug!("[wg] sending response {} bytes", pkt_vec.len());
-                        sock.send(&pkt_vec).await?;
-                        let (extra, _) = drain_tunn(&mut tunn, &mut out_buf, &client_id);
+                        log::debug!("[wg] sending response {} bytes", pkt.len());
+                        sock.send(pkt).await?;
+                        let (extra, _) = drain_tunn(&mut tunn, &mut out_buf);
                         for pkt in extra {
                             // Same rule as above: these are handshake packets, and
                             // a dropped one is a session that will never be
@@ -605,7 +616,9 @@ pub async fn verify_endpoint_keep_session(
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake success in {:?}", elapsed);
                         if data_check {
-                            let dp_elapsed = verify_dataplane(&sock, &mut tunn, &client_id, local_ipv4, start, deadline).await?;
+                            let dp_elapsed =
+                                verify_dataplane(&sock, &mut tunn, local_ipv4, start, deadline)
+                                    .await?;
                             return Ok((dp_elapsed, EstablishedSession {
                                 tunn: Arc::new(Mutex::new(Box::new(tunn))),
                                 sock: Arc::new(sock),
@@ -682,3 +695,109 @@ pub const WG_SEEDS_V6: &[&str] = &[
     "2606:4700:d0::a29f:c301",
     "2606:4700:d0::bc72:6001",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handshake initiation as `boringtun` writes it: type `1`, three reserved
+    /// bytes, then padding. Only the first four bytes matter here.
+    fn initiation(reserved: [u8; 3]) -> Vec<u8> {
+        let mut pkt = vec![WG_MSG_TYPE_MIN, reserved[0], reserved[1], reserved[2]];
+        pkt.resize(72, 0);
+        pkt
+    }
+
+    /// The invariant T246 is about, observed on the wire rather than in a
+    /// comment: a tunnel configured with a *stable* account id must still put
+    /// zeros in bytes `1..4` of the first packet it sends.
+    ///
+    /// This drives the real `WgTunnel::run` send path — `encapsulate` on a tunnel
+    /// with no session returns a handshake initiation, which is the exact packet
+    /// the old `inject_client_id` used to stamp — and reads the datagram off a
+    /// loopback socket standing in for the peer.
+    #[tokio::test]
+    async fn an_account_client_id_never_reaches_the_reserved_field() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_endpoint = peer.local_addr().unwrap();
+
+        let cfg = WgConfig {
+            local_private_key: [7u8; 32],
+            peer_public_key: [9u8; 32],
+            peer_endpoint,
+            // Deliberately all-distinct non-zero bytes: if any of them can reach
+            // the wire this assertion is the one that says so.
+            client_id: [0xa1, 0xb2, 0xc3],
+            persistent_keepalive: None,
+            aethernoize: Arc::new(AetherNoizeConfig::off()),
+        };
+
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<Vec<u8>>(8);
+        let tunnel = WgTunnel::new(cfg, inbound_tx).await.unwrap();
+        tokio::spawn(tunnel.run(outbound_rx));
+
+        // Any IPv4-shaped payload: with no session the tunnel answers a
+        // `WriteToNetwork` initiation and queues the data for later.
+        let ip_packet = vec![0x45u8, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 0x40, 0x06];
+        outbound_tx.send(ip_packet).await.unwrap();
+
+        let mut buf = vec![0u8; MAX_PACKET];
+        let n = tokio::time::timeout(Duration::from_secs(5), peer.recv(&mut buf))
+            .await
+            .expect("the tunnel sent nothing to its peer")
+            .unwrap();
+        assert!(n >= 4, "a WireGuard packet is at least 4 bytes, got {n}");
+        assert_eq!(
+            WG_MSG_TYPE_MIN, buf[0],
+            "the first packet of a fresh tunnel is a handshake initiation"
+        );
+        let mut reserved = [0xffu8; 3];
+        reserved.copy_from_slice(&buf[1..4]);
+        assert_eq!(
+            [0u8; 3], reserved,
+            "bytes 1..4 are WireGuard's reserved field: non-zero means a cleartext \
+             tag left the host and that mac1 no longer covers the bytes it was \
+             computed over"
+        );
+    }
+
+    /// The one reserved-field operation that stays: a peer that answers with a
+    /// non-zero tag must still be decapsulable, so the field is normalised
+    /// *before* `decapsulate` rather than after.
+    #[test]
+    fn an_inbound_reserved_field_is_cleared_before_decapsulation() {
+        let mut pkt = initiation([0x04, 0x22, 0x11]);
+        clear_reserved_field(&mut pkt);
+        let mut reserved = [0xffu8; 3];
+        reserved.copy_from_slice(&pkt[1..4]);
+        assert_eq!([0u8; 3], reserved);
+        assert_eq!(WG_MSG_TYPE_MIN, pkt[0], "the message type survives");
+        assert!(
+            pkt[4..].iter().all(|b| *b == 0),
+            "nothing outside the reserved field moved"
+        );
+    }
+
+    /// Obfuscation junk and half-read datagrams share this buffer. A packet that
+    /// is not a WireGuard message is not this function's business, and a short
+    /// one must not panic the receive loop.
+    #[test]
+    fn bytes_that_are_not_a_wireguard_message_type_are_left_alone() {
+        let mut decoy = vec![0xb7u8, 0x01, 0x02, 0x03];
+        clear_reserved_field(&mut decoy);
+        assert_eq!(vec![0xb7u8, 0x01, 0x02, 0x03], decoy);
+
+        let mut too_short = vec![WG_MSG_TYPE_MAX, 0x09];
+        clear_reserved_field(&mut too_short);
+        assert_eq!(vec![WG_MSG_TYPE_MAX, 0x09], too_short);
+
+        let mut last_type = initiation([0x0a, 0x0b, 0x0c]);
+        last_type[0] = WG_MSG_TYPE_MAX;
+        clear_reserved_field(&mut last_type);
+        assert!(
+            last_type[1..4] == [0u8; 3],
+            "the highest message type is in range, so its reserved field is cleared too"
+        );
+    }
+}

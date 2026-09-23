@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import { describeRejectedState } from "@aether/ui";
+import { semverGt } from "../semver";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
@@ -419,19 +420,4 @@ export function useRuntime(
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };
-}
-
-/** Semver-aware greater-than comparison; tolerates pre-release suffixes. */
-function semverGt(a: string, b: string): boolean {
-  const parse = (v: string) =>
-    (v.split("-")[0] ?? "").split(".").map((p) => Number.parseInt(p, 10) || 0);
-  const pa = parse(a);
-  const pb = parse(b);
-  for (let i = 0; i < 3; i++) {
-    const na = pa[i] ?? 0;
-    const nb = pb[i] ?? 0;
-    if (na > nb) return true;
-    if (na < nb) return false;
-  }
-  return false;
 }

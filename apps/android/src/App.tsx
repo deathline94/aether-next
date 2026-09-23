@@ -1,4 +1,4 @@
-import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { AlertTriangle, Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useCallback, useState } from "react";
 import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Same self-hosted faces as the desktop app (T187): Vite hashes the woff2
@@ -56,6 +56,7 @@ function App() {
 
   const {
     settings, runtime, busy, testBusy, saved, saveError, admin, testResult, appVersion,
+    settingsCorrupt, settingsCorruptionNotice, resetSettings, resetSettingsBusy, resetSettingsError,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   } = useRuntime(appendLog);
@@ -89,7 +90,19 @@ function App() {
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
-  const statusText = connected ? "Protected" : running ? "Connecting" : runtime.status === "error" ? "Error" : "Standby";
+  // The beacon reports what the tunnel is doing, not how safe the user is. "Protected"
+  // was a blanket claim in every connected mode, while a local-proxy connection only
+  // carries apps pointed at Aether's own ports. `routingMode` is the same value the
+  // Connection hero resolves its copy from, so the two surfaces cannot disagree.
+  const statusText = connected
+    ? settings.routingMode === "tun"
+      ? "Routed"
+      : "Local proxy"
+    : running
+      ? "Connecting"
+      : runtime.status === "error"
+        ? "Error"
+        : "Standby";
 
   return (
     <main className="app-shell">
@@ -164,6 +177,34 @@ function App() {
             </div>
           </div>
         </header>
+
+        {/* The stored profile is corrupt (ITEM 10). This is said here, on whatever tab
+            the user is on, rather than inside the Settings panel: the same refused write
+            stops `connect`, so an explanation only the Settings tab carries is an
+            explanation a user who just pressed Connect never sees — and the one action
+            that clears the state has to be next to it. */}
+        {settingsCorrupt && (
+          <div className="error-banner" role="alert">
+            <div className="error-banner-content">
+              <AlertTriangle size={18} aria-hidden="true" />
+              <div>
+                <strong>SAVED SETTINGS CORRUPT</strong>
+                <span>{settingsCorruptionNotice}</span>
+                {resetSettingsError && (
+                  <span>RESET REFUSED — {resetSettingsError.message}</span>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="banner-action"
+              onClick={() => void resetSettings()}
+              disabled={resetSettingsBusy}
+            >
+              {resetSettingsBusy ? "Resetting…" : "Reset settings"}
+            </button>
+          </div>
+        )}
 
         {view === "home" && (
           <ErrorBoundary label="Connection tab" resetKeys={tabResetKeys("home", runtime, settings, logFilter)}>

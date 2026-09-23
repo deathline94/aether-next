@@ -234,6 +234,15 @@ class SessionController(
     }
 
     /**
+     * Accept a settings blob that cannot be read: defaults go on disk, the quarantined
+     * copy stays where it is, and this session's in-memory view follows the change.
+     *
+     * This is the only way past the store's write refusal, and the UI reaches it only by
+     * an explicit Reset — an unreadable file is never quietly replaced by a default.
+     */
+    fun resetSettings(): Settings = store.resetCorruptSettings().also { settings = it }
+
+    /**
      * A snapshot of the published state. Never mutated after publication, and
      * always read together with the tunnel's own view of itself, so a
      * `status="connected"` can no longer be handed to the UI alongside a tunnel

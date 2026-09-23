@@ -65,7 +65,7 @@ Presets map protocol + transport + noise + scan so you do not have to hand-tune 
 | `AETHER_SOCKS` | SOCKS listen addr (default `127.0.0.1:1819`) |
 | `AETHER_HTTP` | HTTP CONNECT listen (when used) |
 | `AETHER_NOIZE` | obfuscation profile |
-| `AETHER_SCAN` | `turbo` / `balanced` / `thorough` / `stealth` |
+| `AETHER_SCAN` | `turbo` / `balanced` / `thorough` / `stealth` / `ironclad` |
 | `AETHER_IP` | IPv4 / IPv6 / both |
 | `AETHER_MASQUE_HTTP2` | `1` = force MASQUE over h2 |
 | `AETHER_PEER` | force endpoint, skip scan |

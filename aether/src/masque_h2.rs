@@ -710,7 +710,6 @@ async fn verify_dataplane(
                             // cache. The predicate is the one the H2 tests already
                             // exercised with no production caller.
                             if crate::dns::is_dns_reply(&pkt, resolver) {
-                                confirms += 1;
                                 log::info!("[h2] data-plane verified (DNS reply from {resolver})");
                                 return Ok(());
                             }
@@ -912,12 +911,12 @@ mod tests {
         assert!(!dns::is_dns_reply(&p, resolver));
 
         // A real answer: from the resolver, source port 53, DNS flags with QR set.
-        let mut reply = vec![0u8; 32];
+        let mut reply = vec![0u8; 40];
         reply[0] = 0x45; // IPv4, IHL=5
         reply[9] = 17; // UDP
         reply[12..16].copy_from_slice(&[8, 8, 8, 8]); // src = 8.8.8.8
         reply[20..22].copy_from_slice(&53u16.to_be_bytes()); // src port 53
-        reply[24] = 0x81; // flags: QR + RD
+        reply[30] = 0x81; // DNS flags: QR + RD
         assert!(dns::is_dns_reply(&reply, resolver));
     }
 
@@ -947,7 +946,7 @@ mod tests {
 
         // And a genuine reply must pass, or the gate would fail closed.
         let mut real = spoof.clone();
-        real[24] |= 0x80;
+        real[30] |= 0x80;
         assert!(dns::is_dns_reply(&real, resolver), "real reply rejected");
     }
 

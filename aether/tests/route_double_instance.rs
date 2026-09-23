@@ -105,13 +105,24 @@ fn two_owners_get_two_files_and_one_owner_gets_its_own_back() {
     assert_ne!(a, b, "two owners must not share one file");
     assert_eq!(a, a_again, "the same owner must land on the same file");
     assert_eq!(a.parent(), b.parent(), "both live in the journal directory");
-    let name_a = a.file_name().expect("a file name").to_string_lossy().into_owned();
-    let name_b = b.file_name().expect("a file name").to_string_lossy().into_owned();
+    let name_a = a
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+    let name_b = b
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
     assert!(name_a.contains("111"), "{name_a} does not name its owner");
     assert!(name_b.contains("222"), "{name_b} does not name its owner");
     // A recycled pid in a later boot is a different file: the boot id is in it.
     let rebooted = journal_path_for(&owner(111, BOOT + 1)).expect("a state directory");
-    assert_ne!(a, rebooted, "pid reuse must not inherit the previous boot's file");
+    assert_ne!(
+        a, rebooted,
+        "pid reuse must not inherit the previous boot's file"
+    );
 }
 
 #[test]
@@ -125,7 +136,10 @@ fn a_journal_round_trips_its_owner_identity() {
     let encoded = serde_json::to_string(&journal).expect("encode");
     let back: RouteJournal = serde_json::from_str(&encoded).expect("decode");
     assert_eq!(owner_of(&back), owner_of(&journal));
-    assert_eq!(journal_path_for(&owner_of(&back)), journal_path_for(&owner_of(&journal)));
+    assert_eq!(
+        journal_path_for(&owner_of(&back)),
+        journal_path_for(&owner_of(&journal))
+    );
     // A file written before per-owner journals existed decodes to "unknown boot",
     // which is never equal to a real owner.
     let legacy: RouteJournal = serde_json::from_str(r#"{"version":1,"creator_pid":4242}"#)

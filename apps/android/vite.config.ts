@@ -1,4 +1,7 @@
-import { defineConfig } from "vite";
+// `test` is a vitest key, and vite's own `defineConfig` does not know it: importing
+// the config helper from `vitest/config` is what types the block below without
+// reaching for a triple-slash reference.
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // A config is loaded as ESM, so there is no __dirname, and @types/node is not
@@ -24,6 +27,19 @@ export default defineConfig({
     react: uiPath("./node_modules/react"),
     "react/jsx-runtime": uiPath("./node_modules/react/jsx-runtime"),
     "react/jsx-dev-runtime": uiPath("./node_modules/react/jsx-dev-runtime"),
+  },
+
+  // `packages/ui` installs nothing of its own — there is no root node_modules and
+  // the package deliberately has none — so it has no runner, and its tests would
+  // never be discovered. They run from each app's vitest instead: both suites
+  // execute the same shared-table test, which is the only way that file can mean
+  // what it asserts (one definition, read by both surfaces). The app's own tests
+  // stay under `src/`, exactly as they were found before.
+  test: {
+    include: [
+      "src/**/*.{test,spec}.{ts,tsx}",
+      "../../packages/ui/src/**/*.{test,spec}.{ts,tsx}",
+    ],
   },
   base: "./",
   build: {

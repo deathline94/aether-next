@@ -1,8 +1,8 @@
 //! Routing plane: either the userspace proxy stack or WinTUN, never both.
-use std::net::SocketAddr;
-use tokio::sync::mpsc;
 use crate::error::Result;
 use crate::netstack;
+use std::net::SocketAddr;
+use tokio::sync::mpsc;
 
 pub enum TunGuard {
     /// Held only for its `Drop`, which tears down the WinTUN adapter and routes
@@ -21,7 +21,6 @@ pub async fn spawn(
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<(Option<netstack::StackHandle>, Option<TunGuard>)> {
-
     #[cfg(windows)]
     if crate::tun_win::enabled() {
         let tun = crate::tun_win::spawn(ipv4, peer, mtu, inbound_rx, outbound_tx).await?;

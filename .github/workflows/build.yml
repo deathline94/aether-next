@@ -1,5 +1,5 @@
-# Builds real installable apps on every push to main (and on tags / manual run).
-# Downloads: Actions → run → Artifacts, or the "Latest" GitHub Release (updated every main push).
+# Builds development artifacts on main and distributable apps on trusted tags.
+# Development downloads stay in Actions artifacts; only tag builds publish a Release.
 name: Build apps
 
 on:
@@ -118,24 +118,71 @@ jobs:
     steps:
       - run: echo "all five suites reported independently"
 
+  # The release pipeline's own checks: the checksum step, the packaging policy,
+  # the anchor writers, and the static gates over both workflows. These are cheap
+  # and they run before `publish` can be reached, because every one of them exists
+  # to catch something that a release run would otherwise only discover after the
+  # artifacts are downloadable.
+  #
+  # Why a job of its own rather than more steps in the build jobs: a build job that
+  # has already spent forty minutes compiling cannot tell you whether the step that
+  # packs its output is correct, and the answer to that question fits in seconds.
+  release-integrity:
+    name: Release integrity gates
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: "22"
+      - name: Checksum step, against a fixture release directory
+        run: |
+          set -euo pipefail
+          bash .github/scripts/test-pack-checksums.sh
+          bash .github/scripts/test-pack-checksums.sh --selftest-fail
+      - name: Packaging policy and anchor writers
+        run: |
+          set -euo pipefail
+          node scripts/package-policy.mjs --selftest-fail
+          node scripts/anchor-witness.mjs --selftest-fail
+          # The committed anchor must stay readable by the two writers that touch
+          # it, each of which finds an entry with the same no-braces locator.
+          node scripts/publish-engine-trust.mjs --check --name wintun.dll --file packaging/wintun.dll
+      - name: Static gates over the workflows
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-integrity.mjs
+          node scripts/verify-release-integrity.mjs --selftest-fail
+
   windows-app:
     name: Windows x64
-    needs: [test]
+    needs: [test, release-integrity]
     runs-on: windows-latest
     timeout-minutes: 60
+    outputs:
+      signing_mode: ${{ steps.cert.outputs.signing_mode }}
     permissions:
       contents: read
+      actions: read # download the engine witness from its earlier workflow run
       # attest-build-provenance signs the artifact identity with the runner's
       # OIDC token and records it in the repo's attestation store; nothing else
       # in this job needs either.
       id-token: write
       attestations: write
     env:
-      # Untagged runs only. The committed witness for aether.exe is still the
-      # placeholder on main, and both build.rs and publish-engine-trust.mjs refuse
-      # to produce or verify a *release* against a placeholder unless this is set
-      # explicitly. A tag leaves it empty, so a release cannot be unwitnessed.
-      AETHER_ALLOW_UNWITNESSED: ${{ !startsWith(github.ref, 'refs/tags/') && '1' || '' }}
+      # Two kinds of run, named rather than inferred at every use site. `release`
+      # is a tag: it must ship the witnessed engine, signed by an identity a clean
+      # machine already trusts. `development` is everything else: it may build
+      # against the placeholder anchor that is committed on main, and in exchange
+      # every artifact it produces is named `-dev` and never reaches a download
+      # page. `scripts/package-policy.mjs` is the single reader of this pair.
+      AETHER_PACKAGE_KIND: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || 'development' }}
+      # The development opt-out, and only that: build.rs and
+      # publish-engine-trust.mjs --check both stop a release build against an
+      # unwitnessed anchor unless this is set, so a tag leaves it empty and the
+      # policy step refuses the drift if anything ever sets it on a tag run.
+      AETHER_ALLOW_UNWITNESSED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -153,10 +200,68 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Create ephemeral CI code signing certificate
+      # The signing rule, proved on this machine before anything is signed with it:
+      # a self-signed certificate may only be used when the call says it is a
+      # development build, and a `NotTrusted`/`UnknownError` signature is not
+      # "verified" merely because this run holds the thumbprint. It used to be both
+      # of those things, which is how an engine nobody outside the runner could
+      # verify reached a published package.
+      - name: Test the signing rule before using it
         shell: pwsh
-        timeout-minutes: 2
+        run: ./.github/scripts/test-sign-windows.ps1
+
+      # A release is signed by one identity for its whole life, and that identity
+      # is the one the reviewed anchor pins. The certificate this run needs comes
+      # from the repository's secrets; nothing here may mint one instead, because
+      # a self-signed leaf is exactly what a clean machine's WinVerifyTrust
+      # refuses, and the shipped shell refuses to start an engine it cannot
+      # authenticate (apps/desktop/src-tauri/src/trust.rs).
+      - name: Install the code-signing identity
+        id: cert
+        shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.AETHER_CODESIGN_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.AETHER_CODESIGN_PFX_PASSWORD }}
         run: |
+          $anchor = Get-Content -Raw packaging/trust/engine-trust.json | ConvertFrom-Json
+          $eng = $anchor.files | Where-Object { $_.name -eq 'aether.exe' }
+          if ($env:AETHER_PACKAGE_KIND -eq 'release') {
+            if (-not $env:SIGNING_PFX_BASE64 -or -not $env:SIGNING_PFX_PASSWORD) {
+              throw "a release run needs AETHER_CODESIGN_PFX_BASE64 and AETHER_CODESIGN_PFX_PASSWORD: an artifact signed with a run-local self-signed certificate cannot be verified by anyone who downloads it"
+            }
+            $pfx = Join-Path $env:RUNNER_TEMP "aether-release.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+            $sec = ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation "Cert:\CurrentUser\My" -Password $sec |
+              Where-Object HasPrivateKey | Select-Object -First 1
+            Remove-Item -LiteralPath $pfx -Force
+            if (-not $cert) { throw "the release signing PFX holds no key" }
+            if ($cert.Subject -eq $cert.Issuer) {
+              throw "AETHER_CODESIGN_PFX_BASE64 is self-signed ($($cert.Subject)); anything it signs is NotTrusted on a clean machine"
+            }
+            $leaf = ([BitConverter]::ToString(
+              [Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+            ) -replace '-', '').ToLowerInvariant()
+            if ($eng.cert_sha256.ToLowerInvariant() -ne $leaf) {
+              throw "the release certificate hashes to $leaf but the reviewed anchor pins $($eng.cert_sha256): this run would sign with an identity nobody witnessed"
+            }
+            $cn = $cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            if (-not $cn -or $eng.issued_cn -ne "CN=$cn") {
+              throw "the release certificate's subject is $($cert.Subject) but the anchor's issued_cn is '$($eng.issued_cn)'"
+            }
+            "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "WINDOWS_SIGNER_CN=$cn" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "AETHER_SIGNING_MODE=trusted" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "signing_mode=trusted" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "PINNED_CERT_SHA256=$leaf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Release identity: $($cert.Subject) [$($cert.Thumbprint)], leaf sha256 $leaf (pinned by the anchor)"
+            exit 0
+          }
+
+          # Development only: an ephemeral self-signed certificate, minted per run,
+          # whose signatures nothing outside this job can verify. Every artifact it
+          # touches is named -dev by the packaging step and is never uploaded to a
+          # release, which is the only honest thing available without a CA.
           $pfxPass = "ci-sign-$([Guid]::NewGuid().ToString('N').Substring(0,16))"
           $configPath = Join-Path $env:RUNNER_TEMP "aether-codesign.cnf"
           $keyPath = Join-Path $env:RUNNER_TEMP "aether-codesign.key"
@@ -171,55 +276,120 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed with exit code $LASTEXITCODE" }
 
           $secPass = ConvertTo-SecureString $pfxPass -AsPlainText -Force
-          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass |
+          $devCert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" -Password $secPass |
             Where-Object HasPrivateKey | Select-Object -First 1
-          if (-not $cert) { throw "Imported PFX does not contain a certificate with a private key" }
+          if (-not $devCert) { throw "Imported PFX does not contain a certificate with a private key" }
 
-          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Created ephemeral CI code-signing certificate: $($cert.Subject) [$($cert.Thumbprint)]"
+          "WINDOWS_CERT_THUMBPRINT=$($devCert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $devCn = $devCert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+          "WINDOWS_SIGNER_CN=$devCn" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "AETHER_SIGNING_MODE=ephemeral" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "signing_mode=ephemeral" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "::warning::Development build: signed with a run-local self-signed certificate ($($devCert.Thumbprint)). Artifacts are named -dev and are not published."
+
+      # The policy reads the signing mode selected above; an unset mode is never
+      # evidence of a trusted release identity.
+      - name: Decide what this run is allowed to ship
+        id: policy
+        shell: pwsh
+        run: node scripts/package-policy.mjs --check
+
+      # A release packages the engine the anchor was cut from - the same bytes, not
+      # a recompile of them. Two separately compiled and separately signed PE
+      # files cannot share a digest, so the old shape of this job (prepare-anchor
+      # signs one engine and records its hash, build.yml builds and signs another,
+      # then demands the two match) could only ever be red, and any green would
+      # have meant a check that had stopped comparing anything. The pointer to
+      # those bytes lives in the reviewed anchor, so a release cannot quietly
+      # downgrade to "whatever this run just built".
+      - name: Read the witness pointer from the anchor
+        id: witness
+        if: env.AETHER_PACKAGE_KIND == 'release' || steps.policy.outputs.anchor_complete == 'true'
+        shell: pwsh
+        run: |
+          $anchor = Get-Content -Raw packaging/trust/engine-trust.json | ConvertFrom-Json
+          $eng = $anchor.files | Where-Object { $_.name -eq 'aether.exe' }
+          if ($eng.signing_profile -ne 'trusted-ca') {
+            throw "the anchor witnessed aether.exe with signing_profile '$($eng.signing_profile)', not trusted-ca: those bytes cannot be verified on a clean machine, so they cannot be released"
+          }
+          "run=$($eng.witnessed_run)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "artifact=$($eng.witnessed_artifact)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha256=$($eng.file_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cert=$($eng.cert_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cn=$($eng.issued_cn -replace '^CN=', '')" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download the witnessed engine
+        if: env.AETHER_PACKAGE_KIND == 'release' || steps.policy.outputs.anchor_complete == 'true'
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: ${{ steps.witness.outputs.artifact }}
+          run-id: ${{ steps.witness.outputs.run }}
+          path: witnessed-engine
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Measured before anything can consume it: the bytes that arrive must be the
+      # bytes the anchor describes, or this release would ship something no witness
+      # covers. `--check` is the same comparison the running shell makes at launch;
+      # the -VerifyOnly call is the identity half of it, and it is given no
+      # run-local thumbprint, so `NotTrusted` cannot be excused here.
+      - name: Verify the witnessed engine before it is staged
+        if: env.AETHER_PACKAGE_KIND == 'release' || steps.policy.outputs.anchor_complete == 'true'
+        shell: pwsh
+        run: |
+          $exe = "witnessed-engine/aether.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "the witnessed artifact held no aether.exe" }
+          node scripts/publish-engine-trust.mjs --check --name aether.exe --file $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ".github/scripts/sign-windows.ps1" -VerifyOnly -Path $exe `
+            -ExpectedCertSha256 "${{ steps.witness.outputs.cert }}" `
+            -ExpectedPublisherCN "${{ steps.witness.outputs.cn }}"
+          exit $LASTEXITCODE
+
+      - name: Stage the witnessed engine
+        if: env.AETHER_PACKAGE_KIND == 'release' || steps.policy.outputs.anchor_complete == 'true'
+        shell: pwsh
+        run: |
+          $res = "apps/desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force -Path $res | Out-Null
+          # Copy, never rebuild and never re-sign: the digest the shell vouches for
+          # is a property of these bytes, and re-signing them would change it.
+          Copy-Item -Force "witnessed-engine/aether.exe" "$res/aether.exe"
 
       - name: Build engine
+        if: env.AETHER_PACKAGE_KIND != 'release'
         working-directory: aether
         run: cargo build --release
 
       - name: Sign and verify engine
+        if: env.AETHER_PACKAGE_KIND != 'release'
         shell: pwsh
         run: |
           if (-not (Get-Item "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -ErrorAction SilentlyContinue)) { throw "Code signing cert not found in store" }
           # Single rule for "this binary is properly signed", shared with the
           # installer/GUI signing step and the packaged-artifact re-verification
           # below. It used to be re-typed at each site with different strictness.
-          & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path "aether/target/release/aether.exe"
+          # -DevEphemeral is the explicit, named licence to tolerate a signature
+          # only this run can verify; a release run never reaches this step.
+          & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path "aether/target/release/aether.exe" -ExpectedPublisherCN $env:WINDOWS_SIGNER_CN -DevEphemeral
+
+      - name: Stage wintun driver
+        shell: pwsh
+        run: |
+          $res = "apps/desktop/src-tauri/resources"
+          New-Item -ItemType Directory -Force -Path $res | Out-Null
+          Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
 
       - name: Stage engine
+        if: env.AETHER_PACKAGE_KIND != 'release' && steps.policy.outputs.anchor_complete != 'true'
         shell: pwsh
         run: |
           $res = "apps/desktop/src-tauri/resources"
           New-Item -ItemType Directory -Force -Path $res | Out-Null
           Copy-Item -Force "aether/target/release/aether.exe" "$res/aether.exe"
-          Copy-Item -Force "packaging/wintun.dll" "$res/wintun.dll"
 
-      # The trust anchor is a committed witness, read here and never written: a
-      # job that generates the digest it then checks against cannot fail, which is
-      # the exact defect packaging/trust/README.md documents. build.rs embeds the
-      # committed anchor, so the shell vouches for bytes a reviewer saw in a diff.
-      #
-      # A tag must ship against a real witness, so it is checked before the build
-      # spends its time. An unwitnessed branch build is still allowed — it is a
-      # dev artifact that can never be published, and it says so at compile time.
-      - name: Refuse a tag build whose witness is a placeholder
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        shell: pwsh
-        run: |
-          $anchor = Get-Content -Raw packaging/trust/engine-trust.json | ConvertFrom-Json
-          $zeros = "0000000000000000000000000000000000000000000000000000000000000000"
-          foreach ($f in $anchor.files) {
-            if ($f.file_sha256 -eq $zeros) {
-              throw "tag build has no committed witness for $($f.name); cut one with the prepare-anchor workflow before releasing"
-            }
-          }
-          Write-Host "Committed witness covers every anchored artifact."
-
+      # A development run may be compiled against the placeholder anchor on main;
+      # a release may not, and says so at the policy step above rather than at the
+      # installer of a user who cannot start it.
       - name: Verify staged wintun against the trust anchor
         shell: pwsh
         run: |
@@ -253,56 +423,110 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $gui) { throw "gui missing" }
 
+          $extra = @{}
+          if ($env:AETHER_SIGNING_MODE -eq 'ephemeral') { $extra.DevEphemeral = $true }
           foreach ($bin in @($nsis.FullName, $gui)) {
-            # sign-windows.ps1 now re-reads the signature through the same
-            # Status -eq 'Valid' + CN assertion the release job demands, so the
-            # weaker inline `@("NotSigned","HashMismatch")` re-check that used to
-            # follow this call - and pass a NotTrusted signature - is gone.
-            & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path $bin
+            # sign-windows.ps1 re-reads the signature through the same
+            # Status -eq 'Valid' + whole-CN + pinned-leaf assertion the release
+            # demands; it used to be re-typed per site, with different strictness.
+            & ".github/scripts/sign-windows.ps1" -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path $bin `
+              -ExpectedPublisherCN $env:WINDOWS_SIGNER_CN @extra
           }
 
       - name: Package
         shell: pwsh
         run: |
+          # During packaging, not after installation: the same policy that gated
+          # the build runs again so a package that became non-distributable
+          # between the two (a re-signed engine, a mutated anchor) is never
+          # written out. The label it returns is why a development installer
+          # cannot be mistaken for a release one by a person or a script.
+          node scripts/package-policy.mjs --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $label = "${{ steps.policy.outputs.artifact_label }}"
           $out = "dist-windows"
           New-Item -ItemType Directory -Force -Path $out, "$out/portable/engine" | Out-Null
           $nsis = Get-ChildItem "apps/desktop/src-tauri/target/release/bundle/nsis" -Filter "*setup.exe" |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $nsis) { throw "installer missing" }
-          Copy-Item $nsis.FullName "$out/AetherNext-windows-x64-setup.exe"
+          Copy-Item $nsis.FullName "$out/AetherNext$label-windows-x64-setup.exe"
           $gui = @(
             "apps/desktop/src-tauri/target/release/Aether Next.exe",
             "apps/desktop/src-tauri/target/release/aether-desktop.exe",
             "apps/desktop/src-tauri/target/release/Aether.exe"
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $gui) { throw "gui missing" }
-          Copy-Item $gui "$out/portable/AetherNext-Desktop.exe"
-          Copy-Item "aether/target/release/aether.exe" "$out/portable/engine/aether.exe"
+          Copy-Item $gui "$out/portable/AetherNext$label-Desktop.exe"
+          # Always copy the exact engine that the Tauri bundle staged.
+          Copy-Item -Force "apps/desktop/src-tauri/resources/aether.exe" "$out/portable/engine/aether.exe"
           Copy-Item "packaging/wintun.dll" "$out/portable/wintun.dll"
           Copy-Item "packaging/wintun.dll" "$out/portable/engine/wintun.dll"
-          "Run AetherNext-Desktop.exe" | Set-Content "$out/portable/README.txt"
+          "Run AetherNext$label-Desktop.exe" | Set-Content "$out/portable/README.txt"
           # Ship the witness this build was compiled against: every digest the
           # running shell accepts, and the certificate it accepted, have to be
           # readable next to the binaries they describe.
           Copy-Item -Force "packaging/trust/engine-trust.json" "$out/portable/engine-trust.json"
           Copy-Item -Force "packaging/trust/engine-trust.json" "$out/engine-trust.json"
-          Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext-portable-windows-x64.zip" -Force
+          if ($label -eq '-dev') {
+            # Say it where a person will read it, not only in a filename.
+            $notice = @(
+              'DEVELOPMENT BUILD - NOT A RELEASE.',
+              'This package is signed with a certificate that exists only inside the CI',
+              'run that built it. Use the downloads on the repository release page instead.'
+            )
+            if ('${{ steps.policy.outputs.anchor_complete }}' -ne 'true') {
+              $notice += 'Its engine has no published trust anchor; the installed shell will refuse to start it on a clean machine.'
+            }
+            ($notice + '' + (Get-Content "$out/portable/README.txt")) | Set-Content "$out/portable/README.txt"
+          }
+          Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext$label-portable-windows-x64.zip" -Force
 
       - name: Verify all packaged Windows binaries
         shell: pwsh
         run: |
+          $label = "${{ steps.policy.outputs.artifact_label }}"
           $bins = @(
-            "dist-windows/AetherNext-windows-x64-setup.exe",
-            "dist-windows/portable/AetherNext-Desktop.exe",
-            "dist-windows/portable/engine/aether.exe"
+            "dist-windows/AetherNext$label-windows-x64-setup.exe",
+            "dist-windows/portable/AetherNext$label-Desktop.exe"
           )
+          $extra = @{}
+          if ($env:AETHER_SIGNING_MODE -eq 'ephemeral') {
+            $extra.DevEphemeral = $true
+            $extra.Thumbprint = $env:WINDOWS_CERT_THUMBPRINT
+          }
+          $guiPin = if ($env:AETHER_SIGNING_MODE -eq 'trusted') { $env:PINNED_CERT_SHA256 } else { '' }
           foreach ($b in $bins) {
-            & ".github/scripts/sign-windows.ps1" -VerifyOnly -Thumbprint $env:WINDOWS_CERT_THUMBPRINT -Path $b
+            & ".github/scripts/sign-windows.ps1" -VerifyOnly -Path $b `
+              -ExpectedPublisherCN $env:WINDOWS_SIGNER_CN -ExpectedCertSha256 $guiPin @extra
+          }
+          $engine = "dist-windows/portable/engine/aether.exe"
+          $complete = '${{ steps.policy.outputs.anchor_complete }}' -eq 'true'
+          if ($complete) {
+            & ".github/scripts/sign-windows.ps1" -VerifyOnly -Path $engine `
+              -ExpectedPublisherCN "${{ steps.witness.outputs.cn }}" `
+              -ExpectedCertSha256 "${{ steps.witness.outputs.cert }}"
+          } else {
+            & ".github/scripts/sign-windows.ps1" -VerifyOnly -Path $engine `
+              -ExpectedPublisherCN $env:WINDOWS_SIGNER_CN @extra
           }
           # The outer signature only says the container was signed when it was
           # built; NSIS payloads are not hash-sealed, so extract and check what a
           # user actually ends up running.
-          & "./scripts/verify-installers.ps1" -Installer "dist-windows/AetherNext-windows-x64-setup.exe" -Portable "dist-windows/AetherNext-portable-windows-x64.zip" -Anchor "packaging/trust/engine-trust.json"
+          $verify = @{
+            Installer = "dist-windows/AetherNext$label-windows-x64-setup.exe"
+            Portable = "dist-windows/AetherNext$label-portable-windows-x64.zip"
+            Anchor = "packaging/trust/engine-trust.json"
+            ExpectedPublisherCN = $env:WINDOWS_SIGNER_CN
+            ExpectedGuiCertSha256 = $guiPin
+          }
+          if ($env:AETHER_SIGNING_MODE -eq 'ephemeral') {
+            $verify.Development = $true
+            $verify.DevThumbprint = $env:WINDOWS_CERT_THUMBPRINT
+            if (-not $complete) {
+              $verify.DevEngineSha256 = (Get-FileHash -LiteralPath "apps/desktop/src-tauri/resources/aether.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          & "./scripts/verify-installers.ps1" @verify
           # Same witness, later in the pipeline: nothing between staging and the
           # upload may move the bytes the shell was compiled to accept.
           node scripts/publish-engine-trust.mjs --check --name aether.exe --file dist-windows/portable/engine/aether.exe
@@ -315,15 +539,15 @@ jobs:
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
-            dist-windows/AetherNext-windows-x64-setup.exe
-            dist-windows/AetherNext-portable-windows-x64.zip
+            dist-windows/AetherNext*-windows-x64-setup.exe
+            dist-windows/AetherNext*-portable-windows-x64.zip
 
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: windows
           path: |
-            dist-windows/AetherNext-windows-x64-setup.exe
-            dist-windows/AetherNext-portable-windows-x64.zip
+            dist-windows/AetherNext*-windows-x64-setup.exe
+            dist-windows/AetherNext*-portable-windows-x64.zip
             dist-windows/engine-trust.json
           if-no-files-found: error
 
@@ -334,7 +558,7 @@ jobs:
           if ($env:WINDOWS_CERT_THUMBPRINT) {
             Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
           }
-          @("aether-codesign.cnf", "aether-codesign.key", "aether-codesign.crt", "aether-codesign.pfx") |
+          @("aether-codesign.cnf", "aether-codesign.key", "aether-codesign.crt", "aether-codesign.pfx", "aether-release.pfx") |
             ForEach-Object {
               $path = Join-Path $env:RUNNER_TEMP $_
               if (Test-Path $path) { Remove-Item -LiteralPath $path -Force }
@@ -496,13 +720,20 @@ jobs:
           path: dist-android/*.apk
           if-no-files-found: error
 
-  # Always refresh the GitHub Release so downloads stay in one place.
-  # - push to main / manual → updates release "Latest" (tag: latest)
-  # - push tag v1.2.3 → updates that versioned release
+  # A GitHub Release is a download for somebody else's machine, so it is only
+  # refreshed when the artifacts say they can survive one: the engine they carry
+  # has a published witness, and its signature chains to something a clean install
+  # trusts (scripts/package-policy.mjs). A push to main whose engine anchor is
+  # still the committed placeholder produces `-dev` artifacts on the run page and
+  # touches no release - which is the honest outcome of a run that minted its own
+  # certificate, and the alternative was a package that refuses to start its own
+  # engine the moment it is installed.
+  # - tag v1.2.3 → that versioned release, or the job fails
+  # - push to main / manual → release "Latest" (tag: latest) when publishable
   publish:
     name: Publish downloads
     needs: [test, windows-app, android-apk]
-    if: ${{ always() && needs.test.result == 'success' && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/') && needs.test.result == 'success' && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
     # A named environment is the only handle GitHub has for "who may let this
     # out": the settings on `release` (required reviewers, wait timers) are what
@@ -512,69 +743,55 @@ jobs:
     environment: release
     permissions:
       contents: write
+    env:
+      AETHER_PACKAGE_KIND: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || 'development' }}
+      AETHER_SIGNING_MODE: ${{ needs.windows-app.outputs.signing_mode }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with:
           path: dist
           merge-multiple: true
+      # Judged on the anchor that ships *inside* the artifacts, not on a job
+      # output: the file a user finds next to the binaries is the file that has to
+      # be able to vouch for them. A tag fails here; a development run reports
+      # publishable=false and the release steps below are skipped.
+      - name: Ask whether this run may publish
+        id: eligible
+        run: |
+          set -euo pipefail
+          node scripts/package-policy.mjs --check --anchor dist/engine-trust.json
+      # The payload flatten, the checksums and the manifest checks live in
+      # .github/scripts/pack-checksums.sh, not here. They used to be inline, and an
+      # inline shell body in YAML is code nobody can run before it ships: the step
+      # wrote one sidecar per payload and then built the manifest by globbing the
+      # directory - which took the sidecars with it - so the manifest held 2N lines
+      # against the count of N the next line demanded. Publish could not pass, on
+      # any ref, and only a release run could reveal it.
+      # `bash .github/scripts/test-pack-checksums.sh` runs this step's logic against
+      # a fixture release directory and asserts the manifest lists every payload
+      # exactly once, that every sidecar verifies, and that a manifest missing a
+      # payload fails the step instead of publishing.
       - name: Pack + checksums
         id: pack
         run: |
           set -euo pipefail
-          mkdir -p out
-          # Flattening `dist/**` into `out/` used to be `cp -v {} out/`, which
-          # silently overwrites when two payloads share a basename - the release
-          # then ships whichever find() visited last. Refuse instead.
-          find dist -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.apk' \) | LC_ALL=C sort > /tmp/pack-list
-          while IFS= read -r f; do
-            b="$(basename "$f")"
-            if [[ -e "out/$b" ]]; then
-              echo "::error::two artifacts flatten to out/$b - existing source vs '$f'"
-              exit 1
-            fi
-            cp -v "$f" "out/$b"
-          done < /tmp/pack-list
-          cd out
-          ls -la
-          for f in ./*; do
-            [ -f "$f" ] || continue
-            sha256sum "$f" | tee "$f.sha256"
-          done
-          # `./*` rather than `*`: a name beginning with a dash would otherwise be
-          # parsed as an option by sha256sum.
-          # No `|| true`: this used to swallow every failure and still publish. An
-          # empty or partial SHA256SUMS.txt is precisely the artifact nobody notices
-          # until a download cannot be checked, so assert the manifest covers every
-          # payload and that it verifies.
-          sha256sum ./* > SHA256SUMS.txt
-          test -s SHA256SUMS.txt
-          expected=$(find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name '*.sha256' | wc -l)
-          actual=$(grep -c . SHA256SUMS.txt)
-          if [[ "$expected" != "$actual" ]]; then
-            echo "::error::SHA256SUMS.txt lists $actual digest(es) for $expected artifact(s)"
-            exit 1
-          fi
-          sha256sum -c --quiet SHA256SUMS.txt
-          count=$(find . -maxdepth 1 -name '*.sha256' | wc -l)
-          if [[ "$count" != "$expected" ]]; then
-            echo "::error::$count per-file .sha256 sidecars for $expected artifacts"
-            exit 1
-          fi
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            {
-              echo "tag=${GITHUB_REF_NAME}"
-              echo "title=${GITHUB_REF_NAME}"
-              echo "prerelease=false"
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo "tag=latest"
-              echo "title=Latest build"
-              echo "prerelease=true"
-            } >> "$GITHUB_OUTPUT"
-          fi
+          bash .github/scripts/pack-checksums.sh --src dist --out out
+      - name: Development artifacts, nothing published
+        if: steps.eligible.outputs.publishable != 'true'
+        run: |
+          {
+            echo "## Not published: development artifacts"
+            echo
+            echo 'The engine in these files is not covered by a published trust anchor'
+            echo 'and/or is signed with a certificate only the run that built it can verify.'
+            echo 'They remain downloadable from this workflow run; they are not downloads'
+            echo 'for end users. See `packaging/trust/README.md` and run the'
+            echo '**Prepare engine anchor** workflow to change that.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::skipping the release upload: this run's package is not distributable"
       - name: Upload to GitHub Release
+        if: steps.eligible.outputs.publishable == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.pack.outputs.tag }}

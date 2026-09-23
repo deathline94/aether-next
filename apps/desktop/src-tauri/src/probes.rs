@@ -30,7 +30,7 @@ pub(crate) fn diagnostics_blocking(app: AppHandle) -> Result<serde_json::Value, 
     }
     let settings = load_settings_or_defaults(&app);
     let executable = engine_path(&app, &settings)?;
-    verify_engine_or_refuse(&executable)?;
+    let engine_guard = verify_engine_or_refuse(&executable)?;
 
     let mut command = Command::new(&executable);
     scrub_ambient_engine_env(&mut command);
@@ -43,6 +43,7 @@ pub(crate) fn diagnostics_blocking(app: AppHandle) -> Result<serde_json::Value, 
     let mut child = command
         .spawn()
         .map_err(|e| CommandError::new("spawn_failed", format!("Could not run the engine: {e}")))?;
+    drop(engine_guard);
     // Read both pipes on their own threads so a child that fills one of them
     // cannot deadlock against the wait below, and give the wait a deadline: an
     // engine that wedges inside `--diagnostics` used to hold this command — and,

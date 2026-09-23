@@ -96,14 +96,34 @@ internal object ScanLimits {
      */
     const val MAX_CONCURRENCY = 500
 
+    /**
+     * Lanes a MASQUE/H3 scan may run, which is fewer than a cheap one can.
+     *
+     * The web layer already refuses to advertise more than this for H3; a shell that
+     * clamped 1..500 for every protocol left the number able to reach the engine from
+     * anywhere else — a stored value, another producer, a hand-written call — and ask
+     * for lanes the handshake-safety rule exists to prevent. Mirrors
+     * `SCAN_MAX_CONCURRENCY_H3` and the engine's `EXPENSIVE_MAX_CONCURRENCY`.
+     */
+    const val MAX_CONCURRENCY_H3 = 16
+
     /** The timeout actually sent to the engine, for the protocol the user picked. */
     fun clampTimeout(timeoutMs: Int, protocol: String): Int {
         val floor = if (isMasque(protocol)) MASQUE_MIN_TIMEOUT_MS else MIN_TIMEOUT_MS
         return timeoutMs.coerceIn(floor, MAX_TIMEOUT_MS)
     }
 
-    fun clampConcurrency(concurrency: Int): Int =
-        concurrency.coerceIn(MIN_CONCURRENCY, MAX_CONCURRENCY)
+    /**
+     * Lanes for the protocol actually being scanned.
+     *
+     * [protocol] defaults to empty — a caller with no protocol in hand keeps the
+     * absolute ceiling rather than being silently narrowed. The scan path does have
+     * one, and passes it.
+     */
+    fun clampConcurrency(concurrency: Int, protocol: String = ""): Int {
+        val ceiling = if (isMasque(protocol)) MAX_CONCURRENCY_H3 else MAX_CONCURRENCY
+        return concurrency.coerceIn(MIN_CONCURRENCY, ceiling)
+    }
 
     fun isMasque(protocol: String): Boolean =
         protocol.contains("h3", ignoreCase = true) || protocol.equals("masque", ignoreCase = true)

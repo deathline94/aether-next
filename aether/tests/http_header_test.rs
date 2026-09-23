@@ -4,7 +4,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
 async fn test_read_header_valid() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
 
     tokio::spawn(async move {
@@ -20,7 +22,9 @@ async fn test_read_header_valid() {
 
 #[tokio::test]
 async fn test_read_header_rejects_oversized_boundary() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
 
     let server_task = tokio::spawn(async move {
@@ -36,12 +40,17 @@ async fn test_read_header_rejects_oversized_boundary() {
     let res = server_task.await.expect("server join");
     assert!(res.is_err(), "Oversized header must be rejected");
     let err_str = res.unwrap_err().to_string();
-    assert!(err_str.contains("HTTP header too large"), "Expected 'HTTP header too large', got: {err_str}");
+    assert!(
+        err_str.contains("HTTP header too large"),
+        "Expected 'HTTP header too large', got: {err_str}"
+    );
 }
 
 #[tokio::test]
 async fn test_read_header_rejects_late_terminator_past_16k() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
 
     let server_task = tokio::spawn(async move {

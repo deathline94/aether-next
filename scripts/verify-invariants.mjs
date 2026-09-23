@@ -72,7 +72,46 @@
 }
 
 /* ------------------------------------------------------------------- gates */
-/* Each gate: name, invariant, summary, scan(api), inject() -> {file, content} */
+/* Each gate: name, invariant, summary, scan(api), inject() -> {file, content}
+ *
+ * ---------------------------------------------------------------- CSS sheets
+ * Reviewer item 24 moved the shared half of both app stylesheets into
+ * `packages/ui/src/shared.css`, which each app loads *before* its own sheet.
+ * That is a hazard for every check here that scans a sheet by path: a gate still
+ * pointed at an app's own sheet alone would keep printing "ok" while reading a
+ * fifth of the rules, and every rule it stopped reading is one that can now
+ * regress freely. So no CSS gate opens an app sheet by literal path any more -
+ * they go through the union helpers below, and `--selftest-fail` proves each one
+ * still detects its defect through them.
+ *
+ * `packages/ui/tokens.css` is the palette itself, so the gates that forbid a
+ * colour literal outside the token fence exclude it; the gates that look for
+ * undefined vars, dead duplicates and orphan rules include everything.
+ */
+const SHARED_CSS_DIR = 'packages/ui/src';
+const uniq = (xs) => [...new Set(xs)];
+/** Every stylesheet one app renders from, in load order: shared sheet, then its own. */
+function sheetsFor(api, app) {
+  return uniq(api.files(SHARED_CSS_DIR, /\.css$/).concat(api.files(app, /\.css$/)));
+}
+/** Every stylesheet in the frontend tree, shared sheet and token source included. */
+function allSheets(api) {
+  return uniq(
+    api.files('apps', /\.css$/)
+      .concat(api.files(SHARED_CSS_DIR, /\.css$/))
+      .concat(api.files('packages', /\.css$/)),
+  );
+}
+/** The app's own `src/App.css`, or null when it is not there to audit. */
+function appSheet(api, app) {
+  return api.files(app, /App\.css$/).find((f) => rel(f) === `${app}/src/App.css`) ?? null;
+}
+/** Sheets that *use* the palette: both app sheets plus the shared sheet, and not
+ *  `packages/ui/tokens.css`, which is where the colours are allowed to be spelled. */
+function styleSheets(api) {
+  return uniq(['apps/desktop', 'apps/android'].flatMap((a) => api.files(a, /\.css$/))
+    .concat(api.files(SHARED_CSS_DIR, /\.css$/)));
+}
 
 /* ------------------------------------------------- WCAG colour arithmetic */
 /*
@@ -468,15 +507,28 @@
     name: 'ipc-typed-errors',
     invariant: 'BC-20',
     summary: 'Tauri commands return CommandError, never String',
-    scan(api) {
-      const v = [];
-      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
-        const t = api.read(f);
-        const re = /Result<[^<>]*,\s*String\s*>/g;
-        let m;
-        while ((m = re.exec(t))) v.push(`${locate(f, t, m.index)} stringly IPC error type`);
-      }
-      return v;
+    scan(api) {
+      const v = [];
+      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
+        const t = api.read(f);
+        const commands = /#\[tauri::command(?:\([^)]*\))?\]/g;
+        let command;
+        while ((command = commands.exec(t))) {
+          if (isComment(t, command.index)) continue;
+          const remaining = t.slice(commands.lastIndex);
+          const fn = /\b(?:async\s+)?fn\s+\w+\s*\(/.exec(remaining);
+          if (!fn) continue;
+          const signatureStart = commands.lastIndex + fn.index;
+          const bodyStart = t.indexOf('{', signatureStart);
+          if (bodyStart < 0) continue;
+          const signature = t.slice(signatureStart, bodyStart);
+          const stringError = /->\s*Result\s*<[\s\S]*?,\s*String\s*>/.exec(signature);
+          if (stringError) {
+            v.push(`${locate(f, t, signatureStart + stringError.index)} stringly IPC error type`);
+          }
+        }
+      }
+      return v;
     },
     inject() {
       return {
@@ -516,8 +568,8 @@
       const defined = (src) =>
         new Set([...src.matchAll(/\.([A-Za-z][\w-]*)/g)].map((m) => m[1]));
       const FOR_APP = {
-        'apps/desktop': defined(sheet('apps/desktop/src/App.css') + '\n' + tokens),
-        'apps/android': defined(sheet('apps/android/src/App.css') + '\n' + tokens),
+        'apps/desktop': defined(sheetsFor(api, 'apps/desktop').map((x) => api.read(x)).join('\n') + '\n' + tokens),
+        'apps/android': defined(sheetsFor(api, 'apps/android').map((x) => api.read(x)).join('\n') + '\n' + tokens),
       };
       /*
        * Per app, not a union. Unioning the two sheets is how a class that only
@@ -575,7 +627,7 @@
     summary: 'no 100vh, transition:all, unguarded :hover, alpha hairlines, nested keyframes, undefined vars',
     scan(api) {
       const v = [];
-      const all = api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/));
+      const all = allSheets(api);
       for (const f of all) {
         const raw = api.read(f);
         /*
@@ -887,6 +939,7 @@
       const specs = [
         // The engine's own ladder, in prober.rs.
         ['aether/src/prober.rs', new RegExp(`EXPENSIVE_MAX_CONCURRENCY: usize = ${NUM}`), 'engineH3Lanes'],
+        ['aether/src/prober.rs', new RegExp(`EXPENSIVE_DEFAULT_CONCURRENCY: usize = ${NUM}`), 'engineExpensiveDefault'],
         ['aether/src/prober.rs', new RegExp(`SCAN_CONCURRENCY_CEILING: usize = ${NUM}`), 'engineLanes'],
         ['aether/src/prober.rs', /EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis\((\d[\d_]*)\)/, 'engineMasqueFloor'],
         // The web layer's shared copy.
@@ -900,6 +953,7 @@
         // directory scan rather than one named file so that a *second* clamp added
         // somewhere else in the shell is caught as drift instead of ignored.
         ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MAX_CONCURRENCY = ${NUM}`), 'kotlinLanes'],
+        ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MAX_CONCURRENCY_H3 = ${NUM}`), 'kotlinH3Lanes'],
         ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MIN_CONCURRENCY = ${NUM}`), 'kotlinMinLanes'],
         ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp(`MASQUE_MIN_TIMEOUT_MS = ${NUM}`), 'kotlinMasqueFloor'],
         ['apps/android/android/app/src/main/java/app/aethernext/EngineProfiles.kt', new RegExp('MIN_TIMEOUT_MS = ' + NUM), 'kotlinFloor'],
@@ -943,7 +997,29 @@
           v.push(`${label}: ${where} — one limit, several numbers (${from})`);
         }
       };
-      eq('H3 lane ceiling', 'engineH3Lanes', 'uiH3Lanes');
+      eq('H3 lane ceiling', 'engineH3Lanes', 'uiH3Lanes', 'kotlinH3Lanes');
+      // The lane the control opens on is deliberately not a fourth number to keep in
+      // step: it is either an alias of the H3 ceiling or that same digit. A restated
+      // literal that drifts is exactly how the field came to advertise 250 lanes for
+      // a run the engine narrows to 16, so an accidental second copy is a failure.
+      const uiDefault = (api.read('packages/ui/src/index.ts').match(
+        /SCAN_DEFAULT_CONCURRENCY\s*=\s*([A-Za-z0-9_]+)/,
+      ) ?? [])[1];
+      if (!uiDefault) {
+        v.push('SCAN_DEFAULT_CONCURRENCY is not defined in packages/ui/src/index.ts');
+      } else if (uiDefault !== 'SCAN_MAX_CONCURRENCY_H3' && want(uiDefault) !== found.uiH3Lanes) {
+        v.push(
+          `the control opens on ${uiDefault}, which is neither an alias of nor the same number as the H3 ceiling ${found.uiH3Lanes}`,
+        );
+      }
+      // The engine's expensive-scan baseline is a narrowing, not a ceiling: it has to
+      // sit inside the ladder every surface above agrees on, or the run answers with a
+      // lane count no control can show.
+      if (!(found.engineExpensiveDefault >= found.uiMinLanes && found.engineExpensiveDefault <= found.uiH3Lanes)) {
+        v.push(
+          `the engine's expensive baseline ${found.engineExpensiveDefault} is outside the shared lane ladder ${found.uiMinLanes}..${found.uiH3Lanes}`,
+        );
+      }
       eq('MASQUE/QUIC timeout floor', 'engineMasqueFloor', 'uiMasqueFloor', 'kotlinMasqueFloor');
       eq('timeout floor', 'uiFloor', 'kotlinFloor');
       eq('timeout ceiling', 'uiCeiling', 'kotlinCeiling');
@@ -1202,7 +1278,7 @@
       // invisible. Both sheets carried `overflow-wrap: anywhere` twice, in the
       // same rule, in parallel copies of each other.
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const text = api.read(f);
         // Strip comments' bodies but keep their newlines: replacing a block comment
         // with nothing shifts every later line number, and a violation that names
@@ -1279,7 +1355,7 @@
       const minWidth = typeof win.minWidth === 'number' ? win.minWidth : 0;
       const minHeight = typeof win.minHeight === 'number' ? win.minHeight : 0;
       const v = [];
-      for (const f of api.files('apps/desktop/src', /\.css$/)) {
+      for (const f of sheetsFor(api, 'apps/desktop')) {
         const src = api.read(f);
         for (const m of src.matchAll(/@media[^{]*?\((max-width|max-height):\s*(\d+)px\)/g)) {
           const limit = m[1] === 'max-width' ? minWidth : minHeight;
@@ -1387,7 +1463,7 @@
        * still every colour in the sheets, because each one is declared somewhere.
        */
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const src = api.read(f);
         const masked = blankComments(src);
         const tokens = sheetColourTokens(masked);
@@ -1457,7 +1533,7 @@
        */
       const CONTROL = /(input|select|textarea|combobox|search|stepper|chassis|toggle|knob|checkbox|radio|-btn|button)/i;
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const src = api.read(f);
         const masked = blankComments(src);
         const tokens = sheetColourTokens(masked);
@@ -1515,7 +1591,7 @@
       // either spelling from drifting back down.
       const FLOOR = 11;
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const src = api.read(f);
         const masked = blankComments(src);
         for (const m of masked.matchAll(/(--text-[\w-]+)\s*:\s*([\d.]+)px/g)) {
@@ -1535,6 +1611,105 @@
     },
   },
   {
+    name: 'mobile-informative-type-floor',
+    invariant: 'BC-12',
+    summary: 'on the phone sheet, only reviewed metadata sits under --text-label',
+    scan(api) {
+      /*
+       * `type-scale-floor` asks whether anything is under 11px. On a phone 11px
+       * is not a floor: repair item 22 found the hero status word, every field
+       * label, every form hint and the log line itself sitting exactly there,
+       * because one token sized both the tracked uppercase eyebrow and the
+       * sentence explaining what STANDBY means. This is the other half of the
+       * rule — text under `--text-label` has to be decoration or non-essential
+       * metadata, and the set below is what that was decided to mean, one
+       * selector at a time. It reads both ways on purpose: a new small label
+       * fails, and so does a listed selector that no longer sits under the
+       * floor, because a budget nobody prunes turns back into a shrug.
+       */
+      const SHEET = 'apps/android/src/App.css';
+      const METADATA_TIER = new Set([
+        // uppercase, letter-spaced captions that name a block rather than state
+        // a fact about it
+        '.brand-text span', '.eyebrow', '.panel-eyebrow', '.topbar-eyebrow',
+        '.section-heading p', '.about-panel p', '.bento-category',
+        // tags and pills whose word restates a state already shown beside them
+        '.beacon-tag', '.discovered-proto', '.phase-pill', '.profile-active-tag',
+        '.scope-phase-tag', '.stat-chip-pill', '.tactical-chip',
+        // counts, rates and totals: numbers ABOUT the diagnostics, not the verdict
+        '.chip-count', '.proto-tab .chip-count', '.log-count-badge', '.rtt-badge',
+        '.scan-badges .badge', '.scan-card-footer', '.stream-count',
+        '.terminal-center-telemetry',
+        // a caption under a larger value, a unit, a timestamp, a hint
+        '.field-hint', '.stat-label', '.spec-badge span',
+        '.stepper-suffix', '.terminal-log-row time',
+        // the version string, the sidebar's one-line detail, and the terminal's
+        // aria-hidden shell chrome
+        '.version-bar', '.beacon-detail', '.terminal-title-text',
+      ]);
+      const PHONE_SHEETS = sheetsFor(api, 'apps/android');
+      const maskedSheets = PHONE_SHEETS.map((x) => blankComments(api.read(x)));
+      const sheetAt = (idx) => {
+        let base = 0;
+        for (let i = 0; i < PHONE_SHEETS.length; i += 1) {
+          if (idx < base + maskedSheets[i].length + 1) return [PHONE_SHEETS[i], idx - base, maskedSheets[i]];
+          base += maskedSheets[i].length + 1;
+        }
+        return [PHONE_SHEETS[0], idx, maskedSheets[0] ?? ''];
+      };
+      if (!PHONE_SHEETS.some((x) => rel(x) === SHEET)) return [`${SHEET} not found, so the mobile type floor ran on nothing`];
+      const code = maskedSheets.join('\n');
+      const tokens = new Map();
+      for (const m of code.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)) tokens.set(m[1], m[2].trim());
+      const pxOf = (value) => {
+        const ref = value.match(/^var\((--[\w-]+)\)$/);
+        if (ref) {
+          const target = tokens.get(ref[1]);
+          return target ? pxOf(target) : null;
+        }
+        // String.match with /g hands back the whole match, and Number("13px") is NaN:
+        // so read the captured digits: the floor of this gate is that number.
+        const nums = [...value.matchAll(/([\d.]+)px/g)].map((m) => Number(m[1]));
+        return nums ? Math.min(...nums.map(Number)) : null;
+      };
+      const FLOOR = pxOf(tokens.get('--text-label') ?? '');
+      if (!Number.isFinite(FLOOR)) {
+        return [`${SHEET}: --text-label resolves to no px value, so there is no informative floor to check against`];
+      }
+      const v = [];
+      const small = new Set();
+      for (const [sel, body, blockAt] of ruleBlocks(code)) {
+        for (const d of body.matchAll(/(?:^|[;{\s])font-size:\s*([^;]+)/g)) {
+          const px = pxOf(d[1].trim());
+          const declAt = code.indexOf('font-size', blockAt); const [hereF, hereAt, hereT] = sheetAt(declAt);
+          if (px === null) {
+            v.push(`${locate(hereF, hereT, hereAt)} ${sel}: font-size "${d[1].trim()}" resolves to no size, so the floor could not be read off it`);
+            continue;
+          }
+          if (px >= FLOOR) continue;
+          small.add(sel);
+          if (!METADATA_TIER.has(sel)) {
+            v.push(`${locate(hereF, hereT, hereAt)} ${sel} is ${px}px, under the ${FLOOR}px --text-label floor, and is not on the reviewed metadata list: raise it, or justify the selector as decoration`);
+          }
+        }
+      }
+      for (const sel of [...METADATA_TIER].sort()) {
+        if (!small.has(sel)) {
+          v.push(`${SHEET}: the metadata tier still allows ${sel} to sit under ${FLOOR}px and it no longer does — delete it from the list so the list stays a measurement`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/android/src/App.css',
+        content:
+          ':root{--text-label:13px;--text-micro:11px}\n' +
+          '.zzq-informative-status-label-qx { font-size: var(--text-micro); }\n',
+      };
+    },
+  },
+  {
     name: 'declarations-live-in-a-block',
     invariant: 'BC-11',
     summary: 'every CSS declaration sits inside a rule block',
@@ -1547,7 +1722,7 @@
        * script added ~100 tokens that way, and nothing else noticed.
        */
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const code = blankComments(api.read(f));
         let depth = 0;
         const at = (idx) => code.slice(0, idx).split('\n').length;
@@ -1622,7 +1797,7 @@
         const size = new Map();
         // A gate that inspected nothing must not report success.
         if (!classes.size) v.push(`${app}: no pointer targets found in the JSX, so this gate is checking nothing`);
-        for (const f of api.files(app, /\.css$/)) {
+        for (const f of sheetsFor(api, app)) {
           const code = blankComments(api.read(f));
           for (const [sel, body] of ruleBlocks(code)) {
             const h = Math.max(px(body, 'height') ?? -Infinity, px(body, 'min-height') ?? -Infinity);
@@ -1678,7 +1853,7 @@
        * each block against its siblings only.
        */
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const code = blankComments(api.read(f));
         const stack = [];
         const groups = new Map();
@@ -1756,7 +1931,8 @@
     summary: 'files that exist in both frontends may not drift further apart than recorded',
     scan(api) {
       /*
-       * FR-037 wants one shared source; ten files are still copied into both apps,
+       * FR-037 wants one shared source; fourteen pairs are still copied into both
+       * apps - the count in the `BASELINE` map below, which the check verifies it read -
        * and the reason every UI fix in this project has had
        * to be applied twice (and, historically, was applied once) is that pair.
        * The error boundary is no longer one of them: it is a shared component with
@@ -1769,7 +1945,7 @@
        * wording of `aria-invalid`, and both apps re-export one file. What is left are
        * the behavioural twins: `App.tsx`, `useRuntime`, `useScanner`, `types.ts` and
        * the tab components, whose recorded identity is below 100 precisely because
-       * the two surfaces do the same job differently.
+       * the two surfaces do the same job differently; the other 6 records are at 0 or 100.
        *
        * So this is a ratchet, not a promise: each file's code-line identity is
        * recorded as it stands, and a change may only raise it. Drift below the
@@ -1783,7 +1959,22 @@
         // 71 before the speed-preset table moved to `packages/ui`: the ratio fell
         // *because* the duplication did. A floor may drop only for that reason,
         // and the reviewer has to say so here rather than edit the number quietly.
-        ['components/ConnectionTab.tsx', 69],
+        // 69 -> 62 for the same reason a second time. The session claims both apps
+        // made in their own words - the hero's three lines per status, the
+        // connected-state wording keyed on the routing mode, the two listener tiles,
+        // the carrier / protocol / cipher names, and the state, coverage and endpoint
+        // answers - now live in `packages/ui/src/statusCopy.ts`, where each app's
+        // `PLATFORM` record is the only thing fed in from outside: Android cannot let
+        // an app set the system proxy, so there the stored `system-proxy` profile
+        // degrades to the local listeners, and that difference is a flag rather than
+        // a second vocabulary. The move raised the measurement from 49 to 62 on the
+        // way out; the 69 it fell to was recorded while both files still carried
+        // their own copy of those sentences, and it had already been undercut by the
+        // wave that drifted them apart. What the residual gap is made of, and is
+        // meant to stay: the phone's "Connection status" evidence panel, the order
+        // its sections come in at a 390 px viewport, and each card's own word for its
+        // fields - design, not duplication.
+        ['components/ConnectionTab.tsx', 62],
         ['components/ErrorBoundary.tsx', 100],
         ['components/ScannerTab.tsx', 80],
         ['components/SettingsTab.tsx', 72],
@@ -1860,7 +2051,7 @@
        * overlay carries no hue, so there is nothing for it to drift from.
        */
       const v = [];
-      for (const f of api.files('apps', /\.css$/)) {
+      for (const f of styleSheets(api)) {
         const raw = api.read(f);
         const outside = raw
           .split('/*==AETHER-TOKENS-START==*/')
@@ -1895,7 +2086,7 @@
       // change --emerald without the ladder and this fails, instead of quietly
       // shipping emerald text under sky-blue glows.
       const v = [];
-      for (const f of api.files('apps', /\.css$/).concat(api.files('packages', /\.css$/))) {
+      for (const f of allSheets(api)) {
         const tokens = sheetColourTokens(blankComments(api.read(f)));
         for (const [name, value] of Object.entries(tokens.resolved)) {
           const m = name.match(/^--(.+)-a(\d{2,3})$/);
@@ -1925,7 +2116,7 @@
     summary: 'corner radii come from the --radius-* scale, and the measured leftovers only shrink',
     scan(api) {
       const v = [];
-      const sheets = api.files('apps', /\.css$/);
+      const sheets = styleSheets(api);
       const defined = new Set();
       const used = new Set();
       for (const f of sheets) {
@@ -2020,7 +2211,7 @@
           .replace(/:not\([^)]*\)/g, '')
           .trim();
       const v = [];
-      for (const f of api.files('apps', /\.css$/)) {
+      for (const f of styleSheets(api)) {
         const text = blankComments(api.read(f));
         const hovered = new Set();
         const pressed = new Set();
@@ -2166,12 +2357,12 @@
       const ORPHAN_BUDGET = { 'apps/desktop': 0, 'apps/android': 0 };
       const v = [];
       for (const app of ['apps/desktop', 'apps/android']) {
-        const sheetFile = api.files(app, /App\.css$/).find((f) => rel(f).endsWith(`${app}/src/App.css`));
+        const sheetFile = appSheet(api, app) ?? sheetsFor(api, app)[0];
         if (!sheetFile) {
           v.push(`${app}: no App.css to audit`);
           continue;
         }
-        const sheet = blankComments(api.read(sheetFile));
+        const sheet = uniq(sheetsFor(api, app)).map((x) => blankComments(api.read(x))).join('\n');
         const defined = new Set();
         for (const line of sheet.split(/\r?\n/)) {
           const brace = line.indexOf('{');
@@ -2190,12 +2381,12 @@
         const budget = ORPHAN_BUDGET[app] ?? 0;
         if (dead.length > budget) {
           v.push(
-            `${app}/src/App.css: ${dead.length} class rule(s) name nothing any source mentions — ${dead.slice(0, 14).join(', ')}${dead.length > 14 ? `, … (+${dead.length - 14})` : ''}`,
+            `${app} sheets (own + shared): ${dead.length} class rule(s) name nothing any source mentions — ${dead.slice(0, 14).join(', ')}${dead.length > 14 ? `, … (+${dead.length - 14})` : ''}`,
           );
         }
         if (dead.length < budget) {
           v.push(
-            `${app}/src/App.css: only ${dead.length} orphan(s) left against a budget of ${budget} — lower it in the same commit so the number stays a measurement`,
+            `${app} sheets (own + shared): only ${dead.length} orphan(s) left against a budget of ${budget} — lower it in the same commit so the number stays a measurement`,
           );
         }
       }
@@ -2259,7 +2450,62 @@
     },
   },
   {
-    name: 'wire-tokens-cross-layer',
+    name: 'wg-reserved-field-stays-zero',
+    invariant: 'BC-01',
+    summary: "no identifier is stamped into WireGuard's reserved packet bytes",
+    scan(api) {
+      // RFC 8718 §2: the four-byte message-type field carries three *reserved*
+      // bytes that are zero on transmission. boringtun writes that whole word
+      // itself while sealing (noise/handshake.rs:736 and :821,
+      // noise/session.rs:207) and keys `mac1` over `&dst[..mac1_off]` verbatim
+      // right after (noise/handshake.rs:688-694); inbound, it classifies a
+      // packet from u32::from_le_bytes(src[0..4]) with the reserved bytes still
+      // inside that word (noise/mod.rs:133-161). So there is no moment at which
+      // a caller can give those bytes a value the authentication covers:
+      // writing them is always writing them after the seal. T246 removed the
+      // per-account `client_id` this used to carry on every packet — a cleartext
+      // identifier that also made the packet unclassifiable to a
+      // standards-faithful peer.
+      //
+      // A source rule rather than only a unit test because the engine cannot be
+      // compiled on every machine that runs the checks, and because the defect
+      // class is one of the six send sites growing the call back, which no one
+      // function's test would see.
+      const v = [];
+      const reservedWrite = /\[\s*1\s*\.\.\s*4\s*\]\s*\.copy_from_slice\(\s*([^)]*)\)/;
+      const zeroLiteral = /^&?\[\s*0u8?\s*(?:;\s*3\s*|,\s*0\s*,\s*0\s*)\]$/;
+      const injectorNamed = /\bfn\s+\w*(?:inject|stamp|embed)\w*id\w*\s*\(/;
+      for (const f of api.files('aether/src', /\.rs$/)) {
+        const t = api.read(f);
+        t.split(String.fromCharCode(10)).forEach((raw, i) => {
+          const line = raw.trim();
+          if (line.startsWith('//') || line.startsWith('*')) return;
+          const w = line.match(reservedWrite);
+          if (w && !zeroLiteral.test(w[1].trim())) {
+            v.push(
+              `${rel(f)}:${i + 1} writes a non-zero reserved field (${w[1].trim()}) — after the seal, so neither mac1 nor the AEAD covers it`,
+            );
+          }
+          if (injectorNamed.test(line)) {
+            v.push(
+              `${rel(f)}:${i + 1} ${line.slice(0, line.indexOf('('))} injects an identifier into a packet header`,
+            );
+          }
+        });
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'aether/src/__selftest__.rs',
+        content:
+          'fn inject_client_id(pkt: &mut [u8], client_id: &[u8; 3]) {\n  pkt[1..4].copy_from_slice(client_id);\n}\n',
+      };
+    },
+  },
+  {
+    name: 'wire-tokens-cross-layer',
+
     invariant: 'BC-13',
     summary: 'every scan / ip / transport token a producer can emit is named by the engine',
     scan(api) {
@@ -2448,4 +2694,4 @@
 }
 
 main();
-
+

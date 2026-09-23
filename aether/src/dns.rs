@@ -315,10 +315,10 @@ pub fn is_dns_reply(pkt: &[u8], resolver: Ipv4Addr) -> bool {
     }
     // DNS header: flags at offset 2, QR is the top bit. An echo of the probe we
     // sent has QR clear, so it is not evidence of anything.
-    if pkt.len() < ihl + 12 {
+    if pkt.len() < ihl + 8 + 12 {
         return false;
     }
-    pkt[ihl + 2] & 0x80 != 0
+    pkt[ihl + 8 + 2] & 0x80 != 0
 }
 
 #[cfg(test)]

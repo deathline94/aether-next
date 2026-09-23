@@ -19,6 +19,18 @@
 **Purpose**: Create the scaffolding later tasks fill in, so no task edits a file that does not exist yet and the gate harness exists before any fix is attempted.
 
 - [x] T001 Create the root npm workspace manifest `package.json` (`workspaces: ["packages/ui","apps/desktop","apps/android"]`, `private: true`) — the repo has **no** root `package.json` today; each app carries its own lockfile, which is how desktop and Android drifted apart behaviourally (only Android has the connect watchdog).
+  **Corrected at reconciliation (2026-09-23): every coordinate in this line is now
+  false, in both directions.** A root `package.json` does exist, and it declares **no**
+  `workspaces:` key — `package.json:6` carries the decision as its `description`, and
+  gate `npm-lock-is-the-one-npm-reads` refuses the shape. The workspace named here was
+  in fact created and then deleted in `9cb6ca5`, for the reason recorded in the
+  Execution log at the foot of this file (`npm ci` inside `apps/*` resolved to a root
+  with no lockfile; both frontend jobs died with `EUSAGE`). The drift this task was for
+  is handled by `packages/ui` plus `frontend-fork-parity`, not by a shared install
+  graph, and the example it cites is stale too: desktop gained its own connect watchdog
+  under T121, with `apps/desktop/src-tauri/tests/connect_watchdog_test.rs` over it. The
+  tick means "the problem was addressed and the rejected solution is gated", not
+  "the artifact named here exists".
 - [x] T002 [P] Scaffold `packages/ui/` with `packages/ui/package.json` (name `@aether/ui`), `packages/ui/tokens.css`, `packages/ui/src/index.ts`, `packages/ui/src/components/` — per plan.md §Structure.
 - [x] T003 [P] Create `aether/src/trust.rs` and `aether/src/route_repair.rs` as documented skeletons and register both in `aether/src/lib.rs` (two new modules exist to end the "one policy, three copies" defect; see plan.md Complexity Tracking).
 - [x] T004 [P] Create `apps/android/android/app/src/main/java/app/aethernext/Liveness.kt` with a pure `fun decideLiveness(prev: LongArray, now: LongArray, elapsedMs: Long, attempt: Int): Decision` stub returning `Alive` — T203's table tests target this file first.
@@ -49,6 +61,10 @@
 - [x] T018 [P] Introduce the typed error surface in `apps/desktop/src-tauri/src/lib.rs`: `#[derive(thiserror::Error, Serialize, specta::Type)] enum CommandError { kind, field: Option<String>, message }`; convert **all 10** command signatures from `Result<_, String>`. `field` is what lets Settings render an inline error instead of an eternal "Auto-Saving".
 - [ ] T019 Wire `tauri-specta` 2.0.0-rc.x + `specta` + `specta-typescript` in `apps/desktop/src-tauri/{Cargo.toml,src/lib.rs}`: derive `specta::Type` on `Settings`/`RuntimeState`/`LogEvent`, add `Builder::constant("SCAN_MAX", 500)`, and add `apps/desktop/src-tauri/src/bin/export-bindings.rs` writing `apps/desktop/src/bindings.ts` **statically** (the default `#[cfg(debug_assertions)] builder.export()` only works in dev, so CI would otherwise never regenerate it).
 - [x] T020 Convert `pump_scan_stream`/`handle_engine_line` in `apps/desktop/src-tauri/src/lib.rs` (`:1571-1610`, `:1761-1792`) from `serde_json::Value` + `match ty` to `serde_json::from_str::<SessionEvent>()` + typed re-emit, so a new engine variant fails the shell's compile instead of falling into `_ => {}`.
+  Landed, and the paths in this line are since stale: `lib.rs` was split, so
+  `handle_engine_line` is at `apps/desktop/src-tauri/src/events.rs:99` and
+  `pump_scan_stream` at `apps/desktop/src-tauri/src/scan.rs:302`. Confirmed by reading
+  both signatures, not by the file name.
 - [x] T021 [P] Define the `ConfigEnvelope` format in `aether/src/config.rs`: magic `AETHERCFG2\n`, `u8` schema version, 12-byte `OsRng` nonce, ChaCha20-Poly1305 with **AAD = canonical absolute path + magic + schema version**; `KeySource::{Shell,DpapiFile,Keystore,None}`. Bind the rule verbatim: *with `KeySource::None`, `save()` writes only non-secret config and refuses secrets.*
 - [ ] T022 [P] Create the `EndpointRegistry` actor skeleton in `aether/src/cache.rs` (one owning task, `mpsc` request/response, file as write-behind snapshot only) with existing free functions delegating to it so callers migrate incrementally.
 - [x] T023 [P] Add the counter substrate in `aether/src/netstack.rs` and `aether/src/quic.rs`: `tx_deferred`, `dgram_dropped`, `inbound_dropped`, `frames_lost`, `cache_entries_rejected`, `ignored_offstream_status`, `malformed_event` — every silent-drop path gets a number **before** the paths are fixed, so "did this guard ever fire?" is answerable.
@@ -101,6 +117,21 @@
 - [x] T037 [US1] Define `RouteJournal` in `aether/src/route_repair.rs` per data-model.md §5: `version`, `created_at`, `creator_pid`, `creator_process_start_time`, `tun_luid`, `tun_alias`, `tun_if_index`, `phys_luid`, `gateway`, `peer_host`, `entries[{prefix,next_hop,family,proto,valid_lifetime_s}]`, `before{adapter_dns,interface_metric,peer_route_present}` — written **before** any mutation.
 - [x] T038 [US1] Implement deletion scoping in `aether/src/tun_win.rs::remove_routes`: identifiers present → by LUID + prefix + next-hop; absent/zero → **only** prefixes whose next-hop equals the recorded tunnel address; unscoped prefix deletion becomes unrepresentable. The comment being removed states legacy files "fall back to the old global behavior rather than leaking routes" — that fallback is the defect.
 - [ ] T039 [US1] Replace all route/adapter mutation in `aether/src/tun_win.rs` with `netioapi` FFI via `windows-sys` (`aether/Cargo.toml` + `apps/desktop/src-tauri/Cargo.toml` features): `CreateIpForwardEntry2`/`DeleteIpForwardEntry2`/`GetIpForwardTable2`, `MIB_IPFORWARD_ROW2` keyed on `InterfaceLuid`+`DestinationPrefix`+`NextHop`, `Protocol = MIB_IPPROTO_NETMGMT`. No `powershell.exe`, `route.exe`, `netsh`, `ipconfig`.
+  **Left open at reconciliation because the last sentence is one clause short of true,
+  and it is the *named* exception that keeps it honest.** Routes and adapter state are
+  native — `aether/src/tun_win.rs:15-17` imports
+  `CreateIpForwardEntry2`/`DeleteIpForwardEntry2`/`GetIpForwardTable2`/`GetIpInterfaceEntry`
+  and every route add/remove in the module goes through them; the only
+  `run_cmd` call left in `tun_win.rs` is at `:195`. That one call is
+  `prepare_adapter_device` (`:239`, script rendered at `:195-198`) running
+  `Enable-NetAdapter` + `Disable-NetAdapterBinding ms_tcpip6` — an NDIS protocol binding
+  with no binding in the `windows-sys` features this crate enables, which the function's
+  own doc comment (`:218-237`) states, along with the hand-written FFI ban. It owns no
+  state and journals nothing, so it cannot leave the host damaged; the box stays open
+  until either that pair goes native or the exception is ratified as the design. Live
+  adapter behaviour (does the binding actually come off, does a metric survive) is a
+  clean-Windows-VM observation, which is T030/T052/T078's checkpoint and is not this
+  machine.
 - [x] T040 [US1] Call `route_repair::run_unconditionally()` as the **first** action of GUI setup in `apps/desktop/src-tauri/src/lib.rs` (~`:2120`), independent of `routing_mode`, emitting a `RepairRecord`.
   > Landed as an unconditional call at engine startup (`cli::run`, every non-scan launch) instead of in the GUI process: the journal is engine-owned and pid-guarded, so the process that may have died is the one that replays it. `--repair-routes` covers the manual case.
 - [x] T041 [US1] Add `aether.exe --repair-routes` and `--repair-proxy` CLI paths in `aether/src/main.rs` so the uninstall flow can reverse state without ever entering TUN mode.
@@ -108,10 +139,32 @@
 - [x] T042 [US1] Restore adapter state from the journal's `before` block in `aether/src/tun_win.rs`: `InterfaceMetric` reverts to the recorded value (never a default) and DNS comes from `configured_dns_servers()`, removing today's hardcoded `Set-DnsClientServerAddress @('1.1.1.1','1.0.0.1')` at `:137` which the proxy path honours and the TUN path silently ignores.
   DNS half done; the line reference in this task was wrong (`:137` is the gateway script) — the literals were in `configure_adapter_ip`. The tunnel adapter now gets `socks::dns_servers_for_adapter(configured_dns_servers())`: same source of truth as the proxy path, order preserved, duplicates dropped, IPv6 excluded (the adapter's v6 binding is disabled a few lines earlier), and an IPv6-only list still falls back to usable defaults rather than leaving the NIC with no resolver. Both the PowerShell path and the `netsh` fallback use it. `adapter_resolvers_come_from_the_configured_list` lives in `socks.rs`, not `tun_win.rs`, so it runs on every CI OS rather than only on the one platform that can load the driver.
   InterfaceMetric half not done, and the reason is recorded here rather than hidden: the only adapter whose metric we change is the Wintun adapter we created, so resetting *it* to automatic is the correct inverse — `AdapterBefore` describes state the engine never touches, both production writers pass `before: None`, and nothing reads the field. Tracked as T042b.
+  > **Closed at reconciliation (2026-09-23) by T042b's decision, not by new code.**
+  > `AdapterBefore` no longer exists: `aether/src/route_repair.rs:135-144` records that
+  > the field was deleted rather than implemented, with the reason (filling it in needs
+  > a query surface the engine does not have, and a restore path that writes a
+  > third-party adapter's numbers back is a bigger host-mutation risk than the
+  > unreachable guarantee it replaced). So there is no `before` block left to populate
+  > and the InterfaceMetric clause of this task is answered — as a refusal, which is
+  > what T042b existed to decide. What the adapter config actually does now is native
+  > (`netioapi`/`SetIpInterfaceEntry` in `tun_win.rs`, see T039) and its teardown is
+  > journalled step-by-step (`aether/src/tun_win.rs:1083` `TeardownAttempt`).
 - [x] T042b [US1] Decide what `AdapterBefore` in `aether/src/route_repair.rs` is for: either snapshot the physical adapter (DNS servers, `InterfaceMetric`, MTU) before the first mutation and restore exactly those in `reset_adapter_config`, or delete the field. A journal schema that advertises a "before" state and is written as `None` on every path is a guarantee nothing checks — the same shape as a fix guard that cannot be reached.
+  **Decided: deleted.** `aether/src/route_repair.rs:135-144` is the decision, in the
+  place the field used to be declared, and `grep -rn AdapterBefore aether/src` now
+  matches only that comment. Both options in this task were live until it was taken;
+  the second one is the one that removed a promise no path could keep.
 
 - [x] T043 [US1] Remove every `let _ = ps(&script)` cleanup discard in `aether/src/tun_win.rs` (`:368` and siblings); cleanup failures become `log::error!` + `SessionEvent::Error` (INV-5).
-- [x] T044 [US1] Set 90 s `ValidLifetime`/`PreferredLifetime` with a 30 s refresh loop in `aether/src/tun_win.rs`, documented as a **backstop**, never the primary teardown mechanism.
+- [ ] T044 [US1] Set 90 s `ValidLifetime`/`PreferredLifetime` with a 30 s refresh loop in `aether/src/tun_win.rs`, documented as a **backstop**, never the primary teardown mechanism.
+  **Unticked at reconciliation (2026-09-23): this box was checked while the text
+  underneath it began "Not implemented, on purpose".** The argument below still
+  stands and is the reason it stays open — the tick was simply the ledger contradicting
+  itself. Remaining work, verbatim from the reasoning: lifetimes may only be added
+  *together with* a presence watchdog that re-installs within ~1 s of a miss and treats
+  a failed refresh as a hard tunnel error; until that pair exists this is a fail-open
+  trade, and `recover_stale_routes()` at every engine start is the backstop that
+  fails closed.
   **Not implemented, on purpose — this task would trade a fail-closed failure for a fail-open one.** `New-NetRoute` does accept `-ValidLifetime`/`-PreferredLifetime` (verified against the cmdlet), so the mechanism exists. What does not hold is the premise that expiry is a safe backstop for *these* routes: the prefixes we install are the split defaults (`0.0.0.0/1`, `128.0.0.0/1`) on the tunnel interface. When they are present traffic goes through the tunnel; when they are absent traffic falls back to the physical default gateway. A stale route after a crash therefore black-holes (loud, no leak, and the journal replay at every start already clears it). A route that expires while the tunnel is up — refresh thread starved, laptop asleep, spawn failing inside the grace window — leaks every request while the UI still reads Connected. For a VPN the second is the worse bug.
   To take this up, the change is not "add lifetimes" but "add lifetimes **and** a presence watchdog that re-installs within ~1 s of a miss and treats a failed refresh as a hard tunnel error" — the leak must be impossible before the expiry is enabled. Until someone builds that pair, `recover_stale_routes()` at every engine start (T040/T041) plus the pid-liveness guard is the backstop, and it fails closed.
 - [ ] T045 [US1] Move host-mutation ownership to the GUI in `apps/desktop/src-tauri/src/lib.rs` (already elevated in TUN mode at `:1349`); give the engine a `DuplicateHandle` of the parent process handle plus `WaitForSingleObject` so a graceful teardown handshake precedes `child.kill()`; raise the grace window at `:1551-1571` from 5 s to 15 s, keeping the job object as backstop.
@@ -122,7 +175,15 @@
   Done as `aether/src/host_lock.rs`, wired into `install_routes`, `remove_routes` and `recover_stale_routes`. Windows uses a named mutex and Unix an advisory `flock` on a permanent file, so liveness is the kernel's answer rather than a staleness heuristic: `WAIT_ABANDONED_0` says the holder died, and a crashed process's flock goes with it — which is why the guard cannot wedge the host, and why no mtime window is consulted. Failing to acquire is a refusal to mutate, never a mutation without it; the refused teardown keeps the journal so the next start's pid-guarded replay does the removal.`remove_routes_locked` exists separately because `flock` is per-descriptor and would make a nested acquire fail and silently skip a removal.
   Reuses T083's proven pattern rather than `ProvisionGuard` verbatim, and the substring PID matching it mentions (T035) was already replaced by exact-field matching plus `OpenProcess`/`GetExitCodeProcess`. Two tests: contention from a second thread, and a holder that exits without releasing.
 - [x] T048 [US1] Upgrade `ProxySnapshot` in `apps/desktop/src-tauri/src/lib.rs:1938-1954` to snapshot **all four registry** values with hard-fail reads (no `.unwrap_or(0)`): `ProxyEnable`, `ProxyServer`, `ProxyOverride`, `AutoConfigURL`; keep `InternetSetOptionW(SETTINGS_CHANGED)` then `(REFRESH)` after **both** directions.
-  Four of the five done; the fifth is a registry shape, not an oversight. `ProxySnapshot` now carries `AutoConfigURL`, `enable` clears it while the tunnel owns the proxy, `restore` puts it back, and `verify_readback_values` takes two snapshots instead of three loose parameters so a future field cannot be written-and-never-compared again. The `.unwrap_or(0)` and the two `.ok()` reads are gone: a failed read used to become "there was no proxy", which the restore then honoured by *deleting* a value it had never successfully read. `#[serde(default)]` keeps a recovery file from an older build restorable (`a_recovery_file_from_an_older_build_still_-` `restores`).
+  **All four registry values it names are in the snapshot** — `ProxySnapshot` at
+  `apps/desktop/src-tauri/src/proxy.rs:71-86` carries `enabled`, `server`, `bypass` and
+  `auto_config_url`, and `read_enable` beside it (`:92-95`) says why `ProxyEnable`
+  alone may default to 0 while no other read may. Re-read at reconciliation because this
+  entry's own opener claimed "Four of the five done": that fifth clause is not an
+  undone part of this task, it is a scope error in the task text — per-connection PAC is
+  not a registry value at all. Leaving the sentence as written made the box read as a
+  partial with no marker; the real remainder is T048b.
+  `ProxySnapshot` now carries `AutoConfigURL`, `enable` clears it while the tunnel owns the proxy, `restore` puts it back, and `verify_readback_values` takes two snapshots instead of three loose parameters so a future field cannot be written-and-never-compared again. The `.unwrap_or(0)` and the two `.ok()` reads are gone: a failed read used to become "there was no proxy", which the restore then honoured by *deleting* a value it had never successfully read. `#[serde(default)]` keeps a recovery file from an older build restorable (`a_recovery_file_from_an_older_build_still_-` `restores`).
   Per-connection `INTERNET_PER_CONN_PROXY_PAC` is not a registry value: it lives in the opaque `Connections\DefaultConnectionSettings` RAS blob and is set through `InternetSetOptionW(INTERNET_PER_CONN_LIST)` on a connection handle this process does not own. Snapshotting it means parsing that blob's versioned layout, which is a task of its own — filed as T048b rather than approximated here.
 - [ ] T048b [US1] Per-connection proxy state: read and restore `Connections\DefaultConnectionSettings` (or `InternetQueryOptionW` with `INTERNET_PER_CONN_LIST`) so a machine whose proxy is configured per dial-up/VPN connection is not restored by half. Needs the blob's versioned layout decoded; the value-level snapshot in T048 does not cover it.
   **Detection half done; the write half is not.** A per-connection proxy outranks the
@@ -212,8 +273,20 @@
   one action pinned to two different commits. Its `inject` case carries both defect shapes at once,
   and `--selftest-fail` confirms the gate notices them, so the gate is proven able to fail rather
   than assumed; the 39-character ref in the fixture is the same class as the 34-character one that
-  broke `engine-windows`. All 14 gates pass on the current tree, where every action is a full SHA
-  and one SHA per action.
+  broke `engine-windows`.
+  **The last sentence of this entry ("All 14 gates pass on the current tree") is
+  retired: it was true of one day's tree and reads as a standing claim.** The gate set
+  is owned by `scripts/verify-invariants.mjs`, not by this file, and it moves — measured
+  at reconciliation time (2026-09-23) that harness held **40** gates and exited 1, with
+  two failing: `ipc-typed-errors` (5 `Result<_, String>` sites in
+  `apps/desktop/src-tauri/src/trust.rs`, which the in-flight crypt32/DER reader is
+  adding under T060 — the rule scans every `.rs` in the crate, so it does not distinguish
+  a `#[tauri::command]` from an internal helper) and `frontend-fork-parity` (three twin
+  pairs below their recorded baseline, from concurrent UI edits). `actions-pinned-to-full-commit`
+  itself was green. There is also a **second** harness this file never mentioned:
+  `scripts/verify-release-integrity.mjs`, 4 gates, all green at the same measurement, and
+  run only from `build.yml:155-156` — i.e. on a release build, not on a push. Anyone
+  reading a gate count off this file is reading a stale one; run the two scripts.
 - [ ] T052 [US1] **Checkpoint**: T031–T036 green; then re-run each with its new guard deleted and confirm all go red again (quickstart step 3). Record both in the PR — a guard nobody has killed is not a guard.
 
 **Checkpoint**: At this point US1 is fully functional and independently testable: the app can no longer leave the host's network misconfigured by any termination path.
@@ -243,6 +316,13 @@
   `aether/tests/` file would test nothing: the engine's `trust.rs` is MASQUE SPKI
   pinning and never consults `EMBEDDED_RELEASE_HASHES`.
 - [x] T055 [P] [US2] Failing test in `aether/tests/wintun_resolution.rs`: `AETHER_WINTUN` pointing at a foreign DLL ⇒ connect fails and the DLL marker file is never created. Fails today: `aether/src/tun_win.rs:25-47` reads the env var and a CWD-relative path in an **elevated** process.
+  **That path does not exist and never did — the coverage is inline, and here is where
+  it actually is:** `aether/src/tun_win.rs:2349` `mod wintun_resolution_tests`, cases
+  `an_environment_variable_cannot_name_the_driver` (`:2357`),
+  `only_a_plain_wintun_dll_inside_the_install_roots_is_accepted` (`:2388`),
+  `the_beside_exe_candidate_is_the_only_fallback` (`:2417`). "Green" below is a CI
+  verdict, not one this machine can repeat: `aether/` does not compile here
+  (boring-sys/libclang), so these three were read, not run.
   Test written and green: `tun_win::wintun_resolution_tests` (3 cases) — an
       `AETHER_WINTUN` plant in a temp directory is never resolved, the candidate is never read
       or written, only a plain `wintun.dll` inside the install roots is accepted, and the
@@ -258,15 +338,47 @@
       it can be tested without an edge to dial; removing the validity check turns two of the six
       red. The `install_pin_verification` path is also covered: an unknown host and an empty pin
       set are refusals, not fallbacks.
-- [x] T057 [P] [US2] Failing compile-fail test in `aether/tests/no_release_bypass.rs` that `VerifyPolicy::Insecure` is unnameable in release, plus a release-binary string grep for a dev-trust branch.
+- [ ] T057 [P] [US2] Failing compile-fail test in `aether/tests/no_release_bypass.rs` that `VerifyPolicy::Insecure` is unnameable in release, plus a release-binary string grep for a dev-trust branch.
+  **Unticked at reconciliation (2026-09-23): the box was checked for a test file that
+  does not exist, and for a scan no workflow runs.** Neither artifact is in the tree —
+  `aether/tests/` holds no `no_release_bypass.rs`, `aether/Cargo.toml` has no
+  compile-fail harness (no `trybuild`; its only dev-dependency is vendored `quiche`
+  with `internal`), and `grep -nE "strings|Select-String|findstr|dumpbin" .github/workflows/*.yml`
+  returns nothing, so no release binary is ever scanned for a dev-trust branch.
+  What *is* true, and why the finding behind this task is not open: the variant itself
+  is debug-only at `aether/src/trust.rs:327-328` (`#[cfg(debug_assertions)] Insecure`),
+  its one consumer is `aether/src/tls.rs:292`, and gate `tls-no-ambient-bypass` refuses
+  an environment kill-switch reaching it. That is a mechanism plus a text gate, not the
+  falsifiable test this task asked for — the removal is asserted by the compiler's own
+  cfg, which nothing here has ever observed failing.
+  **Remaining work, exactly:** either a compile-fail case
+  (`trybuild`/`ui_test` as a dev-dependency — a dependency decision) asserting
+  `VerifyPolicy::Insecure` fails to name under `--release`, or a release-artifact scan
+  in `build.yml` over the built `aether.exe`. One of the two, not both, closes this.
 - [x] T058 [P] [US2] Failing test in `aether/tests/spki_pin_per_host.rs`: a pin issued for host A must not authenticate host B. Fails today: `MASQUE_PINS` (`aether/src/consts.rs:17-22`) is a global 2-entry set and `aether/src/masque_h2.rs:133` adds `set_verify_hostname(false)`.
+  **Where "the last two cases above" actually live — `aether/tests/spki_pin_per_host.rs`
+  does not exist:** `aether/tests/tls_pin_chain.rs:458`
+  `a_host_credited_with_a_key_it_does_not_present_is_rejected` and `:521`
+  `a_chain_checked_host_accepts_its_real_name_and_rejects_a_wrong_one`, plus
+  `aether/src/trust.rs:461` `every_committed_pin_declares_its_provenance`. The two
+  `tls_pin_chain.rs` cases are **parse-checked only, never run here** (the engine does
+  not compile on this machine); `trust.rs:461` is the one that can run anywhere, and it
+  is the reason a labelled-unmeasured pin cannot be mistaken for a measured one. The
+  data half is machine-checkable and gated: `scripts/verify-masque-pins.mjs` and its
+  `--selftest-fail` run in `ci.yml:376-377`.
   Covered by the last two cases above (per-host pin sets are enforced by lookup, a host with
       no set is an error rather than a pass) and by `masque_h2`'s per-set
       `require_hostname`, which is data-driven from `masque-pins.json` rather than a global
       `set_verify_hostname(false)`. The committed file still carries `require_hostname: false`
-      for the two Cloudflare edges for the reason already recorded in `packaging/trust/README.md`:
-      the peer is dialled by IP, and flipping it needs a live handshake to confirm which digest
-      belongs to which SNI.
+      for the two Cloudflare edges, but the reason is now measured rather than assumed
+      (2026-09-23, `openssl s_client -connect 162.159.198.2:443 -servername <sni> -showcerts`,
+      TCP and `-quic -alpn h3`): both SNIs receive the same self-signed
+      `CN=masque.cloudflareclient.com` leaf, whose SAN names neither of them, so a name check
+      against the dialled SNI rejects the live edge. The question "which digest belongs to
+      which SNI" is answered the other way — the leaf is chosen by the IP dialled, not by the
+      SNI — which is why the second digest is kept and labelled unmeasured, and why flipping
+      either flag needs an endpoint-keyed policy (a code change), not more rows in the file.
+      See `packaging/trust/masque-pins.json` and `packaging/trust/README.md`.
 - [x] T059 [US2] Failing CI-fixture test that `scripts/verify-installers.ps1` exits non-zero for an unsigned build **and** when it extracts zero binaries. Fails today: `.github/workflows/build.yml:194-207` checks only the outer `setup.exe`, recording a pass while the installed GUI exe is unsigned.
   Done as `scripts/selftest-verify-installers.ps1`, run on every push by the new `installer-verifier`
   job in `.github/workflows/ci.yml`. Three fixtures, each checked red before the gate was believed:
@@ -294,7 +406,9 @@
   against a freshly-issued certificate), together with `WTD_DISABLE_MD2_MD4` and
   `WTD_CACHE_ONLY_URL_RETRIEVAL`. Anchoring the chain at the pin rather than the system
   root program is a *stricter* equality test already satisfied by comparing the leaf
-  digest. **What is genuinely left:** the leaf digest and subject are read by a *second*
+  digest. **What is genuinely left:** *(written before the 2026-09-23 wave; the closing
+  paragraph below supersedes it — this is now done in source, not verified)* the leaf
+  digest and subject are read by a *second*
   opener — `powershell.exe Get-AuthenticodeSignature` (`:404-420`) — after WinVerifyTrust
   read the file, so the two reads are not the same handle: a swap window, bounded by
   needing write access to a directory whose DACL this app already restricts, and by the
@@ -326,6 +440,28 @@
   What has to be settled first is the link route (the full `windows` crate, which
   does declare `CryptQueryObject`, or `kind = "raw-dylib"`), proven by
   `cargo test --lib` on a Windows host, not by compilation.
+  **Reconciled 2026-09-23: that blocker dissolved because the route changed — no FFI was
+  needed at all, and the swap window is closed in source but still in flight.** The
+  signer is now read out of the bytes that were hashed, by a hand-rolled DER walk with no
+  new linkage: `apps/desktop/src-tauri/src/trust.rs:653` `witness_bytes` → `:666`
+  `authenticode_signer` → `:1063` `authenticated_signer`, with `BinaryWitness`
+  (`:607-629`) deliberately un-constructible field by field so the digest and the signer
+  cannot come from two observations. `powershell.exe Get-AuthenticodeSignature` is gone
+  from the module — `:1292-1299` records what it used to do and why two unrelated
+  readings of a *path* were the bug — and `:1309` compares the pair against the anchor.
+  The `authenticated_signer` lookup is by the signer's issuer **and** serial number, the
+  rule this entry's own analysis named, so a leaf wrapped into somebody else's PKCS#7
+  does not read as pinned.
+  **Why this is not a tick:** the tree moved during the measurement. `cargo test --lib`
+  in `apps/desktop/src-tauri` failed to compile with 6 errors in this exact file
+  (`trust.rs:726` `usize::try_from(… .der(…))`) and the same command passed, 21 tests
+  green, minutes later — a mid-edit state, not a verdict. Two things are still owed
+  before this closes: a test that names a *real* signed binary's signer (the
+  `the_signer_of_a_genuinely_signed_binary_is_returned` case above is not in the file —
+  `grep -n genuinely_signed` matches nothing), and the DER reader's own error type,
+  which is what the `ipc-typed-errors` gate is currently red on (`Result<_, String>` at
+  `trust.rs:653,791,795,929,1062`). Owner: the item-4 agent, file
+  `apps/desktop/src-tauri/src/trust.rs`.
 - [x] T061 [US2] Make verification unconditional across every branch in `apps/desktop/src-tauri/src/lib.rs::engine_path` (`:1046-1094`) and `connect` (`:1368`), including custom `enginePath` and `AETHER_ENGINE`.
 - [x] T062 [US2] Narrow the trusted root: remove `exe.parent().parent()` from the allowed roots in `apps/desktop/src-tauri/src/lib.rs:762-787` — for perMachine that is `C:\Program Files`, for portable a user-writable extraction directory, while the child is handed the DPAPI master key.
   Done. `allowed_binary_roots` replaces "the exe's directory and its parent": the roots are
@@ -353,8 +489,21 @@
   Deviation worth recording: there is no `LoadLibraryExW` call to pass flags to. The only library the engine loads is wintun, and `wintun-bindings` does that load internally via `libloading` (absolute path, `LOAD_WITH_ALTERED_SEARCH_PATH`); the process-wide default set by `SetDefaultDllDirectories` covers every other resolution, which is the outcome T073 was after.
 - [x] T074 [US2] Verify `wintun.dll` **before** load using the `wintun` crate's `verify_binary_signature` feature (WinVerifyTrust VERIFY→CLOSE + signer `WireGuard LLC`, no `DllMain` execution) plus the pinned SHA-256; make the GUI's check mandatory rather than `if let Some(wintun) = wintun_path()`, which today is skipped precisely when the packaged DLL is missing.
   Done. `wintun-bindings` now builds with `verify_binary_signature`, which runs WinVerifyTrust (VERIFY then CLOSE) and requires the signer display name to be `WireGuard LLC` *before* `LoadLibrary`, so a substituted DLL is refused without executing its `DllMain`. The shell's check is no longer `if let Some(wintun) = wintun_path(&app)`: in TUN mode a missing `wintun.dll` is an error and the digest comparison against the anchor always runs.
-- [x] T075 [US2] Reorder `.github/workflows/build.yml` to sign **before** bundling: stable PFX from secrets → `cargo build --release` → sign `aether.exe` → verify signature → stage engine → **verify staged digest == `engine-trust.json` [NEW GATE]** → `npm ci && npm run build` → `npm run tauri build --config '{"bundle":{"windows":{"certificateThumbprint":…,"digestAlgorithm":"sha256","timestampUrl":…}}}'` → **extract-and-verify all inner binaries [NEW GATE]** → write release digests post-signing → upload.
-  Partial: the trust-anchor publish step and three `--check` gates (staged, `dist-windows/portable/engine/*`, shipped `wintun.dll`) landed with T071 via `scripts/publish-engine-trust.mjs`, and the anchor now travels with the artifacts. Remaining: the sign-before-bundling reorder (`certificateThumbprint` handed to `tauri build` instead of post-hoc `Set-AuthenticodeSignature`) and the NSIS extract-and-verify gate — see T075b.
+- [ ] T075 [US2] Reorder `.github/workflows/build.yml` to sign **before** bundling: stable PFX from secrets → `cargo build --release` → sign `aether.exe` → verify signature → stage engine → **verify staged digest == `engine-trust.json` [NEW GATE]** → `npm ci && npm run build` → `npm run tauri build --config '{"bundle":{"windows":{"certificateThumbprint":…,"digestAlgorithm":"sha256","timestampUrl":…}}}'` → **extract-and-verify all inner binaries [NEW GATE]** → write release digests post-signing → upload.
+  **Unticked at reconciliation: this box was checked on top of a note that opens
+  "Partial:".** Re-measured against the workflow, two of its three clauses are in and
+  the third is not: the anchor/`--check` gates run at `build.yml:151,337,392-398,505-507`,
+  and the **NSIS extract-and-verify gate landed** — `build.yml:502` calls
+  `scripts/verify-installers.ps1 -Installer … -Portable … -Anchor packaging/trust/engine-trust.json`,
+  so the second NEW GATE in this line is no longer open (see T076, T059).
+  **Remaining, exactly one clause:** sign before bundling. `build.yml:406` is a bare
+  `npm run tauri build` with no `certificateThumbprint` config, and the binaries are
+  signed after the bundle is assembled (`:428`), which is what this reorder exists to
+  remove. The note's `Set-AuthenticodeSignature` wording is itself stale — that call is
+  now `.github/scripts/sign-windows.ps1`, exercised by `test-sign-windows.ps1` on every
+  push (`:208`) — so the work is a reorder, not a rewrite, and it is gated by
+  `no-ephemeral-signature-on-a-distributable-artifact`
+  (`scripts/verify-release-integrity.mjs`, `build.yml:155`). Owner with T075b.
 - [x] T076 [US2] Delete the "Sign and verify GUI and installer" step (`build.yml:150-170`) and rewrite "Verify all packaged Windows binaries" (`:194-207`) to call `scripts/verify-installers.ps1`. Document why: tauri-bundler signs the main exe after `patch_binary` (`bundle.rs:155`), sidecars while skipping already-signed files (`:296-336`), NSIS plugins/uninstaller/outer installer (`nsis/mod.rs:672-679`,`:306`,`:717`) and `resources/*` excluding signed files (`:792`) — so wintun's WireGuard LLC signature survives.
   Rewritten rather than deleted, and the task's premise corrected: that step is the only thing
   that *signs* the standalone GUI copy and the outer NSIS container (tauri-bundler signs the bundle
@@ -388,14 +537,62 @@
 - [x] T080 [P] [US3] Failing test in `aether/tests/envelope_v2.rs`: identical ciphertext at a different path must fail authentication. Fails today: no AAD binding exists, so an encrypted `aether-masque.toml` blob replays verbatim onto `aether.toml`.
 - [x] T081 [P] [US3] Failing test in `aether/tests/atomic_write_test.rs` (extend): a planted `<path>.bak` with a foreign identity must be ignored by `load()`. Fails today: `aether/src/config.rs:270-278` copies it over the live file with the error ignored, and `:232-260` creates it via `std::fs::copy`/`MoveFileExW` outside the ACL-restricted writer.
 - [x] T082 [P] [US3] Failing test in `aether/tests/cache_validation.rs`: `epoch > now + 300`, `successes ≥ 2^31`, and out-of-allowlist addresses must be dropped and counted. Fails today: `aether/src/cache.rs:96-107` uses `saturating_sub` on a wall clock so a future timestamp never decays and permanently earns the freshness bonus; `:65-93` does unchecked `successes + failures`; there is no provenance check at all.
+  **No `aether/tests/cache_validation.rs` exists; the coverage is inline in the module
+  under test.** `aether/src/cache.rs:1034` `sanitising_rejects_fabricated_history`
+  asserts the skew and the counter clamps together (`MAX_FUTURE_SKEW_SECS = 300` at
+  `:36`, `MAX_SUCCESSES = 1000` at `:39`, both applied in `sanitise` at `:128-140`), and
+  `:1068` `an_address_in_v6_dressing_is_still_the_address_it_embeds` is the provenance
+  half — eleven reserved/linked spellings (loopback, link-local, `fc00::/7`,
+  `100.64.0.0/10`, multicast, `::ffff:`-mapped IMDS) refused and three real edges kept,
+  the rule the old `is_loopback`-only check could not express; rejected entries bump
+  `counters::CACHE_ENTRIES_REJECTED` at `:151-153`, so "dropped **and counted**" is the
+  shipped shape. Not run here — engine code, see the toolchain note.
 - [x] T083 [P] [US3] Failing test in `aether/tests/cache_concurrency.rs`: 10 000 concurrent writers from two processes must lose no update. Fails today: `aether/src/cache.rs:157-191` treats a lock as stale at `mtime > 5 s` (stealing live holders), `unwrap_or(true)` on an `elapsed()` error makes it always stale, `continue` bypasses the deadline so it can spin, and `Drop` unlinks whoever's lock file exists.
   Done, with the assertion rewritten to something the design can actually satisfy. The task asked for "10 000 concurrent writers, no update lost" while T101 (already done) deliberately made a lock timeout *skip* the mutation instead of writing unlocked — skipping is losing an update, by choice. So the test states the property that survives that rule: an update a writer was told it applied must still be there afterwards, and one process's write must never erase another's (each writer rewrites the whole document, so that is the first thing a missing lock breaks). Two real OS processes, 120 updates each, plus a starvation guard that both made progress — otherwise the check passes on two empty histories. Verified falsifiable by an env-gated lock bypass, which turns it red.
   `record_success`/`record_failure`/`add_to_*_with_rtt`/`write_with_rtt` now return `cache::Mutation{Applied,Skipped}` and the connect and scan paths log the skip, because a function that can decline to do its job and says nothing is the same defect as a guard that cannot fail.
+  > Measured at reconciliation (2026-09-23) rather than accepted: the file **is** where
+  > this line says (`aether/tests/cache_concurrency.rs`, one case
+  > `two_processes_updating_the_cache_lose_no_applied_update`), and the scale is
+  > `const WRITES: usize = 120` per process — two real OS processes, 240 updates, not the
+  > "10 000 concurrent writers" this task names. The box stands because the *property*
+  > the rewrite argues for is the one the design can hold, and the rewrite is disclosed
+  > above; it is recorded here so no reader mistakes the case for the volume. Not run on
+  > this machine — engine code.
 - [x] T084 [P] [US3] Failing test in `aether/tests/cache_read_nondestructive.rs`: a corrupt cache must be preserved as `.corrupt.<seq>` and a read must not rename it at all. Fails today: `aether/src/cache.rs:36-40` renames to a fixed `.corrupt` **from read paths** (`get_masque_sorted`/`get_wireguard_sorted` call `load_endpoints` without the lock), clobbering any prior `.corrupt`.
+  **No such test file exists; the coverage is inline.** The rename is now
+  `quarantine_corrupt` (`aether/src/cache.rs:253`), which writes
+  `.corrupt.<pid>.<seq>` (`:257`) and logs rather than overwrites on failure (`:264`),
+  and the read-half claim is asserted by `a_read_does_not_disturb_the_file_on_disk`
+  (`:1172`) beside `partial_and_legacy_documents_still_parse` (`:1195`). Engine code —
+  read here, run on CI.
 - [x] T085 [P] [US3] Failing test in `aether/tests/h2_endpoint_survival.rs`: an H2-cached gateway verified while `masque_h2::enabled()` must not accrue failures. Fails today: `aether/src/session.rs:583-607` always probes over QUIC while `prober.rs:458-513` shares one `CacheKind::Masque` slot, so healthy H2 gateways are evicted after 3 strikes and every connect pays a full scan.
   Done as part of T099. `CachedEndpoint.transport` separates the two histories and `session.rs`'s cached-gateway verify now calls `masque_h2::verify_h2` when H2 is on, so an H2 gateway is measured over the transport it will be used on. Guarded by `a_failure_over_one_transport_cannot_evict_the_other` and `a_success_over_one_transport_does_not_reset_the_other` (both verified to fail when the transport-blind matching is put back).
+  > Corrected at reconciliation: **`aether/tests/h2_endpoint_survival.rs` does not exist.**
+  > Those two cases are in `aether/src/cache.rs:930` and `:963`, inside the module's own
+  > `mod tests` (with the legacy-file half at `:991`). And "both verified to fail when
+  > the transport-blind matching is put back" cannot have been observed on this machine —
+  > `aether/` does not compile here — so that mutation result is a CI-side claim, held to
+  > that standard, not a local one.
 - [x] T086 [P] [US3] Failing test in `apps/android/android/app/src/test/java/app/aethernext/ConfigKeyStoreTest.kt`: `UnrecoverableKeyException` ×2 then success ⇒ alias survives and `aether.toml` intact; `BadPaddingException` ⇒ quarantine. Fails today: `ConfigKeyStore.kt:31-52` routes **any** exception into `rotateAndRecover()`, which deletes the key and quarantines the config — one transient `keystore2` failure costs the identity permanently.
 - [x] T087 [P] [US3] Failing test in `aether/tests/acl_principal.rs`: the ACL principal must derive from the process token, not `%USERNAME%`. Fails today: `aether/src/config.rs:131-148` grants `/grant:r {USERNAME}:F` from an **elevated** process, so the next ordinary launch cannot read its own config and re-provisions a new WARP device.
+  **`aether/tests/acl_principal.rs` does not exist, and the coverage that does is
+  thinner than this box implies.** The one case is
+  `aether/src/win_acl.rs:106` `sid_is_a_sid_and_not_the_user_name`, which asserts the
+  *shape* of what `current_user_sid()` returns — not, on its own, that an elevated
+  process and an ordinary one get different SIDs from different tokens. The behaviour
+  this task is about is real in source: `config.rs:319` takes the principal from
+  `win_acl::current_user_sid()` (`OpenProcessToken` + `GetTokenInformation(TokenUser)`,
+  `win_acl.rs:29-70`) and `restrict_windows_acl` (`config.rs:314`) hands `icacls`
+  `/reset` — a still-empty file only — then `/inheritance:r /grant:r *<sid>:F`
+  (`:332-341`), each step returning `Err` unless the process exits zero (`:343-356`).
+  The only `%USERNAME%` left in the engine is `win_acl.rs:3-6`, describing the defect.
+  Two honest residuals: the
+  elevated-vs-ordinary difference is argued from the API, not observed, and what
+  `aether/tests/atomic_write_test.rs:172` proves is only that the writer **fails closed**
+  when `restrict_windows_acl` errors (`test_write_private_file_fails_closed_on_acl_failure`,
+  behind the `test-hooks` feature) — nothing anywhere asserts that `/reset` removed an
+  older build's stray ACE. `win_acl.rs:1-17` records the same
+  correction for the SDDL descriptor the specs used to claim.
 - [x] T088 [P] [US3] Failing test in `apps/desktop/src-tauri/tests/dpapi_key_test.rs`: off-Windows the master key must not be stored in plaintext. Fails today: `apps/desktop/src-tauri/src/lib.rs:114-118`,`:163-167` make `encrypt`/`decrypt` the identity function off-Windows with a no-op ACL at `:57-60`.
   Done. `dpapi::KeyService` names the platform's secret store in one place; `encrypt_with`/`decrypt_with` take it explicitly and the `None` arm returns `key_service_unavailable` instead of the old `Ok(data.to_vec())`. The identity function is gone from the source, so no branch can be mistaken for protection. The guard test is deliberately *not* `#[cfg(windows)]` — that is what hid the defect: every assertion about the wrapping ran only on the one platform where it held. Verified falsifiable by re-injecting the pass-through, watching the test fail, then restoring. T096 (Keychain/libsecret) still owes macOS and Linux a real backend.
 
@@ -487,6 +684,18 @@
 - [x] T107 [P] [US4] Failing test `drain_survives_undersized_reader` in `aether/src/quic.rs`: a 4 000-byte then a 64-byte datagram must both reach `inbound_tx`, and the queue must never exceed 2048 entries. Today `enable_dgram(true, 65536, 65536)` (`tls.rs:182`) sets an **entry count** (spec.md §Clarifications: the original "wedge" claim was disproved — `dgram_recv` pops before comparing lengths, `quiche/quiche/src/lib.rs:6802-6816`), so the true defects are queue depth permitting tens of MB, and `Err(_) => break` at `quic.rs:844-873` hiding fatal receive errors.
 - [x] T108 [P] [US4] Failing test in `aether/src/quic.rs`: `Error::Done` from `dgram_send`/`send_body` must increment `dgram_send_dropped` and preserve or report the loss, never discard silently (`:66-79`); with no request stream open, outbound packets must be counted, not dropped invisibly (`:492-508` has no `else`).
 - [x] T109 [P] [US4] Failing test in `apps/desktop/src/components/__tests__/ConnectionTab.test.tsx`: every stat renders `—` when its field is `null`. Fails today: `ConnectionTab.tsx:88-94` regexes `/(\d+)\s*ms/` against a string containing no timing (`lib.rs:1623` returns `OK via {via} · ip=… loc=…`) and falls back to `< 45 ms`; `:283` shows `PACKET LOSS 0.0%`; `:293` animates `[42,68,55,84,…]`; `:423` prints `HTTP LISTENING / SOCKS5 READY` beside `DORMANT` at `:404-409`; `:348-353` asserts `END-TO-END TLS 1.3` for WireGuard.
+  > **Reconciliation note covering T109, T166, T167, T168 and T171 as a class
+  > (2026-09-23):** all five name a `src/**/__tests__/…` path, and **no `__tests__`
+  > directory exists in either frontend** — neither app has a `vitest.config.*` and
+  > neither `vite.config.ts` carries a `test:` block, so discovery is vitest's own
+  > default (`**/*.{test,spec}.?(c|m)[jt]s?(x)`), which is why every one of these files
+  > was written beside its source under a different name than its box advertises. The
+  > tests are real; the pointers were fiction. Current locations: desktop `src/components/ConnectionTab.test.ts`,
+  > `src/hooks/useScanner.test.ts`, `src/components/SettingsTab.test.ts` +
+  > `SettingsTab.render.test.tsx`, `src/components/a11y.test.tsx`; Android
+  > `src/components/ConnectionTab.test.ts`, `src/hooks/useScanner.test.ts`,
+  > `src/components/SettingsTab.test.tsx`, `src/a11y.test.tsx`. The count that owns
+  > these numbers is the run output, not this file.
   All five claims are gone from the tree, checked against the current file rather than the line
   numbers in the task (they had moved): latency is `not measured` unless `test_connection` really
   returned milliseconds, packet loss is `not measured` and always has been unavailable, the
@@ -502,7 +711,10 @@
   reintroducing a fake chart or a `< 45 ms` fallback fails the gate on any pull. The new
   alternative's reachability was proven against the pre-fix files (it matched exactly the two
   sparkline arrays, nothing else in the tree), and the gate's inject defect now carries both
-  banned forms. 10 desktop + 8 Android UI tests and all 13 gates pass.
+  banned forms. *(The sentence this line closed with — "10 desktop + 8 Android UI tests
+  and all 13 gates pass" — is a per-day measurement and is retired: see the gate/test
+  totals at the foot of the file, and note that "all … pass" was not even true at
+  reconciliation, when two of the 40 gates were red.)*
   Still open and owned elsewhere: a real latency source for these two rows is T124
   (`handshake_rtt_ms` / `active_endpoint_rtt_ms` on `RuntimeState`); until then the honest
   rendering is "not measured", which is what ships.
@@ -654,6 +866,37 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T139 [P] [US5] Failing test in `aether/tests/dns_ech_bootstrap.rs`: an ECH reply with a mismatched transaction ID, `QR == 0`, wrong question name, or `TC` set must be ignored. Fails today: `aether/src/dns.rs:35-103` validates none, and the id generated at `:44` never reaches the parser — one spoofed reply attributed to 1.1.1.1 installs an attacker-chosen ECHConfigList.
 - [x] T140 [P] [US5] Failing test in `aether/tests/port_randomisation.rs`: sample 1 000 allocated ports — all in band, unique vs live sockets, consecutive-difference stddev > 100. Fails today: `netstack.rs:405`,`:414-418` hand out 49152, 49153, …, making DNS spoofing retries free.
 - [x] T141 [P] [US5] Failing tests in new `aether/tests/scan_budget.rs` and extended `aether/tests/scanner_cancellation_test.rs`: `scan_start.total` must equal candidates actually examined; hits deduped by `(ip, port)`; drill-down must enumerate neighbours. Fails today: `prober.rs:416-419`/`:561-565` apply a 6 s floor and ≤16 workers against an unchanged 30/60 s deadline over 1 400–20 000 candidates (≈5 % coverage) while `:527-536` announces the full count; drill-down increments `found` but not `scanned` (`:627`,`:647`); and `:736-738` computes `(current_host.wrapping_sub(offset)) % 254`, which underflows to a near-random host.
+  > **Reconciled 2026-09-23 — three of the files named in T139–T141 above do not
+  > exist.** The cases were written inline in the module under test, and because
+  > `aether/` cannot be compiled on this machine none of the three boxes carries a local
+  > red→green observation: they are read-and-confirmed, with CI as the runner.
+  >
+  > - **T139** — no `aether/tests/dns_ech_bootstrap.rs`. Real location
+  >   `aether/src/dns.rs:325` (`mod tests`):
+  >   `accepts_a_well_formed_answer` (`:365`) and
+  >   `rejects_forged_or_unasked_for_answers` (`:374`), driven by a `reply(flags, ancount,
+  >   name)` builder over `parse_https_ech(msg, QID, NAME)`, which refuses a wrong
+  >   transaction id, an unasked name, the `TC` bit, a non-response flag, an error rcode
+  >   and `ancount == 0` — every clause this task listed, plus the truncated packet.
+  > - **T140** — no `aether/tests/port_randomisation.rs`. Real location
+  >   `aether/src/netstack.rs:2097`
+  >   `ephemeral_ports_are_scattered_and_cover_the_band`, which is stronger than asked
+  >   and differently shaped: it walks the whole `EPHEMERAL_SPAN` of 16 384 allocations
+  >   (`:865-866`) rather than sampling 1 000, asserts band containment, uniqueness over
+  >   the full cycle, and `min_delta >= 17` instead of the stddev>100 statistic. The
+  >   "unique vs live sockets" half is `pick_free_port`/`alloc_unique_port`
+  >   (`:925-940`) over `live_local_ports` — worth naming because no test in the file
+  >   exercises *that* path; the scatter property is measured on `alloc_port` alone.
+  > - **T141** — no `aether/tests/scan_budget.rs`; the budget cases went into the file
+  >   that already existed: `aether/tests/scanner_cancellation_test.rs:295`
+  >   `drill_down_probes_never_inflate_the_sweep_counter` and `:330`
+  >   `a_partial_sweep_is_not_complete_and_reports_every_fiftieth`, over `ScanTally`
+  >   (`aether/src/prober.rs:549-600`), whose `reported()` is `scanned.min(total)` with
+  >   drill probes tallied apart. Dedupe: `prober.rs:2066`
+  >   `candidates_are_deduplicated`; the underflow: `:1978`
+  >   `stage2_neighbours_saturate_inside_the_subnet`. What no test covers is the
+  >   *deadline* clause of this task (`candidates / concurrency × per_probe`), which is
+  >   arithmetic inside the scan loop and needs the budget read out as a pure value.
 
 ### Implementation for User Story 5
 
@@ -695,7 +938,14 @@ Checked each part against the current tree rather than assuming the task text wa
 
 - [ ] T165 [P] [US6] Wire the remaining gates into `scripts/verify-invariants.*`: bindings-diff; `className`→selector; banned-CSS (`100vh`, `transition: all`, bare `:hover`, `border: 1px solid rgba(255,255,255,<0.10)`, undefined `var(--x)`); contrast-from-tokens; "no breakpoint equals a window minimum"; "same component defined twice with different bodies". **Each fails today** with the evidence recorded in `contracts/ui-design-contract.md`.
 - [x] T166 [P] [US6] Failing test in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: scan A (40 H3 hits) then scan B (WireGuard) ⇒ heading reflects only B and rows key on `addr + protocol`. Fails today: `useScanner.ts:106` filters only same-protocol rows, and dedup at `:68` keys on `addr` alone, so an IP live on both transports keeps the old protocol and RTT and lands in the wrong bucket.
+  Real path: `apps/desktop/src/hooks/useScanner.test.ts` (no `__tests__` directory
+  exists — see the class note under T109). Fixed by T176, whose note names the two
+  cases.
 - [x] T167 [P] [US6] Failing test `bestRtt`/`working` in `apps/desktop/src/hooks/__tests__/useScanner.test.ts`: `bestRtt` is the minimum of the sorted list and `working` is authoritative from `scan_progress`. Fails today: `useScanner.ts:65` `bestRtt: ev.rtt || prev.bestRtt` shows the most recent hit ("Best: 240 ms" above a "12 ms" row), and `:64`'s per-hit `working + 1` oscillates against `:57`'s overwrite from the engine's every-50-probes count.
+  Same real path as T166, and it is a *named-case* claim, not a named-file claim:
+  `bestRtt`/`working` are asserted inside that file, ticked in the 2026-09-22 status
+  audit below. Re-checked here only to the extent this machine can: the file exists and
+  vitest runs it green; the arithmetic it pins is the shipped `useScanner` reducer.
 - [x] T168 [P] [US6] Failing test in `apps/desktop/src/components/__tests__/SettingsTab.test.tsx`: a rejected save renders an inline field error and clears optimistic state. Fails today: `useRuntime.ts:134-141` only appends a log line while `SettingsTab.tsx:497,515` keep reading "Synchronizing changes…" / "Auto-Saving" forever.
   Fixed by T051b, tested here rather than in the file the task names (the repo keeps component tests
   beside their components, not under `__tests__`). `SettingsTab.render.test.tsx` (3): the shell's
@@ -705,7 +955,8 @@ Checked each part against the current tree rather than assuming the task text wa
   the tab still says "Synchronizing changes…" and shows nothing red — the negative control that stops
   the first two from passing on a component that renders an error unconditionally. Clearing the
   optimistic state on the next edit is covered at the hook level in `useRuntime.test.ts`.
-  25 desktop UI tests pass and `tsc --noEmit` is clean.
+  *(Its closing figure, "25 desktop UI tests pass", is a same-day count — retired; the
+  totals at the foot of the file are the current measurement.)*
 - [x] T169 [P] [US6] Failing test: `NumberField` at value `0` steps to the clamped neighbour, not back to the previous value.
   Landed as `apps/desktop/src/components/ui.test.tsx` (4) in both UIs via the T181 fix; see that entry.
   Test infrastructure note worth keeping: vitest here runs without `globals: true`, which switches off
@@ -1173,7 +1424,21 @@ Checked each part against the current tree rather than assuming the task text wa
 ### Tests for User Story 7 (write first — must fail)
 
 - [x] T202 [P] [US7] Failing test in `apps/android/android/app/src/test/java/app/aethernext/AetherVpnServiceTest.kt`: a fake `VpnService.Builder` whose `addDisallowedApplication` throws must prevent `establish()` and yield an error state. Fails today: `AetherVpnService.kt:130-134` swallows the exception with `catch (_: Exception) { }` and establishes `0.0.0.0/0` anyway — self-routing loop, MTU collapse, total no-connectivity, nothing logged. There is no `protect()` anywhere in the codebase.
-- [ ] T203 [P] [US7] Failing table-driven test in new `apps/android/android/app/src/test/java/app/aethernext/LivenessTest.kt` against T004's `decideLiveness`: `rx↑ && tx==0` ×3 windows ⇒ Dead; all-zero ×6 with a failed probe ⇒ Dead; healthy ⇒ Alive; `attempt ≥ 3` ⇒ Exhausted. Fails today: `TProxyGetStats()` is declared at `AetherVpnService.kt:384` and **never called**; `onLost` only does `setUnderlyingNetworks(null)` (`:143-171`); `markConnected()` is a one-shot compare-and-set (`SessionController.kt:403-411`) that can never be revoked — a green badge over a blackhole is the default outcome of every handoff.
+- [x] T203 [P] [US7] Failing table-driven test in new `apps/android/android/app/src/test/java/app/aethernext/LivenessTest.kt` against T004's `decideLiveness`: `rx↑ && tx==0` ×3 windows ⇒ Dead; all-zero ×6 with a failed probe ⇒ Dead; healthy ⇒ Alive; `attempt ≥ 3` ⇒ Exhausted. Fails today: `TProxyGetStats()` is declared at `AetherVpnService.kt:384` and **never called**; `onLost` only does `setUnderlyingNetworks(null)` (`:143-171`); `markConnected()` is a one-shot compare-and-set (`SessionController.kt:403-411`) that can never be revoked — a green badge over a blackhole is the default outcome of every handoff.
+  **Ticked at reconciliation (2026-09-23) on a run, not on prose.** The file exists and
+  `:app:testDebugUnitTest` executes 10 cases in it, all passing (whole Android JVM suite
+  measured at 19 classes / 168 tests / 0 failures — see the totals at the foot of this
+  file, another agent can move that number). The four signatures this task lists are
+  each pinned by a named case: `rxAdvancingWithTxFrozenIsDeathAfterThreeWindows`,
+  `sixSilentWindowsWithAFailedProbeIsDeath`,
+  `trafficInBothDirectionsKeepsItAliveAndClearsAStall`,
+  `aSpentBudgetIsDeathAndIsDecidedBeforeTheCounters`, over the four-way
+  `LivenessDecision{Alive,DeadRxOnly,DeadSilent,Exhausted}` at
+  `apps/android/android/app/src/main/java/app/aethernext/Liveness.kt:36-53`. The
+  decision is split from the polling service precisely so it is testable without a
+  device; what is **not** observed by any of this is the real `TProxyGetStats()` counter
+  semantics, which needs the shipped `libhev-socks5-tunnel` blob (see T222's
+  untraceable-binaries note) — the table proves the rule, not the input.
 - [ ] T204 [P] [US7] Failing test in new `apps/android/android/app/src/test/java/app/aethernext/AetherBridgeTest.kt`: `invoke()` returns in < 50 ms while a 12 s stub blocks, and every request id receives exactly one resolution (ok or timeout). Fails today: `@JavascriptInterface invoke` runs on the JavaBridge thread and blocks there — `stopAndWait`'s `Thread.sleep(50)` poll (`EngineRunner.kt:291-305`), `VpnService.prepare()`'s binder call, `startForegroundService`, and a synchronous 12 s OkHttp `execute()` (`SessionController.kt:233-254`) — freezing the single-threaded JS runtime.
 - [ ] T205 [P] [US7] Failing test in new `apps/android/android/app/src/test/java/app/aethernext/MainActivityTest.kt`: consent must be requested on the main thread, and `onStop` of activity A must leave activity B's listener receiving events. Fails today: `AetherBridge.kt:54` calls `activity.requestVpnPermission()` from the bridge thread, `MainActivity.kt:188-197` uses `startActivityForResult` there (main-thread-only; the bridge's `catch (e: Exception)` at `:31` swallows the outcome), and `onDestroy` installs a no-op emitter on the **process singleton** with `launchMode` default `standard` — one activity's destroy silences another's events.
 - [x] T206 [P] [US7] Failing test in `apps/android/.../SessionControllerTest.kt`: `stopVpnService()`/`disconnect()` must surface failure. Fails today: `:360-369` swallows `IllegalStateException` from a background `startService` and `disconnect()` unconditionally reports `disconnected/Ready` — the user is told the VPN is off while the tun is up. Also assert a reconnect with a **new** SOCKS port is honoured: `onStartCommand` sees `tun != null` and drops the new port without re-establishing and without `onVpnEstablished()` (`AetherVpnService.kt:65-66`, `SessionController.kt:148`), and `connect()` never calls `stopVpnService()` first.
@@ -1182,7 +1447,21 @@ Checked each part against the current tree rather than assuming the task text wa
 ### Implementation for User Story 7
 
 - [x] T208 [US7] Make loop avoidance fail-closed in `apps/android/.../AetherVpnService.kt` (fixes T202) and document why `protect()` cannot reach the engine's sockets (`protect(int)` operates on an fd in the caller's table and the engine is a `ProcessBuilder` child), so `addDisallowedApplication` is the mechanism and its failure is fatal.
-- [ ] T209 [US7] Implement the liveness watchdog in `apps/android/.../AetherVpnService.kt` using `TProxyGetStats` (semantics `[tx_packets, tx_bytes, rx_packets, rx_bytes]`, zeroed on each `hev_socks5_tunnel_main()` entry, so capture the baseline **after** `TProxyStartService`), polling every 5 s on the worker, wired to `decideLiveness` in `Liveness.kt` (fixes T203).
+- [x] T209 [US7] Implement the liveness watchdog in `apps/android/.../AetherVpnService.kt` using `TProxyGetStats` (semantics `[tx_packets, tx_bytes, rx_packets, rx_bytes]`, zeroed on each `hev_socks5_tunnel_main()` entry, so capture the baseline **after** `TProxyStartService`), polling every 5 s on the worker, wired to `decideLiveness` in `Liveness.kt` (fixes T203).
+  **Ticked at reconciliation: the wiring this box asked for is in the service, and the
+  "declared and never called" premise above it is now false.**
+  `apps/android/android/app/src/main/java/app/aethernext/AetherVpnService.kt:516` takes
+  the baseline (`liveness.baseline(TProxyGetStats(), elapsedRealtime())`) with the
+  zeroing rule written at `:483`, `:558` samples on the worker's cadence, `:568` turns a
+  silent window into `verdictForSilentPath(underlyingNetworkAvailable(), probe)` — so
+  the counter path and the active data-path probe (`:626` `probeThroughTunnel`,
+  T203's other half) decide together — and the declaration at `:975` is now a call site.
+  What this box still does **not** prove is the on-device behaviour: no device is
+  attached here, the 5 s poll has never run against a real handoff, and the hev ABI it
+  reads counters from is one of T222's untraceable blobs. The regression net is
+  `LivenessTest.kt` (10 cases) + `TunnelDataPathProbeTest.kt` (13) +
+  `SupervisedRestartTest.kt` (12), all green on the JVM at measurement time; T225's
+  device checkpoint is what closes this for real, and it is open.
 - [x] T210 [US7] Implement the supervised restart in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, `TProxyStopService()`, close the fd, re-`establish()`, restart hev — 3 attempts with 2/8/30 s backoff, then a terminal `error` state with "Network changed — reconnect required" and no auto-retry until the user taps connect; make `markConnected()` revocable via `resetConnected()`.
 - [ ] T211 [US7] Convert the bridge to async in `apps/android/.../AetherBridge.kt` + `apps/android/src/bridge.ts`: `invoke(cmd, argsJson, requestId)` returns immediately, work dispatches onto `SessionController.scope`, results resolve via `evaluateJavascript("__aetherResolve(<id>,<json>)")`, JS holds a `Map<id, resolver>` with a 30 s timeout (fixes T204). Rejected: Capacitor's plugin runtime (a whole runtime + config for one bridge) and `WebMessageListener` (needs a JS port handshake, unusable before page load).
 - [ ] T212 [US7] Adopt coroutines as the module's single concurrency model in `apps/android/.../{SessionController,AetherVpnService,EngineRunner}.kt`: `SupervisorJob() + Dispatchers.IO`; make `disconnect()`/`testConnection` `suspend`; delete `Thread.sleep` poll loops. `kotlinx-coroutines-android` is already declared and unused — this is the decision that consumes it rather than dropping it.
@@ -1240,7 +1519,17 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T216 [US7] Honour a changed SOCKS port on reconnect in `apps/android/.../SessionController.kt`: bump `vpnGeneration`, tear down and re-establish, and call `stopVpnService()` at the top of `connect()` (fixes T206's second half).
 - [ ] T217 [US7] Add supervision policy in `apps/android/.../{EngineService,AetherVpnService}.kt`: `START_STICKY` + `onTaskRemoved { stopSelf() }`, a partial wake lock only while `status == connected`, a `WorkManager` periodic keep-alive, and `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` offered with an eligibility explanation. Both services are currently `START_NOT_STICKY` with no retry, so a LowMemoryKiller kill ends everything silently and doze can stall QUIC timers.
   **Two of the four clauses are in, one is refused on purpose, one needs a
-  dependency.** `EngineService.onTaskRemoved` now defers to
+  dependency.** *(Re-measured 2026-09-23 so those words are checkable: the box stays
+  unchecked because the last two clauses are genuinely open. The landed pair is*
+  `EngineService.kt:30-31` `onTaskRemoved` *and the* `PARTIAL_WAKE_LOCK` *taken at*
+  `AetherVpnService.kt:783`; *the refusal is now a decision rather than prose —*
+  `ServiceRestartPolicy.startCommandFor` *maps* `RemainStopped` *and* `KeepAliveOnly`
+  *both to* `Service.START_NOT_STICKY` `AetherVpnService.kt:1301-1302`*, tested by*
+  `ServiceRestartPolicyTest` *(9 cases). The open two are the* WorkManager *keep-alive*
+  *(no* androidx.work *dependency in* `app/build.gradle.kts`*) and*
+  `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` *(no bridge command, no UI, no
+  eligibility copy —* `grep -rn IGNORE_BATTERY_OPTIMIZATIONS apps/android` *is empty).*
+  `EngineService.onTaskRemoved` now defers to
   `SessionController.shutdownHeadless` rather than calling `stopSelf()` blind — a bare
   `stopSelf()` strands the controller believing it is connected while the process that
   carried the traffic is gone, and the headless rule no-ops when a UI is still attached
@@ -1313,12 +1602,49 @@ Checked each part against the current tree rather than assuming the task text wa
   restate the same scope one level down while losing the comment that says why.
 - [x] T232 [US8] Move all secret material into `env:` indirection in `.github/workflows/build.yml:304-305` with `::add-mask::` and never `echo` it; keep explicit file globs plus `if-no-files-found: error` on uploads; keep the publish job's artefacts flat (its `merge-multiple` whole-tree download is the risky pattern).
 - [x] T233 [US8] Add `actions/attest-build-provenance@v2` for the exe and APK (`subject-path: dist-windows/*`, `dist-android/*`) and document `gh attestation verify` in `Docs/GUIDE.en.md`.
-- [ ] T234 [US8] Track `packaging/*.sha256` and `packaging/trust/certificate-sha256.txt`, and make `build.yml:315` read the expected wintun digest from them instead of a hardcoded constant.
+- [x] T234 [US8] Track `packaging/*.sha256` and `packaging/trust/certificate-sha256.txt`, and make `build.yml:315` read the expected wintun digest from them instead of a hardcoded constant.
+  **Ticked 2026-09-23 for its substance, with the named files called out as absent.**
+  `git ls-files packaging/` lists `trust/{README.md,engine-trust.json,masque-pins.json,quiche-vendor.json}`
+  and `wintun.dll` — no `*.sha256`, no `certificate-sha256.txt`. The reason is not
+  laziness but consolidation: `packaging/trust/engine-trust.json` is the single tracked
+  witness carrying **both** halves (`file_sha256` *and* `cert_sha256` + `issued_cn` per
+  artifact, e.g. the `wintun.dll` entry at `:58-62`), and a parallel set of `.sha256`
+  files would be a second copy of a list that a gate already refuses to let drift. The
+  second clause is met and measurable: `grep -nE "[0-9a-f]{64}" .github/workflows/build.yml`
+  matches **nothing** — no digest is hardcoded in any workflow — and the wintun digest is
+  read from the anchor at `build.yml:151` and `:393` via
+  `node scripts/publish-engine-trust.mjs --check --name wintun.dll --file …`, the same
+  comparison the running shell makes at launch (`trust-anchor-not-self-generated` keeps
+  `build.rs` from generating what it ships). Residual, named rather than ticked away:
+  the certificate pin has no *reviewed-file* path of its own — `build.yml:253` compares
+  the signing leaf against `$eng.cert_sha256` from the anchor, so rotating a certificate
+  means editing `engine-trust.json`, which is documented in `packaging/trust/README.md`
+  but is not a separate human-readable list this task asked for.
 - [x] T235 [US8] Extend `.gitignore` with `*.key`, `*.pem`, `*.pfx`, `*.crt` (and `*.p12`) plus explicit `!` exceptions for the vendored example keys under `quiche/` (2 147 tracked files live there - 88 % of the 2 433 tracked total - including `quiche/{apps/src/bin,fuzz,quiche/examples,tokio-quiche/examples}/cert.key`). Done: the ten tracked fixtures are enumerated as negations after checking `git ls-files -i -c --exclude-standard` returns nothing, so no tracked file was orphaned. Same commit also anchored the over-broad `aether*.toml`/`aether*.json` patterns to the repository root and deleted the `!packaging/**` exception that let a committed archive bypass the rule.
 - [x] T236 [US8] Pin the vendored `quiche/` tree with a committed checksum and a patch manifest recording every local deviation so an upgrade cannot silently change semantics. Manifest landed at `quiche/PATCHES.md` rather than the path named here, because it has to sit beside the tree it describes, and `research.md` R30 already called it `PATCHES.md`; the checksum is `packaging/trust/quiche-vendor.json`, regenerated by `node scripts/verify-quiche-vendor.mjs --write` and checked (with a tamper selftest) by `ci.yml`'s `supply-chain` job. Deviation inventory measured against the resolved base commit, not from memory: 6 files, 33 hunks, +173/-27 - the anti-DPI `initial_crypto_frag` patch in `quiche/quiche/src/lib.rs`, the workspace `boring` 4.3 -> 4.22 pin, and 4 files that are a verbatim forward-port of upstream `8215ecdd` (QPACK header-bomb hardening) which carries no local marker and is therefore invisible to `grep -rn Aether quiche/`. The two defects this task named from memory - `dgram_recv` pop-before-length-check and `to_wire()`'s `BufferTooShort -> 0x999` - were NOT deviations: both are upstream 0.29.x behaviour, byte-identical to the base, and are recorded as such rather than as patches. Also recorded here, previously unclaimed by any task: `cargo deny` was configured and invoked by nothing (now the `supply-chain` job), `bans.multiple-versions`/`bans.wildcards` are hard errors with a generated exemption list, and `licenses.copyleft` key is a no-op that the cargo-deny docs mark as removed.
 
 
 - [ ] T237 [US8] Wire `cargo deny check`, `osv-scanner`, `zizmor`, `actionlint` and the T007 disallowed-methods clippy gates into `.github/workflows/ci.yml`, and record the honest posture note: `RUSTSEC-2023-0071` is the **`rsa` Marvin** advisory, not a `ring` one, so `ring 0.16.20` via `boringtun 0.6.0` is an EOL/duplicate-crate risk rather than a known vulnerability; `x25519-dalek =2.0.0-rc.3` is a hard pin to a pre-release and must be raised or justified.
+  **Four of the five named tools are wired and stay open only on `osv-scanner`, so the
+  box is not ticked.** Measured against `ci.yml` at reconciliation (2026-09-23): the
+  `supply-chain` job (`:103-137`) installs cargo-deny by pinned version **and archive
+  digest** (`:114-126`) and runs both locks (`:131`, `:133`) plus the `deny.toml`
+  skip-block check (`:137`); `workflow-lint` (`:224-282`) runs actionlint to a pinned
+  digest (`:235-242`) and zizmor (`:257`) with a SARIF upload (`:275`) and a
+  findings-fail step (`:282`); `cargo clippy --all-targets -- -D warnings` runs on the
+  engine (`:55`, `:215`) and the shell (`:199`), and `disallowed-methods-configured` in
+  the 40-gate harness is what refuses an emptied `clippy.toml`. The Marvin posture note
+  is recorded in the file that enforces it — `deny.toml:32-38` keeps the skip **with the
+  reason that the advisory belongs to `rsa`, which is absent from this graph**, rather
+  than pretending it matched `ring`.
+  > Reconciled: the entry below ("Three of four are real") understates one clause and
+  > overstates none, and now has company — `npm audit` runs at `ci.yml:145-151` for both
+  > shipped trees and the dev trees, which is the JS-side coverage `osv-scanner` would
+  > otherwise add; the split is deliberate and worth recording precisely — the two
+  > shipped-tree audits (`ci.yml:145-150`, `npm audit --omit=dev`) have no
+  > `continue-on-error` and **do** gate, while the dev-tree audit (`:152-158`) is
+  > `continue-on-error: true` because the one advisory there needs a vitest 3→4 major and
+  > "a test-runner major must not be able to stop a release" (`:143-144`).
   **Three of four are real, and the fourth is written down rather than faked.**
   cargo-deny runs both locks (`ci.yml:131-134`) plus `measure-deny.mjs`; actionlint is
   pinned to a full SHA; zizmor distinguishes "no findings" from "findings" from "the
@@ -1333,7 +1659,34 @@ Checked each part against the current tree rather than assuming the task text wa
   from real findings (the known dev-tree vitest advisory would otherwise red-line every
   CI run). That is a job for a machine that can run it, not a file edit.
 - [x] T238 [US8] Add the release-time verification step recomputing the staged engine digest and failing on any mismatch with `packaging/trust/engine-trust.json` (pairs with T071/T226).
-- [x] T239 [US8] **Ratify the constitution** (FR-045): populate `.specify/memory/constitution.md` — currently an unpopulated template with `[PRINCIPLE_1_NAME]` placeholders, i.e. **zero ratified principles** — with BC-01…BC-22 as principles: falsifiable fixes, no unverifiable completion claims, fail-closed host mutation, no unencrypted secrets, no fabricated telemetry, one contract source. The empty template is why fourteen prior rounds could each claim completion.
+- [ ] T239 [US8] **Ratify the constitution** (FR-045): populate `.specify/memory/constitution.md` — currently an unpopulated template with `[PRINCIPLE_1_NAME]` placeholders, i.e. **zero ratified principles** — with BC-01…BC-22 as principles: falsifiable fixes, no unverifiable completion claims, fail-closed host mutation, no unencrypted secrets, no fabricated telemetry, one contract source. The empty template is why fourteen prior rounds could each claim completion.
+  **Unticked at reconciliation (2026-09-23): this box was checked against a file that
+  does not exist, and the tree is now worse than the premise it was written against.**
+  `find . -iname 'constitution*'` outside `.git` returns nothing and there is no
+  `.specify/` directory at all — so not even the `[PRINCIPLE_1_NAME]` template
+  `plan.md:41` describes is present, and FR-045 has no artifact. It is not a
+  bookkeeping slip either: `Docs/GUIDE.en.md:156` tells a reader "The governing rules
+  are ratified in `.specify/memory/constitution.md`", which points a user at nothing and
+  *asserts a ratification that never happened*. That sentence is the exact defect class
+  this feature exists to remove, in the documentation.
+  **What is actually in place, so this is not left as a hole:** the six rules named
+  above are each enforced by something that runs — `BC-01…BC-22` are enumerated in
+  `spec.md`/`plan.md`/`data-model.md`/`quickstart.md`, and every one of them is carried
+  by a tag on a real gate in `scripts/verify-invariants.mjs` (40 of them) or
+  `scripts/verify-release-integrity.mjs` (4), each with an `inject()` case that
+  `--selftest-fail` exercises. So the enforcement exists; the *ratified governance
+  record* does not.
+  **Remaining work, exactly:** (1) decide where a ratified constitution can live at all —
+  `.gitignore:137` ignores `.specify/`, so the path this task names **cannot be
+  committed** and FR-045 is unsatisfiable in-repo as written; either un-ignore the one
+  file or choose a tracked home (`.specify` is tool scratch elsewhere, so a tracked
+  `Docs/CONSTITUTION.md` or `specs/015`'s own BC table is the honest option);
+  (2) write the constitution with the six principles as law and BC-01…BC-22 as their
+  invariants, or record a deliberate decision to make `spec.md`'s BC table the
+  constitution instead; (3) either way, fix
+  `Docs/GUIDE.en.md:156` so it points at whatever exists. Steps (1) and (2) are an
+  authorship decision for the maintainer, which is why this is named and not filled in
+  unilaterally.
 - [x] T240 [US8] Remove untracked working-tree clutter that misleads readers (`architecture-review-20260723.html`, `rustup-init.exe` 12 MB, stale `aether*.toml` working files), confirming via `git ls-files` that none are tracked so no history rewrite is needed. Checked: none of the three names exists in the tree or in `git ls-files`, the only root `.toml` files are `deny.toml` and `aether/clippy.toml` (both configs), and `git status` is empty - so no rewrite was ever needed.
 - [ ] T241 [US8] **Checkpoint**: `scripts/verify-invariants` exits 0 **and** `--selftest-fail` exits non-zero; `zizmor` clean on both workflows; the traceability table generated with zero unmapped findings.
 
@@ -1463,7 +1816,29 @@ Checked each part against the current tree rather than assuming the task text wa
   standalone copy of the header builder, since the engine cannot be compiled on this
   box.
 
-- [ ] T246 [P] Make `client_id` injection a per-tunnel random 3-byte tag, **default off** (`aether/src/wireguard.rs:19-37`): `mac1` is computed over the packet with reserved bytes zeroed, so against any standards-strict WG peer every injected packet fails authentication (undialable, no diagnostic), and against Cloudflare it emits a stable cleartext per-account identifier on every packet including thousands of probe packets.
+- [x] T246 [P] Make `client_id` injection a per-tunnel random 3-byte tag, **default off** (`aether/src/wireguard.rs:19-37`): `mac1` is computed over the packet with reserved bytes zeroed, so against any standards-strict WG peer every injected packet fails authentication (undialable, no diagnostic), and against Cloudflare it emits a stable cleartext per-account identifier on every packet including thousands of probe packets.
+  **Ticked 2026-09-23 because the decision this line was waiting on has been taken — by
+  the maintainer's repair brief, not by an agent — and the answer was "off", implemented
+  as removal rather than as a default.** There is no tag and no toggle:
+  `clear_reserved_field` (`aether/src/wireguard.rs:45`) zeroes bytes `1..4` on both the
+  egress and the receive path (`:174`, `:431`), and the doc comment above it
+  (`:22-44`) records *why* the feature cannot be a post-`encapsulate` overwrite at all —
+  it cites `append_mac1_and_mac2` hashing the header with reserved bytes zero
+  (`noise/handshake.rs:688-694`) and `Tunn::parse_incoming_packet` classifying by that
+  same `u32` (`noise/mod.rs:133-161`), so a stamped packet is unauthenticateable *and*
+  unclassifiable, and a real tag needs reserved support inside `boringtun` before the
+  MAC. **That argument is transcribed from the code comment, not re-derived here** —
+  `boringtun` is not vendored in this tree, so the two cited lines are this project's
+  claim about a dependency and no check on this machine can read them. What is verified
+  locally is the behaviour that matters for the finding: bytes `1..4` leave and arrive
+  zero, and the gate refuses anything else.
+  **Enforcement:** gate `wg-reserved-field-stays-zero` [BC-01] (in
+  `scripts/verify-invariants.mjs:2377`, with an `inject()` case `--selftest-fail`
+  exercises), which is what stops the next edit from quietly stamping something again.
+  **Residual, and it is no longer this task's:** `aether/src/account.rs:451-471` still
+  decodes a bad or absent `client_id` into zeros and proceeds. With nothing writing those
+  bytes to the wire that is now a stored-field question, not a cleartext correlation
+  handle, and it stays listed under T243.
 - [x] T247 [P] Fix the two `let _ =` TLS no-ops in `aether/src/tls.rs:87-94`: `set_cipher_list` governs only pre-1.3 suites so the "rotate ClientHello profile per-session" control changes nothing while its error is discarded — use `set_ciphers13`/signature-algorithm permutation and propagate failure; raise the H2 floor from TLS 1.2 to 1.3 in `aether/src/masque_h2.rs:70-74`.
   **Both halves closed, the first one earlier than this note.** `tls.rs` no longer
   calls `set_cipher_list` at all: the four "rotated" strings were TLS 1.3 suite names
@@ -1515,18 +1890,60 @@ Checked each part against the current tree rather than assuming the task text wa
 
 - [x] T249 [P] Add `cargo fmt --check`, `npx tsc --noEmit` for both apps, and stylelint to `.github/workflows/ci.yml`; run `npx stylelint 'apps/*/src/**/*.css' --fix` after T192's structural edits, then hand-verify the token diff.
   **Two of the three are wired; the third is a dependency decision, not a task.**
-`cargo fmt --check` runs on the touched files (the `fmt` job - and it recurses into
-the engine submodules, which is why no new engine module is cheap here). The
-typecheck half is already covered twice over: `ci.yml:180,310` run `npm run build`,
-which is `tsc -b && vite build` in both apps, and both were verified green locally.
-**stylelint is not added, deliberately:** it is not in either lockfile, installing it
+  *(Numbers in this note were corrected at reconciliation, 2026-09-23, because two of
+  them overstated what `ci.yml` does.)*
+  `cargo fmt --check` runs on the touched files (the `fmt` job, `ci.yml:58-97` — "Rust
+  files touched by this change must be rustfmt-clean" at `:84`, with whole-tree debt
+  reported informationally at `:97`), and it recurses into
+  the engine submodules, which is why no new engine module is cheap here). The
+  typecheck half is already covered twice over: `ci.yml:180,310` run `npm run build`,
+  which is `tsc -b && vite build` in both apps, and both were verified green locally.
+  > **Corrected on three points, each checked against the file that owns it.**
+  > (a) `npm run build` is `tsc && vite build` in `apps/desktop/package.json:9` and
+  > `tsc -b && vite build` in `apps/android/package.json:9` — different invocations, both
+  > of which typecheck, neither of which is the `npx tsc --noEmit` this task named: there
+  > is **no standalone typecheck step** in `ci.yml`: `grep -n tsc .github/workflows/ci.yml`
+  > matches exactly one line, the comment at `:181` that says `npm run build` typechecks.
+  > A type error is therefore caught *by the build job*, and a build job that is skipped
+  > or not required still lets one through.
+  > (b) "fmt is a touched-files ratchet" is the accurate description and the note below
+  > said as much — retained, because the whole-tree gate is the informational one and CI
+  > is not clean on it.
+  > (c) "the repo already has 34 mechanical CSS gates" could not be reproduced: naming
+  > them from `scripts/verify-invariants.mjs` gives **16** CSS/sheet/typography rules
+  > (`css-class-resolution`, `css-banned-patterns`, `css-no-dead-duplicates`,
+  > `css-breakpoint-reachable`, `css-no-conflicting-duplicate-selectors`,
+  > `declarations-live-in-a-block`, `no-orphaned-class-rules`, `colour-single-source`,
+  > `token-alpha-triples`, `radius-scale-ratchet`, `wcag-pair-contrast`,
+  > `wcag-state-edges`, `type-scale-floor`, `mobile-informative-type-floor`,
+  > `touch-target-minimum`, `press-feedback-on-controls`) plus
+  > `scripts/sync-tokens.mjs --check`. The argument for not adding stylelint does not
+  > depend on the larger number, so the number is cut rather than kept.
+  **stylelint is not added, deliberately:** it is not in either lockfile, installing it
 needs the network (this machine runs offline), a first run would produce a findings
 list nobody has read, and the repo already has 34 mechanical CSS gates - colour
 single-source, token alpha triples, contrast pairs, dead duplicates, unreachable
 breakpoints, press parity, radius ratchet - that stylelint does not cover, while
 covering little those do not. If a CSS parser is wanted for its own sake, that is a
 dependency to choose, so it is left named rather than silently half-installed.
-- [x] T250 [P] Update `Docs/GUIDE.en.md`, `README.md` and `PRODUCT.md` for the ratified constitution's invariants, the pin-rotation procedure, `--repair-routes`/`--repair-proxy`, the diagnostics export, and the deliberately-unsigned-updater decision.
+- [ ] T250 [P] Update `Docs/GUIDE.en.md`, `README.md` and `PRODUCT.md` for the ratified constitution's invariants, the pin-rotation procedure, `--repair-routes`/`--repair-proxy`, the diagnostics export, and the deliberately-unsigned-updater decision.
+  **Unticked at reconciliation (2026-09-23): two of the five clauses and one of the three
+  files are not what this line says.** No `PRODUCT.md` exists anywhere in the tree
+  (`find -iname PRODUCT.md` → nothing), and the "ratified constitution's invariants"
+  clause cannot be documented while T239 is unmet. What is genuinely in the docs, with
+  the line: `Docs/GUIDE.en.md:116-117` for `aether --repair-routes` and
+  `AetherNext.exe --repair-proxy`; `:99-100` for `gh attestation verify` on both the
+  setup exe and the APK (T233); `:142` for why no updater ships ("an updater that
+  downloads a new engine is a second trust path"), which is the same decision T128 and
+  T077 record; and the pin-rotation procedure in `packaging/trust/README.md`
+  (`:10`, `:116`, `:149`, `:191` — expiry is capped precisely so a rotation is planned).
+  **Two residuals, both small and both real:** the diagnostics export is a shipped
+  feature with no user-facing sentence — it exists in
+  `apps/desktop/src/App.tsx` / `hooks/useRuntime.ts` and in
+  `aether/src/diagnostics.rs`, and `Docs/GUIDE.en.md` never mentions it — and
+  `GUIDE.en.md:156` currently documents the constitution as *ratified* where it points
+  at a file that does not exist, which is a false statement in a user-facing doc rather
+  than a missing one. Fix `:156` with or before the rest.
 - [x] T251 [P] Mark `specs/001`–`specs/014` superseded by `015` with a one-line note each rather than deleting them, so no future reader treats `014`'s 40/40 `[x]` as evidence of fixed behaviour. Done as a blockquote under each H1 (five lines, naming the failure mode: guards that are unreachable, inverted, or never wired into CI), in all 14 `spec.md` files.
 - [ ] T252 Run the complete `quickstart.md` validation end to end (all 9 sections including the §1 soak and §9 device pass), attach artefacts, and record each guard's step-3 mutation result.
 - [ ] T253 Run `/speckit-converge` to diff the shipped tree against FR-001…FR-047 and append any unbuilt work as new tasks, then `/speckit-analyze` for cross-artifact consistency, then re-verify every `tasks.md` checkbox against source rather than trusting it — the discipline this feature exists to install.
@@ -1668,6 +2085,11 @@ Tests first and provably red → entities/models → services → host integrati
 
 ```bash
 # Red tests first — distinct files, all parallel:
+# CORRECTED 2026-09-23: four of these ten paths are not where the tests are. Only
+# envelope_v2.rs, atomic_write_test.rs, cache_concurrency.rs and ConfigKeyStoreTest.kt
+# / dpapi_key_test.rs exist. cache_validation.rs, cache_read_nondestructive.rs,
+# h2_endpoint_survival.rs and acl_principal.rs were never created — that coverage is
+# inline in aether/src/{cache.rs,win_acl.rs}; see each box for the real file:line.
 T079  aether/tests/envelope_v2.rs                T080  aether/tests/envelope_v2.rs (path-binding case)
 T081  aether/tests/atomic_write_test.rs          T082  aether/tests/cache_validation.rs
 T083  aether/tests/cache_concurrency.rs          T084  aether/tests/cache_read_nondestructive.rs
@@ -1911,6 +2333,30 @@ gates plus `--selftest-fail`, `sync-tokens --check`, `tsc -b` in both frontends,
 -D warnings`, `rustfmt --check` on every engine file the change touched, and the
 Android unit suite (14 classes, 115 tests).
 
+> **Retracted at reconciliation (2026-09-23). That sentence is the most overstated line
+> in this file, and it is kept above so the correction can be seen against it rather
+> than pasted over it.** Every number in it had moved and the "is green" was false when
+> re-measured — which is the failure mode this whole feature exists to remove, committed
+> by the section whose heading claims to verify against the tree. Re-measured, on a
+> working tree other agents were editing while these commands ran:
+>
+> | claim above | measured at reconciliation | who owns the number now |
+> |---|---|---|
+> | "38 invariant gates" | **40** in `scripts/verify-invariants.mjs`, and the harness **exits 1**: 2 gates red at 14:30 (`ipc-typed-errors`, `frontend-fork-parity`), **3** red at 15:05 (adding `wire-tokens-cross-layer`, from the same `packages/ui` status-copy lift). Plus **4** gates in a second harness this file never named, `scripts/verify-release-integrity.mjs`, all green at both measurements but run only from `build.yml:155-156` — release builds, not pushes. | the two scripts |
+> | "152 frontend tests" | **118** in 18 files (`apps/desktop`) and **157** in 25 files (`apps/android`) at 14:33 — and **133 in 19 files** / **200 in 30 files with 9 failing** three minutes later at 15:05, in the item-8/25 status-copy lift (`src/components/ConnectionTab.test.ts`, `ConnectionTab.modes.test.tsx`). The Android-web suite is **red** as this is written. | each app's suite |
+> | "the shell's `cargo test --lib` (8)" | **21 passed, 0 failed** — *after* the same command failed to compile with 6 errors in `src/trust.rs` minutes earlier. A mid-edit sample; read the crate, not this row. | `apps/desktop/src-tauri` |
+> | "Android unit suite (14 classes, 115 tests)" | **19 classes / 168 tests / 0 failures** (`:app:testDebugUnitTest --rerun-tasks --offline`, tallied from every `TEST-*.xml` rather than one). | `apps/android/android` |
+>
+> **Not re-run at reconciliation, so this section asserts nothing about them:**
+> `sync-tokens --check`, `tsc -b` in either app, `cargo clippy --all-targets -D warnings`,
+> and `rustfmt --check`. They were reported green by whoever wrote the sentence; nobody
+> here has observed that since.
+>
+> **Standing rule for every count in this file, including the ones below:** a number
+> naming gates, tests or percentages is a same-day measurement of a moving tree. Cite
+> the script that owns it and run it; a checkbox, a count and a prose claim are none of
+> them evidence of behaviour.
+
 ### Fixed and proven by a check that can fail
 Gates: spawn sites compared by argument and required in-function verification;
 disallowed-method lists non-empty; radius scale ratchet; orphaned class rules; press
@@ -1924,12 +2370,39 @@ no press; two FR-037 twin pairs merged into `packages/ui`.
 
 ### Open, with the reason it is not finished here — not silently skipped
 1. **Needs a machine that can compile `aether/`** (GNU toolchains only here,
-   `boring-sys` needs libclang): T022 endpoint-cache actor, T039 netioapi replacing
-   `route.exe`/`netsh`, T019 `tauri-specta` bindings, T060's crypt32 signer witness,
+   `boring-sys` needs libclang): T022 endpoint-cache actor, ~~T039 netioapi replacing
+   `route.exe`/`netsh`~~, T019 `tauri-specta` bindings, ~~T060's crypt32 signer witness~~,
    T048b's write half. T060 and T048b each carry the attempted design and the exact
    blocker; a signature change landed blind here would be a CI failure, not a fix.
+   Added by the pin measurement: `aether/tests/tls_pin_chain.rs`'s two new cases
+   (`a_host_credited_with_a_key_it_does_not_present_is_rejected`,
+   `a_chain_checked_host_accepts_its_real_name_and_rejects_a_wrong_one`) and
+   `trust.rs`'s `every_committed_pin_declares_its_provenance` are parse-checked only
+   (`rustc --emit=metadata` on the file: no syntax errors, name resolution against
+   `boring`/`serde` unavailable), never run. The data half is green on this machine:
+   `node scripts/verify-masque-pins.mjs` and its `--selftest-fail`, seven tamper
+   cases each caught.
+   > **Two of the five items above are struck, because they were stale in the same way
+   > the preamble was (reconciliation, 2026-09-23).** **T039** is no longer
+   > "needs a compiling engine": routes and adapter state are already native
+   > (`CreateIpForwardEntry2`/`DeleteIpForwardEntry2`/`GetIpForwardTable2` in
+   > `aether/src/tun_win.rs`), `route.exe` is spawned nowhere, and one documented
+   > `Enable-NetAdapter`/`Disable-NetAdapterBinding` PowerShell call survives as a named
+   > exception — what blocks the box now is a clean-VM adapter observation, not a build.
+   > **T060** is no longer a crypt32 problem: the signer is read from the hashed bytes by
+   > a dependency-free DER walk (`apps/desktop/src-tauri/src/trust.rs:653-673`), which
+   > the shell's own `cargo test --lib` can and did run — so the FFI-link blocker
+   > dissolved rather than being cleared, and what is left on T060 is proof, not
+   > compilability. See both entries.
 2. **Needs a network install, so a dependency decision**: T224 okhttp 4.x to 5.x,
    stylelint (T249), osv-scanner (T237), WorkManager keep-alive (T217).
+   > **The stated reason is wrong and is corrected rather than repeated: this machine
+   > does have network access** (an earlier round's "runs offline" assumption cost ~55
+   > minutes on a toolchain upgrade that then worked). Installing a dependency here is
+   > possible, so none of these four is blocked by capability — each is open because
+   > **adding a dependency is the maintainer's decision**, and for `osv-scanner`
+   > specifically because its release assets publish no digest to pin (see T237). Saying
+   > "needs a network install" made four choices look like one constraint.
 3. **Needs a device or a second host**: the per-connection proxy blob, real VPN
    revoke behaviour, the VM checkpoints (T030/T052/T078/T103/T130/T164/T201/T225/
    T241/T252/T253).
@@ -1941,8 +2414,98 @@ no press; two FR-037 twin pairs merged into `packages/ui`.
    `client_id` injection default (T246), junk ceiling against the 1280 IPv6 MTU,
    whether `START_STICKY` should re-route traffic after a LowMemoryKiller kill (the
    ledger argues for the ledger + explicit resume switch that already exist).
+   > **Two of these four were decided by the maintainer's 2026-09-23 repair brief, so
+   > listing them as open is itself an overstatement of the remaining work.**
+   > **T246** — injection is **off**, implemented as `clear_reserved_field`
+   > (`aether/src/wireguard.rs:45`) and pinned by gate `wg-reserved-field-stays-zero`.
+   > **`START_STICKY`** — the answer is *explicit manual*: `ServiceRestartPolicy` maps
+   > every restart verdict except a user-requested one to `Service.START_NOT_STICKY`
+   > (`apps/android/.../AetherVpnService.kt:1301-1302`), tested by
+   > `ServiceRestartPolicyTest` (9 cases). Still genuinely the maintainer's:
+   > **FR-014's DPAPI dual-wrap (T255)** and **`MAX_JUNK_SIZE = 2048` against the 1280
+   > IPv6 path MTU (T245)** — both change what a user can recover or what the wire looks
+   > like, and neither can be measured on this machine.
 
 The cheapest genuine next step is T198's `types.ts`: settling it unblocks
 `useLogs.ts` and `App.tsx` behind it, and both are user-visible. Everything else on
 this list needs a capability this machine does not have - a compiling engine, a network
 install, a device - or a decision that is yours to make.
+
+---
+
+## Reconciliation of this ledger against the source (2026-09-23, reviewer item 26)
+
+**What this pass was.** The brief's item 26, whose cause this file states itself: this
+line's discipline requires re-verifying every checkbox against source and tests, because
+several unchecked tasks describe work already present and several checked ones describe
+work already partial. It was run as a read of the tree, not of this file: every entry
+touched above was confirmed with a grep, a read or a command first, and the entries whose
+prose contradicted their own box were corrected in place — history kept, truth substituted.
+
+**Two rules this pass wrote into the file above, because it kept breaking them.**
+First: a count of gates or tests is owned by the script that produces it
+(`scripts/verify-invariants.mjs`, `scripts/verify-release-integrity.mjs`, each app's
+`npx vitest run`, `:app:testDebugUnitTest`), never by this file — so every figure here is
+now labelled "measured at reconciliation time" and was in fact re-measured twice, 33
+minutes apart, and moved both times. Second: a checkbox is not evidence of behaviour, and
+neither is a green run — an entry may now say "read-and-confirmed" (source proves the
+mechanism) without implying the mechanism was ever *observed failing and then passing* on
+this machine. Where a mutation result was claimed for engine code it is now attributed to
+CI, because `aether/` does not compile here.
+
+### Per-item verdicts for the 27 items of the repair brief
+
+| # | Item | Verdict | Evidence in source, and the exact remaining work |
+|---|---|---|---|
+| 1 | checksum manifest | **COMPLETE** | `.github/scripts/pack-checksums.sh` + `test-pack-checksums.sh`, both invoked in `build.yml:142-143` (normal and `--selftest-fail`); gate `release-manifest-logic-runs-from-a-tested-script` green. Nothing left in-tree; only a release run proves the shipped manifest. |
+| 2 | witnessed engine == packaged engine | **COMPLETE in source / UNVERIFIABLE-HERE** | gate `witnessed-engine-is-the-packaged-engine`, `scripts/anchor-witness.mjs` (self-tested, `build.yml:148`), `prepare-anchor.yml:183-186`. **Remaining:** an actual tag run; and it is T075's open reorder (post-bundle signing at `build.yml:428`) that keeps this a source-level claim rather than an observed one. |
+| 3 | refuse an unpublished anchor | **COMPLETE in source** | `anchor_not_published` + `--check` at `build.yml:151,337,392-398,440,505-507`; gate `an-unwitnessed-package-is-never-a-download`. **Remaining:** the same live release observation as item 2. |
+| 4 | trusted signing identity | **IN FLIGHT — other agent owns it** | Pinned leaf + `issued_cn` (`trust.rs:420-500`), ephemeral self-signing fenced behind `-DevEphemeral` (`sign-windows.ps1:126-128`, gate `no-ephemeral-signature-on-a-distributable-artifact`), swap window closed by the DER witness (`trust.rs:653-673`, `:1292-1315`). **Remaining:** the 5 `Result<_, String>` sites `ipc-typed-errors` is red on, `rustfmt` on that file, a test that names a real binary's signer, and the test-binary load hazard recorded in `.qoder/REPAIR-HANDOFF.md:4-19`. See T060. |
+| 5 | journal kept until teardown confirmed | **COMPLETE in source / UNVERIFIABLE-HERE** | `TeardownAttempt` (`tun_win.rs:1083-1110`) with 6 cases (`:2473,2487,2496,2511,2528,2541`). Engine code: read here, run on CI. |
+| 6 | Android supervised restart | **COMPLETE** | `VpnRestart.kt`, `SupervisedRestartTest` (12) and `ServiceRestartPolicyTest` (9), both green in the JVM run measured at reconciliation. |
+| 7 | data-path probe (green badge over blackhole) | **COMPLETE in source** | `probeThroughTunnel` (`AetherVpnService.kt:1191`), `verdictForSilentPath` (`:1176`), `TunnelDataPathProbeTest` (13). **Remaining:** T225's device pass — no phone, no handoff observed. |
+| 8 | routing-mode-aware copy | **IN FLIGHT and currently RED** | Same claim in both apps (`desktop/ConnectionTab.tsx:483-492`, `android/ConnectionTab.tsx:305-306,528,634`); the shared copy is being lifted to `packages/ui/src/statusCopy.ts` and 9 Android tests fail at measurement (`ConnectionTab.test.ts` 6, `ConnectionTab.modes.test.tsx` 3) — location genuinely in flux. |
+| 9 | payload validation | **PARTIAL — one platform** | Android strict parsing landed (`apps/android/src/scanEventPayload.ts`, 12+8 tests). **Remaining:** desktop still casts — `apps/desktop/src/hooks/useScanner.ts:149` is `listen<ScanEvent>` with no parser, and `parseScanEvent` exists in no desktop file. Lift it to `packages/ui` and apply both sides. |
+| 10 | corrupt settings | **PARTIAL — Android only; no task box covers it** | Kotlin store + `reset_settings` (`AetherBridge.kt:88`), `settingsPayload.ts`, `useSettingsHealth.ts`, `SettingsCorruptionTest` (13) and 4 web files. **Remaining:** (a) `apps/desktop/src` contains **zero** occurrences of "corrupt" and `src-tauri` has no `reset_settings` command — the whole desktop half is unwritten; (b) Android's `SettingsTab` is not yet passed the notice (one line in `apps/android/src/App.tsx`, per `REPAIR-HANDOFF.md:45-49`), so it renders at the `App` level only. |
+| 11 | WireGuard reserved bytes | **COMPLETE — decided OFF** | `clear_reserved_field` (`wireguard.rs:45`, called `:174`/`:431`) + gate `wg-reserved-field-stays-zero`. Closes T246, which used to be "the user's decision"; the decision came from the brief. |
+| 12 | per-host MASQUE pins | **COMPLETE with measured evidence** | Both VIPs present the same leaf for both SNIs, so `require_hostname`/`require_chain` are false *on measurement*; `3fbb1d74…` kept as a labelled UNMEASURED FALLBACK (`masque-pins.json:63,115`) and `scripts/verify-masque-pins.mjs` + `--selftest-fail` now run in `ci.yml:376-377`. **Remaining:** a second network vantage for that one pin; the two new `tls_pin_chain.rs` cases are parse-checked only. |
+| 13 | native netioapi | **PARTIAL by a named exception** | Routes and adapter state native; one `Enable-NetAdapter`/`Disable-NetAdapterBinding` PowerShell call left (`tun_win.rs:239`, reason in its doc comment `:218-237`), `route.exe` spawned nowhere. **Remaining:** T039's box needs the clean-VM adapter observation, not more editing. |
+| 14 | scanner lanes | **COMPLETE** | `packages/ui/src/index.ts:33,46,67` (H3 ceiling derived, `SCAN_DEFAULT_CONCURRENCY`), `ScanLaneCeilingTest` (6), clamp tests in both apps, gate `numeric-limits-cross-layer` green and refusing a restated default. |
+| 15 | save lifecycle | **PARTIAL — Android only** | `apps/android/src/saveState.ts` + `saveState.test.ts` (7) + `useRuntime.saveLifecycle.test.ts` (8) + the dots' CSS in the Android sheet. **Remaining:** desktop's dock is still boolean-driven (`apps/desktop/src/components/SettingsTab.tsx:595-609` reads `dirty`/`saved`), has no `saveState` module, and its sheet carries none of the dot rules — the "Synchronized flash that outlives the write" defect is still live there. |
+| 16 | dev mock | **COMPLETE** | `mockScanPlan` derives events from the request and the version from package metadata (`apps/android/src/bridge.ts`), pinned by `bridge.scanPlan.test.ts` (11). |
+| 17 | semver | **COMPLETE for the only app that has the problem** | `apps/desktop/src/semver.ts` + `semver.test.ts` (9, green at measurement). **Android has no update check at all** — `api.github.com` appears in `apps/desktop/src/hooks/useRuntime.ts:24` and nowhere in `apps/android/src` — so there is nothing to fix there, and that is a fact about the phone app, not a gap in this item. |
+| 18 | restart after an OS kill | **DECIDED and implemented as explicit-manual** | `ServiceRestartPolicy` → `START_NOT_STICKY` (`AetherVpnService.kt:1301-1302`) + 9 tests. **Remaining (open on purpose, dependency-gated):** WorkManager keep-alive (`androidx.work` is in no Gradle file — verified absent) and `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` (verified absent from every Kotlin/TS/XML in `apps/android`). |
+| 19 | per-connection proxy | **PARTIAL BY DESIGN** | Refuses before mutating: `preflight_per_connection` (`proxy.rs:337`), 9 `#[test]` in that file, all observed passing in the shell run at measurement. **Remaining:** the write-back half needs a real dial-up/VPN profile to be tested against — T048b, not attempted blind. |
+| 20 | evidence directly below the connect control | **IN FLIGHT** | The CSS half is measured and fits one screenful (item 22 below), but the literal "directly below" still needs the component to shorten `coverageEvidence().detail` — `REPAIR-HANDOFF.md:26-28` owns the measurement; nothing here re-derives it. |
+| 21 | — | **NOT RECOVERABLE FROM THE TREE** | This pass could not tie brief item 21 to any artifact, gate or file in the working tree, and will not invent one. Recorded as unresolved; the brief's own text is the only authority on what it asked for. |
+| 22 | Android `App.css` (evidence panel, save dots, 680px block) | **PARTIAL / asymmetric** | The rules exist and were Chrome-measured by their author. Re-checked here only for symmetry: `grep -c` of `.connection-evidence`/`save-pending-dot`/`save-idle-dot` is **11 in the Android sheet, 1 in the desktop's** — so this item's work is real and one-app, and item 24 is what would make it one source. |
+| 23 | one mark, every carrier | **COMPLETE in substance, UNGATED** | Single source `packages/ui/brand/` (4 assets); `apps/desktop/public/aether.svg` and `apps/android/public/aether.svg` are **byte-identical** to `aether-mark.svg` (verified with `cmp`, not by eye), and the Android launcher/monochrome/notification drawables carry the same two paths (`ic_launcher_foreground.xml:3-8`, `ic_notification.xml:3`). **Remaining:** no gate watches any of it — `grep -n brand scripts/verify-invariants.mjs` matches nothing — so every one of those copies can drift silently, which is precisely the class of defect this feature was built to end. |
+| 24 | CSS consolidation into one source | **IN FLIGHT** | The two sheets are 3 836 / 3 433 lines; the author's own count is 93.6 % byte-identical with 8 of 375 selectors Android-only. **Hazard named before it is taken:** the 16 CSS gates and `scripts/sync-tokens.mjs` scan `apps/**`, so rules moved into `packages/ui` go invisible to them unless each is repointed at shared *and* app sheets — see the memory lesson that a gate scoped to one app goes blind on the package. |
+| 25 | status copy in one place | **IN FLIGHT** | `packages/ui/src/statusCopy.ts` + `statusCopy.test.ts` exist; `streamLabel` is confirmed in **both** apps with tests in both (`android/ActivityTab.tsx:104` + `ActivityTab.copy.test.tsx`, `desktop/ActivityTab.tsx:62` + `ActivityTab.test.ts`) — though note it is currently *duplicated* with identical assertions, not lifted. **Remaining:** the consumers' import repoint, which is the 9 red tests under item 8. |
+| 26 | **this reconciliation** | **COMPLETE** | Entries corrected: T001, T020, T039, T042, T042b, T044, T048, T052b, T055, T057, T058, T060, T075, T082, T083, T084, T085, T087, T109, T139–T141, T166, T167, T168, T203, T209, T217, T234, T237, T239, T246, T249, T250, plus the US3 parallel-example block and the Closing inventory's preamble. Ticked on verified evidence: T203, T209, T234, T246. Un-checked where the box outran the work: T044, T057, T075, T239, T250. |
+| 27 | AGP vs `compileSdk 36` | **PARTIAL — correct residue** | AGP 8.11.2 (`android/build.gradle.kts:8`) and Gradle 8.13 (`gradle-wrapper.properties:3`) — 8.11 being the first line that supports API 36; `compileSdk = targetSdk = 36` (`app/build.gradle.kts:8,13`); `:app:testDebugUnitTest` measured green at 19 classes / 168 tests. **Remaining, and not a defect to delete:** `assembleRelease` needs per-ABI `libaether.so` this host cannot cross-compile, so `:app:checkReleasePayloads` refusing is the guard working; the same is true of `:app:checkWwwAssets` before `npm run sync-www`. |
+
+### What this machine cannot prove, so nothing above may claim it
+
+1. **A clean Windows 11 VM.** Every host-mutation behaviour — real route install/teardown
+   after `taskkill /F`, the adapter binding actually coming off, wintun loading from a
+   packaged driver, the uninstall sweep — is T030/T052/T078/T103/T130/T164/T201/T225/
+   T241/T252/T253 territory, and none of it is observable here.
+2. **A physical Android device.** Handoffs, doze, `onRevoke` from Quick Settings, the
+   consent sheet, keystore behaviour under lock, and whether the liveness watchdog's
+   `TProxyGetStats()` semantics match the shipped blob.
+3. **A compiled `aether/`.** boring-sys needs libclang this toolchain does not have, so
+   no engine test in this file — including every "verified by mutation" claim about engine
+   code — was ever run here. They are read-and-confirmed, with CI as the runner.
+   What does run: `.qoder/check-windows-sys-imports.mjs` and scratch-crate builds.
+4. **A real release run.** Items 1–4 gate a pipeline; a pipeline that has not run is not
+   an observation. Tag runs also need `environment: release` configured repo-side
+   (T231's named residual), which no file in this tree can enable.
+5. **A dependency install decision.** okhttp 5, stylelint, osv-scanner, `androidx.work`,
+   `trybuild` for T057. Not a capability limit — the network works here — these are the
+   maintainer's calls.
+6. **A second network vantage**, for the one MASQUE pin still labelled UNMEASURED
+   FALLBACK, and any live edge check at all from outside this connection.
+7. **A browser render for the CSS items.** Live measurement here has been possible before
+   (vite preview + a real browser), but this pass did not perform it: items 20/22/24 carry
+   their author's numbers, attributed as such, and a static gate cannot see inert CSS.

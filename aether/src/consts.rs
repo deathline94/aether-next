@@ -71,4 +71,3 @@ pub const CDN_ANYCAST_POOL: &[&str] = &[
 
 #[allow(dead_code)]
 pub const QUIC_PORT: u16 = 443;
-

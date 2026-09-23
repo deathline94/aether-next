@@ -80,7 +80,7 @@ impl HostMutationGuard {
 
     #[cfg(windows)]
     fn try_acquire() -> TryAcquired {
-        match acquire_mutex(GLOBAL_MUTEX_NAME) {
+        match Self::acquire_mutex(GLOBAL_MUTEX_NAME) {
             // Not being able to *create* it is a privilege fact about this
             // process, not about another session. Degrade, and make the reduced
             // coverage visible: the residual window — a service-instance engine
@@ -90,7 +90,7 @@ impl HostMutationGuard {
                     "[host-lock] {why}; using the session-local mutex instead, which does not \
                      exclude an engine running as a service or under another account"
                 );
-                acquire_mutex(LOCAL_MUTEX_NAME)
+                Self::acquire_mutex(LOCAL_MUTEX_NAME)
             }
             // A `Global\` mutex that exists but is held is the answer we want:
             // contention across sessions and accounts. Held is returned as-is.

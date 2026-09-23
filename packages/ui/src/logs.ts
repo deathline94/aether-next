@@ -97,13 +97,44 @@ export function hitKeyOf(entry: Pick<LogLine, "message"> & Partial<Pick<LogLine,
 
 export const isErrorLine = (l: LogLine) => l.level === "error" || l.level === "warn";
 
+/**
+ * The probe chatter that says nothing about a transition.
+ *
+ * One list, because the console asks the same question twice: "is this line a
+ * milestone" (what the `milestones` filter selects) and "should this row wear the
+ * DEBUG badge" (what the row itself shows). Written out in both apps, in both
+ * places, they are four copies of one rule that can each be edited on their own.
+ */
+const PROBE_NOISE_MARKERS = ["probe src", "probe timeout", "candidate rejected"] as const;
+
 /** milestones: exclude noisy progress and probe error lines so transitions stand out. */
 export const isMilestoneLine = (l: LogLine) =>
   !l.message.includes("scanning...") &&
-  !l.message.includes("probe src") &&
   !l.message.includes("probe candidate failed") &&
-  !l.message.includes("probe timeout") &&
-  !l.message.includes("candidate rejected");
+  !PROBE_NOISE_MARKERS.some((marker) => l.message.includes(marker));
+
+/**
+ * Which severity a row is drawn as. The engine sends three levels; the fourth,
+ * `debug`, is what this module already recognises as probe chatter, so the badge
+ * and the milestone filter cannot disagree about which lines are noise.
+ */
+export type LogSeverity = "info" | "warn" | "error" | "debug";
+
+export function logSeverityOf(entry: Pick<LogLine, "level" | "message">): LogSeverity {
+  if (entry.level === "error") return "error";
+  if (entry.level === "warn") return "warn";
+  const msg = entry.message.toLowerCase();
+  if (msg.includes("debug") || msg.includes("trace")) return "debug";
+  return PROBE_NOISE_MARKERS.some((marker) => msg.includes(marker)) ? "debug" : "info";
+}
+
+/** The badge text, which is not the CSS class name the row is keyed on. */
+export const LOG_SEVERITY_LABELS: Record<LogSeverity, string> = {
+  info: "INFO",
+  warn: "WARN",
+  error: "ERR",
+  debug: "DEBUG",
+};
 
 /**
  * One line plus the three verdicts taken about it.

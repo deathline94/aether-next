@@ -33,6 +33,19 @@ export const SCAN_MIN_CONCURRENCY = 1;
 export const SCAN_MAX_CONCURRENCY_H3 = 16;
 
 /**
+ * The lanes the scanner opens with, which is the most the protocol it opens *on*
+ * can run.
+ *
+ * Both front-ends start on `masque-h3` and started the lane field at 250 — the
+ * width of a cheap H2/WireGuard scan, against the 16 above. The control then
+ * advertised 250 lanes while the engine clamped the run to 16, and the panel only
+ * learned the real number from the first `scan_start` frame: the field lied during
+ * the whole opening of a scan, which is exactly when it is read. Derived from the
+ * H3 ceiling instead of restating it, so the default cannot drift from the ladder.
+ */
+export const SCAN_DEFAULT_CONCURRENCY = SCAN_MAX_CONCURRENCY_H3;
+
+/**
  * Whether a scan's probes are QUIC handshakes — the only condition under which
  * `hunt_best` raises the per-probe floor to 6 s and narrows the run to 16 lanes
  * (`VerifyCost::Expensive`, `aether/src/prober.rs`).
@@ -61,6 +74,13 @@ export function scanConcurrencyCeiling(protocol: string): number {
  * the Android hook sent the raw number), which is the same rule written twice and
  * disagreed about the one thing that matters: the number printed in the "starting
  * scan" log is the number the engine will not honour for an H3 run.
+ *
+ * It is a *display* rule as well as a send rule, and both hooks resolve their lane
+ * field through it: the number a protocol cannot run must not sit in the input, in
+ * the hint or in the request, and it is idempotent, so re-resolving what the field
+ * already shows is a no-op. The raw request survives underneath — switching to a
+ * transport that can carry it puts the user's own number back, as `scanNoizeFor`
+ * does for the noise profile.
  */
 export function clampConcurrency(value: number, protocol = ""): number {
   if (!Number.isFinite(value)) return SCAN_MIN_CONCURRENCY;

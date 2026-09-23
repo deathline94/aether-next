@@ -34,6 +34,10 @@ param(
     # reproducing a failure locally.
     [string]$Directory,
     [string]$ExpectedPublisherCN = "deathline94",
+    [string]$ExpectedGuiCertSha256 = "",
+    [switch]$Development,
+    [string]$DevThumbprint = "",
+    [string]$DevEngineSha256 = "",
     [string]$EngineName = "aether.exe",
     [string]$DriverName = "wintun.dll",
     [string]$GuiNamePattern = "Aether*.exe"
@@ -85,21 +89,16 @@ function Get-PEFiles([string]$root) {
     }
 }
 
-function Test-Signature([string]$path, [string]$expectCN) {
-    $sig = Get-AuthenticodeSignature -FilePath $path
-    if (-not $sig.SignerCertificate) {
-        return "unsigned ($($sig.Status)): $path"
+function Test-Signature([string]$path, [string]$expectCN, [bool]$allowDev, [string]$pin = "") {
+    $helper = Join-Path (Split-Path -Parent $PSCommandPath) "..\.github\scripts\sign-windows.ps1"
+    $extra = @{}
+    if ($allowDev) { $extra.DevEphemeral = $true; $extra.Thumbprint = $DevThumbprint }
+    try {
+        & $helper -VerifyOnly -Path $path -ExpectedPublisherCN $expectCN -ExpectedCertSha256 $pin @extra | Out-Null
+        return $null
+    } catch {
+        return $_.Exception.Message
     }
-    if ($sig.Status -notin @("Valid", "NotSigned")) {
-        return "signature status $($sig.Status) for $path"
-    }
-    if ($sig.Status -eq "NotSigned") {
-        return "unsigned: $path"
-    }
-    if ($expectCN -and $sig.SignerCertificate.Subject -notmatch [regex]::Escape($expectCN)) {
-        return "publisher mismatch: expected '$expectCN', got '$($sig.SignerCertificate.Subject)' for $path"
-    }
-    return $null
 }
 
 $targets = @()
@@ -123,6 +122,12 @@ if ($Directory) {
 }
 
 try {
+    if ($Development -and -not $DevThumbprint) { throw "development verification needs the run-local certificate thumbprint" }
+    if (-not $Development -and ($DevThumbprint -or $DevEngineSha256)) { throw "development verification inputs may not reach a release" }
+    $anchorDoc = Get-Content $Anchor -Raw | ConvertFrom-Json
+    $engineEntry = $anchorDoc.files | Where-Object { $_.name -eq $EngineName } | Select-Object -First 1
+    if (-not $engineEntry) { throw "trust anchor has no entry for $EngineName" }
+    $engineCN = $engineEntry.issued_cn -replace '^CN=', ''
     $engineDigest = Get-AnchorDigest $EngineName
     $driverDigest = Get-AnchorDigest $DriverName
     $placeholder = "0" * 64
@@ -142,12 +147,19 @@ try {
             $failures.Add("$($t.Name): no $EngineName inside; the installer would launch an engine that was never packaged")
         } else {
             $hash = (Get-FileHash $engine.FullName -Algorithm SHA256).Hash.ToLower()
-            if ($engineDigest -eq $placeholder) {
+            if ($engineDigest -eq $placeholder -and -not $Development) {
                 $failures.Add("$($t.Name): the anchor still carries a placeholder digest for $EngineName, so nothing can vouch for it (publish it first)")
+            } elseif ($engineDigest -eq $placeholder) {
+                if ($DevEngineSha256 -notmatch '^[0-9a-fA-F]{64}$' -or $hash -ne $DevEngineSha256.ToLowerInvariant()) {
+                    $failures.Add("$($t.Name): development engine digest $hash does not match the run's staged digest $DevEngineSha256")
+                }
             } elseif ($hash -ne $engineDigest) {
                 $failures.Add("$($t.Name): $EngineName is $hash but $Anchor says $engineDigest")
             }
-            $problem = Test-Signature $engine.FullName $ExpectedPublisherCN
+            $engineIsDev = $Development -and $engineDigest -eq $placeholder
+            $engineExpectedCN = if ($engineIsDev) { $ExpectedPublisherCN } else { $engineCN }
+            $engineCertPin = if ($engineIsDev) { "" } else { $engineEntry.cert_sha256 }
+            $problem = Test-Signature $engine.FullName $engineExpectedCN $engineIsDev $engineCertPin
             if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
 
@@ -159,12 +171,12 @@ try {
             }
             # WireGuard's own signature must survive bundling: a re-signed or stripped
             # driver is a different trust story than the one the anchor describes.
-            $problem = Test-Signature $driver.FullName "WireGuard LLC"
+            $problem = Test-Signature $driver.FullName "WireGuard LLC" $false
             if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
 
         foreach ($gui in ($pes | Where-Object { $_.Name -like $GuiNamePattern -and $_.Name -ne $EngineName })) {
-            $problem = Test-Signature $gui.FullName $ExpectedPublisherCN
+            $problem = Test-Signature $gui.FullName $ExpectedPublisherCN ([bool]$Development) $ExpectedGuiCertSha256
             if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
     }

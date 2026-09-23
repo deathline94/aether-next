@@ -387,16 +387,30 @@ mod tests {
     use quiche::h3::NameValue;
 
     fn header_value(hs: &[h3::Header], name: &[u8]) -> Option<Vec<u8>> {
-        hs.iter().find(|h| h.name() == name).map(|h| h.value().to_vec())
+        hs.iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.value().to_vec())
     }
 
     #[test]
     fn h3_headers_cf_mirrors_h2_recipe() {
         let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Cf, None);
-        assert_eq!(header_value(&hs, b":method").as_deref(), Some(&b"CONNECT"[..]));
-        assert_eq!(header_value(&hs, b":authority").as_deref(), Some(&b"cloudflareaccess.com"[..]));
-        assert_eq!(header_value(&hs, b"cf-connect-proto").as_deref(), Some(&b"cf-connect-ip"[..]));
-        assert_eq!(header_value(&hs, b"pq-enabled").as_deref(), Some(&b"false"[..]));
+        assert_eq!(
+            header_value(&hs, b":method").as_deref(),
+            Some(&b"CONNECT"[..])
+        );
+        assert_eq!(
+            header_value(&hs, b":authority").as_deref(),
+            Some(&b"cloudflareaccess.com"[..])
+        );
+        assert_eq!(
+            header_value(&hs, b"cf-connect-proto").as_deref(),
+            Some(&b"cf-connect-ip"[..])
+        );
+        assert_eq!(
+            header_value(&hs, b"pq-enabled").as_deref(),
+            Some(&b"false"[..])
+        );
         // Classic CONNECT: no extended-CONNECT pseudo-headers.
         assert!(header_value(&hs, b":protocol").is_none());
         assert!(header_value(&hs, b":path").is_none());
@@ -406,10 +420,19 @@ mod tests {
     #[test]
     fn h3_headers_standard_is_extended_connect() {
         let hs = connect_ip_request_mode("cloudflareaccess.com", "/", H3HeaderMode::Standard, None);
-        assert_eq!(header_value(&hs, b":protocol").as_deref(), Some(&b"cf-connect-ip"[..]));
-        assert_eq!(header_value(&hs, b":scheme").as_deref(), Some(&b"https"[..]));
+        assert_eq!(
+            header_value(&hs, b":protocol").as_deref(),
+            Some(&b"cf-connect-ip"[..])
+        );
+        assert_eq!(
+            header_value(&hs, b":scheme").as_deref(),
+            Some(&b"https"[..])
+        );
         assert_eq!(header_value(&hs, b":path").as_deref(), Some(&b"/"[..]));
-        assert_eq!(header_value(&hs, b"capsule-protocol").as_deref(), Some(&b"?1"[..]));
+        assert_eq!(
+            header_value(&hs, b"capsule-protocol").as_deref(),
+            Some(&b"?1"[..])
+        );
         assert!(header_value(&hs, b"cf-connect-proto").is_none());
     }
 
@@ -426,8 +449,7 @@ mod tests {
     #[test]
     fn h3_headers_protocol_override_reaches_the_wire() {
         for mode in [H3HeaderMode::Cf, H3HeaderMode::Standard, H3HeaderMode::Both] {
-            let hs =
-                connect_ip_request_mode("example.com", "/", mode, Some("connect-ip"));
+            let hs = connect_ip_request_mode("example.com", "/", mode, Some("connect-ip"));
             let token = match mode {
                 H3HeaderMode::Cf => b"cf-connect-proto".as_slice(),
                 _ => b":protocol".as_slice(),
@@ -514,7 +536,8 @@ mod tests {
             let mut b = OctetsMut::with_slice(&mut value);
             b.put_varint(1).unwrap();
             b.put_u8(6).unwrap();
-            b.put_bytes(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).unwrap();
+            b.put_bytes(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                .unwrap();
             b.put_u8(128).unwrap();
             b.off()
         };

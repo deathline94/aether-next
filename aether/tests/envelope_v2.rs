@@ -57,7 +57,10 @@ fn identity(device: &str) -> Identity {
 }
 
 fn use_key() {
-    runtime_env::set("AETHER_CONFIG_KEY", &base64::engine::general_purpose::STANDARD.encode(KEY));
+    runtime_env::set(
+        "AETHER_CONFIG_KEY",
+        &base64::engine::general_purpose::STANDARD.encode(KEY),
+    );
 }
 
 fn no_key() {
@@ -101,7 +104,10 @@ fn save_refuses_to_write_secret_material_without_a_key() {
     let path = dir.file("aether.toml");
     no_key();
 
-    let err = fails(save(&path, &identity("dev")), "plaintext must not be written");
+    let err = fails(
+        save(&path, &identity("dev")),
+        "plaintext must not be written",
+    );
     let msg = err.to_string();
     assert!(
         msg.contains("AETHER_CONFIG_KEY"),
@@ -120,7 +126,10 @@ fn a_copied_envelope_fails_authentication_at_the_other_path() {
 
     save(&a, &identity("device-A")).expect("save A");
     let raw = fs::read(&a).expect("read A");
-    assert!(raw.starts_with(b"AETHERCFG2\n"), "v2 magic expected, got {raw:?}");
+    assert!(
+        raw.starts_with(b"AETHERCFG2\n"),
+        "v2 magic expected, got {raw:?}"
+    );
     assert_eq!(raw[b"AETHERCFG2\n".len()], 1, "schema version byte");
 
     // The v1 shape had no AAD, so this copy authenticated perfectly and the
@@ -143,7 +152,11 @@ fn each_config_file_gets_its_own_key_stream() {
     use_key();
     save(&a, &identity("same")).expect("a");
     save(&b, &identity("same")).expect("b");
-    assert_ne!(fs::read(&a).unwrap(), fs::read(&b).unwrap(), "nonce reuse across files");
+    assert_ne!(
+        fs::read(&a).unwrap(),
+        fs::read(&b).unwrap(),
+        "nonce reuse across files"
+    );
     no_key();
 }
 
@@ -161,7 +174,9 @@ fn a_v1_envelope_still_opens_and_is_upgraded_in_place() {
     );
     let cipher = ChaCha20Poly1305::new((&KEY).into());
     let nonce = [3u8; 12];
-    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plain.as_bytes()).expect("seal v1");
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain.as_bytes())
+        .expect("seal v1");
     let mut blob = b"AETHERCFG1\n".to_vec();
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ct);
@@ -173,7 +188,10 @@ fn a_v1_envelope_still_opens_and_is_upgraded_in_place() {
         fs::read(&path).unwrap().starts_with(b"AETHERCFG2\n"),
         "reading a v1 file must upgrade it"
     );
-    let again = present(succeeds(load(&path), "upgrade must be readable"), "an identity");
+    let again = present(
+        succeeds(load(&path), "upgrade must be readable"),
+        "an identity",
+    );
     assert_eq!(again.device_id, "legacy-v1", "upgrade must be readable");
     no_key();
 }
@@ -202,7 +220,10 @@ fn plaintext_without_a_key_is_refused_rather_than_accepted_forever() {
 
     let err = fails(load(&path), "plaintext must not be a stable state");
     assert!(err.to_string().contains("AETHER_CONFIG_KEY"), "{err}");
-    assert!(Path::new(&path).exists(), "the file is preserved for the user to migrate");
+    assert!(
+        Path::new(&path).exists(),
+        "the file is preserved for the user to migrate"
+    );
 }
 
 #[test]
@@ -220,8 +241,17 @@ fn a_planted_backup_is_quarantined_and_never_becomes_the_identity() {
     save(&bak, &identity("impostor")).expect("save impostor to bak");
 
     let id = present(succeeds(load(&path), "load"), "an identity");
-    assert_eq!(id.device_id, "real", "the backup must never override the live config");
-    assert!(!Path::new(&bak).exists(), "the backup must be moved out of the way");
-    assert!(Path::new(&format!("{path}.quarantined")).exists(), "and kept for inspection");
+    assert_eq!(
+        id.device_id, "real",
+        "the backup must never override the live config"
+    );
+    assert!(
+        !Path::new(&bak).exists(),
+        "the backup must be moved out of the way"
+    );
+    assert!(
+        Path::new(&format!("{path}.quarantined")).exists(),
+        "and kept for inspection"
+    );
     no_key();
 }

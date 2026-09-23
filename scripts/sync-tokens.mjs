@@ -24,7 +24,15 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TOKENS = join(ROOT, 'packages/ui/tokens.css');
-const SHEETS = ['apps/desktop/src/App.css', 'apps/android/src/App.css'];
+// `packages/ui/src/shared.css` is the sheet both frontends load before their own
+// (reviewer item 24). It needs the fence for the same reason the app sheets do:
+// every CSS gate resolves `var(--x)` inside one file, so the literals have to be
+// physically present there too, not only at runtime.
+const SHEETS = [
+  'packages/ui/src/shared.css',
+  'apps/desktop/src/App.css',
+  'apps/android/src/App.css',
+];
 const CHECK = process.argv.includes('--check');
 
 const src = readFileSync(TOKENS, 'utf8');

@@ -20,11 +20,13 @@ const CSV_HIT: &str = "\"aether.exe\",\"472\",\"Console\",\"1\",\"1,234,567 K\"\
 const CSV_MISS: &str = "\"Memory Compression\",\"40\",\"Services\",\"0\",\"89,120 K\"\r\n\
                          \"svchost.exe\",\"1724\",\"Services\",\"0\",\"12,340 K\"\r\n";
 
-const TABLE_HIT: &str = "Image Name                     PID Session Name        Session#    Mem Usage\n\
+const TABLE_HIT: &str =
+    "Image Name                     PID Session Name        Session#    Mem Usage\n\
 ========================= ======== ================ =========== ============\n\
 aether.exe                    472 Console                    1      9,640 K\n";
 
-const TABLE_MISS: &str = "Image Name                     PID Session Name        Session#    Mem Usage\n\
+const TABLE_MISS: &str =
+    "Image Name                     PID Session Name        Session#    Mem Usage\n\
 ========================= ======== ================ =========== ============\n\
 svchost.exe                   4720 Console                    1     12,340 K\n\
 dwm.exe                       1472 Console                    1     98,760 K\n";
@@ -149,7 +151,10 @@ fn clock_skew_cannot_turn_a_live_holder_into_a_dead_one() {
         Liveness::Dead
     );
     // `created_unix == 0` is "not recorded", not "the epoch".
-    assert_eq!(combine_liveness(0, this_boot, Liveness::Alive), Liveness::Alive);
+    assert_eq!(
+        combine_liveness(0, this_boot, Liveness::Alive),
+        Liveness::Alive
+    );
     assert_eq!(
         combine_liveness(0, this_boot, Liveness::Unknown),
         Liveness::Unknown

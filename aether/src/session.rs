@@ -1154,7 +1154,7 @@ async fn run_masque_tunnel(
             },
             _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
             _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
-            _ = supervise.tick().await => session_event::mark_progress(),
+            _ = supervise.tick() => session_event::mark_progress(),
         }
     };
 
@@ -1362,7 +1362,7 @@ async fn run_wireguard_tunnel(
             r = &mut tunnel_fut => break r,
             _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
             _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
-            _ = supervise.tick().await => session_event::mark_progress(),
+            _ = supervise.tick() => session_event::mark_progress(),
         }
     };
 
@@ -1559,7 +1559,7 @@ async fn run_warp_in_warp(
             _ = outer_task.done() => break Err(AetherError::Other("outer WARP tunnel exited".into())),
             _ = inner_task.done() => break Err(AetherError::Other("inner WARP tunnel exited".into())),
             _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
-            _ = supervise.tick().await => session_event::mark_progress(),
+            _ = supervise.tick() => session_event::mark_progress(),
         }
     };
     drop(socks_fut);

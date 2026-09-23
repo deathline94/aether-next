@@ -89,12 +89,38 @@ jobs:
           CMAKE_GENERATOR: Ninja
         run: cargo build --release
 
-      # Same ephemeral CI identity build.yml signs with, so the witnessed cert is
-      # the cert the bundled engine actually carries. Swapping in a different
-      # signer here would make the anchor describe bytes no release ever ships.
-      - name: Sign engine
+      # The identity that signs the witnessed engine is the identity every release
+      # will be checked against, so it comes from the repository's secrets when one
+      # is configured. Without it this job still cuts a witness - of a development
+      # artifact - but it records signing_profile: ephemeral-dev, and
+      # scripts/package-policy.mjs then refuses to publish anything built on those
+      # bytes. That is the honest outcome: the witness describes what it saw, and
+      # the release job packages these same bytes instead of signing its own.
+      - name: Install the code-signing identity
+        id: cert
         shell: pwsh
+        env:
+          SIGNING_PFX_BASE64: ${{ secrets.AETHER_CODESIGN_PFX_BASE64 }}
+          SIGNING_PFX_PASSWORD: ${{ secrets.AETHER_CODESIGN_PFX_PASSWORD }}
         run: |
+          if ($env:SIGNING_PFX_BASE64 -and $env:SIGNING_PFX_PASSWORD) {
+            $pfx = Join-Path $env:RUNNER_TEMP "aether-witness.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation "Cert:\CurrentUser\My" `
+              -Password (ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force) |
+              Where-Object HasPrivateKey | Select-Object -First 1
+            Remove-Item -LiteralPath $pfx -Force
+            if (-not $cert) { throw "the witness signing PFX holds no key" }
+            if ($cert.Subject -eq $cert.Issuer) {
+              throw "AETHER_CODESIGN_PFX_BASE64 is self-signed ($($cert.Subject)); witness it as ephemeral-dev instead, or fix the secret"
+            }
+            "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "cn=$($cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "profile=trusted-ca" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Witness identity: $($cert.Subject) [$($cert.Thumbprint)]"
+            exit 0
+          }
+          Write-Host "::warning::no AETHER_CODESIGN_PFX_BASE64 secret: the witnessed engine is signed with a run-local self-signed certificate, so the anchor will record signing_profile=ephemeral-dev and no release can be cut from it"
           $pfxPass = "ci-sign-$([Guid]::NewGuid().ToString('N').Substring(0,16))"
           $configPath = Join-Path $env:RUNNER_TEMP "aether-anchor.cnf"
           $keyPath = Join-Path $env:RUNNER_TEMP "aether-anchor.key"
@@ -110,17 +136,28 @@ jobs:
             -Password (ConvertTo-SecureString $pfxPass -AsPlainText -Force) |
             Where-Object HasPrivateKey | Select-Object -First 1
           if (-not $cert) { throw "no importable signing certificate" }
+          "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cn=$($cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "profile=ephemeral-dev" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # Signed through the same single rule build.yml signs the shipped installer
+      # with, once, here - these are the bytes a release must later package. A
+      # second signing of a second compilation cannot produce this digest, which is
+      # exactly why the release job downloads this run's artifact instead of
+      # rebuilding the engine and demanding a match.
+      - name: Sign the engine once
+        shell: pwsh
+        run: |
           $eng = "aether/target/release/aether.exe"
-          # Signed and asserted through .github/scripts/sign-windows.ps1 - the same
-          # single rule build.yml signs the shipped installer with. This step used to
-          # demand exactly `Status -eq 'Valid'` while build.yml accepted anything but
-          # NotSigned/HashMismatch, on the same ephemeral self-signed certificate; the
-          # two could not both be right, and the witness is the stricter consumer.
-          & ".github/scripts/sign-windows.ps1" -Thumbprint $cert.Thumbprint -Path $eng
+          $extra = @{}
+          if ('${{ steps.cert.outputs.profile }}' -eq 'ephemeral-dev') { $extra.DevEphemeral = $true }
+          & ".github/scripts/sign-windows.ps1" -Thumbprint "${{ steps.cert.outputs.thumbprint }}" `
+            -Path $eng -ExpectedPublisherCN "${{ steps.cert.outputs.cn }}" @extra
           $sig = Get-AuthenticodeSignature -LiteralPath $eng
+          if ($null -eq $sig.SignerCertificate) { throw "no signer certificate on $eng after signing" }
           $sha = (([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
           "ANCHOR_CERT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ANCHOR_CN=$($sig.SignerCertificate.Subject)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ANCHOR_CN=CN=${{ steps.cert.outputs.cn }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Witness the staged engine
         shell: pwsh
@@ -134,6 +171,33 @@ jobs:
           # it names is the exact failure this pipeline is built to prevent.
           node scripts/publish-engine-trust.mjs --check --name aether.exe `
             --file apps/desktop/src-tauri/resources/aether.exe
+
+      # The other half of the witness: which run's artifact holds the bytes the
+      # digest above describes, and under which signing profile. Written by a
+      # script rather than by hand because a reviewer has to be able to see that
+      # the pointer and the digest were produced by the same step, in the same
+      # diff, against the same file.
+      - name: Record the witness pointer in the anchor
+        shell: pwsh
+        env:
+          SIGNING_PROFILE: ${{ steps.cert.outputs.profile }}
+        run: |
+          node scripts/anchor-witness.mjs --name aether.exe `
+            --run "$env:GITHUB_RUN_ID" --artifact engine-witness `
+            --profile $env:SIGNING_PROFILE
+          node scripts/anchor-witness.mjs --check --name aether.exe `
+            --run "$env:GITHUB_RUN_ID" --artifact engine-witness --profile $env:SIGNING_PROFILE
+
+      # The exact file the digest above was measured over, uploaded after the
+      # witness was written and before anything else can touch it. `build.yml`
+      # downloads this and nothing else for a release.
+      - name: Upload the witnessed engine
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: engine-witness
+          path: aether/target/release/aether.exe
+          if-no-files-found: error
+          retention-days: 365
 
       - name: Open the witness pull request
         env:
@@ -156,6 +220,15 @@ jobs:
           $body = "Automatically cut by ``.github/workflows/prepare-anchor.yml`` (run $env:RUN_ID)." +
             "`n`nMerge this before tagging a release: a tag build refuses to bundle an " +
             "engine whose bytes are not witnessed by the committed anchor." +
+            "`n`nWitnessed artifact: ``engine-witness`` from run $env:RUN_ID " +
+            "(signing profile ``${{ steps.cert.outputs.profile }}``). The release job downloads " +
+            "that artifact and packages those bytes; it does not build or sign an engine." +
+            ($(if ('${{ steps.cert.outputs.profile }}' -eq 'ephemeral-dev') {
+              "`n`n**This witness cannot be released from**: it is signed by a certificate that " +
+              "exists only inside this run, so ``scripts/package-policy.mjs`` will refuse any " +
+              "tag built against it. Add AETHER_CODESIGN_PFX_BASE64 and re-run to witness a " +
+              "distributable engine."
+            } else { "" })) +
             "`n`nA rotation with no diff here is a pipeline bug, not a no-op."
           gh pr create --base $env:DEFAULT_BASE `
             --title "Trust anchor for engine $(git rev-parse --short HEAD)" `

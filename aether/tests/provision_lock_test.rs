@@ -19,7 +19,10 @@ fn test_provision_lock_mutual_exclusion_and_release() {
     let lock_buf = std::path::PathBuf::from(lock_path);
 
     let res = ProvisionGuard::try_acquire(&lock_buf, Duration::from_millis(150));
-    assert!(res.is_err(), "Concurrent lock acquisition must fail and not fail open");
+    assert!(
+        res.is_err(),
+        "Concurrent lock acquisition must fail and not fail open"
+    );
     let err_msg = res.err().unwrap().to_string();
     assert!(
         err_msg.contains(&format!("held by pid={} (alive=true)", std::process::id())),
@@ -45,7 +48,8 @@ fn test_provision_lock_mutual_exclusion_and_release() {
 fn test_multi_contender_provision_lock_sequential_exclusion() {
     use std::sync::{Arc, Barrier};
 
-    let temp_dir = std::env::temp_dir().join(format!("aether_test_prov_multi_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("aether_test_prov_multi_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir).expect("create temp dir");
 
@@ -89,7 +93,10 @@ fn test_multi_contender_provision_lock_sequential_exclusion() {
         contenders,
         "All contenders must sequentially acquire and release the lock"
     );
-    assert!(lock_buf.exists(), "Lock file must exist after all contenders drop");
+    assert!(
+        lock_buf.exists(),
+        "Lock file must exist after all contenders drop"
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

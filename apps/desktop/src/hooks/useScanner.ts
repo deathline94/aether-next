@@ -16,6 +16,7 @@ import {
   clampConcurrency,
   effectiveScanTimeout,
   scanVerdict,
+  SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
 import { NOIZE_PROFILES, oneOf } from "@aether/ui/enums";
 import type { ScanProtocol } from "@aether/ui/enums";
@@ -40,6 +41,9 @@ export function scanNoizeFor(protocol: ScanProtocol, noize: NoizeProfile): Noize
  * The clamp itself lives in `packages/ui`, beside the ladder it reads, so both
  * front-ends resolve a protocol to the same number of lanes. Re-exported here
  * because the tests and callers of this module reach for it by this path.
+ *
+ * It resolves the *displayed* number too, not only the outgoing one: see
+ * `effectiveConcurrency` below, which is what the panel is handed.
  */
 export { clampConcurrency };
 
@@ -98,7 +102,20 @@ export function useScanner(
 ) {
   const [protocol, setProtocol] = useState<ScanProtocol>("masque-h3");
   const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
-  const [concurrency, setConcurrency] = useState(250);
+  // What the user asked for, which is not necessarily what this protocol can run.
+  // The field used to open at 250 — a cheap H2/WireGuard width — on a scan that
+  // opens on H3 and stops at 16, so the control advertised lanes the engine would
+  // never put on the wire, and the first `scan_start` frame contradicted the number
+  // still printed in the box.
+  const [requestedConcurrency, setRequestedConcurrency] = useState(SCAN_DEFAULT_CONCURRENCY);
+  // One resolution, shown and sent: the panel gets *this* as `concurrency`, the log
+  // line prints it and the request carries it, so no path can name a lane count the
+  // others do not run. Re-clamping an already clamped number is a no-op, which is
+  // what makes the three safe to read from the same value.
+  const effectiveConcurrency = useMemo(
+    () => clampConcurrency(requestedConcurrency, protocol),
+    [requestedConcurrency, protocol],
+  );
   // 6s: at or above the engine's expensive-mode (H3/BoringSSL) per-probe floor so
   // the UI default never silently under-budgets QUIC handshake probes.
   const [timeoutMs, setTimeoutMs] = useState(6000);
@@ -230,8 +247,10 @@ export function useScanner(
     setEndpoints([]);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     // The two values are clamped before they are both announced and sent, so the
-    // log line describes the run the engine will actually perform.
-    const workers = clampConcurrency(concurrency, protocol);
+    // log line describes the run the engine will actually perform — and they are
+    // the resolved values the fields above already show rather than a second
+    // clamp that could disagree with the first.
+    const workers = effectiveConcurrency;
     const timeout = effectiveScanTimeout(protocol, timeoutMs);
     const noiseProfile = scanNoizeFor(protocol, noize);
     appendLog({
@@ -256,7 +275,7 @@ export function useScanner(
     } finally {
       setBusy(false);
     }
-  }, [busy, active, protocol, ipScan, concurrency, timeoutMs, noize, running, appendLog, clearLogs]);
+  }, [busy, active, protocol, ipScan, effectiveConcurrency, timeoutMs, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
     // Retire the run id with the run: without this, a stopped scan's stragglers
@@ -277,7 +296,9 @@ export function useScanner(
   return {
     protocol, setProtocol,
     ipScan, setIpScan,
-    concurrency, setConcurrency,
+    // The lanes this protocol runs, which is the number the field shows; the setter
+    // still takes what the user asks for, so a wider transport can carry it.
+    concurrency: effectiveConcurrency, setConcurrency: setRequestedConcurrency,
     timeoutMs, setTimeoutMs,
     noize: effectiveNoize, setNoize,
     endpoints, active, scanState: displayedScanState, busy,

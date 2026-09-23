@@ -24,14 +24,13 @@ type Origins = HashMap<SocketAddr, (SocketAddr, Instant)>;
 /// A peer address, unique per index, standing in for "a destination the client
 /// sent to".
 fn peer(i: usize) -> SocketAddr {
-    SocketAddr::new(
-        IpAddr::from([1, 2, (i / 251) as u8, (i % 251) as u8]),
-        443,
-    )
+    SocketAddr::new(IpAddr::from([1, 2, (i / 251) as u8, (i % 251) as u8]), 443)
 }
 
-const CLIENT_A: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 5150);
-const CLIENT_B: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 5151);
+const CLIENT_A: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 5150);
+const CLIENT_B: SocketAddr =
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 5151);
 
 /// A destination the association never contacted must not be able to reach the
 /// client — and specifically must not be forwarded to whoever happens to be
@@ -62,7 +61,12 @@ fn overflow_ages_out_lru_instead_of_wiping_the_table() {
     // All inside the TTL, all distinct: nothing here is legitimately dead, so
     // only the budget itself can justify removing an entry.
     for i in 0..UDP_ORIGIN_MAX {
-        note_origin_at(&mut map, peer(i), CLIENT_A, base + Duration::from_millis(i as u64));
+        note_origin_at(
+            &mut map,
+            peer(i),
+            CLIENT_A,
+            base + Duration::from_millis(i as u64),
+        );
     }
     assert_eq!(map.len(), UDP_ORIGIN_MAX);
 

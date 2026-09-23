@@ -53,18 +53,19 @@ pub(crate) const MAX_TRANSIENT_ACCEPTS: u32 = 32;
 /// readiness arm, which tears down a perfectly healthy tunnel because one client
 /// raced its own connect.
 ///
-/// On both platforms these arrive as `Uncategorized`, so the raw code is not
-/// checked: the streak bound in [`MAX_TRANSIENT_ACCEPTS`] is what keeps a
-/// non-transient failure from spinning here forever.
+/// Resource exhaustion is identified by its OS code because Rust's generic
+/// error kinds do not distinguish it reliably across platforms.
 pub(crate) fn is_transient_accept(e: &std::io::Error) -> bool {
-    matches!(
+    if matches!(
         e.kind(),
         std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::Uncategorized
-    )
+    ) {
+        return true;
+    }
+    matches!(e.raw_os_error(), Some(23 | 24 | 55 | 105 | 10024 | 10055))
 }
 /// Hard ceiling on one accepted session, both proxies (T163).
 ///

@@ -14,9 +14,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! counters {
-    ($( #[doc = $doc:literal] $name:ident => $key:literal, )*) => {
+    ($( $(#[doc = $doc:literal])+ $name:ident => $key:literal, )*) => {
         $(
-            #[doc = $doc]
+            $(#[doc = $doc])+
             pub static $name: AtomicU64 = AtomicU64::new(0);
         )*
 

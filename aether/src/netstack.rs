@@ -1842,7 +1842,7 @@ mod tests {
     /// cannot walk around.
     #[test]
     fn ipv4_targets_in_ipv6_form_are_refused_too() {
-        let mapped = |a, b, c, d| {
+        let mapped = |a: u8, b: u8, c: u8, d: u8| {
             IpAddr::V6(Ipv6Addr::new(
                 0,
                 0,
@@ -1850,8 +1850,8 @@ mod tests {
                 0,
                 0,
                 0xffff,
-                (a << 8 | b) as u16,
-                (c << 8 | d) as u16,
+                (u16::from(a) << 8) | u16::from(b),
+                (u16::from(c) << 8) | u16::from(d),
             ))
         };
         let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));

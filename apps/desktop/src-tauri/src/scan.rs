@@ -72,7 +72,7 @@ pub(crate) fn scan_blocking(
     };
 
     let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
-    verify_engine_or_refuse(&executable)?;
+    let engine_guard = verify_engine_or_refuse(&executable)?;
     let mut command = Command::new(&executable);
     scrub_ambient_engine_env(&mut command);
     command
@@ -123,6 +123,7 @@ pub(crate) fn scan_blocking(
         dpapi_key.zeroize();
         format!("Could not start scan: {e}")
     })?;
+    drop(engine_guard);
     // A scan child never brings the tunnel up, so it gets the key line and no
     // driver line — the engine only waits for the second when AETHER_TUN is on.
     if let Err(e) = handoff_preamble(&mut child, &dpapi_key, None) {

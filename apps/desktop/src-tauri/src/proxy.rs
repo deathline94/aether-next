@@ -308,6 +308,67 @@ pub mod windows_proxy {
         }
         Ok(out)
     }
+    /// Refuse to take over the system proxy on a machine whose connections decide
+    /// their own route.
+    ///
+    /// The alternative this replaced: mutate the per-user values anyway and let
+    /// the 30 s coherence check *report* the conflict afterwards. That leaves a
+    /// window in which the UI reads Connected while that connection's traffic
+    /// follows a proxy Aether never set — the fail-open this module exists to
+    /// avoid, discovered late rather than refused up front.
+    ///
+    /// Refusing rather than snapshot-and-restoring is the option the code can
+    /// actually honour. A `DefaultConnectionSettings` blob is authored by the
+    /// connection manager for a profile this process does not own; writing one
+    /// back means either restoring bytes captured before the session (clobbering
+    /// any change the user or the dialer made while we were up) or rebuilding a
+    /// versioned layout this decoder only reads the head of. So the module never
+    /// writes them — which is only honest if it also never *assumes* it owns them.
+    ///
+    /// An unreadable blob refuses too: a connection this decoder cannot read is a
+    /// connection whose route it cannot promise anything about, and "cannot tell"
+    /// has to cost a session rather than a lie.
+    ///
+    /// `Option<String>` rather than a `Result` because the success case carries
+    /// nothing, and because a `Result` with a `String` failure in this crate is
+    /// what the repo's `ipc-typed-errors` gate reads as a stringly-typed IPC
+    /// error — which this is not: it never crosses the boundary, it only decides
+    /// whether the registry gets touched.
+    pub fn preflight_per_connection(
+        checked: Result<Vec<PerConnectionProxy>, String>,
+    ) -> Option<String> {
+        match checked {
+            Ok(conflicts) if conflicts.is_empty() => None,
+            Ok(conflicts) => {
+                let listed = conflicts
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} → {} via {}",
+                            c.connection,
+                            c.effective,
+                            if c.via_script { "PAC" } else { "proxy server" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Some(format!(
+                    "this machine has per-connection proxy settings ({listed}) that take precedence \
+                     over the system proxy Aether sets. Those settings are owned by the connection \
+                     manager and are neither snapshotted nor restored here, so the system proxy \
+                     cannot be managed on this machine without leaving one connection unswept: \
+                     refuse to enable it. Full-device (tun) mode does not depend on these values."
+                ))
+            }
+            Err(why) => Some(format!(
+                "this machine's per-connection proxy settings cannot be read ({why}), so Aether \
+                 cannot tell whether a connection would outrank the system proxy. Changing the \
+                 proxy without knowing that is the difference between a tunnel and a Connected \
+                 badge over raw traffic, so nothing is changed. Full-device (tun) mode does not \
+                 depend on those settings."
+            )),
+        }
+    }
 
     #[cfg(test)]
     mod per_connection_tests {
@@ -381,6 +442,114 @@ pub mod windows_proxy {
             b = blob(8, FLAG_USE_PROXY, Some("   "), None);
             assert!(decode_connection_proxy(&b, "WiFi").is_err());
         }
+
+        /// A connection carrying its own enable bit, server **and** PAC URL — the
+        /// shape a dial-up/VPN profile has after `SetProxyReg` copies the per-user
+        /// values into it — alongside a second connection with only a server. Both
+        /// outrank everything `enable` writes, so both have to stop it.
+        #[test]
+        fn a_connection_with_its_own_server_and_pac_refuses_the_takeover_up_front() {
+            let both = blob(
+                8,
+                FLAG_USE_PROXY | FLAG_USE_SCRIPT,
+                Some("10.0.0.9:3128"),
+                Some("http://corp/conn.pac"),
+            );
+            let server = blob(7, FLAG_USE_PROXY, Some("proxy.isp:8080"), None);
+            let direct = blob(8, 0, Some("stale:1"), None);
+
+            let mut conflicts = Vec::new();
+            for (name, b) in [("VPN", &both), ("Ethernet", &server), ("WiFi", &direct)] {
+                if let Some(c) = decode_connection_proxy(b, name).unwrap() {
+                    conflicts.push(c);
+                }
+            }
+            assert_eq!(2, conflicts.len(), "a direct connection is not a conflict");
+            let vpn = &conflicts[0];
+            assert!(
+                vpn.via_script,
+                "WinINet consults the PAC ahead of the server, so the refusal names the PAC"
+            );
+
+            let refusal = preflight_per_connection(Ok(conflicts)).expect("a conflict refuses");
+            for named in ["VPN", "Ethernet", "http://corp/conn.pac", "proxy.isp:8080"] {
+                assert!(
+                    refusal.contains(named),
+                    "the refusal must not hide which connection: {named}"
+                );
+            }
+            assert!(
+                !refusal.contains("10.0.0.9:3128"),
+                "the server a script outranks is not the route, so naming it would \
+                 misdescribe the conflict"
+            );
+            assert!(
+                refusal.contains("tun"),
+                "the only way off this machine's registry is the mode that does not read it"
+            );
+        }
+
+        #[test]
+        fn a_machine_with_no_per_connection_proxy_is_not_blocked() {
+            // Refusing here too would be a new way for an unrelated registry quirk
+            // to stop a session, which is why the empty list is its own case.
+            assert!(preflight_per_connection(Ok(Vec::new())).is_none());
+        }
+
+        #[test]
+        fn a_blob_nobody_can_read_refuses_rather_than_passing_the_connection() {
+            let b = blob(9, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            let unreadable = decode_connection_proxy(&b, "VPN").unwrap_err();
+            assert!(preflight_per_connection(Err(unreadable)).is_some());
+            // …and the refusal says why, because "cannot tell" has to be legible
+            // to the user whose connect button just did nothing.
+            let why = preflight_per_connection(Err("offset 12 lies outside the blob".into()))
+                .expect("an unreadable blob refuses");
+            assert!(why.contains("offset 12 lies outside the blob"), "{why}");
+        }
+
+        /// What makes "restore does not cover per-connections" a complete answer
+        /// instead of a half-truth: this module has no per-connection writer, so a
+        /// teardown has nothing to leave behind. Pinned against the source because
+        /// `winreg` gives the tests no seam — and a future `set_raw_value` on a
+        /// `Connections` subkey is precisely the edit this refuses to let slip in.
+        #[test]
+        fn per_connection_state_is_never_written_so_there_is_nothing_to_restore() {
+            let src = include_str!("proxy.rs");
+            // The shipped code, not this file's own assertions: the strings named
+            // below appear in this test by design, so a whole-file search would
+            // report the test as the violation.
+            let shipped = src.split_once("#[cfg(test)]").map_or(src, |head| head.0);
+            let reader = shipped
+                .split_once("pub fn per_connection_conflicts()")
+                .expect("the reader, by name")
+                .1
+                .split_once("\n    }")
+                .expect("the end of its body")
+                .0;
+            for writer in [
+                "set_value",
+                "set_raw_value",
+                "delete_value",
+                "delete_subkey",
+                "create_subkey",
+            ] {
+                assert!(
+                    !reader.contains(writer),
+                    "the per-connection reader now calls {writer}: per-connection state would then \
+                     need a snapshot and a restore, and `preflight_per_connection`'s reason for \
+                     refusing would be gone"
+                );
+            }
+            assert!(
+                reader.contains("winreg::enums::KEY_READ"),
+                "the Connections key is opened read-only"
+            );
+            assert!(
+                !shipped.contains("set_raw_value"),
+                "no blob write exists anywhere in the shipped module"
+            );
+        }
     }
 
     /// Write `want` over the current values and confirm it stuck. Used when a third
@@ -417,6 +586,14 @@ pub mod windows_proxy {
         endpoint: Option<&str>,
         recovery_path: Option<&Path>,
     ) -> Result<(ProxySnapshot, ProxySnapshot), (String, Option<ProxySnapshot>)> {
+        // Fail closed *before* anything is touched. The mirror, the recovery file
+        // and the four values all sit below this line, so a refusal here leaves
+        // nothing half-written and no journal claiming a change that never
+        // happened. See `preflight_per_connection` for why this is a refusal
+        // rather than a per-connection snapshot.
+        if let Some(why) = preflight_per_connection(per_connection_conflicts()) {
+            return Err((why, None));
+        }
         let key = key().map_err(|e| (e.to_string(), None))?;
         let snapshot = read_snapshot(&key).map_err(|e| (e.message, None))?;
         // Registry mirror first: from this moment on, a deleted recovery file is

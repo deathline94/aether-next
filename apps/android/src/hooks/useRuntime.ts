@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, listen } from "../bridge";
 import { defaults, initialRuntime, parseRuntimeState } from "../types";
+import { parseSettingsPayload } from "../settingsPayload";
+import { parseTestOutcome } from "../nativeOutcome";
+import { useSettingsHealth } from "./useSettingsHealth";
+import type { SaveState } from "../saveState";
 import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
@@ -36,11 +40,25 @@ export function useRuntime(
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState<IpcError | null>(null);
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<TestOutcome | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  // The stored profile's own health, reported on the state frame rather than on the
+  // settings payload: `SettingsStore.load()` hands back defaults for a blob it cannot
+  // read, so a settings payload alone cannot tell "nothing stored" from "the user's
+  // profile is unreadable and is being preserved". See `useSettingsHealth`.
+  const profileIsNotTheUsers = useCallback(() => {
+    setSettingsLoaded(false);
+    setSettingsLoadError(true);
+  }, []);
+  const {
+    settingsCorrupt, settingsCorruption, settingsCorruptionNotice,
+    resetSettingsBusy, resetSettingsError,
+    applyFrame, blocksHydration, resetCorruptReport,
+  } = useSettingsHealth(appendLog, profileIsNotTheUsers);
 
   // One log line per distinct refused shape, not one per frame: a shell that
   // emits a bad status every second must not fill the console with it.
@@ -51,10 +69,73 @@ export function useRuntime(
   const pendingSaveRef = useRef<Settings | null>(null);
   const settingsRef = useRef(settings);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /// Monotonic save token: only the newest dispatch may report the dock, so a
+  /// slow write of an older payload cannot land the state of a newer one.
+  const saveSeqRef = useRef(0);
 
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running || !settingsLoaded;
+
+  /**
+   * Put a `get_settings` reply into state, or say why it could not go in.
+   *
+   * One path for hydration and for "Retry", because a second copy of the read is
+   * how a weaker validator gets to exist: both call the same parser the events use,
+   * a payload that is merely *incomplete* falls back to the documented default with
+   * the field named in the log, and a payload that carries a value this build cannot
+   * represent is refused whole — never merged over the profile already on screen,
+   * and never rewritten to disk by the next edit as if the user had chosen it.
+   */
+  const applyLoadedSettings = useCallback(
+    (loaded: Settings | null) => {
+      const parsed = loaded === null ? null : parseSettingsPayload(loaded);
+      if (parsed?.ok) {
+        const { settings: merged, corrected } = parsed;
+        settingsRef.current = merged;
+        setSettings(merged);
+        // A readable payload is not yet a readable *profile*: while the shell reports
+        // the stored blob corrupt, what was just applied are its defaults, and the
+        // hydration failure has to stay on screen with it.
+        setSettingsLoadError(blocksHydration());
+        // A profile that has just been read *is* the one on disk: nothing is
+        // pending, and the dock must say so rather than "Synchronizing…".
+        setSaveState("idle");
+        if (corrected.length > 0) {
+          appendLog({
+            level: "warn",
+            message: `Settings from disk were incomplete or out of range (${corrected.join(", ")}); the defaults are in use for those until you change them.`,
+          });
+        }
+        return;
+      }
+      setSettingsLoadError(true);
+      appendLog({
+        level: "error",
+        message: parsed
+          ? `Refused the settings the shell sent (${parsed.reason}). Keeping the profile already on screen.`
+          : "Could not read the settings from disk.",
+      });
+    },
+    [appendLog, blocksHydration],
+  );
+
+  /**
+   * A `get_state` reply that cannot be read is reported, not displayed.
+   *
+   * Leaving the previous status standing would show something as the engine's
+   * state when the only fact is that the answer did not parse, so the hero goes to
+   * the one state that admits it knows nothing and offers the way out (dismiss, or
+   * the next frame the shell sends).
+   */
+  const reportUnknownEngineState = useCallback(
+    (reason: string) => {
+      const detail = `Engine status unreadable (${reason}); no tunnel state is shown.`;
+      setRuntime({ status: "error", detail, pid: null, endpoint: null });
+      appendLog({ level: "error", message: detail });
+    },
+    [appendLog],
+  );
 
   // Initialize: load settings, state, admin/version + subscribe to engine events.
   useEffect(() => {
@@ -66,6 +147,9 @@ export function useRuntime(
       try {
         const unlistenState = await listen<unknown>("session://state", (event) => {
           receivedRuntimeEvent.current = true;
+          // The settings report rides on the same frame, and is read before the
+          // frame is narrowed to the four fields the tunnel has copy for.
+          applyFrame(event.payload);
           const next = parseRuntimeState(event.payload);
           if (next) {
             setRuntime(next);
@@ -122,25 +206,35 @@ export function useRuntime(
           invoke<{ version?: string }>("app_info").catch(() => null),
         ]);
         if (disposed) return;
-        if (loadedSettings) {
-          settingsRef.current = { ...defaults, ...loadedSettings };
-          setSettings(settingsRef.current);
-          setSettingsLoadError(false);
-        } else {
-          setSettingsLoadError(true);
+        // The frame first, because it is what says whether the settings about to be
+        // applied are the user's: `get_settings` answers a corrupt blob with valid
+        // defaults, and only `settingsError` distinguishes that from a healthy read.
+        if (state !== null) applyFrame(state);
+        applyLoadedSettings(loadedSettings);
+        // The other half of the same rule: `get_state` is a native payload like the
+        // event, so it goes through the event's parser rather than being written
+        // straight into state, where a status this build has no copy for used to
+        // reach `heroCopy[status]` and throw. A frame that cannot be read is
+        // reported as the missing answer it is — the engine's state is unknown, and
+        // "Ready" would be a claim nothing observed.
+        const parsed = state ? parseRuntimeState(state) : null;
+        if (state && !parsed) {
+          reportUnknownEngineState(describeRejectedState(state));
+        } else if (parsed && !receivedRuntimeEvent.current) {
+          setRuntime(parsed);
         }
-        if (state && !receivedRuntimeEvent.current) setRuntime(state);
         setAdmin(Boolean(isAdmin));
         setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
       } finally {
-        if (!disposed) {
-          setSettingsLoaded(true);
-        }
+        // Hydration completed, but "loaded" is a claim about the *user's* profile: a
+        // corrupt or unreadable stored blob leaves the form showing defaults, and a
+        // form that says so is locked until the reset below clears it.
+        if (!disposed) setSettingsLoaded(!blocksHydration());
       }
     }
     void initialize();
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
-  }, [appendLog]);
+  }, [appendLog, applyFrame, applyLoadedSettings, blocksHydration, reportUnknownEngineState]);
 
   // Cleanup timers on unmount.
   useEffect(() => () => {
@@ -191,15 +285,23 @@ export function useRuntime(
     saveDebounceRef.current = setTimeout(async () => {
       const toSave = pendingSaveRef.current;
       if (!toSave) return;
+      const mine = ++saveSeqRef.current;
+      setSaveState("saving");
       try {
         await invoke("save_settings", { settings: toSave });
+        if (mine !== saveSeqRef.current) return; // superseded by a newer edit
         setSaveError(null);
-        setSaved(true);
+        setSaveState("saved");
         if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
-        savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
+        savedTimerRef.current = setTimeout(() => setSaveState("idle"), 1200);
       } catch (error) {
+        if (mine !== saveSeqRef.current) return;
         const err = ipcError(error);
         setSaveError(err);
+        // Still pending: the value on screen is not the value on disk, and a
+        // refusal is not a synchronisation. `saveError` is what the dock reads as
+        // the rejection; the lifecycle stays `dirty`.
+        setSaveState("dirty");
         appendLog({ level: "error", message: `Save settings failed: ${err.message}` });
       }
     }, SAVE_DEBOUNCE_MS);
@@ -217,6 +319,10 @@ export function useRuntime(
     const prev = settingsRef.current;
     settingsRef.current = settings;
     if (!settingsLoaded || prev === settings) return;
+    // An edit is pending the moment it lands on screen, and only the write below
+    // may call it "saving": the dock used to read every state that was not a
+    // just-flashed success as a synchronisation in progress.
+    setSaveState("dirty");
     persistSettings(settings);
   }, [settings, settingsLoaded, persistSettings]);
 
@@ -274,9 +380,10 @@ export function useRuntime(
     setTestBusy(true);
     setTestResult(null);
     try {
-      const result = await invoke<TestOutcome>("test_connection", { settings });
-      setTestResult(result);
-      appendLog({ level: "info", message: result.detail });
+      const outcome = parseTestOutcome(await invoke("test_connection", { settings }));
+      if (!outcome) throw new Error("The connectivity check answered with something this build cannot read");
+      setTestResult(outcome);
+      appendLog({ level: "info", message: outcome.detail });
     } catch (error) {
       const msg = errorMessage(error);
       // A failure has no latency. Reporting the error text as if it were a
@@ -296,10 +403,12 @@ export function useRuntime(
   const retrySettings = useCallback(async () => {
     try {
       const loaded = await invoke<Settings>("get_settings");
-      if (loaded) {
-        settingsRef.current = { ...defaults, ...loaded };
-        setSettings(settingsRef.current);
-        setSettingsLoadError(false);
+      // The same guard and the same reporting as hydration.
+      applyLoadedSettings(loaded ?? null);
+      // A corrupt read answers with defaults, so "loaded from disk" would be true of
+      // the shell's answer and false of the user's profile. Only a frame with nothing
+      // to report may say it; the reset below is what changes that.
+      if (loaded && !blocksHydration()) {
         setSettingsLoaded(true);
         appendLog({ level: "info", message: "Settings loaded from disk." });
       }
@@ -307,11 +416,32 @@ export function useRuntime(
       setSettingsLoadError(true);
       appendLog({ level: "error", message: `Retry load settings failed: ${errorMessage(error)}` });
     }
-  }, [appendLog]);
+  }, [appendLog, applyLoadedSettings, blocksHydration]);
+
+  /**
+   * The one action that resolves a corrupt stored profile.
+   *
+   * `SettingsStore.save` refuses every write while one is unresolved — including the
+   * one `connect()` performs — so this is not a convenience: without it the user can
+   * neither save nor tunnel, on a device whose settings screen says everything is
+   * synchronized. On the shell's confirmation the profile is re-read, which is what
+   * takes the form out of "reading from disk" and onto the defaults now on disk.
+   */
+  const resetSettings = useCallback(async () => {
+    if (await resetCorruptReport()) await retrySettings();
+  }, [resetCorruptReport, retrySettings]);
 
   return {
-    settings, runtime, busy, testBusy, saved, saveError, admin, testResult,
+    // `saved` is the lifecycle, not a boolean: `App.tsx` forwards this key straight
+    // to the Settings dock, and a dock that can only say "synchronizing" or
+    // "synchronized" cannot say "nothing pending". `saveState` is the same value
+    // under the name a caller that can pass a second prop should use.
+    settings, runtime, busy, testBusy, saved: saveState, saveState, saveError,
+    admin, testResult,
     appVersion: appVersion ?? "…",
+    // The stored profile's health and its remedy, as the shell reported them (ITEM 10).
+    settingsCorrupt, settingsCorruption, settingsCorruptionNotice,
+    resetSettings, resetSettingsBusy, resetSettingsError,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   };

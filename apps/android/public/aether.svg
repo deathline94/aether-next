@@ -1,16 +1,43 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Aether">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 24 24" role="img" aria-label="Aether">
   <!--
-    Aether identity master (P1-1). A single, clean vector in the repo's existing
-    mint/emerald language: the same padlock silhouette already sketched at
-    res/drawable/ic_launcher.xml and the #66E3A4 / #173026 pair themes.xml uses as
-    colorPrimary / colorPrimaryVariant. This file is the one true mark that the
-    desktop raster set (via `tauri icon`) and the Android adaptive layers derive
-    from — the shipped app icons were previously the stock third-party Tauri mark.
+    THE AETHER MARK. One geometry, authored by hand on a 24-unit grid, reused
+    verbatim by every consumer: the desktop/Tauri raster set, the browser tabs of
+    both apps, and the Android adaptive launcher layers.
+
+    WHAT IT IS. An A whose apex opens into a tunnel portal, crossed by a line
+    that enters the bore and leaves through both feet. Letter, tunnel and traffic
+    in two strokes. It replaces the generic padlock this file used to hold, which
+    said "security" about as specifically as a stock icon does and disagreed with
+    the tunnel-arrow motif `apps/android/index.html` was inlining as its favicon.
+
+    WHY STROKES. Two round-capped strokes survive being rasterised at 16px:
+    there is no counter thin enough to fill in, no enclosed white to disappear,
+    and nothing that depends on the plate or on colour. The same path data is
+    therefore valid as a launcher glyph, as a favicon, as a `monochrome`
+    adaptive-icon layer a launcher tints to one colour, and as an inline glyph in
+    the UI. Filled artwork would have needed a separate simplified cut per size.
+
+    THE TWO PATHS ARE THE CONTRACT.
+      portal   M4.6 20 L10.1 6.2 Q12 2.2 13.9 6.2 L19.4 20
+      line     M2.9 16 H21.1
+    stroke-width 3.3, round caps, round joins, one flat colour. Any asset carrying
+    the mark carries those two `d` strings unchanged. Only the framing changes per
+    medium, and the framings are these:
+      aether-mark.svg            plate + scale 0.62   app icon master (Tauri source)
+      aether-mark-mono.svg       bare, full grid      inline UI, tinting, print
+      aether-launcher-*.xml      scale 2.2 on 108dp   Android safe zone (66dp)
+      index.html favicon         plate + scale 0.80   16px browser tab
+
+    STILL TO DO, by whoever owns `apps/android/android/`: the two launcher layers
+    there are the padlock, and `res/drawable/ic_notification.xml` is the old
+    arch-and-arrow. The XML files next to this one are the drop-ins for the first;
+    the status-bar silhouette wants the same two strokes at 24dp.
   -->
-  <rect width="1024" height="1024" rx="224" fill="#0b0f11"/>
-  <rect x="22" y="22" width="980" height="980" rx="204" fill="none" stroke="#173026" stroke-width="20"/>
-  <path fill="none" stroke="#66e3a4" stroke-width="52" d="M388 560 V440 A124 124 0 0 1 636 440 V560"/>
-  <path fill="#66e3a4" d="M356 512 h312 a56 56 0 0 1 56 56 v256 a56 56 0 0 1 -56 56 h-312 a56 56 0 0 1 -56 -56 v-256 a56 56 0 0 1 56 -56 z"/>
-  <circle cx="512" cy="676" r="58" fill="#0b0f11"/>
-  <rect x="494" y="676" width="36" height="104" rx="18" fill="#0b0f11"/>
+  <rect width="24" height="24" rx="5.25" fill="#0b0f11"/>
+  <g transform="translate(12 12) scale(0.62) translate(-12 -12)"
+     fill="none" stroke="#66e3a4" stroke-width="3.3"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4.6 20 L10.1 6.2 Q12 2.2 13.9 6.2 L19.4 20"/>
+    <path d="M2.9 16 H21.1"/>
+  </g>
 </svg>

@@ -9,6 +9,14 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { nextOptionIndex } from "@aether/ui";
+import {
+  LOG_FILTER_HINT,
+  LOG_FILTER_LABELS as FILTERS,
+  scanProgressCopy,
+  streamLabel,
+  TERMINAL_TITLE,
+} from "@aether/ui/statusCopy";
+import { LOG_SEVERITY_LABELS, logSeverityOf } from "@aether/ui/logs";
 import { RENDER_CAP } from "../hooks/useLogs";
 import type { LogEntry, LogFilter, ScanState } from "../types";
 
@@ -26,36 +34,6 @@ interface ActivityTabProps {
   scanState: ScanState;
   status: string;
 }
-
-const FILTERS: { id: LogFilter; label: string }[] = [
-  { id: "milestones", label: "Milestones" },
-  { id: "hits", label: "Hits" },
-  { id: "errors", label: "Errors" },
-  { id: "raw", label: "Raw" },
-];
-
-function getLogCategory(entry: LogEntry): "info" | "warn" | "error" | "debug" {
-  if (entry.level === "error") return "error";
-  if (entry.level === "warn") return "warn";
-  const msg = entry.message.toLowerCase();
-  if (
-    msg.includes("debug") ||
-    msg.includes("trace") ||
-    msg.includes("probe src") ||
-    msg.includes("candidate rejected") ||
-    msg.includes("probe timeout")
-  ) {
-    return "debug";
-  }
-  return "info";
-}
-
-const LEVEL_LABELS: Record<"info" | "warn" | "error" | "debug", string> = {
-  info: "INFO",
-  warn: "WARN",
-  error: "ERR",
-  debug: "DEBUG",
-};
 
 /**
  * Scroll the console to the newest line and leave the "was that us?" latch clear.
@@ -134,6 +112,7 @@ export function ActivityTab({
   };
 
   const empty = filterCounts.raw === 0;
+  const scan = scanProgressCopy(scanState);
   const pct =
     scanState.total > 0
       ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
@@ -146,19 +125,19 @@ export function ActivityTab({
           <div className="scan-card-header">
             <div className="scan-title">
               <Sparkles size={15} className="spin-icon" aria-hidden="true" />
-              <strong>Active Engine Scan ({scanState.mode.toUpperCase()})</strong>
+              <strong>{scan.headline}</strong>
               <span className="phase-pill">{scanState.phase}</span>
             </div>
             <div className="scan-badges">
-              <span className="badge concurrency">{scanState.concurrency} workers</span>
-              <span className="badge working">{scanState.working} working</span>
-              {scanState.bestRtt && <span className="badge rtt">best {scanState.bestRtt}</span>}
+              <span className="badge concurrency">{scan.concurrency}</span>
+              <span className="badge working">{scan.working}</span>
+              {scan.fastest && <span className="badge rtt">{scan.fastest}</span>}
             </div>
           </div>
           <div
             className="scan-progress-bar-bg"
             role="progressbar"
-            aria-label="Engine scan progress"
+            aria-label="Server scan progress"
             aria-valuemin={0}
             aria-valuemax={scanState.total}
             aria-valuenow={scanState.scanned}
@@ -166,9 +145,7 @@ export function ActivityTab({
             <div className="scan-progress-bar-fill active-glow" style={{ width: `${pct}%` }} />
           </div>
           <div className="scan-card-footer">
-            <small className="tabular-nums">
-              Probed {scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()} candidates
-            </small>
+            <small className="tabular-nums">{scan.progressLabel}</small>
             <small className="tabular-nums">{pct}%</small>
           </div>
         </div>
@@ -183,14 +160,15 @@ export function ActivityTab({
             <span className="win-dot green" aria-hidden="true" />
             {/* Decorative window chrome. A shell prompt promises a shell: nothing
                 here takes input, and a screen reader would have read the typed
-                command as content. The console below carries the real name. */}
-            <span className="terminal-title-text font-mono" aria-hidden="true">session-log · aether@android</span>
+                command as content. The console below carries the real name, and
+                this line now says what it is rather than dressing as one. */}
+            <span className="terminal-title-text font-mono" aria-hidden="true">{TERMINAL_TITLE}</span>
           </div>
 
           <div className="terminal-center-telemetry">
             <span className={`status-dot ${status}`} aria-hidden="true" />
             <span className="stream-count tabular-nums">
-              {filterCounts[logFilter].toLocaleString()} shown / {filterCounts.raw.toLocaleString()} buffer
+              {filterCounts[logFilter].toLocaleString()} of {filterCounts.raw.toLocaleString()} lines shown
             </span>
           </div>
 
@@ -216,20 +194,20 @@ export function ActivityTab({
               className={`tactile-terminal-btn ${copied ? "copied" : ""}`}
               onClick={handleCopy}
               disabled={empty}
-              title="Copy visible or complete logs to clipboard"
+              title="Copy these log lines to the clipboard"
             >
               {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
-              <span>{copied ? "Copied" : "Copy Buffer"}</span>
+              <span>{copied ? "Copied" : "Copy logs"}</span>
             </button>
             <button
               type="button"
               className="tactile-terminal-btn danger"
               onClick={clearLogs}
               disabled={empty}
-              title="Flush current session logs"
+              title="Empty the log list on this screen"
             >
               <Ban size={13} aria-hidden="true" />
-              <span>Clear</span>
+              <span>Clear logs</span>
             </button>
           </div>
         </header>
@@ -267,10 +245,15 @@ export function ActivityTab({
             ))}
           </div>
 
-          <div className="terminal-mode-indicator">
-            {/* The stream is live; the terminal is not a TTY — it cannot be
-                written to, and saying otherwise advertised a prompt. */}
-            <span className="mode-tag font-mono">STREAM: LIVE</span>
+          <div
+            className="terminal-mode-indicator"
+            role="status"
+            aria-live="polite"
+          >
+            {/* The terminal is not a TTY either — it cannot be written to, and
+                saying so advertised a prompt. What the tag names now is the state
+                the log itself is in, the only thing this panel can know. */}
+            <span className="mode-tag font-mono">{streamLabel(status)}</span>
           </div>
         </div>
 
@@ -279,6 +262,10 @@ export function ActivityTab({
           ref={consoleRef}
           className="activity-console tactical-terminal-screen font-mono"
           onScroll={handleScroll}
+          // `role="log"` is what tells assistive tech that this region's content is
+          // appended as it happens — the same role the desktop console carries, so a
+          // new line is announced on both surfaces rather than only seen.
+          role="log"
           aria-label="Engine log output"
           // A scroll region the keyboard cannot reach: `tabIndex={0}` is what lets
           // PageUp/PageDown and the arrows read the lines above the fold.
@@ -287,27 +274,30 @@ export function ActivityTab({
           {hasMore && (
             <div className="log-more-hint">
               <small className="tabular-nums">
-                Buffer truncated for display: showing the last {RENDER_CAP} matching entries. Use "Copy Buffer" for full export.
+                Only the last {RENDER_CAP} matching lines are shown here. Use "Copy logs" to take everything the buffer holds.
               </small>
             </div>
           )}
 
+          {/* An empty console and a filtered-out console look the same and mean
+              opposite things, so they say different sentences: the first is the
+              normal state before anything has run, the second a filter to widen. */}
           {visibleLogs.length === 0 ? (
             <div className="empty-logs">
               <Terminal size={32} className="empty-term-icon" aria-hidden="true" />
-              <strong>{empty ? "Awaiting Daemon Output" : "No Records In Selected Filter"}</strong>
+              <strong>{empty ? "No log lines yet" : "Nothing matches this filter"}</strong>
               <span>
                 {empty
-                  ? "Carrier daemon and probe events will stream here automatically upon execution."
-                  : "Switch to 'Raw' to inspect unfiltered packet and probe streams."}
+                  ? "Engine start-up, server scans and connection events appear here while Aether runs."
+                  : "Choose \"All lines\" to see every line the engine has sent."}
               </span>
             </div>
           ) : (
             visibleLogs.map((entry) => {
-              const category = getLogCategory(entry);
-              const label = LEVEL_LABELS[category];
+              const category = logSeverityOf(entry);
+              const label = LOG_SEVERITY_LABELS[category];
               return (
-                <div className={`terminal-log-row ${category}`} key={entry.id} title={category.toUpperCase()}>
+                <div className={`terminal-log-row ${category}`} key={entry.id}>
                   <span className="row-gutter">
                     <span className="gutter-dot" aria-hidden="true" />
                   </span>
@@ -329,7 +319,7 @@ export function ActivityTab({
       {empty && !scanState.active && (
         <div className="activity-hint">
           <ScrollText size={13} aria-hidden="true" />
-          <span>Milestones hides high-frequency network packets. Select "Raw" to inspect full socket traces.</span>
+          <span>{LOG_FILTER_HINT}</span>
         </div>
       )}
     </div>

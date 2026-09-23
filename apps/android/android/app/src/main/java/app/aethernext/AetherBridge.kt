@@ -85,6 +85,7 @@ class AetherBridge(
     internal fun dispatch(cmd: String, args: JSONObject): Any? = when (cmd) {
         "get_settings" -> handleGetSettings()
         "save_settings" -> handleSaveSettings(args)
+        "reset_settings" -> handleResetSettings()
         "get_state" -> session.getState().toJson()
         "is_admin" -> session.isVpnPrepared()
         "connect" -> handleConnect(args)
@@ -156,6 +157,13 @@ class AetherBridge(
         return JSONObject.NULL
     }
 
+    /**
+     * Discard an unreadable settings blob on the user's explicit word, and answer with the
+     * settings that are on disk now — so the page leaves its error state in the same
+     * round-trip instead of guessing that the reset took.
+     */
+    internal fun handleResetSettings(): Any = session.resetSettings().toJson()
+
     internal fun handleConnect(args: JSONObject): Any {
         val s = if (args.has("settings")) {
             Settings.fromJson(args.getJSONObject("settings"))
@@ -186,7 +194,7 @@ class AetherBridge(
     internal fun handleScan(args: JSONObject): Any {
         val protocol = args.optString("protocol", "masque-h3")
         val ipVersion = args.optString("ipVersion", "v4")
-        val concurrency = ScanLimits.clampConcurrency(args.optInt("concurrency", 250))
+        val concurrency = ScanLimits.clampConcurrency(args.optInt("concurrency", ScanLimits.MAX_CONCURRENCY_H3), protocol)
         // The single clamp. The UI used to advertise 100-30000 ms while this line
         // quietly coerced the number to >=3000 (>=6000 for MASQUE), so the two sides
         // disagreed about what the user had asked for; both now read [ScanLimits].

@@ -93,10 +93,13 @@ async fn dns_resolve_does_not_fail_on_a_proxy_budget_error() {
 
     // `dns_resolve` cannot complete without a peer, but it must fail *after*
     // getting its socket — a budget refusal here is the T137 outage.
-    let err = tokio::time::timeout(Duration::from_secs(20), aether::socks::dns_resolve(&stack, "a.example"))
-        .await
-        .expect("resolution attempts, it does not hang")
-        .expect_err("nothing answers inside `bare_stack`");
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        aether::socks::dns_resolve(&stack, "a.example"),
+    )
+    .await
+    .expect("resolution attempts, it does not hang")
+    .expect_err("nothing answers inside `bare_stack`");
     let msg = err.to_string();
     assert!(
         !msg.contains("too many UDP associations (proxy)"),
@@ -117,7 +120,12 @@ async fn dns_resolve_does_not_fail_on_a_proxy_budget_error() {
 #[tokio::test]
 async fn metadata_and_loopback_targets_are_refused_at_the_choke_point() {
     let (stack, _inbound) = bare_stack();
-    for dst in ["127.0.0.1:1337", "169.254.169.254:80", "100.64.0.1:53", "[::1]:443"] {
+    for dst in [
+        "127.0.0.1:1337",
+        "169.254.169.254:80",
+        "100.64.0.1:53",
+        "[::1]:443",
+    ] {
         let dst: SocketAddr = dst.parse().unwrap();
         let outcome = tokio::time::timeout(Duration::from_secs(5), stack.open_tcp(dst))
             .await

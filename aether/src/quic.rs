@@ -693,6 +693,7 @@ pub async fn run(
         }
 
         if let (Some(h3c), Some(sid)) = (h3_conn.as_mut(), req_stream) {
+            let ready_before_poll = h3_ready;
             poll_h3(
                 &mut conn,
                 h3c,
@@ -704,7 +705,7 @@ pub async fn run(
                 &inbound_tx,
                 &mut dataplane_ok,
                 &mut addr_assigned,
-                h3_ready,
+                ready_before_poll,
                 &mut h3_body,
             )?;
         }
@@ -780,7 +781,7 @@ pub async fn run(
             }
         }
 
-        flush(&mut conn, &sockets).await?;
+        flush(&mut conn, &sockets, &mut flush_buf).await?;
 
         if conn.is_closed() {
             if !established_ever && !ech_retried && current_ech.is_some() {
@@ -795,7 +796,7 @@ pub async fn run(
                     let scid_bytes = random_scid();
                     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
                     conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
-                    maybe_enable_diagnostics(&mut conn, "tunnel-retry");
+                    maybe_enable_diagnostics(&mut conn, "tunnel-retry").await;
                     if let Some(ref ech) = current_ech {
                         tls::inject_ech(&mut conn, ech)?;
                     }
@@ -812,7 +813,7 @@ pub async fn run(
                     h3_conn = None;
                     req_stream = None;
                     capsules = CapsuleParser::new();
-                    flush(&mut conn, &sockets).await?;
+                    flush(&mut conn, &sockets, &mut flush_buf).await?;
                     continue;
                 }
             }
@@ -1058,10 +1059,12 @@ fn drain_capsules_drop_on_saturation(
             Ok(Some(masque::Capsule::Datagram(payload))) => {
                 // RFC 9297 stream fallback: IP packets arriving as DATAGRAM
                 // capsules (used when H3 DATAGRAM was not negotiated).
-                if !*dataplane_ok {
-                    h3_stage("first_inbound_datagram", "dataplane capsule received");
+                if watch_dataplane && is_forwardable_ip_packet(&payload) {
+                    if !*dataplane_ok {
+                        h3_stage("first_inbound_datagram", "dataplane capsule reply received");
+                    }
+                    *dataplane_ok = true;
                 }
-                *dataplane_ok = true;
                 if inbound_tx.try_send(payload).is_err() {
                     let n = crate::counters::bump(&crate::counters::INBOUND_DROPPED);
                     if n == 1 || n.is_multiple_of(1000) {
@@ -1424,7 +1427,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let scid_bytes = random_scid();
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
     let mut conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
-    maybe_enable_diagnostics(&mut conn, "verify");
+    maybe_enable_diagnostics(&mut conn, "verify").await;
 
     if let Some(ref ech) = p.ech_config_list {
         // Not `let _ =`: if the injection failed, this connection is going out

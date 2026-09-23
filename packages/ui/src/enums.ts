@@ -29,6 +29,23 @@ export const IP_FAMILY_OPTIONS: readonly { value: IpFamily; label: string }[] = 
   { value: "both", label: "Dual-Stack" },
 ];
 
+/**
+ * The family as a telemetry tile names it, which is not the menu's wording.
+ *
+ * "IPv4 Only" is a choice being made; the status line is answering a question, and
+ * `settings.ipVersion.toUpperCase()` — which one surface printed — answers it with
+ * a stored token. Both apps kept their own spelling of the three answers.
+ */
+const IP_FAMILY_DISPLAY: Record<IpFamily, string> = {
+  v4: "IPv4",
+  v6: "IPv6",
+  both: "IPv4 + IPv6",
+};
+
+export function ipFamilyLabel(ipVersion: IpFamily): string {
+  return IP_FAMILY_DISPLAY[ipVersion];
+}
+
 /** Probe velocity profile. `ScanMode` in the shell. */
 export const SCAN_MODES = ["turbo", "balanced", "thorough", "stealth", "ironclad"] as const;
 export type ScanMode = (typeof SCAN_MODES)[number];

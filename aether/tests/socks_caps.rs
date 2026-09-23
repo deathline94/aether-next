@@ -35,7 +35,9 @@ fn bare_stack() -> (netstack::StackHandle, mpsc::Sender<Vec<u8>>) {
 /// the assertion on the bytes is the whole difference between the two paths —
 /// which is exactly why "read two bytes and check them" is the test.
 async fn greeting(sock: &mut TcpStream) -> [u8; 2] {
-    sock.write_all(&[VER, 0x01, NO_AUTH]).await.expect("greeting");
+    sock.write_all(&[VER, 0x01, NO_AUTH])
+        .await
+        .expect("greeting");
     let mut reply = [0u8; 2];
     sock.read_exact(&mut reply).await.expect("greeting reply");
     reply
@@ -59,7 +61,11 @@ async fn saturated_client_limit_answers_with_a_refusal_not_a_reset() {
         let reply = tokio::time::timeout(Duration::from_secs(10), greeting(&mut sock))
             .await
             .expect("an admitted client is answered");
-        assert_eq!(reply, [VER, NO_AUTH], "client {i} was not admitted normally");
+        assert_eq!(
+            reply,
+            [VER, NO_AUTH],
+            "client {i} was not admitted normally"
+        );
         held.push(sock);
     }
 
