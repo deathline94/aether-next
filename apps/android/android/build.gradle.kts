@@ -5,6 +5,6 @@ plugins {
     // updates from 2026-08-31, and 16 KB-aligned packaging needs 8.7+. The Gradle
     // wrapper is at AGP's own documented minimum (8.13), so the build no longer
     // warns that the plugin was tested only through SDK 35.
-    id("com.android.application") version "8.11.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+    id("com.android.application") version "9.4.1" apply false
+    id("org.jetbrains.kotlin.android") version "2.4.20" apply false
 }
