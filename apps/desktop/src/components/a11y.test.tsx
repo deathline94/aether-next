@@ -81,6 +81,21 @@ function renderAndCheck(label: string, ui: React.ReactElement) {
     dangling.map((l) => l.getAttribute("for")),
     `${label}: every <label for> has to point at a control that exists`,
   ).toEqual([]);
+  // The same rule for the other half of ARIA referencing: a widget that names a
+  // target the tree does not contain is worse than one that names nothing, because
+  // it promises a relationship and then is silent.
+  const danglingControls = Array.from(container.querySelectorAll("[aria-controls]")).flatMap((el) =>
+    (el.getAttribute("aria-controls") || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .filter((id) => !doc.getElementById(id))
+      .map((id) => `${el.getAttribute("role") || el.tagName} -> #${id}`),
+  );
+  expect(
+    danglingControls,
+    `${label}: every aria-controls has to point at a node that exists`,
+  ).toEqual([]);
   return expectAccessible(label, container);
 }
 

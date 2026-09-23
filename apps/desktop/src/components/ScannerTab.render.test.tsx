@@ -122,6 +122,27 @@ describe("ScannerTab probe parameters", () => {
     expect(screen.getAllByRole("tab")[1]?.getAttribute("aria-selected")).toBe("true");
   });
 
+  it("keeps the panel present when a filter leaves it empty", () => {
+    // Every chip declares `aria-controls={resultsId}`. Filtering to a protocol
+    // with no rows used to replace the panel with a bare empty-state div, so the
+    // id disappeared and each chip pointed at nothing at the exact moment the
+    // filter had something to say.
+    renderTab({
+      endpoints: [{ addr: "104.16.0.1:443", rtt: "12ms", rttMs: 12, protocol: "masque-h3" }],
+    });
+    const chip = screen
+      .getAllByRole("tab")
+      .find((t) => /wireguard/i.test(t.textContent ?? ""));
+    if (!chip) throw new Error("the wireguard filter chip did not render");
+    fireEvent.click(chip);
+    expect(screen.getByText(/no endpoints found/i)).toBeTruthy();
+    const panel = screen.getByRole("tabpanel");
+    for (const tab of screen.getAllByRole("tab")) {
+      const target = tab.getAttribute("aria-controls") ?? "";
+      expect(document.getElementById(target)).toBe(panel);
+    }
+  });
+
   it("prints an unmeasured round-trip as such, not as a blank HIGH LATENCY row", () => {
     renderTab({
       endpoints: [

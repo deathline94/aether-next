@@ -415,7 +415,17 @@ export function ScannerTab({
             <span>Launch a standalone scan above to locate the fastest Cloudflare IP candidates.</span>
           </div>
         ) : filteredEndpoints.length === 0 ? (
-          <div className="empty-logs">
+          <div
+            className="empty-logs"
+            // The chips beside this still say they control it: `aria-controls`
+            // named `resultsId`, and an empty result dropped the only element that
+            // carried that id, so every tab pointed at nothing exactly when the
+            // filter had something to report.
+            id={resultsId}
+            role="tabpanel"
+            aria-labelledby={`proto-tab-${protoFilter}`}
+            tabIndex={0}
+          >
             <Search size={28} aria-hidden="true" />
             <strong>No endpoints found for {protoFilter.toUpperCase()}</strong>
             <span>Switch to "All Protocols" or launch another scan targeting this protocol.</span>

@@ -974,10 +974,24 @@ Checked each part against the current tree rather than assuming the task text wa
        android `:133`) and the save bar too (`SettingsTab.tsx:572`); no component
        prints the raw status enum beside the beacon (0 matches for an upper-cased
        status render); and the active profile card is excluded from the disabled
-       dim. Still open, and both are design work rather than a fix: the filter chips
-       as a proper APG radiogroup instead of a `role="tablist"` with no panel
-       relationship, and `:active` press feedback, which exists on 3 selectors per
-       sheet against ~20 interactive controls.
+       dim. The chips clause is stale in its own way: the filter is *not* a
+       `role="tablist"` misuse with "no `aria-controls`" — each chip carries
+       `role="tab"`, `aria-selected`, `aria-controls={resultsId}` and a roving
+       `tabIndex`, the dock cycles with ArrowLeft/Right through `nextOptionIndex`,
+       and the list is a `role="tabpanel"` labelled by the selected chip (a
+       `ScannerTab.render.test.tsx` test asserts exactly that). Whether a *filter*
+       ought to be a radiogroup rather than a tab set is a semantics argument, not a
+       broken state. What was genuinely broken sat one level down and is fixed:
+       filtering to a protocol with no rows replaced the panel with a bare
+       empty-state div, so the id every chip named ceased to exist and each
+       `aria-controls` pointed at nothing precisely when the filter had something to
+       report. The empty state now carries the panel's `id`/`role`/
+       `aria-labelledby`/`tabIndex` in both apps; the new test is red against the
+       previous markup ("Unable to find an accessible element with the role
+       tabpanel") and green after, and the a11y helper asserts the general rule —
+       every `aria-controls` in a rendered tab resolves to a node that exists.
+       Still open, design work rather than a fix: `:active` press feedback, which
+       exists on 3 selectors per sheet against ~20 interactive controls.
   -->
 - [ ] T195 [US6] Fix control semantics in `apps/desktop/src/components/{ui.tsx,ScannerTab.tsx,SettingsTab.tsx,App.tsx}`: filter chips become an APG radio group (`role="radiogroup"`/`radio`, `aria-checked`, roving `tabIndex`, arrow-key cycling) instead of a `role="tablist"` misuse with no `aria-controls`; `role="tablist"` is reserved for the real tab strip with `aria-controls`/`aria-selected`/`role="tabpanel"`; remove `tabIndex={-1}` from the −/+ steppers (mouse-only today); stop a wrapped `<label>` + `aria-label` giving one control two accessible names; ignore `ctrlKey/metaKey/altKey` in `App.tsx:40-52`; add `tabIndex={0}` + `aria-label` to `.tactical-terminal-screen` and `.discovered-list` (keyboard users cannot scroll them today); add `aria-live="polite"`/`role="status"` on the hero and save dock and transfer focus on tab switch; define `:active` press feedback (only 3 of ~20 controls have it); stop printing the raw `DISCONNECTED` enum beside a "Standby" beacon; make state never colour-only (the 7 px dot at 1.96:1 is currently the sole signal) and exclude `.profile-card.active` from the disabled dim so the ACTIVE profile stays identifiable while connected.
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
