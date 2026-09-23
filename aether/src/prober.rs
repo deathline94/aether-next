@@ -38,8 +38,13 @@ pub enum IpScan {
 impl IpScan {
     pub fn parse(s: &str) -> IpScan {
         match s.trim().to_lowercase().as_str() {
+            // `v4` is named rather than left to the fallback: both shells send
+            // exactly the strings the Settings UI offers, and a value that only
+            // works because nothing else matched is indistinguishable from a typo
+            // the day the catch-all changes.
+            "4" | "v4" | "ipv4" => IpScan::V4,
             "6" | "v6" | "ipv6" => IpScan::V6,
-            "both" | "all" | "dual" => IpScan::Both,
+            "both" | "all" | "dual" | "dual-stack" => IpScan::Both,
             _ => IpScan::V4,
         }
     }
@@ -74,6 +79,10 @@ impl ScanMode {
     pub fn parse(s: &str) -> ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
+            // Named rather than left to the fallthrough: this is the default
+            // the shells send on a fresh install, so "worked by accident" and
+            // "accepted" must not be the same statement.
+            "balanced" => ScanMode::Balanced,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
             "stealth" | "quiet" => ScanMode::Stealth,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,

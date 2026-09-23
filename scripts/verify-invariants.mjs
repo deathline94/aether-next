@@ -350,6 +350,33 @@ const RADIUS_LEFTOVERS = {
   'apps/android/src/App.css': 8,
 };
 
+/**
+ * Tokens that are real settings but never reach the engine as a transport, ip or
+ * scan word — they select shell-side behaviour instead. Listed rather than
+ * guessed, so renaming one is a reviewable edit and not a silent hole in
+ * `wire-tokens-cross-layer`.
+ */
+/** Every `value: "x"` token in a Settings menu module. */
+const literalsOfValues = (text) => [...text.matchAll(/value:\s*"([^"]+)"/g)].map((m) => m[1]);
+
+/*
+ * Junk/noise levels reach the engine as AETHER_NOIZE and are resolved by the
+ * profile table in aether/src/aethernoize.rs, whose names this gate does not
+ * read - listed here so the gap is visible and reviewable rather than a silent
+ * skip; wiring the engine's noise table into the comparison is still open.
+ */
+const UNGATED_NOIZE_LEVELS = new Set([
+  'off', 'light', 'medium', 'high', 'max', 'custom',
+]);
+
+const SHELL_ONLY_TOKENS = new Set([
+  'proxy-only', 'system-proxy', 'tun', // routing mode: selects shell behaviour
+  'auto', // 'let the engine choose', consumed by the shell's transport switch
+  'proxy-only', 'system-proxy', 'tun', // routing mode: selects shell behaviour
+  'auto', // "let the engine choose", consumed by the shell's transport switch
+]);
+
+
 const GATES = [
   {
     name: 'config-single-reader',
@@ -2206,6 +2233,104 @@ const GATES = [
         file: 'apps/desktop/src/__selftest___relative_import.ts',
         content:
           'import { SCAN_MAX_CONCURRENCY } from "../../../packages/ui/src/index.ts";\nexport const x = SCAN_MAX_CONCURRENCY;\n',
+      };
+    },
+  },
+  {
+    name: 'wire-tokens-cross-layer',
+    invariant: 'BC-13',
+    summary: 'every scan / ip / transport token a producer can emit is named by the engine',
+    scan(api) {
+      // `protocol-tokens-cross-layer` exists because a mistyped transport used to run
+      // MASQUE in silence. The same shape sits under the other two token fields: the
+      // engine parses AETHER_IP and AETHER_SCAN with a catch-all arm, so a value it
+      // does not name does not fail — it quietly becomes IPv4 or `balanced`, which in
+      // a scan is a different search than the one the user asked for. Those parses
+      // stay total (the interactive prompts lean on the default), so this is where the
+      // promise is kept instead: every token any producer can emit appears by name in
+      // an engine match arm.
+      const literals = (s) => [...s.matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+      const srcOf = (dir, re, base) => {
+        const f = api.files(dir, re).find((x) => rel(x).endsWith(`/${base}`));
+        return f ? { text: api.read(f).replace(/\r\n/g, '\n'), path: rel(f) } : null;
+      };
+      const arms = (text, signature) => {
+        const at = text.indexOf(signature);
+        if (at < 0) return null;
+        const body = text.slice(at, at + 1400);
+        const out = new Set();
+        for (const m of body.matchAll(/((?:"[^"]*"\s*\|?\s*)+)=>/g)) {
+          for (const lit of literals(m[1])) out.add(lit);
+        }
+        return out;
+      };
+
+      const prober = srcOf('aether/src', /\.rs$/, 'prober.rs');
+      const session = srcOf('aether/src', /\.rs$/, 'session.rs');
+      if (!prober || !session) return ['aether/src/{prober,session}.rs not found, so no token sets were compared'];
+      const sets = {
+        'IpScan::parse': arms(prober.text, 'pub fn parse(s: &str) -> IpScan'),
+        'ScanMode::parse': arms(prober.text, 'pub fn parse(s: &str) -> ScanMode'),
+        'Protocol::try_parse': arms(session.text, 'pub fn try_parse(s: &str) -> Result<Protocol>'),
+      };
+      const unreadable = Object.entries(sets).filter(([, s]) => !s || !s.size).map(([n]) => n);
+      if (unreadable.length) {
+        return [`no match arms could be read out of ${unreadable.join(', ')} in the engine, so the comparison ran on nothing`];
+      }
+      const accepted = new Set([].concat(...Object.values(sets).map((s) => [...s])));
+      const problems = [];
+      const check = (label, tokens) => {
+        const unknown = [...new Set(tokens)].filter((t) => t && !accepted.has(t) && !SHELL_ONLY_TOKENS.has(t) && !UNGATED_NOIZE_LEVELS.has(t));
+        if (unknown.length) {
+          problems.push(
+            `${label} can emit ${unknown.map((u) => `"${u}"`).join(', ')}, which no engine parse arm names — an unnamed value does not fail there, it falls through to IPv4 / balanced / MASQUE`,
+          );
+        }
+      };
+
+      // What a user can actually pick in Settings (both frontends send these strings
+      // to the engine, Android verbatim and desktop through its wire enums).
+      const uiTokens = [];
+      for (const f of api.files('packages/ui/src', /\.ts$/)) {
+        uiTokens.push(...literalsOfValues(api.read(f).replace(/\r\n/g, '\n')));
+      }
+      if (!uiTokens.length) {
+        problems.push('packages/ui: no `value:` tokens found, so the UI half of the comparison ran on nothing');
+      } else {
+        check('packages/ui Settings menus', uiTokens);
+      }
+
+      // The desktop shell's own enums, found by the values they carry so a rename
+      // cannot quietly drop a field out of this check.
+      const settings = srcOf('apps/desktop/src-tauri/src', /\.rs$/, 'settings.rs');
+      if (!settings) {
+        problems.push('apps/desktop/src-tauri/src/settings.rs not found, so the shell wire enums were not compared');
+      } else {
+        for (const m of settings.text.matchAll(/enum\s+(\w+)\s*\{([\s\S]*?)\n\s*\}/g)) {
+          const tokens = [...m[2].matchAll(/=\s*"([^"]+)"/g)].map((x) => x[1]);
+          if (!tokens.length || !tokens.some((t) => accepted.has(t))) continue;
+          check(`${m[1]} (desktop wire enum)`, tokens);
+        }
+      }
+
+      const runner = srcOf('apps/android/android/app/src/main/java/app/aethernext', /\.kt$/, 'EngineRunner.kt');
+      if (!runner) {
+        problems.push('EngineRunner.kt not found, so the Android translator was not compared');
+      } else {
+        const at = runner.text.indexOf('fun protocolEnv');
+        const body = at < 0 ? null : runner.text.slice(at, runner.text.indexOf('internal fun isHttp2', at));
+        if (!body) {
+          problems.push(`${runner.path}: protocolEnv not found to read the tokens it emits`);
+        } else {
+          check(`${runner.path} protocolEnv`, [...body.matchAll(/->\s*"[^"]*"/g)].map((x) => x[0].replace(/.*->\s*"/, '').replace(/"$/, '')));
+        }
+      }
+      return problems;
+    },
+    inject() {
+      return {
+        file: 'packages/ui/src/__selftest___tokens.ts',
+        content: 'export const BROKEN = [\n  { value: "ultrasonic", label: "Turbo++" },\n  { value: "both", label: "Dual-stack" },\n];\n',
       };
     },
   },
