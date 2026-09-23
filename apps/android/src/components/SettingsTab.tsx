@@ -171,15 +171,15 @@ export function SettingsTab({
               <span>Exact size of the ClientHello packet dispatched in the first datagram</span>
             </div>
             <NumberField
-              label="QUIC Initial first fragment size"
-              min={16}
-              max={512}
-              step={16}
-              suffix="B"
-              disabled={settingsLocked}
-              value={settings.quicInitialFragSize}
-              onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })}
-            />
+            label="QUIC Initial first fragment size"
+            min={16}
+            max={512}
+            step={16}
+            suffix="B"
+            disabled={settingsLocked}
+            value={settings.quicInitialFragSize}
+            onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })}
+          />
           </div>
         )}
 
@@ -219,77 +219,81 @@ export function SettingsTab({
             </div>
             <div className="matrix-grid">
               <div className="matrix-cell">
-                <label>
+                <label htmlFor="field-junk-packet-count">
                   <span>Junk Packet Count</span>
-                  <NumberField
-                    label="Junk packet count"
-                    min={0}
-                    max={64}
-                    step={1}
-                    suffix="pkts"
-                    disabled={settingsLocked}
-                    value={settings.noizeJc}
-                    onCommit={(noizeJc) => patchSettings({ noizeJc })}
-                  />
                 </label>
+                <NumberField
+                  id="field-junk-packet-count"
+                  label="Junk packet count"
+                  min={0}
+                  max={64}
+                  step={1}
+                  suffix="pkts"
+                  disabled={settingsLocked}
+                  value={settings.noizeJc}
+                  onCommit={(noizeJc) => patchSettings({ noizeJc })}
+                />
               </div>
 
               <div className="matrix-cell">
-                <label>
+                <label htmlFor="field-min-payload-size-bytes">
                   <span>Min Payload Size</span>
-                  <NumberField
-                    label="Min payload size (bytes)"
-                    min={0}
-                    max={2048}
-                    step={16}
-                    suffix="B"
-                    disabled={settingsLocked}
-                    value={settings.noizeJmin}
-                    onCommit={(noizeJmin) =>
-                      patchSettings({
-                        noizeJmin,
-                        ...(noizeJmin > settings.noizeJmax ? { noizeJmax: noizeJmin } : {}),
-                      })
-                    }
-                  />
                 </label>
+                <NumberField
+                  id="field-min-payload-size-bytes"
+                  label="Min payload size (bytes)"
+                  min={0}
+                  max={2048}
+                  step={16}
+                  suffix="B"
+                  disabled={settingsLocked}
+                  value={settings.noizeJmin}
+                  onCommit={(noizeJmin) =>
+                    patchSettings({
+                      noizeJmin,
+                      ...(noizeJmin > settings.noizeJmax ? { noizeJmax: noizeJmin } : {}),
+                    })
+                  }
+                />
               </div>
 
               <div className="matrix-cell">
-                <label>
+                <label htmlFor="field-max-payload-size-bytes">
                   <span>Max Payload Size</span>
-                  <NumberField
-                    label="Max payload size (bytes)"
-                    min={0}
-                    max={2048}
-                    step={16}
-                    suffix="B"
-                    disabled={settingsLocked}
-                    value={settings.noizeJmax}
-                    onCommit={(noizeJmax) =>
-                      patchSettings({
-                        noizeJmax,
-                        ...(noizeJmax < settings.noizeJmin ? { noizeJmin: noizeJmax } : {}),
-                      })
-                    }
-                  />
                 </label>
+                <NumberField
+                  id="field-max-payload-size-bytes"
+                  label="Max payload size (bytes)"
+                  min={0}
+                  max={2048}
+                  step={16}
+                  suffix="B"
+                  disabled={settingsLocked}
+                  value={settings.noizeJmax}
+                  onCommit={(noizeJmax) =>
+                    patchSettings({
+                      noizeJmax,
+                      ...(noizeJmax < settings.noizeJmin ? { noizeJmin: noizeJmax } : {}),
+                    })
+                  }
+                />
               </div>
 
               <div className="matrix-cell">
-                <label>
+                <label htmlFor="field-burst-interval-ms">
                   <span>Burst Interval</span>
-                  <NumberField
-                    label="Burst interval (ms)"
-                    min={0}
-                    max={5000}
-                    step={10}
-                    suffix="ms"
-                    disabled={settingsLocked}
-                    value={settings.noizeIntervalMs}
-                    onCommit={(noizeIntervalMs) => patchSettings({ noizeIntervalMs })}
-                  />
                 </label>
+                <NumberField
+                  id="field-burst-interval-ms"
+                  label="Burst interval (ms)"
+                  min={0}
+                  max={5000}
+                  step={10}
+                  suffix="ms"
+                  disabled={settingsLocked}
+                  value={settings.noizeIntervalMs}
+                  onCommit={(noizeIntervalMs) => patchSettings({ noizeIntervalMs })}
+                />
               </div>
             </div>
           </div>
@@ -436,41 +440,43 @@ export function SettingsTab({
 
         <div className="setting-row input-row">
           <div className="port-field-block">
-            <label>
+            <label htmlFor="field-http-proxy-port">
               <div className="field-meta">
                 <strong>HTTP Proxy Port</strong>
                 <span className="field-hint">1024–65535</span>
               </div>
-              <NumberField
-                label="HTTP proxy port"
-                min={1024}
-                max={65535}
-                step={1}
-                disabled={settingsLocked}
-                value={settings.httpPort}
-                invalid={rejected("httpPort")}
-                onCommit={(httpPort) => patchSettings({ httpPort })}
-              />
             </label>
+            <NumberField
+              id="field-http-proxy-port"
+              label="HTTP proxy port"
+              min={1024}
+              max={65535}
+              step={1}
+              disabled={settingsLocked}
+              value={settings.httpPort}
+              invalid={rejected("httpPort")}
+              onCommit={(httpPort) => patchSettings({ httpPort })}
+            />
           </div>
 
           <div className="port-field-block">
-            <label>
+            <label htmlFor="field-socks5-proxy-port">
               <div className="field-meta">
                 <strong>SOCKS5 Proxy Port</strong>
                 <span className="field-hint">1024–65535</span>
               </div>
-              <NumberField
-                label="SOCKS5 proxy port"
-                min={1024}
-                max={65535}
-                step={1}
-                disabled={settingsLocked}
-                value={settings.socksPort}
-                invalid={rejected("socksPort")}
-                onCommit={(socksPort) => patchSettings({ socksPort })}
-              />
             </label>
+            <NumberField
+              id="field-socks5-proxy-port"
+              label="SOCKS5 proxy port"
+              min={1024}
+              max={65535}
+              step={1}
+              disabled={settingsLocked}
+              value={settings.socksPort}
+              invalid={rejected("socksPort")}
+              onCommit={(socksPort) => patchSettings({ socksPort })}
+            />
           </div>
         </div>
 

@@ -1838,9 +1838,14 @@ code, kbd, pre {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 14px;
 }
-.matrix-cell label {
+/* The label used to be the grid that stacked the caption over the control, and it
+   wrapped a compound control to do it. The block lays that out now, so the label
+   can point at the input instead of containing it. */
+.matrix-cell {
   display: grid;
   gap: 6px;
+}
+.matrix-cell label {
   font-size: var(--text-micro);
   color: var(--muted);
   font-weight: 600;
@@ -1851,11 +1856,11 @@ code, kbd, pre {
 .param-field-block {
   flex: 1 1 200px;
   min-width: 0;
+  display: grid;
+  gap: 6px;
 }
 .port-field-block label,
 .param-field-block label {
-  display: grid;
-  gap: 6px;
   width: 100%;
 }
 .field-meta {

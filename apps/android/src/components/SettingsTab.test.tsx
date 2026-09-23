@@ -29,6 +29,23 @@ const renderTab = (settings: Settings) => {
 };
 
 describe("android boot-start setting", () => {
+  it("labels point at a control instead of wrapping one", () => {
+    // The desktop's a11y suite asserts the same two facts; this file is the only
+    // place the Android markup gets checked at all, because there is no Android
+    // axe suite (T171 covers the desktop tabs only). A `<label>` that contains the
+    // −/+ buttons labels a compound control by nesting, and a label with no `for`
+    // associates only until someone reorders the children.
+    renderTab({ ...defaults });
+    const labels = Array.from(document.querySelectorAll("label"));
+    expect(labels.length).toBeGreaterThan(0);
+    expect(labels.filter((l) => l.querySelector("button, input, select")).length).toBe(0);
+    const withFor = labels.filter((l) => l.hasAttribute("for"));
+    expect(withFor.length).toBeGreaterThan(0);
+    for (const l of withFor) {
+      expect(document.getElementById(l.getAttribute("for") ?? "")).not.toBeNull();
+    }
+  });
+
   it("offers a switch that reports and writes launchAtLogin", () => {
     const patch = renderTab({ ...defaults, launchAtLogin: false });
     expect(switch_().getAttribute("aria-checked")).toBe("false");

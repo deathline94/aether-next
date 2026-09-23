@@ -932,18 +932,30 @@ Checked each part against the current tree rather than assuming the task text wa
        again (the two assertions that had to change to pass are the proof the old
        names were what the suite was locking in). `npx tsc -b` clean, 102 desktop +
        48 android tests green.
-       NOT DONE — the structural half: the `<label>` still *wraps* the compound
-       control (the two −/+ buttons and the input) at 16 sites instead of carrying
-       an `htmlFor`. The task's stated blocker is inaccurate: there is no
-       `.label > *` rule anywhere in either sheet, and the three rules that do
-       apply (`App.css:1850`, `:1864-1865`, android `:1828`, `:1842-1843`) keep
-       matching if the `<label>` stays inside the block, so converting the wrapper
-       is 16 JSX moves plus one `id`/`htmlFor` pair per field and no CSS work. The
-       attempt here stalled on a CRLF-blind regex (both apps' sources are CRLF and
-       the rewrite matched nothing across three tries) and was abandoned rather
-       than half-applied; the fields are named correctly in the meantime, so the
-       residual defect is click-to-focus behaviour on a label that contains
-       buttons, not an unnamed control.
+       DONE (same round) — the structural half. All 16 `<label>`s that wrapped a
+       compound control (two −/+ buttons and an input) now carry `htmlFor` and the
+       control carries the matching `id`, so the caption is a sibling of the widget
+       instead of its ancestor. The task's own blocker rationale was wrong in both
+       directions: there is no `.label > *` rule anywhere in either sheet, but CSS
+       *did* have to move, because `.matrix-cell label` and
+       `.port-field-block label, .param-field-block label` were the grid that
+       stacked caption over control — so that `display: grid; gap: 6px` is on the
+       blocks now and the label rules keep only the typography. `App.css:1863-1883`
+       / android `:1841-1861`.
+       Guarded by two new assertions, checked in the helper that every desktop a11y
+       render already goes through (so all three tabs are covered, not just the one
+       that changed): a `<label>` may contain no interactive descendant, and every
+       `label[for]` resolves to an element that exists. Red-verified by reverting
+       `SettingsTab.tsx` to HEAD and re-running: it fails naming the offenders
+       (`HTTP Proxy Port1024–65535−+`), green after the restore — the property is
+       measured, not asserted. Android has no a11y/axe suite at all (T171 covers
+       the desktop tabs only), so the same two checks went into
+       `SettingsTab.test.tsx` there; they were not red-run separately.
+       NOT measured: the CSS move. The live render kept serving a cached pre-fix
+       bundle through two rebuilds and a cache-busting navigation, so
+       `getComputedStyle` reported the old markup both times; the claim that the
+       layout is identical (same grid, same gap, one level up) is reasoned from the
+       rules, not read off a render. Re-check it in the §1 manual pass.
        NOT TOUCHED — the other ten clauses of this task (APG radio group for the
        filter chips, `tabIndex={-1}` on the steppers, the `App.tsx` modifier-key
        filter, scrollable-region focus, `aria-live` on hero/save dock, `:active`

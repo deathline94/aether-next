@@ -60,6 +60,27 @@ async function expectAccessible(label: string, container: HTMLElement) {
 
 function renderAndCheck(label: string, ui: React.ReactElement) {
   const { container } = render(ui);
+  // axe checks the accessibility *tree*; these two check the markup that produces
+  // it, and both were true of the field labels before T195: a `<label>` wrapped a
+  // compound control (its −/+ buttons are interactive descendants), and the label
+  // had no `for` at all, so the association existed only as long as the nesting
+  // happened to put a labelable element first.
+  const wrapping = Array.from(container.querySelectorAll("label")).filter((l) =>
+    l.querySelector("button, input, select, textarea"),
+  );
+  expect(
+    wrapping.map((l) => l.textContent?.trim().slice(0, 28)),
+    `${label}: a <label> must not contain the controls it labels`,
+  ).toEqual([]);
+  const doc = container.ownerDocument;
+  const dangling = Array.from(container.querySelectorAll("label[for]")).filter((l) => {
+    const id = l.getAttribute("for");
+    return !id || !doc.getElementById(id);
+  });
+  expect(
+    dangling.map((l) => l.getAttribute("for")),
+    `${label}: every <label for> has to point at a control that exists`,
+  ).toEqual([]);
   return expectAccessible(label, container);
 }
 

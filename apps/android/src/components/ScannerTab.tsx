@@ -290,38 +290,40 @@ export function ScannerTab({
 
         <div className="setting-row input-row">
           <div className="param-field-block">
-            <label>
+            <label htmlFor="field-concurrency-workers">
               <div className="field-meta">
                 <strong>Concurrency (Workers)</strong>
                 <span className="field-hint">{SCAN_MIN_CONCURRENCY}–{scanConcurrencyCeiling(protocol)} lanes</span>
               </div>
-              <NumberField
-                label="Concurrency (workers)"
-                min={SCAN_MIN_CONCURRENCY}
-                max={scanConcurrencyCeiling(protocol)}
-                step={10}
-                value={concurrency}
-                disabled={active}
-                onCommit={setConcurrency}
-              />
             </label>
+            <NumberField
+              id="field-concurrency-workers"
+              label="Concurrency (workers)"
+              min={SCAN_MIN_CONCURRENCY}
+              max={scanConcurrencyCeiling(protocol)}
+              step={10}
+              value={concurrency}
+              disabled={active}
+              onCommit={setConcurrency}
+            />
           </div>
           <div className="param-field-block">
-            <label>
+            <label htmlFor="field-timeout-ms">
               <div className="field-meta">
                 <strong>Timeout (ms)</strong>
                 <span className="field-hint">{scanTimeoutFloor(protocol)}–{SCAN_MAX_TIMEOUT_MS} ms</span>
               </div>
-              <NumberField
-                label="Timeout (ms)"
-                min={scanTimeoutFloor(protocol)}
-                max={SCAN_MAX_TIMEOUT_MS}
-                step={100}
-                value={timeoutMs}
-                disabled={active}
-                onCommit={setTimeoutMs}
-              />
             </label>
+            <NumberField
+              id="field-timeout-ms"
+              label="Timeout (ms)"
+              min={scanTimeoutFloor(protocol)}
+              max={SCAN_MAX_TIMEOUT_MS}
+              step={100}
+              value={timeoutMs}
+              disabled={active}
+              onCommit={setTimeoutMs}
+            />
           </div>
         </div>
 
