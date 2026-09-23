@@ -504,4 +504,30 @@ class SessionControllerTest {
 
         tempDir.deleteRecursively()
     }
+
+    // ─── T217: the headless rule that `onTaskRemoved` and `onDestroy` both lean on ───
+
+    @Test
+    fun aSessionSomeoneCanStillSeeIsNeverTornDownHeadlessly() {
+        // `EngineService.onTaskRemoved` and `MainActivity.onDestroy` both call this,
+        // and the whole safety of doing so sits in the first guard: swiping the
+        // task must not kill a tunnel that another window is still showing.
+        val h = harness(routingMode = "tun")
+        VpnTunnel.established(true, 1819)
+        h.controller.attachUi("activity-A") { _, _ -> }
+
+        h.controller.shutdownHeadless()
+
+        assertTrue("a live session with an attached UI must survive the call", h.controller.runner.isRunning())
+        assertEquals("no service may be stopped behind a visible tunnel", 0, h.context.stopServiceCalls.size)
+
+        assertTrue(h.controller.detachUi("activity-A"))
+        h.controller.shutdownHeadless()
+
+        assertFalse(
+            "with the last sink gone the tunnel cannot be left running where nothing can stop it",
+            h.controller.runner.isRunning(),
+        )
+        assertEquals("disconnected", h.controller.getState().status)
+    }
 }

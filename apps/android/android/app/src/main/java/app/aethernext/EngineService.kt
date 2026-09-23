@@ -16,6 +16,22 @@ import androidx.core.app.ServiceCompat
 class EngineService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * The task was swiped away from Recents.
+     *
+     * Android does not promise `onDestroy` on the activity in this path, and it
+     * definitely does not promise it when an OEM kills the UI while keeping a
+     * foreground service's process alive — which leaves a full-device tunnel and
+     * an engine running with nothing on screen that could ever stop them. The
+     * controller owns that decision: [SessionController.shutdownHeadless] no-ops
+     * while any UI is still attached (the task may have been removed with the
+     * activity living in another one) and tears the session down when none is.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        SessionController.getOrNull()?.shutdownHeadless("the app's task was swiped away")
+    }
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
