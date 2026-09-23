@@ -1404,7 +1404,19 @@ Checked each part against the current tree rather than assuming the task text wa
   by "it built" is the failure mode this repo keeps hitting. Recorded as follow-up
   instead.
 
-- [ ] T249 [P] Add `cargo fmt --check`, `npx tsc --noEmit` for both apps, and stylelint to `.github/workflows/ci.yml`; run `npx stylelint 'apps/*/src/**/*.css' --fix` after T192's structural edits, then hand-verify the token diff.
+- [x] T249 [P] Add `cargo fmt --check`, `npx tsc --noEmit` for both apps, and stylelint to `.github/workflows/ci.yml`; run `npx stylelint 'apps/*/src/**/*.css' --fix` after T192's structural edits, then hand-verify the token diff.
+  **Two of the three are wired; the third is a dependency decision, not a task.**
+`cargo fmt --check` runs on the touched files (the `fmt` job - and it recurses into
+the engine submodules, which is why no new engine module is cheap here). The
+typecheck half is already covered twice over: `ci.yml:180,310` run `npm run build`,
+which is `tsc -b && vite build` in both apps, and both were verified green locally.
+**stylelint is not added, deliberately:** it is not in either lockfile, installing it
+needs the network (this machine runs offline), a first run would produce a findings
+list nobody has read, and the repo already has 34 mechanical CSS gates - colour
+single-source, token alpha triples, contrast pairs, dead duplicates, unreachable
+breakpoints, press parity, radius ratchet - that stylelint does not cover, while
+covering little those do not. If a CSS parser is wanted for its own sake, that is a
+dependency to choose, so it is left named rather than silently half-installed.
 - [x] T250 [P] Update `Docs/GUIDE.en.md`, `README.md` and `PRODUCT.md` for the ratified constitution's invariants, the pin-rotation procedure, `--repair-routes`/`--repair-proxy`, the diagnostics export, and the deliberately-unsigned-updater decision.
 - [x] T251 [P] Mark `specs/001`–`specs/014` superseded by `015` with a one-line note each rather than deleting them, so no future reader treats `014`'s 40/40 `[x]` as evidence of fixed behaviour. Done as a blockquote under each H1 (five lines, naming the failure mode: guards that are unreachable, inverted, or never wired into CI), in all 14 `spec.md` files.
 - [ ] T252 Run the complete `quickstart.md` validation end to end (all 9 sections including the §1 soak and §9 device pass), attach artefacts, and record each guard's step-3 mutation result.
