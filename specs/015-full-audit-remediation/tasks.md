@@ -1900,3 +1900,49 @@ frontend tests, both `tsc -b`, both `vite build`.
   tasks (T030, T052, T078, T103, T130, T164, T201, T252, T253), which are
   validation runs - several need a clean Windows 11 VM, a device, or CI, and
   none can be signed off from this machine.
+
+---
+
+## Closing inventory (verified against the tree, not against this file)
+
+Everything that can be checked on this machine was run and is green: 38 invariant
+gates plus `--selftest-fail`, `sync-tokens --check`, `tsc -b` in both frontends,
+152 frontend tests, the shell's `cargo test --lib` (8) and `cargo clippy --all-targets
+-D warnings`, `rustfmt --check` on every engine file the change touched, and the
+Android unit suite (14 classes, 115 tests).
+
+### Fixed and proven by a check that can fail
+Gates: spawn sites compared by argument and required in-function verification;
+disallowed-method lists non-empty; radius scale ratchet; orphaned class rules; press
+feedback parity; transport and noise/scan/ip tokens cross-layer; shared package by
+name. Behaviour: transport refusal in engine + both shells; `warp`, `v4`, `balanced`,
+`dual-stack` named rather than defaulted; the phone's collapsed noise ladder; the
+per-connection proxy that outranks the system proxy; emitter registry survival and the
+headless rule; `onTaskRemoved`; wake lock under doze; publish gated by environment;
+error mapping unified across frontends; 12 dead CSS rules; 13 controls with hover but
+no press; two FR-037 twin pairs merged into `packages/ui`.
+
+### Open, with the reason it is not finished here — not silently skipped
+1. **Needs a machine that can compile `aether/`** (GNU toolchains only here,
+   `boring-sys` needs libclang): T022 endpoint-cache actor, T039 netioapi replacing
+   `route.exe`/`netsh`, T019 `tauri-specta` bindings, T060's crypt32 signer witness,
+   T048b's write half. T060 and T048b each carry the attempted design and the exact
+   blocker; a signature change landed blind here would be a CI failure, not a fix.
+2. **Needs a network install, so a dependency decision**: T224 okhttp 4.x to 5.x,
+   stylelint (T249), osv-scanner (T237), WorkManager keep-alive (T217).
+3. **Needs a device or a second host**: the per-connection proxy blob, real VPN
+   revoke behaviour, the VM checkpoints (T030/T052/T078/T103/T130/T164/T201/T225/
+   T241/T252/T253).
+4. **Behavioural, not mechanical**: T198's remaining ten twins - `App.tsx` (66),
+   `useRuntime` (60), `useScanner` (56), `types.ts` (52) - where the gap is the two
+   surfaces doing the same job differently; `useLogs.ts` cannot merge before
+   `types.ts` is settled. T212's coroutine migration is the same class.
+5. **Yours to decide, recorded rather than chosen**: DPAPI dual-wrap (T255),
+   `client_id` injection default (T246), junk ceiling against the 1280 IPv6 MTU,
+   whether `START_STICKY` should re-route traffic after a LowMemoryKiller kill (the
+   ledger argues for the ledger + explicit resume switch that already exist).
+
+The first step with more turns is item 4's cheapest member or item 1's `osv-scanner`
+free of charge? no: item 1's gate for `TransportKind`/routing tokens is already
+covered; the cheapest true next step is T198's `types.ts`, because it unblocks
+`useLogs.ts` and `App.tsx` behind it.
