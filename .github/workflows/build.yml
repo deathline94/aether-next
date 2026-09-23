@@ -504,6 +504,12 @@ jobs:
     needs: [test, windows-app, android-apk]
     if: ${{ always() && needs.test.result == 'success' && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
+    # A named environment is the only handle GitHub has for "who may let this
+    # out": the settings on `release` (required reviewers, wait timers) are what
+    # stands between a merged PR and an artefact signed by this repo's identity
+    # and served to every auto-updater. Without it `contents: write` on the tag
+    # run is an unguarded publish path.
+    environment: release
     permissions:
       contents: write
     steps:

@@ -1898,6 +1898,46 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'disallowed-methods-configured',
+    invariant: 'BC-18',
+    summary: 'every clippy.toml still bans something, so -D warnings has teeth',
+    scan(api) {
+      // CI runs clippy with `-D warnings`, which is only a guarantee while the
+      // `disallowed-methods` list is non-empty: an emptied file switches the lint
+      // off for the crate and reports zero violations. The list is the rule; the
+      // run is only the enforcement.
+      const v = [];
+      const configs = api.files('aether', /clippy\.toml$/).concat(api.files('apps', /clippy\.toml$/));
+      if (configs.length < 2) {
+        v.push(
+          `only ${configs.length} clippy.toml found (engine and shell each carry one) — a banned-method list nobody can see is not a rule`,
+        );
+      }
+      for (const f of configs) {
+        const text = api.read(f);
+        const block = /disallowed-methods\s*=\s*\[([\s\S]*?)\n\]/.exec(text);
+        if (!block) {
+          v.push(`${rel(f)}: declares no \`disallowed-methods\` array`);
+          continue;
+        }
+        const entries = block[1]
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => l.startsWith('{') && l.includes('path'));
+        if (!entries.length) {
+          v.push(`${rel(f)}: disallowed-methods is empty — clippy -D warnings bans nothing there`);
+        }
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/clippy.toml',
+        content: '# emptied during the self-test\ndisallowed-methods = []\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */
