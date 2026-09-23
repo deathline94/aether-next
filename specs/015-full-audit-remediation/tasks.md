@@ -1175,6 +1175,44 @@ Checked each part against the current tree rather than assuming the task text wa
 - [ ] T252 Run the complete `quickstart.md` validation end to end (all 9 sections including the §1 soak and §9 device pass), attach artefacts, and record each guard's step-3 mutation result.
 - [ ] T253 Run `/speckit-converge` to diff the shipped tree against FR-001…FR-047 and append any unbuilt work as new tasks, then `/speckit-analyze` for cross-artifact consistency, then re-verify every `tasks.md` checkbox against source rather than trusting it — the discipline this feature exists to install.
 
+- [x] T254 [US3] FR-014: retry transient platform crypto failures and surface them typed; destroy key material only on explicit, evidenced corruption. `apps/desktop/src-tauri/src/dpapi.rs`.
+  **Two of the three clauses closed; the third is a product decision (T255).**
+  `CryptProtectData`/`CryptUnprotectData` were called exactly once each and every
+  failure — LSASS busy, the DPAPI directory held by another process, a profile that
+  is not mapped yet, *and* a genuinely corrupt blob — came back as the same
+  undifferentiated `format!("CryptUnprotectData failed: {err}").into()`, which the
+  caller cannot act on and the user cannot read. Now: `classify_dpapi` splits the
+  last-error code into `Retryable`/`Fatal` with `Fatal` as the default (an unknown
+  code is never guessed at), `dpapi_attempt` spends a fixed budget of 3 attempts
+  with 60/240 ms backoff on a retryable one and returns immediately on a fatal one,
+  and the surfaced `CommandError` carries `key_service_unavailable` vs
+  `key_service_rejected` so the UI can say "try again" rather than "your identity is
+  gone". No path deletes anything: the key file is left in place whatever the
+  failure, which is the clause the requirement is really about.
+  Also fixed while in there: `raw_key` was a plain `[u8; 32]` with a manual
+  `zeroize()` at the *bottom* of the function, while five of the six exits are `?`
+  and a stack array has no `Drop` — so every failure path left a master key sitting
+  in the frame of a process that keeps running. Both the generated key and the
+  unwrapped one are `Zeroizing` now, which covers the `?` exits by construction.
+  **Verified locally** (`cargo test --lib` in `src-tauri`, which works here even
+  though the engine does not build): `a_bad_moment_is_told_apart_from_bad_bytes`,
+  `the_retry_budget_spends_itself_on_a_transient_and_not_on_a_corrupt` (asserts the
+  retryable case costs 3 calls and the corrupt one costs exactly 1), and
+  `transcribed_codes_match_the_windows_headers`, which pins each hand-transcribed
+  Win32 constant against `windows_sys` itself — the table has to compile on every
+  platform, so a typo in a code would otherwise be a silent security downgrade.
+  The live-DPAPI round trip (wrap, mutate, prove the file survives) is *not* in the
+  suite for a measured reason: referencing `get_or_create_dpapi_config_key` from
+  this crate's test binary makes the whole binary fail to load under the GNU
+  toolchain here (`STATUS_ENTRYPOINT_NOT_FOUND`, before any test runs), so it would
+  cost every other shell test to gain one. The invariant it would have checked is
+  held by the 30th gate instead — `master-key-never-destroyed` (BC-03), which fails
+  if any shell source deletes `config_key.dpapi` or the `key_file` binding, and
+  which `--selftest-fail` proves can fail.
+
+- [ ] T255 [US3] FR-014's remaining clause: "key material MUST be dual-wrapped for recovery". Needs a decision, not a patch. `config_key.dpapi` holds one DPAPI user-scope blob; if the Windows profile's DPAPI master key is lost (reimage, domain trust break, corrupt `%APPDATA%\Microsoft\Protect`), every identity on disk is unrecoverable and the only remedy is a fresh enroll. A second wrap is only worth having if it lives in a *different* failure domain, and the three candidates are not equivalent: (a) a user-chosen recovery passphrase (real recovery, but it is a feature — onboarding prompt, forgotten-passphrase path, `argon2` KDF, verifier, UI strings in three frontends); (b) `CRYPTPROTECT_LOCAL_MACHINE` (no new UX, but any local administrator and any elevated process can then unwrap the master key, which is a weaker promise than the user scope the whole envelope design is built on); (c) rely on the domain backup key if the machine already has one (no code, no guarantee, silent on home PCs). Chosen here: none, and the file is never destroyed on a crypto failure, which removes the *accidental* loss path and leaves only the profile-loss path.
+
+
 ---
 
 ## Dependencies & Execution Order

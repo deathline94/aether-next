@@ -656,6 +656,38 @@ const GATES = [
     },
   },
   {
+    name: 'master-key-never-destroyed',
+    invariant: 'BC-03',
+    summary: 'no code path deletes the DPAPI master-key envelope',
+    scan(api) {
+      // FR-014's subject is not the retry, it is what a failure is allowed to
+      // cost: `config_key.dpapi` is the only wrapped copy of the secret that
+      // decrypts every identity on the machine, so a decrypt failure — transient
+      // or proven — must leave the bytes alone. Deletion is irreversible and
+      // silent, and this is the check that keeps it that way. The writer's own
+      // temp file (`*.tmp`) is fair game, so the rule keys on the final name.
+      const v = [];
+      const doomed = /config_key\.dpapi|key_file/;
+      for (const f of api.files('apps/desktop/src-tauri/src', /\.rs$/)) {
+        const t = api.read(f);
+        t.split('\n').forEach((line, i) => {
+          const s = line.trim();
+          if (s.startsWith('//')) return;
+          if (!/\b(remove_file|remove_dir|remove_dir_all|delete_file|DeleteFileW?)\s*\(/.test(s)) return;
+          if (!doomed.test(s)) return;
+          v.push(`${locate(f, t, t.indexOf(line))} deletes the master-key envelope: ${s.slice(0, 78)}`);
+        });
+      }
+      return v;
+    },
+    inject() {
+      return {
+        file: 'apps/desktop/src-tauri/src/__selftest__.rs',
+        content: 'fn f(key_file: &Path) {\n  let _ = std::fs::remove_file(&key_file);\n}\n',
+      };
+    },
+  },
+  {
     name: 'tls-floor-is-1-3',
     invariant: 'BC-03',
     summary: 'every engine TLS context sets its floor to 1.3; no 1.2-or-below constant',
