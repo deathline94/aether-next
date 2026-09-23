@@ -4,7 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       actions:
         patterns:
@@ -14,6 +14,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     groups:
       root-npm:
         dependency-type: development
@@ -26,6 +27,7 @@ updates:
     directory: /apps/desktop
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     groups:
       desktop:
         patterns:
@@ -35,6 +37,7 @@ updates:
     directory: /apps/android
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     groups:
       android-web:
         patterns:
@@ -44,7 +47,7 @@ updates:
     directory: /aether
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     ignore:
       # Pinned to a pre-release by design (see aether/Cargo.toml). Changing it is
       # a deliberate, reviewed act, not a routine bump.
@@ -54,6 +57,7 @@ updates:
     directory: /apps/desktop/src-tauri
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
 
   # Gradle: the Android shell's dependency graph (AGP, Kotlin, androidx, the
   # Tauri-generated WebView glue) was invisible to Dependabot - `gradle` is a
@@ -63,7 +67,7 @@ updates:
     directory: /apps/android/android
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       android-gradle:
         patterns:
