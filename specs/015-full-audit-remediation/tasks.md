@@ -1942,7 +1942,7 @@ no press; two FR-037 twin pairs merged into `packages/ui`.
    whether `START_STICKY` should re-route traffic after a LowMemoryKiller kill (the
    ledger argues for the ledger + explicit resume switch that already exist).
 
-The first step with more turns is item 4's cheapest member or item 1's `osv-scanner`
-free of charge? no: item 1's gate for `TransportKind`/routing tokens is already
-covered; the cheapest true next step is T198's `types.ts`, because it unblocks
-`useLogs.ts` and `App.tsx` behind it.
+The cheapest genuine next step is T198's `types.ts`: settling it unblocks
+`useLogs.ts` and `App.tsx` behind it, and both are user-visible. Everything else on
+this list needs a capability this machine does not have - a compiling engine, a network
+install, a device - or a decision that is yours to make.
