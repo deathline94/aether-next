@@ -1097,6 +1097,28 @@ Checked each part against the current tree rather than assuming the task text wa
 - [x] T196 [US6] **Delete** `endpointPreset` from `apps/desktop/src/types.ts:56` (declared, read by nobody, absent from the Rust struct) and remove the inline hex styles + stray `text-red-400` from `SettingsTab.tsx:40-60`, replacing that banner with the shared `.error-banner` geometry and `var(--coral)`.
 - [x] T197 [US6] Fix Android visual parity in `apps/android/android/app/src/main/res/values/`: add `values-night/themes.xml` (today `Theme.MaterialComponents.DayNight` with a hardcoded `#0D1113` bar paints dark icons on dark in light mode), align `colorPrimary #66E3A4` with `--emerald #00f08a`, and unify the three near-black chrome colours (`#07090b` / `#0D1113` / `#101517`).
 - [ ] T198 [US6] Migrate both UIs onto `packages/ui` for tokens, types and components, converting behavioural differences into props (watchdog enable, hydration merge, scan wording, and `speedProfiles` hint copy which lives inline in `ConnectionTab.tsx` on desktop but in `types.ts` on Android).
+  **Unblocked, and the first pair is merged.** The blocker this item named was
+  structural - a JSX component placed in `packages/ui` could not resolve `react`,
+  because there is no root node_modules and the shared package deliberately has no
+  dependencies of its own (see the root package.json on why it is not an npm
+  workspace). T029's alias made the fix obvious: each app now maps `react`,
+  `react/jsx-runtime` and `react/jsx-dev-runtime` for files outside its own tree,
+  in tsconfig `paths` for the type-check and in `resolve.alias` for the bundler.
+  `components/ErrorBoundary.tsx` - which was byte-identical in the two apps - now
+  lives once in `packages/ui/src/components/`, and each app keeps a one-line
+  re-export so no call site changed. Both `tsc -b` runs, both production builds
+  and both test suites (103 + 49) pass unchanged.
+  Two gates had to learn that a shared component is rendered by both surfaces:
+  `css-class-resolution` now checks a `packages/ui` component's classNames against
+  *both* sheets (one sheet lacking a rule it styles was previously invisible, since
+  neither app's markup mentioned the class any more), and `no-orphaned-class-rules`
+  counts shared markup as a user of a rule - it was the move itself that surfaced
+  `.crash-screen`, which the shared boundary renders.
+  **What is left here:** the remaining eleven twin pairs. `components/ui.tsx` is the
+  next one - its code lines are already identical, so it needs a prose merge rather
+  than a decision - and the behavioural divergences (`App.tsx` at 66, `useRuntime`
+  at 60, `useScanner` at 56, `types.ts` at 52) are the real work, because those
+  numbers are the two frontends doing the same job differently.
   <!-- Progress measured, not claimed (`5a26ef7`, `7c451bf`, this round).
        Moved: the whole console fact-extraction layer (`packages/ui/src/logs.ts`
        - the hit arbiter, the milestone/error predicates and the eviction-aware

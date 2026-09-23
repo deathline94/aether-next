@@ -22,6 +22,12 @@ export default defineConfig(async () => ({
   // @aether/ui and only the type-check would pass.
   resolve: {
     alias: { "@aether/ui": uiSrc },
+    // A component that lives in packages/ui still renders JSX, so the runtime
+    // has to be reachable from there too: no root node_modules exists, and the
+    // shared package deliberately has none of its own.
+    react: uiPath("./node_modules/react"),
+    "react/jsx-runtime": uiPath("./node_modules/react/jsx-runtime"),
+    "react/jsx-dev-runtime": uiPath("./node_modules/react/jsx-dev-runtime"),
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

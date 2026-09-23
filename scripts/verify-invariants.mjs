@@ -484,9 +484,15 @@ const GATES = [
        */
       const BUILD_GENERATED = new Set(['font-mono', 'tabular-nums', 'text-red-400']);
       const v = [];
-      for (const f of api.files('apps', /\.(tsx|jsx)$/)) {
-        const app = Object.keys(FOR_APP).find((a) => rel(f).startsWith(`${a}/`));
-        if (!app) continue;
+      for (const f of api.files('apps', /\.(tsx|jsx)$/).concat(api.files('packages/ui/src', /\.tsx$/))) {
+        const shared = rel(f).startsWith('packages/ui/');
+        const appsToCheck = shared
+          ? Object.keys(FOR_APP)
+          : [Object.keys(FOR_APP).find((a) => rel(f).startsWith(`${a}/`))].filter(Boolean);
+        // A shared component renders on both surfaces, so its classes have to be
+        // styled in both sheets; an app's own markup is checked only against its
+        // own sheet (the union is what let desktop markup borrow a phone rule).
+        for (const app of appsToCheck) {
         const definedFor = FOR_APP[app];
         const t = api.read(f);
         for (const m of t.matchAll(/className=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
@@ -502,6 +508,7 @@ const GATES = [
             }
             if (!definedFor.has(tok)) v.push(`${locate(f, t, m.index)} className "${tok}" has no rule in ${app}/src`);
           }
+        }
         }
       }
       return v;
@@ -1700,13 +1707,16 @@ const GATES = [
     summary: 'files that exist in both frontends may not drift further apart than recorded',
     scan(api) {
       /*
-       * FR-037 wants one shared source; the tree has thirteen files copied into
-       * both apps, and the reason every UI fix in this project has had to be
-       * applied twice (and, historically, was applied once) is that pair. The
-       * copies cannot all be merged yet: `react` resolves only inside each app's
-       * node_modules, so a JSX component placed in packages/ui does not typecheck
-       * or bundle - which is why `components/ui.tsx` and the error boundary are
-       * still per-app twins rather than imports.
+       * FR-037 wants one shared source; the tree still carries twelve files
+       * copied into both apps, and the reason every UI fix in this project has had
+       * to be applied twice (and, historically, was applied once) is that pair.
+       * The error boundary is no longer one of them: it is a shared component with
+       * an identical re-export here per app, which needed each app to map `react`
+       * and the JSX runtimes for files that live outside it (there is no root
+       * node_modules and packages/ui deliberately has none of its own) - a missing
+       * mapping, not a missing install. `components/ui.tsx` is still a twin pair,
+       * whose code is already identical: what separates the two files is comment
+       * prose that has to be reconciled by hand before one of them is deleted.
        *
        * So this is a ratchet, not a promise: each file's code-line identity is
        * recorded as it stands, and a change may only raise it. Drift below the
@@ -2115,8 +2125,12 @@ const GATES = [
           if (brace < 0) continue;
           for (const m of line.slice(0, brace).matchAll(/\.([A-Za-z][\w-]*)/g)) defined.add(m[1]);
         }
+        // Markup that lives in the shared package is rendered by both apps, so it
+        // counts as a user of the rule on each surface — and a rule it needs must
+        // exist in both sheets, not just the one that happened to be edited.
         const corpus = api
           .files(app, /\.(tsx|ts|jsx|js|html)$/)
+          .concat(api.files('packages/ui/src', /\.(tsx|ts)$/))
           .map((f) => api.read(f))
           .join('\n');
         const dead = [...defined].filter((c) => !corpus.includes(c)).sort();

@@ -17,7 +17,11 @@
     "baseUrl": ".",
     "paths": {
       "@aether/ui": ["../../packages/ui/src/index.ts"],
-      "@aether/ui/*": ["../../packages/ui/src/*"]
+      "@aether/ui/*": ["../../packages/ui/src/*"],
+      "react": ["node_modules/@types/react"],
+      "react/jsx-runtime": ["node_modules/@types/react/jsx-runtime"],
+      "react/jsx-dev-runtime": ["node_modules/@types/react/jsx-dev-runtime"],
+      "react/*": ["node_modules/react/*"],
     },
 
     /* Bundler mode */

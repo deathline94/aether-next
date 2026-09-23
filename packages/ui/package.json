@@ -8,7 +8,8 @@
   "types": "src/index.ts",
   "exports": {
     "./tokens.css": "./tokens.css",
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./components/*": "./src/components/*.tsx"
   },
   "peerDependencies": {
     "react": "^19.0.0"
