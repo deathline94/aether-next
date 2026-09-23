@@ -262,6 +262,31 @@
 ### Implementation for User Story 2
 
 - [ ] T060 [US2] Implement the ordered binary-trust pipeline in `aether/src/trust.rs` (contract T-A3): resolve canonical path → file SHA-256 → leaf cert hash + SPKI hash → chain anchored **at the pinned leaf** → `CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_AUTHENTICODE)` → spawn.
+  **The pipeline exists, one step from where this says, and two of its clauses are
+  already satisfied by the step that is there.** It lives in
+  `apps/desktop/src-tauri/src/trust.rs` — `aether/src/trust.rs` is MASQUE SPKI pin
+  parsing and never sees a binary on disk. The order is: canonicalize-or-refuse
+  (`:50-66`) → SHA-256 of the *canonical* path (`:490-500`) → `WinVerifyTrust` with
+  `WINTRUST_ACTION_GENERIC_VERIFY_V2` (`:386-403`) → leaf-DER SHA-256 and publisher CN
+  compared to the committed anchor (`:439-448`) → only then a spawn, from every routing
+  mode, at all four call sites (enforced by `engine-verified-before-every-spawn`).
+  Two premises here are wrong: `CERT_CHAIN_POLICY_AUTHENTICODE` is exactly what the PE
+  SIP runs inside that `WinVerifyTrust` call, so it is not a missing step; and the
+  revocation walk is switched off *deliberately* with the reason written down at
+  `:373-381` (a whole-chain CRL/OCSP walk on every launch fails closed offline and
+  against a freshly-issued certificate), together with `WTD_DISABLE_MD2_MD4` and
+  `WTD_CACHE_ONLY_URL_RETRIEVAL`. Anchoring the chain at the pin rather than the system
+  root program is a *stricter* equality test already satisfied by comparing the leaf
+  digest. **What is genuinely left:** the leaf digest and subject are read by a *second*
+  opener — `powershell.exe Get-AuthenticodeSignature` (`:404-420`) — after WinVerifyTrust
+  read the file, so the two reads are not the same handle: a swap window, bounded by
+  needing write access to a directory whose DACL this app already restricts, and by the
+  verification happening immediately before the spawn. Closing it means taking the signer
+  certificate out of the verified context (the `CryptSIPGetSignedDataMsg` →
+  `CryptQueryObject` → chain route) and deleting the PowerShell dependency. That is
+  ~100 lines of unsafe crypt32 in the one module where a mistake is a bypass, testable
+  here only against a machine's own signed system binaries — so it is named, not
+  attempted blind.
 - [x] T061 [US2] Make verification unconditional across every branch in `apps/desktop/src-tauri/src/lib.rs::engine_path` (`:1046-1094`) and `connect` (`:1368`), including custom `enginePath` and `AETHER_ENGINE`.
 - [x] T062 [US2] Narrow the trusted root: remove `exe.parent().parent()` from the allowed roots in `apps/desktop/src-tauri/src/lib.rs:762-787` — for perMachine that is `C:\Program Files`, for portable a user-writable extraction directory, while the child is handed the DPAPI master key.
   Done. `allowed_binary_roots` replaces "the exe's directory and its parent": the roots are
