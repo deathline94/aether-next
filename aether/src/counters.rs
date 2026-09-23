@@ -28,7 +28,7 @@ macro_rules! counters {
         }
 
         /// `(snapshot key, counter)` for every counter that exists.
-        pub const ALL: &[(&'static str, &'static AtomicU64)] = &[
+        pub static ALL: &[(&'static str, &'static AtomicU64)] = &[
             $( ( $key, &$name ), )*
         ];
     };

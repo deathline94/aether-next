@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
+import { renderHook, act, waitFor, cleanup, configure } from "@testing-library/react";
 import { useRuntime } from "./useRuntime";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -32,6 +32,10 @@ function captureState(): (payload: unknown) => void {
 }
 
 const appendLog = vi.fn();
+
+// CI runs this file alongside several builds; one-second async waits can expire
+// before React finishes hydration under runner contention.
+configure({ asyncUtilTimeout: 5000 });
 
 /**
  * A realistic `get_settings` payload: all eighteen fields the Rust `Settings`
