@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { renderHook, act, waitFor, cleanup, configure } from "@testing-library/react";
+import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
 import { useRuntime } from "./useRuntime";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -33,9 +33,6 @@ function captureState(): (payload: unknown) => void {
 
 const appendLog = vi.fn();
 
-// CI runs this file alongside several builds; one-second async waits can expire
-// before React finishes hydration under runner contention.
-configure({ asyncUtilTimeout: 5000 });
 
 /**
  * A realistic `get_settings` payload: all eighteen fields the Rust `Settings`
@@ -230,21 +227,20 @@ describe("desktop connect watchdog", () => {
     const { result } = renderHook(() => useRuntime(log));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
 
-    vi.useFakeTimers();
+    const timers = vi.spyOn(globalThis, "setTimeout");
     try {
       emit({ status: "connecting", detail: "Starting engine", pid: 7, endpoint: null, handshakeRttMs: null });
       vi.mocked(invoke).mockClear();
-
-      act(() => {
-        vi.advanceTimersByTime(90_000);
-      });
+      const watchdog = timers.mock.calls.find((call) => call[1] === 90_000)?.[0];
+      expect(watchdog).toBeTypeOf("function");
+      act(() => { (watchdog as () => void)(); });
 
       expect(result.current.runtime.status).toBe("error");
       expect(result.current.runtime.detail).toMatch(/timed out/i);
       expect(vi.mocked(invoke).mock.calls.map((c) => c[0])).toContain("disconnect");
       expect(log.mock.calls.map((c) => c[0].message).join("\n")).toMatch(/timed out after 90s/i);
     } finally {
-      vi.useRealTimers();
+      timers.mockRestore();
     }
   });
 
@@ -255,21 +251,21 @@ describe("desktop connect watchdog", () => {
     const { result } = renderHook(() => useRuntime(log));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
 
-    vi.useFakeTimers();
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    const clears = vi.spyOn(globalThis, "clearTimeout");
     try {
       emit({ status: "connecting", detail: "Starting engine", pid: 7, endpoint: null, handshakeRttMs: null });
-      act(() => {
-        vi.advanceTimersByTime(89_000);
-      });
+      const index = timers.mock.calls.findIndex((call) => call[1] === 90_000);
+      expect(index).toBeGreaterThanOrEqual(0);
+      const watchdogId = timers.mock.results[index]?.value;
       emit({ status: "connected", detail: "Session active", pid: 7, endpoint: "104.16.0.1:443", handshakeRttMs: 21 });
-      act(() => {
-        vi.advanceTimersByTime(60_000);
-      });
 
       expect(result.current.runtime.status).toBe("connected");
+      expect(clears.mock.calls.some((call) => call[0] === watchdogId)).toBe(true);
       expect(log.mock.calls.map((c) => c[0].message).join("\n")).not.toMatch(/timed out/i);
     } finally {
-      vi.useRealTimers();
+      timers.mockRestore();
+      clears.mockRestore();
     }
   });
 });

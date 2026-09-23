@@ -102,8 +102,17 @@ fn test_unauthenticated_backup_is_never_restored() {
         !std::path::Path::new(&bak_path).exists(),
         "the stray backup must be moved"
     );
+    let quarantined = fs::read_dir(&dir)
+        .expect("list quarantined files")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("aether.toml.quarantined.")
+        });
     assert!(
-        std::path::Path::new(&format!("{config_path}.quarantined")).exists(),
+        quarantined,
         "and preserved for inspection rather than deleted"
     );
 
@@ -123,6 +132,7 @@ fn test_plaintext_migration_to_encrypted() {
     assert!(!raw.starts_with(b"AETHERCFG"), "Must be legacy plaintext");
 
     set_key();
+    runtime_env::set("AETHER_MIGRATE_PLAINTEXT_CONFIG", "1");
     let loaded = match load(&config_path) {
         Ok(Some(id)) => id,
         Ok(None) => panic!("expected an identity after migration"),
@@ -162,6 +172,7 @@ fn test_plaintext_migration_fails_fatally_when_save_fails() {
     }
 
     set_key();
+    runtime_env::set("AETHER_MIGRATE_PLAINTEXT_CONFIG", "1");
     assert!(
         load(&config_path).is_err(),
         "Migration must fail fatally if the re-save fails"

@@ -203,6 +203,7 @@ fn plaintext_is_migrated_and_the_result_is_read_back() {
     let path = dir.file("aether.toml");
     legacy_plaintext(&path, "plain-dev");
     use_key();
+    runtime_env::set("AETHER_MIGRATE_PLAINTEXT_CONFIG", "1");
 
     let id = present(succeeds(load(&path), "migrate"), "an identity");
     assert_eq!(id.device_id, "plain-dev");
@@ -249,9 +250,15 @@ fn a_planted_backup_is_quarantined_and_never_becomes_the_identity() {
         !Path::new(&bak).exists(),
         "the backup must be moved out of the way"
     );
-    assert!(
-        Path::new(&format!("{path}.quarantined")).exists(),
-        "and kept for inspection"
-    );
+    let quarantined = fs::read_dir(&dir.0)
+        .expect("list quarantined files")
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("aether.toml.quarantined.")
+        });
+    assert!(quarantined, "and kept for inspection");
     no_key();
 }

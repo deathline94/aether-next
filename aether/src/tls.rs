@@ -116,9 +116,10 @@ pub fn install_pin_verification(
     builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| {
         let host = host_owned.as_str();
         let now = crate::trust::now_unix();
-        // Runs before `ctx.chain()` because both need `ctx` and verify_cert
-        // takes it mutably.
-        if require_chain && !(ok && ctx.verify_cert().unwrap_or(false)) {
+        // `ok` is BoringSSL's chain verdict for this callback invocation.
+        // Re-entering `verify_cert()` here attempts verification from inside its
+        // own callback and rejects even a valid chain.
+        if require_chain && !ok {
             log::error!("[tls] {host:?}: certificate chain verification failed");
             return false;
         }

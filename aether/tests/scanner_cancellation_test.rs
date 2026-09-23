@@ -369,9 +369,13 @@ async fn test_scanner_cancellation_barrier_with_populated_cache() {
     let ports = vec![443];
 
     // Verification probe that simulates a long running probe (5s)
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_probe = entered.clone();
     let verify: Box<VerifyFn<'static>> = Box::new(
-        |ip: IpAddr, port: u16, _timeout: Duration, _ironclad: bool| {
+        move |ip: IpAddr, port: u16, _timeout: Duration, _ironclad: bool| {
+            let entered = entered_probe.clone();
             Box::pin(async move {
+                entered.notify_one();
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 Some(ProbeResult {
                     ip,
@@ -382,19 +386,15 @@ async fn test_scanner_cancellation_barrier_with_populated_cache() {
         },
     );
 
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let barrier_clone = barrier.clone();
-
-    tokio::spawn(async move {
-        // Synchronize with main task right before or as hunt starts
-        barrier_clone.wait().await;
-        // Request cancellation
-        request_scan_cancel();
-    });
-
-    barrier.wait().await;
+    let hunt = hunt_best(&config, &ports, IpScan::V4, ScanMode::Balanced, &*verify);
+    tokio::pin!(hunt);
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut hunt => panic!("scan completed before cancellation: {result:?}"),
+    }
     let start = Instant::now();
-    let result = hunt_best(&config, &ports, IpScan::V4, ScanMode::Balanced, &*verify).await;
+    request_scan_cancel();
+    let result = hunt.await;
     let elapsed = start.elapsed();
 
     assert!(result.is_err(), "Expected cancellation error");

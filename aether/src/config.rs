@@ -535,7 +535,7 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
     let allow_plaintext = migration_requested();
     let identity = match read_identity(path, allow_plaintext)? {
         Loaded::Sealed(identity) => return Ok(Some(identity)),
-        Loaded::Plaintext(identity) => identity,
+        Loaded::LegacySealed(identity) | Loaded::Plaintext(identity) => identity,
     };
 
     // A config that is not in the current envelope is rewritten immediately and
@@ -558,7 +558,7 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
                 ));
             }
         }
-        Loaded::Plaintext(_) => {
+        Loaded::LegacySealed(_) | Loaded::Plaintext(_) => {
             return Err(AetherError::Config(
                 "config migration did not produce a sealed envelope".into(),
             ))
@@ -571,8 +571,10 @@ pub fn load(path: &str) -> Result<Option<Identity>> {
 
 /// What `read_identity` found behind the file name.
 enum Loaded {
-    /// Authenticated under the v2 (or legacy v1) envelope.
+    /// Authenticated under the path-bound v2 envelope.
     Sealed(Identity),
+    /// Authenticated under the legacy v1 envelope; rewrite with path binding.
+    LegacySealed(Identity),
     /// Valid identity bytes with no envelope at all — only ever produced when the
     /// caller passed an explicit migration signal.
     Plaintext(Identity),
@@ -594,7 +596,8 @@ fn read_identity(path: &str, allow_plaintext: bool) -> Result<Loaded> {
         )));
     }
     let raw = std::fs::read(path)?;
-    let sealed = raw.starts_with(MAGIC_V2) || raw.starts_with(MAGIC_V1);
+    let legacy_v1 = raw.starts_with(MAGIC_V1);
+    let sealed = raw.starts_with(MAGIC_V2) || legacy_v1;
     let opened = match key()? {
         Some(k) => Some(open(path, &raw, &k)?),
         None if sealed => {
@@ -619,7 +622,9 @@ fn read_identity(path: &str, allow_plaintext: bool) -> Result<Loaded> {
     let persisted: PersistedIdentity =
         toml::from_str(&text).map_err(|e| AetherError::Config(format!("config parse: {e}")))?;
     let identity = Identity::try_from(persisted)?;
-    Ok(if sealed {
+    Ok(if legacy_v1 {
+        Loaded::LegacySealed(identity)
+    } else if sealed {
         Loaded::Sealed(identity)
     } else {
         Loaded::Plaintext(identity)
