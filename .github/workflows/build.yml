@@ -656,8 +656,8 @@ jobs:
           # `test -s` above only proves non-empty. The staged hev payload is what
           # actually terminates the user's tunnel inside the VpnService fd, so it
           # is checked against a recorded digest and its ELF page alignment.
-          node ../../scripts/verify-hev-lock.mjs
-          node ../../scripts/verify-hev-lock.mjs --selftest-fail
+          node ../../../scripts/verify-hev-lock.mjs
+          node ../../../scripts/verify-hev-lock.mjs --selftest-fail
       - name: APKs
         working-directory: apps/android/android
         env:

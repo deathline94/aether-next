@@ -94,7 +94,13 @@ try {
           Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     }
     if (-not $SubjectPath) {
-        throw 'no unsigned PE to sign: build the engine, or pass -SubjectPath <file>'
+        # CI runs this rule before the engine build. Compile a tiny unsigned
+        # managed PE here so the test has no dependency on build order. A
+        # library PE with an .exe name is sufficient for Authenticode checks.
+        $fixture = Join-Path $tmp 'unsigned-fixture.exe'
+        Add-Type -TypeDefinition 'public static class AetherSigningFixture { public static void Marker() {} }' `
+            -OutputAssembly $fixture -OutputType Library
+        $SubjectPath = $fixture
     }
     $subject = Join-Path $tmp 'subject.exe'
     Copy-Item -LiteralPath $SubjectPath -Destination $subject -Force
