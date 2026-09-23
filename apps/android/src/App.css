@@ -259,9 +259,13 @@ option:disabled { color: var(--muted); }
 :root {
   /* Element base styles only — the token block above is GENERATED from
      packages/ui/tokens.css by scripts/sync-tokens.mjs. Geist is bundled via
-     @fontsource-variable and imported in App.tsx/main.tsx, so the sheet DOES
-     carry webfonts; synthetic emphasis stays on so the 500/600/700 tiers the
-     fallback faces can reach are never flattened to 400 (contract U-C2). */
+     @fontsource-variable and imported from App.tsx, so the sheet does carry real
+     webfonts and the 550/650/700 tiers are served by the weight axis. Synthesis is
+     declared rather than inherited because contract U-C2 states a behaviour, and
+     the fallback faces a WebView reaches for are static-weight: synthesis is the
+     only thing keeping 550/650 distinct from 700 there, so "on" has to be a
+     decision on the page, not an accident of the initial value. */
+  font-synthesis: weight style;
   font-family: var(--font-sans);
   color: var(--fg);
   background-color: var(--bg-app);
@@ -877,9 +881,18 @@ code, kbd, pre {
   border: 1.5px solid var(--yellow-a30);
   animation: ping-ring-pulse 1.8s cubic-bezier(0.16, 1, 0.3, 1) 0.9s infinite;
 }
+/*
+ * Measured, not guessed. At the stage's 290px floor the ring's centre sits 106px
+ * above the card's bottom edge and 184px below its top (live render of these
+ * byte-identical rules, pinned to 290px), so `scale(2.2)` took the tail of every
+ * pulse 56 × 2.2 = 123px down — about 17px into the card's own `overflow: hidden`,
+ * with ~55% of the ring's opacity still alive when the cut happened. 1.8 keeps the
+ * worst-case half-extent at 101px, inside the binding edge. The pulse reads as a
+ * pulse; it just stops being sliced in half by the panel it belongs to.
+ */
 @keyframes ping-ring-pulse {
   0% { transform: scale(0.95); opacity: 0.95; }
-  100% { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(1.8); opacity: 0; }
 }
 
 /* Master Heavy Chassis */

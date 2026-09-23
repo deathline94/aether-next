@@ -809,7 +809,29 @@ Checked each part against the current tree rather than assuming the task text wa
   logic extracted as a pure function that can be tested without React's error plumbing. Neither the
   boundary improvement nor the per-tab scoping is in the tree as a result.
 - [x] T187 [US6] Self-host the fonts: add `@fontsource-variable/geist` + `geist-mono` (OFL-1.1), import their CSS from TS so Vite hashes the woff2 into `dist/` same-origin under the existing `font-src 'self'`, and delete the Google Fonts `<link>`s from `apps/desktop/index.html:8-10`. No `asset:` protocol (needs enabling, scoping and `font-src asset: http://asset.localhost`) and no CSP relaxation for `fonts.gstatic.com` — a circumvention tool must not make a pre-tunnel third-party request from its UI, which dev mode currently does live.
-- [ ] T188 [US6] Re-tune typography against the **actually rendered** font in `packages/ui/tokens.css`: `font-synthesis: none` with 550/650/700 tiers collapses arbitrarily against a static-weight system font and `letter-spacing: -0.012em` was tuned for Geist metrics; set `color-scheme: dark` on `:root`, style `option` elements, and define `::selection` (all three currently absent — 0 occurrences — so option lists are 1.13:1 and text selection 1.24:1, i.e. invisible).
+- [x] T188 [US6] Re-tune typography against the **actually rendered** font in `packages/ui/tokens.css`: `font-synthesis: none` with 550/650/700 tiers collapses arbitrarily against a static-weight system font and `letter-spacing: -0.012em` was tuned for Geist metrics; set `color-scheme: dark` on `:root`, style `option` elements, and define `::selection` (all three currently absent — 0 occurrences — so option lists are 1.13:1 and text selection 1.24:1, i.e. invisible).
+  **All four clauses are in, each checked against a live render rather than the
+  source text.** `letter-spacing` is `-0.006em` on `:root` (the `-0.012em` that was
+  tracked for Geist's own metrics closed up 11-13px labels on the fallback);
+  `color-scheme: dark`, `option { … }` and `::selection { … }` live in the generated
+  token block (`packages/ui/tokens.css`, fenced into both sheets by `sync-tokens.mjs`
+  — `--check` clean) because a UA-default light `<select>` popup measured 1.13:1 and
+  the default selection highlight 1.24:1, i.e. both invisible.
+  `font-synthesis` was the last one still only *described*: `App.css` carried a
+  comment asserting synthetic emphasis "stays on" with no declaration anywhere in
+  `apps/` or `packages/` (0 occurrences), so the behaviour was an accident of the
+  initial value while the contract stated it as a decision. Both sheets now declare
+  `font-synthesis: weight style` on `:root`, and the render confirms the intent
+  holds: `document.fonts.check('650 12px "Geist Variable"') === true` with the
+  variable face loaded, so the 550/650/700 tiers come from the weight axis and
+  synthesis is there for the static-weight fallbacks, not for the primary font.
+  While verifying, one stale pointer went too: `apps/desktop/index.html` said the
+  `@fontsource-variable` imports were in `src/main.tsx`; they are in `src/App.tsx`.
+  Not done, deliberately: the 13 distinct `letter-spacing` values that remain per
+  sheet (0.02…0.14em tracking tiers) — those are per-component, byte-identical
+  across the two apps, and collapsing them is the design-scale work of T192, not a
+  defect of its own.
+
 - [x] T189 [US6] Fix edges per contract U-E1 in `packages/ui/tokens.css` and `apps/desktop/src/App.css:26-29`: `box-shadow: inset 0 0 0 1px var(--edge-interactive)` with **opaque** pre-resolved colours and two tokens (`--edge` ≥1.6:1 decorative, `--edge-interactive` ≥3:1), replacing `--border-subtle .05` / `--border-card .07` / `--line .07` which measure 1.05–1.47:1 and antialiase away at Windows 125/150 % — the mechanical cause of the reported "borderless, floating, out of place" cards. Do not merely raise alpha (still composited, still antialiased); WCAG 1.4.11's 3:1 applies where the boundary is the sole affordance.
 - [x] T190 [US6] Restore motion correctness in `apps/desktop/src/App.css`: define `.spin`/`.spin-icon` keyframes **outside** the `prefers-reduced-motion` block (they currently appear **only** inside it, so both "working" spinners are frozen and a healthy engine looks hung), and make the reduced-motion block cover the 7 animations that actually loop (`radar-sweep-spin`, `ping-ring-pulse`, `breathing-glow`, `sparkline-jitter`, `pulse`, `save-sync-pulse`) instead of naming two non-existent selectors.
 - [x] T191 [US6] Add `@media (hover: hover) and (pointer: fine)` guards around all 27 hover rules in `apps/desktop/src/App.css` (and the mobile copy) — `.profile-card:hover` at `:1178` currently sets a **brighter** border than `.profile-card.active` at `:1193`, so after a tap on Android an unselected card looks more selected than the selected one, persistently.
@@ -844,6 +866,25 @@ Checked each part against the current tree rather than assuming the task text wa
        is silently overridden - it is untidy, not wrong. -->
 
 - [ ] T193 [US6] Fix layout traps in `apps/desktop/src/App.css`: `min-width: 0` on the **actual** flex child (the unclassed wrapper at `ConnectionTab.tsx:261`, not `.bento-title-group`) so the bento chip stops being pushed out of the card and clipped instead of ellipsising; stop `.connection-stage{overflow:hidden}` clipping the radar ping rings (≈246 px in a 290 px stage) and `.profiles-panel` clipping the active-card glow; widen the 64 px log time track and switch to 24-hour `hour12: false` (an en-US `02:15:33 PM` is ≈69 px, so rows mis-align twice a day); add `overflow-wrap` for IPv6 and PEM blobs.
+  **The ping-ring half is closed, with the numbers measured rather than assumed; the
+  glow half turned out not to be a defect; three items remain.** In a live render of
+  the built sheet with the stage pinned to its 290 px floor, the ring's centre sits
+  106 px above the card's bottom edge and 184 px below its top, so `scale(2.2)` put
+  the ring's rect at `top 139, bottom 386` against a stage ending at 369 — 17 px of
+  the pulse sliced off every cycle, while still ≈55 % opaque against the
+  `cubic-bezier(0.16, 1, 0.3, 1)` fast-out curve. The clipping is not incidental:
+  `.signal-field` is a 480 px reticle anchored at `right: -20px` precisely to be cut
+  by the card, so lifting `overflow` from the stage would break the decoration to
+  save the ring. The terminal scale is therefore 1.8 (measured rect `162..363`, 6 px
+  of headroom inside the binding edge), applied identically in both sheets since the
+  keyframes were byte-identical, and the arithmetic is recorded beside it. The
+  `.profiles-panel` claim does not survive measurement: its grid pads 18 px
+  vertically and the active-card shadow is `0 0 18px`, so the blur ends where the
+  clip begins rather than being cut — equal extents, no visible slice, nothing
+  changed. Still open here: the `min-width: 0` on the real flex child behind the
+  bento chip, the 64 px log time track with `hour12: false`, and `overflow-wrap` for
+  IPv6/PEM blobs.
+
 - [x] T194 [US6] Replace viewport and window maths: `100svh`/`100dvh` for all 8 `100vh` (including `.tactical-activity-view`'s `calc(100vh - 76px)`, which under-runs a 74 px + safe-inset topbar so the terminal's bottom rows sit behind the 62 px tab bar); move the desktop minimum off the collision point (`minWidth: 901` in `apps/desktop/src-tauri/tauri.conf.json` or `@media (max-width: 899px)` — today a legal 900 px window hides `.sidebar-bottom`, which contains the primary status widget); add the missing 680–900 px breakpoint so the 4-column profile grid does not squeeze to ~129 px cards; remove `maximum-scale=1.0`; fix the ≤680 px endpoint-row empty grid cell and the undiscoverable protocol-dock overflow.
   <!-- Closed 2026-09-22 (`8eaec25`, `72a0886`), with one deliberate deviation.
        The collapse moved to `@media (max-width: 980px)` rather than either
