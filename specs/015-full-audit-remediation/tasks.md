@@ -1114,11 +1114,14 @@ Checked each part against the current tree rather than assuming the task text wa
   neither app's markup mentioned the class any more), and `no-orphaned-class-rules`
   counts shared markup as a user of a rule - it was the move itself that surfaced
   `.crash-screen`, which the shared boundary renders.
-  **What is left here:** the remaining eleven twin pairs. `components/ui.tsx` is the
-  next one - its code lines are already identical, so it needs a prose merge rather
-  than a decision - and the behavioural divergences (`App.tsx` at 66, `useRuntime`
-  at 60, `useScanner` at 56, `types.ts` at 52) are the real work, because those
-  numbers are the two frontends doing the same job differently.
+  **What is left here:** ten twin pairs, and the interesting ones are the four whose
+  recorded identity is below 100 — `App.tsx` (66), `useRuntime` (60), `useScanner`
+  (56), `types.ts` (52) — because that gap is not formatting, it is the two surfaces
+  doing the same job differently, which is what T195's keyboard parity and the forked
+  scanner verdict were symptoms of. `components/ui.tsx` is merged (its copies differed
+  only in comment prose), and the tab components next need the same treatment once
+  their app-specific wiring — `invoke` on desktop, the bridge on Android — sits behind
+  one interface rather than two files.
   <!-- Progress measured, not claimed (`5a26ef7`, `7c451bf`, this round).
        Moved: the whole console fact-extraction layer (`packages/ui/src/logs.ts`
        - the hit arbiter, the milestone/error predicates and the eviction-aware

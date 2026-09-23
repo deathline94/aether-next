@@ -1707,16 +1707,20 @@ const GATES = [
     summary: 'files that exist in both frontends may not drift further apart than recorded',
     scan(api) {
       /*
-       * FR-037 wants one shared source; the tree still carries twelve files
-       * copied into both apps, and the reason every UI fix in this project has had
+       * FR-037 wants one shared source; ten files are still copied into both apps,
+       * and the reason every UI fix in this project has had
        * to be applied twice (and, historically, was applied once) is that pair.
        * The error boundary is no longer one of them: it is a shared component with
        * an identical re-export here per app, which needed each app to map `react`
        * and the JSX runtimes for files that live outside it (there is no root
        * node_modules and packages/ui deliberately has none of its own) - a missing
-       * mapping, not a missing install. `components/ui.tsx` is still a twin pair,
-       * whose code is already identical: what separates the two files is comment
-       * prose that has to be reconciled by hand before one of them is deleted.
+       * mapping, not a missing install. `components/ui.tsx` has gone the same way —
+       * its two copies differed only in comment prose, so the shared file carries
+       * Android's account of the radiogroup contract and desktop's more precise
+       * wording of `aria-invalid`, and both apps re-export one file. What is left are
+       * the behavioural twins: `App.tsx`, `useRuntime`, `useScanner`, `types.ts` and
+       * the tab components, whose recorded identity is below 100 precisely because
+       * the two surfaces do the same job differently.
        *
        * So this is a ratchet, not a promise: each file's code-line identity is
        * recorded as it stands, and a change may only raise it. Drift below the
