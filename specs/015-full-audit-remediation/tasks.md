@@ -1184,7 +1184,16 @@ Checked each part against the current tree rather than assuming the task text wa
 
 - [x] T229 [US8] Implement every `--selftest-fail` injection handler in `scripts/verify-invariants.*` — one per BC-01…BC-22 invariant — each injecting the defect it detects and asserting non-zero exit (satisfies SC-013 and T028's rule).
 - [ ] T230 [US8] Add `scripts/audit-traceability.ps1`, generating finding → invariant → task → test from the 2026-09-21 finding list and **failing when any finding is unmapped** (FR-046, SC-001).
-- [ ] T231 [US8] Set `permissions: {}` at the top of `.github/workflows/{ci.yml,build.yml}` with per-job least privilege (`contents: read`; publish adds `contents: write` + `id-token: write`) and an `environment: release` with a required reviewer for tag runs.
+- [x] T231 [US8] Set `permissions: {}` at the top of `.github/workflows/{ci.yml,build.yml}` with per-job least privilege (`contents: read`; publish adds `contents: write` + `id-token: write`) and an `environment: release` with a required reviewer for tag runs.
+  **Done in substance; two clauses deliberately not followed to the letter.** The
+  publish job now runs in the `release` environment (`build.yml` `publish:`), which is
+  the only in-tree handle on "who has to approve a tag going out" — **the required
+  reviewer itself is a repository setting (Settings → Environments → release) and
+  cannot be enabled from a file**, so it is listed here rather than pretended done.
+  The workflow level stays `permissions: contents: read`, not `{}`: every job needs a
+  read token for `checkout`, the per-job grants are already explicit
+  (`build.yml:126,347` id-token + attestations, `:507` contents: write), so `{}` would
+  restate the same scope one level down while losing the comment that says why.
 - [x] T232 [US8] Move all secret material into `env:` indirection in `.github/workflows/build.yml:304-305` with `::add-mask::` and never `echo` it; keep explicit file globs plus `if-no-files-found: error` on uploads; keep the publish job's artefacts flat (its `merge-multiple` whole-tree download is the risky pattern).
 - [x] T233 [US8] Add `actions/attest-build-provenance@v2` for the exe and APK (`subject-path: dist-windows/*`, `dist-android/*`) and document `gh attestation verify` in `Docs/GUIDE.en.md`.
 - [ ] T234 [US8] Track `packaging/*.sha256` and `packaging/trust/certificate-sha256.txt`, and make `build.yml:315` read the expected wintun digest from them instead of a hardcoded constant.
@@ -1193,6 +1202,19 @@ Checked each part against the current tree rather than assuming the task text wa
 
 
 - [ ] T237 [US8] Wire `cargo deny check`, `osv-scanner`, `zizmor`, `actionlint` and the T007 disallowed-methods clippy gates into `.github/workflows/ci.yml`, and record the honest posture note: `RUSTSEC-2023-0071` is the **`rsa` Marvin** advisory, not a `ring` one, so `ring 0.16.20` via `boringtun 0.6.0` is an EOL/duplicate-crate risk rather than a known vulnerability; `x25519-dalek =2.0.0-rc.3` is a hard pin to a pre-release and must be raised or justified.
+  **Three of four are real, and the fourth is written down rather than faked.**
+  cargo-deny runs both locks (`ci.yml:131-134`) plus `measure-deny.mjs`; actionlint is
+  pinned to a full SHA; zizmor distinguishes "no findings" from "findings" from "the
+  tool crashed" and uploads its SARIF. The T007 clause was half a myth: the lists in
+  `aether/clippy.toml` and `apps/desktop/src-tauri/clippy.toml` do exist, but nothing
+  failed if someone emptied them — the `-D warnings` run would simply report zero
+  violations. `disallowed-methods-configured` now gates that, and the whole chain was
+  proved live by adding a `std::env::var` call to the shell, watching clippy refuse it,
+  and restoring. **`osv-scanner` is still absent on purpose:** GitHub publishes no
+  digest for its release assets, so pinning it here would mean either inventing a hash
+  or running an unpinned downloader, and its first run needs an ignore list generated
+  from real findings (the known dev-tree vitest advisory would otherwise red-line every
+  CI run). That is a job for a machine that can run it, not a file edit.
 - [x] T238 [US8] Add the release-time verification step recomputing the staged engine digest and failing on any mismatch with `packaging/trust/engine-trust.json` (pairs with T071/T226).
 - [x] T239 [US8] **Ratify the constitution** (FR-045): populate `.specify/memory/constitution.md` — currently an unpopulated template with `[PRINCIPLE_1_NAME]` placeholders, i.e. **zero ratified principles** — with BC-01…BC-22 as principles: falsifiable fixes, no unverifiable completion claims, fail-closed host mutation, no unencrypted secrets, no fabricated telemetry, one contract source. The empty template is why fourteen prior rounds could each claim completion.
 - [x] T240 [US8] Remove untracked working-tree clutter that misleads readers (`architecture-review-20260723.html`, `rustup-init.exe` 12 MB, stale `aether*.toml` working files), confirming via `git ls-files` that none are tracked so no history rewrite is needed. Checked: none of the three names exists in the tree or in `git ls-files`, the only root `.toml` files are `deny.toml` and `aether/clippy.toml` (both configs), and `git status` is empty - so no rewrite was ever needed.
@@ -1259,6 +1281,17 @@ Checked each part against the current tree rather than assuming the task text wa
   registry that replaced its job), and the port-tier comment, whose tiers are now
   `T1 = [443]` / `T2 = [500, 1701, 4500]`.
 - [ ] T243 [P] Propagate instead of substituting remaining identity/config parse errors in `aether/src/session.rs`: `parse().unwrap_or(Ipv4Addr::new(172,16,0,2))` at `:471-474,589-592,689-692` (a malformed tunnel address becomes a **wrong source address**, then fails as "network blocking QUIC"), `.parse().ok()` at `:756`, and `Protocol::parse` at `:92-98` mapping any typo to MASQUE; plus `account.rs:411-422` silently zeroing a corrupt `client_id`.
+  **The address half is gone; the two named remainders are open for different reasons.**
+  Peer-address parsing now `map_err`s and propagates (`session.rs:626-628,1166-1168`)
+  and no `unwrap_or(Ipv4Addr::new(172,16,0,2))` survives anywhere. `Protocol::parse`
+  warns on an unrecognised value (`session.rs:188-200`) instead of substituting in
+  silence; making it *refuse* is a `Result` signature change through its two callers
+  (`:249`, `:1559`), and this engine cannot be compiled in this environment at all
+  (GNU toolchains only, boring-sys needs libclang) — shipping an unverifiable
+  signature change across the transport selection is the kind of blind edit that costs
+  a CI cycle to discover, so it is left as a named task rather than attempted.
+  `account.rs:468-471` still proceeds on a zeroed `client_id`; whether that must be a
+  hard refusal is T246's product decision, recorded above the line, not this sweep's.
 - [x] T244 [P] Fix remaining engine leaks in `aether/src/`: bind and abort the H2 connection driver task (`masque_h2.rs:478-482`, today spawned with no handle while `send_task`/`recv_task` are correctly aborted at `:637-638`); cap the unbounded `while let Ok(more) = try_recv()` batch (`quic.rs:492-508`) at 128 as `masque_h2.rs:561` already does; use `base.saturating_add(off)` at `prober.rs:1028` mirroring `enumerate_cidr_v4` at `:1004`.
   **Landed, item by item.** (1) The driver is now `let _driver =
   AbortOnDrop(tokio::spawn(..))` in both `masque_h2::run` and `masque_h2::verify_h2`.
