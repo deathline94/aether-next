@@ -287,6 +287,28 @@
   ~100 lines of unsafe crypt32 in the one module where a mistake is a bypass, testable
   here only against a machine's own signed system binaries — so it is named, not
   attempted blind.
+  **Attempted in this session, and reverted on evidence — but the shape of the fix
+  is now known.** `windows-sys` 0.61 already exports everything the route needs
+  (`CryptMsgGetParam`, `CMSG_SIGNER_INFO`, `CMSG_SIGNER_INFO_PARAM`,
+  `CertEnumCertificatesInStore`, `CertGetNameStringW`, `CertCloseStore`,
+  `CryptMsgClose`, `CERT_NAME_ATTR_TYPE`, `szOID_COMMON_NAME`, `X509_ASN_ENCODING`);
+  only `CryptQueryObject` is absent. The store must be searched by the
+  **authenticated** signer's issuer plus serial number, never by "some certificate in
+  the message carries the pinned digest" — a PKCS#7's extra certificate list is not
+  authenticated, so the weaker rule would accept our leaf wrapped into somebody
+  else's signature. Declaring `CryptQueryObject` by hand as
+  `#[link(name = "crypt32")] extern "system"` compiles, and
+  `cargo clippy --all-targets -- -D warnings` is clean against it, but the crate's
+  **test binary then will not start**: `0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND`, the
+  import binding to something this toolchain's loader cannot satisfy (rustc 1.97
+  here, CI pins 1.88). Two tests were written before the code was kept —
+  `the_signer_of_a_genuinely_signed_binary_is_returned`, which asks kernel32.dll for
+  its signer and would fail on any wrong signer-info layout rather than pass
+  quietly, and `extraction_is_deterministic_and_an_unsigned_file_refuses` — and
+  neither could run, so the change was reverted rather than left as a red suite.
+  What has to be settled first is the link route (the full `windows` crate, which
+  does declare `CryptQueryObject`, or `kind = "raw-dylib"`), proven by
+  `cargo test --lib` on a Windows host, not by compilation.
 - [x] T061 [US2] Make verification unconditional across every branch in `apps/desktop/src-tauri/src/lib.rs::engine_path` (`:1046-1094`) and `connect` (`:1368`), including custom `enginePath` and `AETHER_ENGINE`.
 - [x] T062 [US2] Narrow the trusted root: remove `exe.parent().parent()` from the allowed roots in `apps/desktop/src-tauri/src/lib.rs:762-787` — for perMachine that is `C:\Program Files`, for portable a user-writable extraction directory, while the child is handed the DPAPI master key.
   Done. `allowed_binary_roots` replaces "the exe's directory and its parent": the roots are
