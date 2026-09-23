@@ -134,6 +134,58 @@ fn local_stack_broken(err: &str) -> bool {
     LOCAL.iter().any(|k| err.contains(k))
 }
 
+/// The transport selection is the answer to "which path does my traffic take",
+/// so the parse is tested rather than trusted: an earlier version of it turned
+/// every typo into MASQUE and a log line.
+#[cfg(test)]
+mod protocol_choice_tests {
+    use super::Protocol;
+
+    #[test]
+    fn every_spelling_that_means_a_transport_still_means_it() {
+        for name in [
+            "masque",
+            "MASQUE",
+            " masque-h3 ",
+            "h3",
+            "h2",
+            "",
+            "warp",
+            "WARP",
+        ] {
+            assert!(
+                matches!(Protocol::try_parse(name), Ok(Protocol::Masque)),
+                "{name:?} should mean MASQUE"
+            );
+        }
+        for name in ["wg", "WG", " wireguard "] {
+            assert!(
+                matches!(Protocol::try_parse(name), Ok(Protocol::WireGuard)),
+                "{name:?} should mean WireGuard"
+            );
+        }
+        for name in ["gool", "wiw", "warp-in-warp", "WarpInWarp"] {
+            assert!(
+                matches!(Protocol::try_parse(name), Ok(Protocol::WarpInWarp)),
+                "{name:?} should mean WARP-in-WARP"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typo_refuses_rather_than_running_masque() {
+        for name in ["wiregrd", "wiregad", "h4", "quic", "proxifier", " none"] {
+            let refused = Protocol::try_parse(name);
+            assert!(refused.is_err(), "{name:?} is not a transport");
+            let why = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(
+                why.contains("expected masque|"),
+                "the refusal must say what it wanted, got: {why}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod readiness_tests {
     use super::local_stack_broken;
@@ -179,26 +231,30 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// The transport a name selects, defaulting to MASQUE.
+    /// The transport a name selects, or the reason it selects none.
     ///
-    /// The default is deliberate but it is not silent: an unrecognised value
-    /// (`AETHER_PROTOCOL=wiregrd`) used to fall through to MASQUE with nothing
-    /// written down, which for a tool whose whole job is *which* path your traffic
-    /// takes is the one substitution nobody should discover from a capture.
-    pub fn parse(s: &str) -> Protocol {
+    /// This used to be a total function: `AETHER_PROTOCOL=wiregrd` matched
+    /// nothing, logged a line nobody reads on a headless start, and ran MASQUE.
+    /// For a tool whose entire job is *which* path your traffic takes, silently
+    /// choosing a transport the operator did not ask for is the one substitution
+    /// that should never have to be discovered from a packet capture - so the
+    /// parse refuses, and the refusal reaches the user as a session error.
+    pub fn try_parse(s: &str) -> Result<Protocol> {
         let name = s.trim().to_lowercase();
-        match name.as_str() {
+        Ok(match name.as_str() {
             "wg" | "wireguard" => Protocol::WireGuard,
             "gool" | "wiw" | "warp-in-warp" | "warpinwarp" => Protocol::WarpInWarp,
-            "masque" | "masque-h2" | "masque-h3" | "h3" | "h2" | "" => Protocol::Masque,
-            _ => {
-                log::warn!(
-                    "[+] unrecognised protocol {s:?}; running MASQUE - expected one of \
-                     masque|wg|wireguard|gool|warp-in-warp"
-                );
-                Protocol::Masque
+            // `warp` is a legacy value a shipped config can still hold; the desktop
+            // shell keeps it representable rather than rewriting it, and this engine
+            // has always resolved it to MASQUE. Named here instead of arriving
+            // through a catch-all that would also accept a typo.
+            "warp" | "masque" | "masque-h2" | "masque-h3" | "h3" | "h2" | "" => Protocol::Masque,
+            other => {
+                return Err(AetherError::Config(format!(
+                    "unknown protocol {other:?}; expected masque|masque-h2|masque-h3|h2|h3|wg|wireguard|gool|warp-in-warp|warp"
+                )))
             }
-        }
+        })
     }
 
     pub fn label(&self) -> &'static str {
@@ -246,9 +302,9 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
     session_event::set_phase(session_event::Phase::Identity);
 
     let protocol = if cfg.has_forced_peer() || runtime_env::var("AETHER_PROTOCOL").is_some() {
-        Protocol::parse(&cfg.protocol)
+        Protocol::try_parse(&cfg.protocol)?
     } else {
-        select_protocol().await
+        select_protocol().await?
     };
 
     match protocol {
@@ -1554,9 +1610,9 @@ async fn select_scan_mode_str() -> String {
     }
 }
 
-async fn select_protocol() -> Protocol {
+async fn select_protocol() -> Result<Protocol> {
     if let Some(v) = crate::runtime_env::var("AETHER_PROTOCOL") {
-        return Protocol::parse(&v);
+        return Protocol::try_parse(&v);
     }
 
     let answer = prompt_line(
@@ -1564,11 +1620,11 @@ async fn select_protocol() -> Protocol {
     )
     .await;
 
-    match answer.as_deref() {
+    Ok(match answer.as_deref() {
         Some("2") => Protocol::WireGuard,
         Some("3") => Protocol::WarpInWarp,
         _ => Protocol::Masque,
-    }
+    })
 }
 
 async fn select_ip_version() -> prober::IpScan {

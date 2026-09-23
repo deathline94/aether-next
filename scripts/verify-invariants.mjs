@@ -1984,6 +1984,107 @@ const GATES = [
       };
     },
   },
+  {
+    name: 'protocol-tokens-cross-layer',
+    invariant: 'BC-13',
+    summary: 'every transport name a producer can send is one the engine accepts',
+    scan(api) {
+      // The engine used to answer an unknown transport with MASQUE and a log line,
+      // so a producer could send a name nobody honoured and nothing noticed. It
+      // refuses now, which moves the hazard rather than removing it: a token added
+      // to the Settings enums, to the desktop scan map or to the Android translator
+      // that the engine's own match arms do not list becomes a session that cannot
+      // start. Four lists, compared in one place — the only way to keep the promise
+      // without a screen, a keyboard, or an engine that compiles here.
+      const literals = (s) => [...s.matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+      const srcOf = (dir, re, base) => {
+        const f = api.files(dir, re).find((x) => rel(x).endsWith(`/${base}`));
+        return f ? { text: api.read(f).replace(/\r\n/g, '\n'), path: rel(f) } : null;
+      };
+      const between = (text, start, end) => {
+        const a = text.indexOf(start);
+        if (a < 0) return null;
+        const b = text.indexOf(end, a + start.length);
+        return b < 0 ? null : text.slice(a, b);
+      };
+
+      const problems = [];
+      const engine = srcOf('aether/src', /\.rs$/, 'session.rs');
+      const engineBody = engine && between(engine.text, 'pub fn try_parse', 'pub fn label');
+      const accepted = new Set();
+      if (engineBody) {
+        for (const m of engineBody.matchAll(/((?:"[^"]*"\s*\|?\s*)+)=>\s*Protocol::\w+/g)) {
+          for (const lit of literals(m[1])) accepted.add(lit);
+        }
+      }
+      if (!accepted.size) {
+        return ['aether/src/session.rs: no transport names could be read out of try_parse, so nothing was compared'];
+      }
+      const mustAccept = (label, produced) => {
+        const unknown = [...new Set(produced)].filter((t) => !accepted.has(t));
+        if (unknown.length) {
+          problems.push(
+            `${label} can send ${unknown.map((u) => `"${u}"`).join(', ')}, which is not one of the ${accepted.size} names the engine accepts (${[...accepted].sort().join('|')}) — it refuses what it does not know, so that path is a session that cannot start`,
+          );
+        }
+      };
+
+      // Desktop session: `settings.protocol.as_str()` reaches the engine verbatim.
+      const settings = srcOf('apps/desktop/src-tauri/src', /\.rs$/, 'settings.rs');
+      const enumBody = settings && between(settings.text, 'enum Protocol {', 'default Masque');
+      if (!enumBody) {
+        problems.push(`${settings ? settings.path : 'settings.rs'}: no \`enum Protocol\` block to read transport names from`);
+      } else {
+        const produced = [];
+        for (const m of enumBody.matchAll(/=\s*("[^"]*(?:"\s*\|\s*"[^"]*")*)/g)) produced.push(...literals(m[1]));
+        mustAccept(`${settings.path} enum Protocol`, produced);
+      }
+
+      // Desktop scan: the right-hand side of the map is what the engine receives.
+      const scan = srcOf('apps/desktop/src-tauri/src', /\.rs$/, 'scan.rs');
+      const scanBody = scan && between(scan.text, 'let engine_protocol = match', '\n    };');
+      if (!scanBody) {
+        problems.push(`${scan ? scan.path : 'scan.rs'}: no engine_protocol map to read`);
+      } else {
+        const produced = [];
+        for (const m of scanBody.matchAll(/=>\s*("[^"]*")/g)) produced.push(m[1].replace(/"/g, ''));
+        mustAccept(`${scan.path} engine_protocol`, produced);
+      }
+
+      // Android: the when-arms' results.
+      const runner = srcOf('apps/android/android/app/src/main/java/app/aethernext', /\.kt$/, 'EngineRunner.kt');
+      const envBody = runner && between(runner.text, 'fun protocolEnv', 'internal fun isHttp2');
+      if (!envBody) {
+        problems.push(`${runner ? runner.path : 'EngineRunner.kt'}: no protocolEnv to read`);
+      } else {
+        const produced = [];
+        for (const m of envBody.matchAll(/->\s*("[^"]*")/g)) produced.push(m[1].replace(/"/g, ''));
+        mustAccept(`${runner.path} protocolEnv`, produced);
+      }
+
+      // And every name the Settings UI offers must survive the shell that forwards it.
+      const ui = srcOf('packages/ui/src', /\.ts$/, 'enums.ts');
+      if (!ui) {
+        problems.push('packages/ui/src/enums.ts: no transport list to compare');
+      } else {
+        const offered = literals(ui.text).filter((t) => /^(masque|wireguard|gool|wg|h2|h3)/.test(t));
+        if (!offered.length) {
+          problems.push(`${ui.path}: no transport values found, so the UI half of the comparison ran on nothing`);
+        } else {
+          mustAccept(`${ui.path} PROTOCOLS/SCAN_PROTOCOLS`, offered);
+        }
+      }
+
+      return problems;
+    },
+    inject() {
+      return {
+        file: 'apps/android/android/app/src/main/java/app/aethernext/EngineRunner.kt',
+        content:
+          'class EngineRunner {\n    companion object {\n        internal fun protocolEnv(protocol: String, transport: String): String =\n            when (protocol.lowercase().trim()) {\n                "masque" -> "hyperproto"\n                else -> "masque"\n            }\n\n        internal fun isHttp2(protocol: String, transport: String): Boolean = false\n    }\n}\n',
+      };
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ runner */

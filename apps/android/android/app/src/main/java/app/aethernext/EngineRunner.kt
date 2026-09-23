@@ -498,12 +498,28 @@ open class EngineRunner(
         private const val TAG = "EngineRunner"
 
         /** The engine's protocol token. `wg` and `wireguard` are the same choice. */
+        /**
+         * The transport token handed to the engine, or a refusal.
+         *
+         * The same rule as [noizeEnv] below: translating two names for one feature
+         * is fine, guessing is not. The `else -> "masque"` this replaces answered a
+         * request for WARP-in-WARP with a MASQUE tunnel and nothing written down,
+         * and the engine now refuses a name it does not know rather than choosing
+         * for the user — so a guess here would surface as a failed start.
+         */
         internal fun protocolEnv(protocol: String, transport: String): String =
             when (protocol.lowercase().trim()) {
                 "wireguard", "wg" -> "wg"
-                "masque", "masque-h2", "masque-h3" -> "masque"
-                "gool" -> "gool"
-                else -> "masque"
+                "masque", "masque-h2", "masque-h3", "h2", "h3" -> "masque"
+                "gool", "wiw", "warp-in-warp", "warpinwarp" -> "gool"
+                // Legacy value a shipped config can still hold; the engine resolves
+                // it to MASQUE and says so, so it is passed through, not rewritten.
+                "warp" -> "warp"
+                else -> throw IllegalArgumentException(
+                    "protocol '$protocol' has no engine equivalent; the engine understands " +
+                        "masque|masque-h2|masque-h3|wg|wireguard|gool|warp-in-warp|warp. " +
+                        "Re-select it in Settings.",
+                )
             }
 
         internal fun isHttp2(protocol: String, transport: String): Boolean =

@@ -57,9 +57,18 @@ pub(crate) fn scan_blocking(
     fs::create_dir_all(&dir).map_err(CommandError::from)?;
     restrict_directory_acl(&dir)?;
 
+    // Translate the scan's protocol name, refuse anything unmappable: the
+    // catch-all this replaces answered "masque" to a request for gool, and the
+    // engine no longer papers over a name it does not know.
     let engine_protocol = match protocol.as_str() {
-        "wireguard" => "wireguard",
-        _ => "masque",
+        "wireguard" | "wg" => "wireguard",
+        "masque" | "masque-h2" | "masque-h3" | "h2" | "h3" => "masque",
+        other => {
+            return Err(format!(
+                "scan protocol {other:?} has no engine equivalent; expected masque-h3|masque-h2|wireguard"
+            )
+            .into());
+        }
     };
 
     let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;

@@ -974,7 +974,7 @@ fn poll_h3(
                     }
                     capsules.push(&body[..n]);
                 }
-                drain_capsules(
+                drain_capsules_drop_on_saturation(
                     capsules,
                     addr_tx,
                     probe_src,
@@ -1007,15 +1007,15 @@ fn poll_h3(
 
 /// Consume the MASQUE control capsules this connection has parsed.
 ///
-/// The H2 path has a same-named function in `masque_h2.rs` and the resemblance is
-/// a trap for anyone tempted to merge them: this one is **synchronous** because it
+/// `masque_h2.rs` holds the other capsule drain and merging the two is a trap:
+/// this one is **synchronous** because it
 /// runs inside quiche's poll loop, so its delivery is `try_send` and a saturated
 /// inbound queue drops the datagram - visibly, on the `INBOUND_DROPPED` counter,
 /// because the alternative is blocking the event loop that also has to keep the
 /// connection alive. The H2 copy is `async` and awaits the send instead, since its
 /// caller is a plain recv task with an await point already. Same parse, opposite
 /// backpressure, and each is correct only in the loop it sits in.
-fn drain_capsules(
+fn drain_capsules_drop_on_saturation(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
     probe_src: &mut std::net::Ipv4Addr,
@@ -1162,7 +1162,7 @@ async fn drain_datagrams(
                     // the whole tunnel loop on the netstack consumer — no recv, no
                     // flush, no `on_timeout` — so one slow reader became a QUIC
                     // idle-timeout kill for every flow on the connection.
-                    // `drain_capsules` already answers saturation by dropping and
+                    // `drain_capsules_drop_on_saturation` already answers saturation by dropping and
                     // counting; TCP retransmits, which is the recovery path this
                     // stack is built around.
                     match inbound_tx.try_send(ip_packet) {

@@ -626,7 +626,7 @@ pub async fn run(
                     *last_recv.lock().await = Instant::now();
                     let _ = recv_body.flow_control().release_capacity(chunk.len());
                     capsules.push(&chunk);
-                    drain_capsules(&mut capsules, &inbound_tx, &addr_tx).await;
+                    drain_capsules_await_room(&mut capsules, &inbound_tx, &addr_tx).await;
                 }
                 Ok(Some(Err(e))) => {
                     log::warn!("[h2] recv body error: {e}");
@@ -811,11 +811,11 @@ async fn send_ip_batch(send: &mut h2::SendStream<Bytes>, packets: Vec<Vec<u8>>) 
 
 /// Consume the parsed MASQUE capsules on the H2 path.
 ///
-/// Not interchangeable with `quic::drain_capsules` despite the name: that one runs
+/// Not interchangeable with `quic::drain_capsules_drop_on_saturation`: that one runs
 /// inside quiche's poll loop and must not block, while this one is `async` and
 /// awaits a full inbound queue rather than dropping the packet. Merging them would
 /// pick one of those two policies for a caller that cannot honour it.
-async fn drain_capsules(
+async fn drain_capsules_await_room(
     capsules: &mut CapsuleParser,
     inbound_tx: &mpsc::Sender<Vec<u8>>,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
