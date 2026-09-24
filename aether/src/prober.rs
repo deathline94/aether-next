@@ -201,6 +201,10 @@ pub enum VerifyCost {
 /// Ceiling on an adaptive scan budget: past this the user is better served by
 /// the Stop button than by a scan that keeps running.
 const MAX_SCAN_DEADLINE: Duration = Duration::from_secs(300);
+/// Connect-flow deadline ceiling: kept comfortably below the 90 s supervisor
+/// watchdog so the prober finishes and returns a structured error or hit before
+/// the watchdog triggers.
+const MAX_CONNECT_SCAN_DEADLINE: Duration = Duration::from_secs(60);
 const EXPENSIVE_MIN_TIMEOUT: Duration = Duration::from_millis(6000);
 const EXPENSIVE_DEFAULT_CONCURRENCY: usize = 8;
 const EXPENSIVE_MAX_CONCURRENCY: usize = 16;
@@ -594,10 +598,10 @@ impl ScanTally {
         self.scanned >= self.total
     }
 
-    /// Whether this tick deserves a progress event: every 50 candidates, and always
+    /// Whether this tick deserves a progress event: every 10 candidates, and always
     /// at completion.
     pub fn should_report(&self) -> bool {
-        self.reported().is_multiple_of(50) || self.is_complete()
+        self.reported().is_multiple_of(10) || self.is_complete()
     }
 }
 
@@ -742,7 +746,9 @@ pub async fn hunt_best(
             .per_probe_timeout
             .saturating_mul(waves.saturating_add(2) as u32);
         let before = st.overall_deadline;
-        st.overall_deadline = needed.max(before).min(MAX_SCAN_DEADLINE);
+        // In connect-flow mode (!exhaustive), the deadline must not exceed the
+        // supervisor watchdog (90 s), leaving at least 30 s for handshake + routing.
+        st.overall_deadline = needed.max(before).min(MAX_CONNECT_SCAN_DEADLINE);
         if st.overall_deadline > before {
             log::debug!(
                 "[prober] {} candidates / {} concurrent at {:?} => deadline {:?} (was {:?}, cap {:?})",
@@ -751,7 +757,7 @@ pub async fn hunt_best(
                 st.per_probe_timeout,
                 st.overall_deadline,
                 before,
-                MAX_SCAN_DEADLINE,
+                MAX_CONNECT_SCAN_DEADLINE,
             );
         }
     }
@@ -826,6 +832,7 @@ pub async fn hunt_best(
                     None => break,
                     Some(res) => {
                         tally.candidate_done();
+                        crate::session_event::mark_progress();
                         if tally.should_report() {
                             let scanned = tally.reported();
                             log::info!(
@@ -926,9 +933,18 @@ pub async fn hunt_best(
                                     return Ok(final_best);
                                 }
 
-                                if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
+                                if st.target_successes > 0 && found >= st.target_successes {
                                     log::info!("[+] reached target of {} {}, selecting best", st.target_successes, label);
+                                    break;
+                                }
+
+                                if quiet_until.is_none() {
                                     if !st.quiet_after_first.is_zero() {
+                                        log::info!(
+                                            "[+] found working {}, waiting up to {:?} for faster candidates",
+                                            label,
+                                            st.quiet_after_first
+                                        );
                                         quiet_until = Some(Instant::now() + st.quiet_after_first);
                                     } else {
                                         break;
@@ -1089,8 +1105,14 @@ async fn drill_down_hot_subnet(
             _ = cancel_token.cancelled() => break,
             res = stream.next() => {
                 match res {
-                    Some(Some(pr)) => results.push(pr),
-                    Some(None) => continue,
+                    Some(Some(pr)) => {
+                        crate::session_event::mark_progress();
+                        results.push(pr);
+                    }
+                    Some(None) => {
+                        crate::session_event::mark_progress();
+                        continue;
+                    }
                     None => break,
                 }
             }
@@ -1557,9 +1579,9 @@ impl MasqueProbe {
             config_path: self.config_path.clone(),
             profile: StrategyProfile {
                 turbo_sample: 64,
-                balanced_target: 6,
+                balanced_target: if crate::masque_h2::enabled() { 6 } else { 3 },
                 balanced_sample: 140,
-                stealth_target: 4,
+                stealth_target: 3,
                 stealth_sample: 64,
             },
         }
@@ -2205,6 +2227,72 @@ mod candidate_tests {
         assert!(
             cached.iter().any(|(a, _)| a.ip() == hit && a.port() == 443),
             "cancelled scan must persist its best-so-far endpoint; cache was {cached:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quiet_window_finalizes_when_fewer_than_target_found() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let dir = std::env::temp_dir().join(format!("aether-quiet-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("aether.toml").to_string_lossy().to_string();
+
+        let mut config = test_config();
+        config.config_path = cfg_path.clone();
+        // Target 10 successes, but only 2 exist in the entire pool.
+        config.profile.balanced_target = 10;
+
+        let hit1: IpAddr = "10.0.0.1".parse().unwrap();
+        let hit2: IpAddr = "10.0.1.1".parse().unwrap();
+        let verify = move |ip: IpAddr,
+                           port: u16,
+                           _t: Duration,
+                           _iron: bool|
+              -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
+            Box::pin(async move {
+                if ip == hit1 {
+                    Some(ProbeResult {
+                        ip,
+                        port,
+                        rtt: Duration::from_millis(50),
+                    })
+                } else if ip == hit2 {
+                    Some(ProbeResult {
+                        ip,
+                        port,
+                        rtt: Duration::from_millis(20),
+                    })
+                } else {
+                    None
+                }
+            })
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res = rt.block_on(hunt_best(
+            &config,
+            &[443],
+            IpScan::V4,
+            ScanMode::Balanced,
+            &verify,
+        ));
+
+        assert!(res.is_ok(), "scan must succeed when fewer than target working endpoints exist");
+        let best = res.unwrap();
+        // Lower RTT (hit2 = 20ms) must be chosen over hit1 (50ms).
+        assert_eq!(best.ip, hit2);
+        assert_eq!(best.rtt, Duration::from_millis(20));
+
+        let cached = crate::cache::get_masque_sorted(&cfg_path);
+        assert!(
+            cached.iter().any(|(a, _)| a.ip() == hit2 && a.port() == 443),
+            "chosen best endpoint must be persisted to cache"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

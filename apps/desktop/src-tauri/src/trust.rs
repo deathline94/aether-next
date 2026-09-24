@@ -589,9 +589,9 @@ pub fn verify_authenticode_signature(
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_DATA, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
-        WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE,
-        WTD_STATEACTION_IGNORE, WTD_UI_NONE,
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4,
+        WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_IGNORE, WTD_UI_NONE,
     };
 
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -602,13 +602,6 @@ pub fn verify_authenticode_signature(
         pcwszFilePath: wide_path.as_ptr(),
         hFile: source.as_raw_handle(),
         pgKnownSubject: std::ptr::null_mut(),
-    };
-
-    const WINTRUST_ACTION_GENERIC_VERIFY_V2: windows_sys::core::GUID = windows_sys::core::GUID {
-        data1: 0x00aac56b,
-        data2: 0xcd44,
-        data3: 0x11d0,
-        data4: [0x8c, 0xeb, 0x00, 0xc0, 0x4f, 0xc2, 0xaa, 0xe5],
     };
 
     let mut trust_data = WINTRUST_DATA {
