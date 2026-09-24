@@ -245,11 +245,11 @@ mod tests {
 
     /// The progress stamp is process-global, so the tests that reason about it
     /// cannot run concurrently with each other.
-    static PROGRESS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static PROGRESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn every_phase_has_a_stable_label() {
-        let _g = PROGRESS_LOCK.lock();
+        let _g = PROGRESS_LOCK.blocking_lock();
         let labels = [
             Phase::Starting,
             Phase::Identity,
@@ -304,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn a_stalled_loop_stops_pulsing() {
         use std::time::Duration;
-        let _g = PROGRESS_LOCK.lock();
+        let _g = PROGRESS_LOCK.lock().await;
 
         let _hb = super::start_heartbeat_in(Duration::from_millis(10));
         // The startup mark is a step, so the very first tick pulses.
@@ -335,7 +335,7 @@ mod tests {
     /// session is alive by the pulse it is itself emitting.
     #[test]
     fn setting_a_phase_counts_as_progress_and_a_pulse_does_not() {
-        let _g = PROGRESS_LOCK.lock();
+        let _g = PROGRESS_LOCK.blocking_lock();
         let before = progress_stamp();
         super::set_phase(Phase::Tunnel);
         assert_eq!(progress_stamp(), before + 1);

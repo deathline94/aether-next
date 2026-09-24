@@ -925,7 +925,7 @@ fn poll_h3(
     watch_dataplane: bool,
     // Owned by `run` so a 64 KB allocation is not paid on every wakeup of the
     // tunnel loop (`poll_h3` runs once per select iteration).
-    body: &mut Vec<u8>,
+    body: &mut [u8],
 ) -> Result<()> {
     loop {
         match h3c.poll(conn) {

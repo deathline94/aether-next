@@ -99,7 +99,7 @@ mod tests {
         for (key, counter) in ALL {
             assert_eq!(
                 snap.get(*key).and_then(|v| v.as_u64()),
-                Some(peek(*counter)),
+                Some(peek(counter)),
                 "{key} is declared but snapshot() does not report it"
             );
         }
