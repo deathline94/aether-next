@@ -24,18 +24,16 @@ all-features = false
 
 [advisories]
 version = 2
-# Measured against both committed locks (595 package versions, `aether/Cargo.lock` +
-# `apps/desktop/src-tauri/Cargo.lock`) against RustSec as of this commit: 76 of the
-# locked crates have advisory files, and ZERO of them match a version this tree
-# locks. So `check advisories` is green on arrival and stays meaningful.
+# Windows releases use Tauri. Its cross-platform GTK and URL-pattern dependency
+# tree contains these unmaintained crates with no patched versions available.
+# Keep the exceptions narrow so new vulnerabilities still fail the build.
 ignore = [
-  # Recorded, not ignored for a match: RUSTSEC-2023-0071 is the `rsa` Marvin
-  # advisory and `rsa` is not in either lock at all. The real note belongs to the
-  # crate the old comment misattributed it to: `ring` 0.16.20 is pulled in
-  # transitively by boringtun 0.6.0 alongside ring 0.17.14. That is a
-  # duplicate/EOL-crate risk, not a known vulnerability — no RustSec advisory
-  # covers ring 0.16.20's locked version — and it is tracked in [bans] below.
-  { id = "RUSTSEC-2023-0071", reason = "belongs to rsa (absent from our graph); kept so the ring-0.16-vs-rsa confusion that produced this entry does not come back" },
+  { id = "RUSTSEC-2024-0370", reason = "unmaintained proc-macro-error through Tauri GTK build dependencies; no safe upgrade available" },
+  { id = "RUSTSEC-2025-0081", reason = "unmaintained unic through Tauri urlpattern; no safe upgrade available" },
+  { id = "RUSTSEC-2025-0075", reason = "unmaintained unic through Tauri urlpattern; no safe upgrade available" },
+  { id = "RUSTSEC-2025-0080", reason = "unmaintained unic through Tauri urlpattern; no safe upgrade available" },
+  { id = "RUSTSEC-2025-0100", reason = "unmaintained unic through Tauri urlpattern; no safe upgrade available" },
+  { id = "RUSTSEC-2025-0098", reason = "unmaintained unic through Tauri urlpattern; no safe upgrade available" },
 ]
 
 [bans]
@@ -46,15 +44,13 @@ multiple-versions = "deny"
 # aether apps quiche` matches nothing. A wildcard requirement means the resolver,
 # not this repository, decides which bytes get compiled.
 wildcards = "deny"
-highlight-graph = false
 skip = [
-  # Generated from the two committed lockfiles: 46 crate names carry more
-  # than one version (117 name+version pairs). Each
+  # Generated from the two committed lockfiles: 44 crate names carry more
+  # than one version (112 name+version pairs). Each
   # one is a transitive disagreement this repository does not own - boring/quiche,
   # tauri, smoltcp/boringtun pin different major lines of the same low-level crate.
   # Regenerate with `node scripts/measure-deny.mjs`; a *new* duplicate then shows up
   # as a red `cargo deny check bans` rather than a warning nobody reads.
-  { name = "base64", version = "0.13.1" },
   { name = "base64", version = "0.21.7" },
   { name = "base64", version = "0.22.1" },
   { name = "bitflags", version = "1.3.2" },
@@ -93,8 +89,6 @@ skip = [
   { name = "rand_core", version = "0.6.4" },
   { name = "reqwest", version = "0.12.28" },
   { name = "reqwest", version = "0.13.4" },
-  { name = "ring", version = "0.16.20" },
-  { name = "ring", version = "0.17.14" },
   { name = "schemars", version = "0.8.22" },
   { name = "schemars", version = "0.9.0" },
   { name = "schemars", version = "1.2.1" },
@@ -121,8 +115,6 @@ skip = [
   { name = "toml_edit", version = "0.20.2" },
   { name = "toml_edit", version = "0.22.27" },
   { name = "toml_edit", version = "0.25.13+spec-1.1.0" },
-  { name = "untrusted", version = "0.7.1" },
-  { name = "untrusted", version = "0.9.0" },
   { name = "webpki-roots", version = "0.26.11" },
   { name = "webpki-roots", version = "1.0.9" },
   { name = "windows-core", version = "0.61.2" },
@@ -202,4 +194,8 @@ allow = [
   "MPL-2.0",
   "OpenSSL",
   "CC0-1.0",
+  "0BSD",
+  "CDLA-Permissive-2.0",
+  "Unicode-3.0",
+  "AGPL-3.0-only",
 ]
