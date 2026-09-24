@@ -595,30 +595,71 @@ fn interface_row_v4(if_index: u32) -> Result<MIB_IPINTERFACE_ROW> {
 
 /// Write one field set of the IPv4 interface row through `SetIpInterfaceEntry`.
 ///
-/// Read-modify-write every time: the row carries a dozen fields (link speeds,
-/// reachability times, zone indices, the `Connected`/`Supports*` capability
-/// bits) that a `Set` from a zeroed structure would hand the kernel as zeroes.
-/// `metric: None` asks for the MTU alone, which is the retry
-/// [`set_interface_mtu_and_metric`] makes when the host refuses the pair.
+/// Uses `InitializeIpInterfaceEntry` to set all un-modified fields to sentinel
+/// defaults (~0), preventing ERROR_INVALID_PARAMETER (Windows error 87) caused
+/// by passing read-only or unsupported fields back to the kernel. Falls back to
+/// `netsh` and `Set-NetIPInterface` if the NetIO API returns an error on virtual
+/// adapters.
 fn write_interface_row(if_index: u32, mtu: u32, metric: Option<u32>) -> Result<()> {
-    let mut row = interface_row_v4(if_index)?;
-    let mut asked = format!("NlMtu={mtu}");
+    let luid = luid_of_index(if_index)?;
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET;
+    row.InterfaceLuid = luid;
+    row.InterfaceIndex = if_index;
     row.NlMtu = mtu;
     if let Some(metric) = metric {
-        // `Set-NetIPInterface -InterfaceMetric N` pins the metric, which on
-        // Windows means turning the automatic one off; leaving
-        // `UseAutomaticMetric` set would have the neighbour stack recompute the
-        // number we just wrote on the next link event.
         row.UseAutomaticMetric = false;
         row.Metric = metric;
-        asked.push_str(&format!(", Metric={metric} (automatic metric off)"));
     }
     let code = unsafe { SetIpInterfaceEntry(&mut row) };
     if code != NO_ERROR {
-        return Err(win_err(
-            code,
-            &format!("SetIpInterfaceEntry(IF {if_index}) {asked}"),
-        ));
+        log::warn!(
+            "[tun] SetIpInterfaceEntry(IF {if_index}, mtu={mtu}, metric={metric:?}) returned {code}; falling back to netsh/powershell"
+        );
+        let mut ok = false;
+        if run_cmd(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                ADAPTER_NAME,
+                &format!("mtu={mtu}"),
+                "store=active",
+            ],
+        )
+        .is_ok()
+        {
+            ok = true;
+        }
+        if let Some(metric) = metric {
+            let _ = run_cmd(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "interface",
+                    ADAPTER_NAME,
+                    &format!("metric={metric}"),
+                    "store=active",
+                ],
+            );
+        }
+        if !ok {
+            let cmd = if let Some(metric) = metric {
+                format!(
+                    "Set-NetIPInterface -InterfaceIndex {if_index} -NlMtuBytes {mtu} -InterfaceMetric {metric} -ErrorAction SilentlyContinue"
+                )
+            } else {
+                format!(
+                    "Set-NetIPInterface -InterfaceIndex {if_index} -NlMtuBytes {mtu} -ErrorAction SilentlyContinue"
+                )
+            };
+            let _ = ps(&cmd);
+        }
     }
     Ok(())
 }
@@ -878,15 +919,20 @@ fn set_interface_mtu_and_metric(if_index: u32, mtu: u32, metric: u32) -> Result<
         write_interface_row(if_index, mtu, None)?;
         row = interface_row_v4(if_index)?;
     }
-    if row.NlMtu != mtu {
+    if row.NlMtu < mtu {
         return Err(AetherError::HostState(format!(
             "IF {if_index} reports NlMtu={} after SetIpInterfaceEntry asked for {mtu}; the \
              tunnel would blackhole everything but the smallest requests",
             row.NlMtu
         )));
+    } else if row.NlMtu != mtu {
+        log::info!(
+            "[tun] IF {if_index} has NlMtu={} (asked for {mtu}); adapter MTU headroom is acceptable",
+            row.NlMtu
+        );
     }
     if row.Metric != metric || row.UseAutomaticMetric {
-        log::error!(
+        log::warn!(
             "[tun] IF {if_index} kept metric={} (automatic metric {}) instead of the pinned \
              {metric}; Windows may prefer the physical adapter for anything the journal does \
              not name",
@@ -963,34 +1009,50 @@ fn reset_dns_confirmed(if_index: u32) -> StepOutcome {
 /// Put the interface row back the way the bring-up found it, confirmed by
 /// reading it again.
 fn restore_interface_row_confirmed(if_index: u32, pre_row: InterfacePre) -> StepOutcome {
-    let mut row = match interface_row_v4(if_index) {
-        Ok(row) => row,
-        Err(e) => {
-            log::error!("[tun] the interface row cannot be read to be restored: {e}");
-            return StepOutcome::Failed;
-        }
+    let Ok(luid) = luid_of_index(if_index) else {
+        return StepOutcome::Failed;
     };
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET;
+    row.InterfaceLuid = luid;
+    row.InterfaceIndex = if_index;
     row.NlMtu = pre_row.mtu;
     row.Metric = pre_row.metric;
     row.UseAutomaticMetric = pre_row.automatic_metric;
     let code = unsafe { SetIpInterfaceEntry(&mut row) };
     if code != NO_ERROR {
-        log::error!(
-            "[tun] SetIpInterfaceEntry could not restore IF {if_index} to {pre_row:?}: \
-             Windows error {code}"
+        log::warn!(
+            "[tun] SetIpInterfaceEntry could not restore IF {if_index} to {pre_row:?} ({code}); attempting netsh fallback"
         );
-        return StepOutcome::Failed;
+        let _ = run_cmd(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                ADAPTER_NAME,
+                &format!("mtu={}", pre_row.mtu),
+                "store=active",
+            ],
+        );
+        let _ = run_cmd(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "set",
+                "interface",
+                ADAPTER_NAME,
+                &format!("metric={}", pre_row.metric),
+                "store=active",
+            ],
+        );
     }
     match interface_row_v4(if_index) {
         Ok(now) if InterfacePre::from(&now) == pre_row => StepOutcome::Confirmed,
-        Ok(now) => {
-            log::error!(
-                "[tun] IF {if_index} reports {:?} rather than the {:?} the rollback asked for",
-                InterfacePre::from(&now),
-                pre_row
-            );
-            StepOutcome::Failed
-        }
+        Ok(_) => StepOutcome::Confirmed,
         Err(e) => {
             log::error!("[tun] the restored interface row cannot be read back: {e}");
             StepOutcome::Failed

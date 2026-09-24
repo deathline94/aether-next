@@ -1499,6 +1499,13 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.193.1",
 ];
 
+/// Cloudflare MASQUE H3 QUIC endpoints only listen on these specific VIPs across `MASQUE_PORTS`.
+pub const MASQUE_H3_SEEDS: &[&str] = &[
+    "162.159.198.1",
+    "162.159.198.2",
+    "162.159.198.3",
+];
+
 /// Ports ordered by priority: primary web TLS first, then secondary, then legacy.
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
@@ -1560,26 +1567,27 @@ pub struct MasqueProbe {
 impl MasqueProbe {
     /// Build a [`ProbeConfig`] for MASQUE scanning.
     pub fn probe_config(&self) -> ProbeConfig {
+        let is_h2 = crate::masque_h2::enabled();
         ProbeConfig {
-            verify_cost: if crate::masque_h2::enabled() {
+            verify_cost: if is_h2 {
                 VerifyCost::Cheap
             } else {
                 VerifyCost::Expensive
             },
-            cidrs_v4: MASQUE_CIDRS_V4,
-            cidrs_v6: MASQUE_CIDRS_V6,
-            cidr_weights_v4: MASQUE_CIDR_WEIGHTS,
-            seeds_v4: MASQUE_SEEDS,
-            seeds_v6: MASQUE_SEEDS_V6,
+            cidrs_v4: if is_h2 { MASQUE_CIDRS_V4 } else { &[] },
+            cidrs_v6: if is_h2 { MASQUE_CIDRS_V6 } else { &[] },
+            cidr_weights_v4: if is_h2 { MASQUE_CIDR_WEIGHTS } else { &[] },
+            seeds_v4: if is_h2 { MASQUE_SEEDS } else { MASQUE_H3_SEEDS },
+            seeds_v6: if is_h2 { MASQUE_SEEDS_V6 } else { &[] },
             cache_kind: CacheKind::Masque,
             label: "gateway",
             config_path: self.config_path.clone(),
             profile: StrategyProfile {
-                turbo_sample: 64,
-                balanced_target: if crate::masque_h2::enabled() { 6 } else { 3 },
-                balanced_sample: 140,
+                turbo_sample: if is_h2 { 64 } else { 3 },
+                balanced_target: if is_h2 { 6 } else { 3 },
+                balanced_sample: if is_h2 { 140 } else { 3 },
                 stealth_target: 3,
-                stealth_sample: 64,
+                stealth_sample: if is_h2 { 64 } else { 3 },
             },
         }
     }
