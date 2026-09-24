@@ -188,12 +188,13 @@ impl FragmentConfig {
     }
 
     /// Full random-fragmentation mode driven by AETHER_MASQUE_H2_FRAGMENT* env vars.
-    /// Defaults when unset: chunks 16-32 bytes, delay 2-10 ms.
+    /// Enabled by default to defeat DPI ClientHello SNI blocking.
+    /// Defaults: chunks 16-32 bytes, delay 2-10 ms. Can be disabled via AETHER_MASQUE_H2_FRAGMENT=0/false/off.
     fn from_env() -> Self {
-        let enabled =
-            is_truthy(&crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT").unwrap_or_default());
-        if !enabled {
-            return Self::disabled();
+        if let Some(v) = crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT") {
+            if is_falsy(&v) {
+                return Self::disabled();
+            }
         }
         let (size_min, size_max) = parse_range(
             &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
@@ -246,10 +247,10 @@ impl FragmentConfig {
     }
 }
 
-fn is_truthy(v: &str) -> bool {
+fn is_falsy(v: &str) -> bool {
     matches!(
         v.trim().to_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
+        "0" | "false" | "no" | "off"
     )
 }
 
@@ -401,8 +402,17 @@ async fn connect_tls(
 }
 
 fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
-    let authority = format!("{}:443", cfg.authority);
-    let uri = format!("https://{}", authority);
+    let authority = if cfg.authority.contains(':') {
+        cfg.authority.clone()
+    } else {
+        format!("{}:443", cfg.authority)
+    };
+    // RFC 7540 §8.3 / RFC 9113 §8.5: CONNECT requests MUST NOT include a :scheme
+    // or :path pseudo-header. Providing an authority-only URI ensures h2 emits only
+    // :method and :authority, avoiding HTTP 400 rejection by Cloudflare.
+    let uri: http::Uri = authority
+        .parse()
+        .map_err(|e| AetherError::Masque(format!("build request invalid uri: {e}")))?;
     // #8: Add random-length padding header to defeat H2 frame-size analysis.
     // DPI that fingerprints CONNECT frames by their exact byte length will see
     // a different size every session.

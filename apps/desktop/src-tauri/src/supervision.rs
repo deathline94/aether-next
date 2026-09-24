@@ -871,6 +871,14 @@ pub(crate) fn connect_blocking(
                 },
             )
             .env(
+                "AETHER_MASQUE_H2_FRAGMENT",
+                if settings.transport == TransportKind::H2 {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
+            .env(
                 "AETHER_QUIC_INITIAL_FRAG",
                 if settings.quic_initial_frag {
                     settings.quic_initial_frag_size.clamp(16, 512).to_string()

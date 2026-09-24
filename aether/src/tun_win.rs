@@ -14,11 +14,12 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceAliasToLuid, ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToGuid,
     ConvertInterfaceLuidToIndex, CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
     DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry, FreeInterfaceDnsSettings, FreeMibTable,
-    GetInterfaceDnsSettings, GetIpForwardTable2, GetIpInterfaceEntry, GetUnicastIpAddressTable,
-    InitializeIpForwardEntry, InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry,
-    SetInterfaceDnsSettings, SetIpInterfaceEntry, SetUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
-    DNS_INTERFACE_SETTINGS_VERSION1, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-    MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    GetIfEntry2, GetInterfaceDnsSettings, GetIpForwardTable2, GetIpInterfaceEntry,
+    GetUnicastIpAddressTable, InitializeIpForwardEntry, InitializeIpInterfaceEntry,
+    InitializeUnicastIpAddressEntry, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+    SetUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
+    IP_ADDRESS_PREFIX, MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{
@@ -146,15 +147,34 @@ fn parse_v4(s: &str) -> Result<Ipv4Addr> {
         .map_err(|_| AetherError::HostState(format!("bad ipv4 {s}")))
 }
 
+/// Query the interface's NDIS flags through `GetIfEntry2` to determine if it is a
+/// physical hardware adapter rather than a virtual software/tunnel miniport.
+///
+/// Hardware interfaces have the `HardwareInterface` bit (bit 0) set in
+/// `InterfaceAndOperStatusFlags._bitfield` and `TunnelType == 0`.
+fn is_hardware_interface(if_index: u32) -> bool {
+    let mut row = MIB_IF_ROW2::default();
+    if let Ok(luid) = luid_of_index(if_index) {
+        row.InterfaceLuid = luid;
+    }
+    row.InterfaceIndex = if_index;
+    let code = unsafe { GetIfEntry2(&mut row) };
+    if code != NO_ERROR {
+        return false;
+    }
+    let is_hw = (row.InterfaceAndOperStatusFlags._bitfield & 0x01) != 0;
+    let is_not_tunnel = row.TunnelType == 0;
+    is_hw && is_not_tunnel
+}
+
 /// The physical default gateway: the lowest-total-metric `0.0.0.0/0` IPv4
 /// route with a real next hop, read from the forwarding table itself through
-/// `GetIpForwardTable2` + `GetIpInterfaceEntry` (T039). This is the same query
-/// the old `Get-NetRoute`/`Get-NetIPInterface` script made - `route metric +
-/// interface metric`, our own adapter excluded - without the PowerShell cold
-/// start: `exclude_if` is the tunnel interface index, where the script matched
-/// `InterfaceAlias -ne 'Aether'`.
+/// `GetIpForwardTable2` + `GetIpInterfaceEntry` (T039). Hardware adapters
+/// are strictly prioritized over virtual/tunnel adapters so virtual interfaces
+/// (e.g. previous tunnels or third-party VPNs) cannot hijack the physical gateway.
 fn default_gateway(exclude_if: u32) -> Result<(u32, Ipv4Addr)> {
-    let mut best: Option<(u32, u32, Ipv4Addr)> = None;
+    let mut best_hw: Option<(u32, u32, Ipv4Addr)> = None;
+    let mut best_any: Option<(u32, u32, Ipv4Addr)> = None;
     for row in forward_rows()? {
         let Some(key) = route_key_of_row(&row) else {
             continue;
@@ -174,16 +194,41 @@ fn default_gateway(exclude_if: u32) -> Result<(u32, Ipv4Addr)> {
             continue;
         };
         let total = row.Metric.saturating_add(interface_metric);
-        let better = match best {
+        let hw = is_hardware_interface(key.if_index);
+
+        if hw {
+            let better = match best_hw {
+                Some((total_best, _, _)) => total < total_best,
+                None => true,
+            };
+            if better {
+                best_hw = Some((total, key.if_index, key.next_hop));
+            }
+        }
+
+        let better_any = match best_any {
             Some((total_best, _, _)) => total < total_best,
             None => true,
         };
-        if better {
-            best = Some((total, key.if_index, key.next_hop));
+        if better_any {
+            best_any = Some((total, key.if_index, key.next_hop));
         }
     }
-    best.map(|(_, idx, gateway)| (idx, gateway))
-        .ok_or_else(|| AetherError::HostState("physical default gateway not found".into()))
+
+    let (chosen_hw, chosen) = match (best_hw, best_any) {
+        (Some(hw), _) => (true, Some(hw)),
+        (None, any) => (false, any),
+    };
+    if let Some((metric, idx, gw)) = chosen {
+        log::info!(
+            "[tun] default_gateway selected IF {idx} ({gw}) total_metric={metric} (is_hardware={chosen_hw})"
+        );
+        Ok((idx, gw))
+    } else {
+        Err(AetherError::HostState(
+            "physical default gateway not found".into(),
+        ))
+    }
 }
 
 /// The IPv4 interface metric netioapi reports for one interface.
@@ -608,10 +653,21 @@ fn set_adapter_address(if_index: u32, ipv4: Ipv4Addr) -> Result<()> {
             &format!("CreateUnicastIpAddressEntry({ipv4}/32 IF {if_index})"),
         ));
     }
-    let held = addresses_on(if_index)?;
-    if !held.contains(&ipv4) {
+    let mut ok = false;
+    let mut last_held = Vec::new();
+    for _ in 0..30 {
+        if let Ok(held) = addresses_on(if_index) {
+            if held.contains(&ipv4) {
+                ok = true;
+                break;
+            }
+            last_held = held;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ok {
         return Err(AetherError::HostState(format!(
-            "IF {if_index} reports {held:?} after CreateUnicastIpAddressEntry: {ipv4}/32 is not on it"
+            "IF {if_index} reports {last_held:?} after CreateUnicastIpAddressEntry: {ipv4}/32 is not on it"
         )));
     }
     Ok(())
@@ -691,8 +747,19 @@ fn delete_addresses_on(if_index: u32) -> Result<()> {
             );
         }
     }
-    let left = addresses_on(if_index)?;
-    if !left.is_empty() {
+    let mut clean = false;
+    let mut left = Vec::new();
+    for _ in 0..30 {
+        if let Ok(cur) = addresses_on(if_index) {
+            if cur.is_empty() {
+                clean = true;
+                break;
+            }
+            left = cur;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !clean {
         return Err(AetherError::HostState(format!(
             "IF {if_index} still holds {left:?} after the stale address purge"
         )));
@@ -711,10 +778,21 @@ fn delete_addresses_on(if_index: u32) -> Result<()> {
 /// itself ready.
 fn set_dns_servers(if_index: u32, servers: &[Ipv4Addr]) -> Result<()> {
     write_dns_servers(if_index, servers)?;
-    let reported = dns_servers_on(if_index)?;
-    if !same_dns(servers, &reported) {
+    let mut ok = false;
+    let mut last_reported = Vec::new();
+    for _ in 0..30 {
+        if let Ok(reported) = dns_servers_on(if_index) {
+            if same_dns(servers, &reported) {
+                ok = true;
+                break;
+            }
+            last_reported = reported;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ok {
         return Err(AetherError::HostState(format!(
-            "IF {if_index} reports dns servers {reported:?}, not the {servers:?} written by \
+            "IF {if_index} reports dns servers {last_reported:?}, not the {servers:?} written by \
              SetInterfaceDnsSettings"
         )));
     }

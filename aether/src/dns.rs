@@ -243,13 +243,13 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
 ///
 /// `src` is the tunnel-local IPv4 address; `resolver` is the upstream DNS
 /// target (typically 1.1.1.1 or 8.8.8.8).
-/// The IPv4 resolver the data-plane probe targets. Configurable via
-/// `AETHER_DATAPLANE_PROBE_IP` because the default (8.8.8.8) is blocked in some
-/// regions, which would make a perfectly good tunnel fail verification.
+/// The IPv4 resolver the data-plane probe targets. Defaults to Cloudflare DNS
+/// (1.1.1.1) which lives directly inside the tunnel edge. Configurable via
+/// `AETHER_DATAPLANE_PROBE_IP`.
 pub fn dataplane_probe_target() -> Ipv4Addr {
     crate::runtime_env::var("AETHER_DATAPLANE_PROBE_IP")
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(Ipv4Addr::new(8, 8, 8, 8))
+        .unwrap_or(Ipv4Addr::new(1, 1, 1, 1))
 }
 
 pub fn build_dataplane_probe(src: Ipv4Addr, resolver: Ipv4Addr) -> Vec<u8> {

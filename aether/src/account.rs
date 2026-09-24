@@ -5,7 +5,7 @@ use boring::ec::{EcGroup, EcKey};
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::PKey;
-use boring::x509::{X509Builder, X509NameBuilder};
+use boring::x509::{X509Builder, X509NameBuilder, X509};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -159,9 +159,9 @@ pub fn generate_masque_keypair() -> Result<MasqueKeyPair> {
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
     let not_before = Asn1Time::days_from_now(0).map_err(|e| AetherError::Tls(e.to_string()))?;
-    // L5 fix: widen the 1-day validity slightly for clock-skew tolerance while
-    // keeping the client certificate short-lived.
-    let not_after = Asn1Time::days_from_now(7).map_err(|e| AetherError::Tls(e.to_string()))?;
+    // Validity extended to 90 days to avoid premature expiration while keeping
+    // automatic re-enrollment when expiration nears.
+    let not_after = Asn1Time::days_from_now(90).map_err(|e| AetherError::Tls(e.to_string()))?;
     builder
         .set_not_before(&not_before)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
@@ -485,10 +485,27 @@ pub async fn provision_wg(model: &str, locale: &str, jwt: Option<&str>) -> Resul
     })
 }
 
+/// Check if an X.509 client certificate is expired or expiring within 24 hours.
+pub fn is_cert_expired(cert_pem: &[u8]) -> bool {
+    let Ok(cert) = X509::from_pem(cert_pem) else {
+        return true;
+    };
+    let Ok(threshold) = Asn1Time::days_from_now(1) else {
+        return true;
+    };
+    match cert.not_after().compare(&threshold) {
+        Ok(std::cmp::Ordering::Greater) => false,
+        _ => true,
+    }
+}
+
 pub async fn ensure_masque_enrolled(
     identity: &Identity,
 ) -> Result<(Vec<u8>, Vec<u8>, Option<String>)> {
-    if !identity.cert_pem.is_empty() && !identity.key_pem.is_empty() {
+    if !identity.cert_pem.is_empty()
+        && !identity.key_pem.is_empty()
+        && !is_cert_expired(&identity.cert_pem)
+    {
         return Ok((
             identity.cert_pem.clone(),
             identity.key_pem.clone(),
@@ -496,7 +513,14 @@ pub async fn ensure_masque_enrolled(
         ));
     }
 
-    log::info!("[+] enrolling MASQUE key for device {}", identity.device_id);
+    if !identity.cert_pem.is_empty() && is_cert_expired(&identity.cert_pem) {
+        log::info!(
+            "[+] existing MASQUE certificate for device {} is expired or expiring; re-enrolling",
+            identity.device_id
+        );
+    } else {
+        log::info!("[+] enrolling MASQUE key for device {}", identity.device_id);
+    }
     let keypair = generate_masque_keypair()?;
     let acct = enroll_key(
         &identity.device_id,
@@ -554,7 +578,7 @@ impl Identity {
     }
 
     pub fn has_masque_credentials(&self) -> bool {
-        !self.cert_pem.is_empty() && !self.key_pem.is_empty()
+        !self.cert_pem.is_empty() && !self.key_pem.is_empty() && !is_cert_expired(&self.cert_pem)
     }
 
     pub fn capability(&self) -> IdentityCapability {
