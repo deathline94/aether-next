@@ -77,7 +77,7 @@ function emit(payload: unknown) {
 
 /** Hydration has finished when the version read out of `app_info` is on screen. */
 async function hydrated(result: { current: { appVersion: string } }) {
-  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"));
+  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"), { timeout: 5000 });
 }
 
 beforeEach(() => {

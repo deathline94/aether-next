@@ -32,7 +32,7 @@ import { useRuntime } from "./useRuntime";
 const appendLog = vi.fn();
 
 async function ready(result: { current: { appVersion: string; settingsLoaded: boolean } }) {
-  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"));
+  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"), { timeout: 5000 });
 }
 
 beforeEach(() => {

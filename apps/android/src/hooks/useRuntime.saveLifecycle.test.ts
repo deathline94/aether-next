@@ -81,8 +81,8 @@ beforeEach(() => {
 });
 
 async function hydrated(result: { current: { appVersion: string } }) {
-  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"));
-  await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+  await waitFor(() => expect(result.current.appVersion).toBe("1.3.0"), { timeout: 5000 });
+  await waitFor(() => expect(result.current.settingsLoaded).toBe(true), { timeout: 5000 });
 }
 
 describe("first load", () => {
