@@ -1509,7 +1509,8 @@ pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 const MASQUE_PORTS_T1: &[u16] = &[443];
 const MASQUE_PORTS_T2: &[u16] = &[500, 1701, 4500];
 
-const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
+#[allow(dead_code)]
+pub const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("162.159.198.0/24", 10),
     ("162.159.197.0/24", 10),
     ("162.159.192.0/24", 9),
