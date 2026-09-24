@@ -493,10 +493,10 @@ pub fn is_cert_expired(cert_pem: &[u8]) -> bool {
     let Ok(threshold) = Asn1Time::days_from_now(1) else {
         return true;
     };
-    match cert.not_after().compare(&threshold) {
-        Ok(std::cmp::Ordering::Greater) => false,
-        _ => true,
-    }
+    !matches!(
+        cert.not_after().compare(&threshold),
+        Ok(std::cmp::Ordering::Greater)
+    )
 }
 
 pub async fn ensure_masque_enrolled(

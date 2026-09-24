@@ -570,6 +570,16 @@ fn interface_index(name: &str) -> Result<u32> {
     nonzero_index(if_index, &format!("adapter {name:?}"))
 }
 
+fn adapter_exists(name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    let alias = wide(name);
+    let mut luid = NET_LUID_LH::default();
+    let code = unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) };
+    code == NO_ERROR
+}
+
 /// The IPv4 interface row for one interface, read from the host.
 ///
 /// Keyed by LUID *and* index (the two always agree here: the index is
@@ -2316,16 +2326,23 @@ pub async fn spawn(
         .map_err(|e| AetherError::HostState(format!("load wintun: {e}")))?;
 
     // Prefer existing adapter; create if missing. Orphaned "Aether 1" names are cleaned by WinTun.
-    let adapter = match Adapter::open(&wintun, ADAPTER_NAME) {
-        Ok(a) => {
-            log::info!("[tun] opened existing adapter {ADAPTER_NAME}");
-            a
+    // Check if adapter exists first to avoid Wintun emitting a 0x00000490 error callback on fresh starts.
+    let adapter = if adapter_exists(ADAPTER_NAME) {
+        match Adapter::open(&wintun, ADAPTER_NAME) {
+            Ok(a) => {
+                log::info!("[tun] opened existing adapter {ADAPTER_NAME}");
+                a
+            }
+            Err(e) => {
+                log::info!("[tun] open existing {ADAPTER_NAME} failed ({e}); re-creating");
+                Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
+                    .map_err(|e| AetherError::HostState(format!("create adapter: {e}")))?
+            }
         }
-        Err(e) => {
-            log::info!("[tun] open {ADAPTER_NAME}: {e}; creating");
-            Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
-                .map_err(|e| AetherError::HostState(format!("create adapter: {e}")))?
-        }
+    } else {
+        log::info!("[tun] adapter {ADAPTER_NAME} not found; creating");
+        Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, None)
+            .map_err(|e| AetherError::HostState(format!("create adapter: {e}")))?
     };
 
     let ipv4 = parse_v4(ipv4_cidr)?;

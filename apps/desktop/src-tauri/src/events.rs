@@ -239,6 +239,14 @@ fn env_logger_level(line: &str) -> Option<&'static str> {
         Some("error")
     } else if line.contains(" WARN ") || line.starts_with("WARN ") {
         Some("warn")
+    } else if line.contains(" INFO ")
+        || line.starts_with("INFO ")
+        || line.contains(" DEBUG ")
+        || line.starts_with("DEBUG ")
+        || line.contains(" TRACE ")
+        || line.starts_with("TRACE ")
+    {
+        Some("info")
     } else {
         None
     }

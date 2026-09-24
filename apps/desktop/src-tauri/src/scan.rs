@@ -100,7 +100,7 @@ pub(crate) fn scan_blocking(
         )
         .env(
             "AETHER_MASQUE_H2_FRAGMENT",
-            if protocol == "masque-h2" { "1" } else { "0" },
+            "0",
         )
         .env(
             "AETHER_QUIC_INITIAL_FRAG",

@@ -191,10 +191,12 @@ impl FragmentConfig {
     /// Enabled by default to defeat DPI ClientHello SNI blocking.
     /// Defaults: chunks 16-32 bytes, delay 2-10 ms. Can be disabled via AETHER_MASQUE_H2_FRAGMENT=0/false/off.
     fn from_env() -> Self {
-        if let Some(v) = crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT") {
-            if is_falsy(&v) {
-                return Self::disabled();
-            }
+        let enabled = match crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT") {
+            Some(v) => !is_falsy(&v) && (v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")),
+            None => false,
+        };
+        if !enabled {
+            return Self::disabled();
         }
         let (size_min, size_max) = parse_range(
             &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
@@ -413,18 +415,12 @@ fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
     let uri: http::Uri = authority
         .parse()
         .map_err(|e| AetherError::Masque(format!("build request invalid uri: {e}")))?;
-    // #8: Add random-length padding header to defeat H2 frame-size analysis.
-    // DPI that fingerprints CONNECT frames by their exact byte length will see
-    // a different size every session.
-    let pad_len = rand::Rng::gen_range(&mut rand::thread_rng(), 16..=96);
-    let padding: String = (0..pad_len).map(|_| 'x').collect();
     http::Request::builder()
         .method(Method::CONNECT)
         .uri(uri)
         .header("cf-connect-proto", consts::CF_CONNECT_PROTOCOL)
         .header("pq-enabled", "false")
         .header("user-agent", "")
-        .header("x-pad", padding)
         .body(())
         .map_err(|e| AetherError::Masque(format!("build request: {e}")))
 }

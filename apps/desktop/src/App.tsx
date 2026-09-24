@@ -1,5 +1,5 @@
 import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Self-hosted faces: Vite hashes the woff2 into dist/ so the UI loads them
 // same-origin under `font-src 'self'` and never asks a third party pre-tunnel.
@@ -123,9 +123,28 @@ function App() {
     void connectToPeer(item.addr, proto, trans);
   }, [connectToPeer, appendLog]);
 
+  // Auto-clear logs after every new connect or clean disconnect
+  const prevStatusRef = useRef(runtime.status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    if (prev !== runtime.status) {
+      if (runtime.status === "connecting") {
+        clearLogs();
+      } else if (runtime.status === "disconnected" && prev !== "disconnected") {
+        clearLogs();
+      }
+      prevStatusRef.current = runtime.status;
+    }
+  }, [runtime.status, clearLogs]);
+
   const exportLogs = useCallback(async (): Promise<boolean> => {
     if (logs.length === 0) return false;
-    const diagnostics = await engineDiagnostics();
+    let diagnostics = "unavailable";
+    try {
+      diagnostics = await engineDiagnostics();
+    } catch {
+      // ignore
+    }
     const text = [
       logs
         .map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`)
@@ -133,13 +152,38 @@ function App() {
       "# engine diagnostics",
       diagnostics,
     ].join("\n\n");
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      appendLog({ level: "warn", message: "Clipboard copy failed — is the window focused?" });
-      return false;
+
+    // 1. Try modern clipboard API
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // Fall back to execCommand
+      }
     }
+
+    // 2. Fallback using temporary textarea
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.top = "0";
+      textarea.style.left = "0";
+      textarea.style.opacity = "0";
+      textarea.style.pointerEvents = "none";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const success = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (success) return true;
+    } catch {
+      // Fallback failed
+    }
+
+    appendLog({ level: "warn", message: "Clipboard copy failed — is the window focused?" });
+    return false;
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];

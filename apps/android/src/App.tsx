@@ -1,5 +1,5 @@
 import { AlertTriangle, Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Same self-hosted faces as the desktop app (T187): Vite hashes the woff2
 // into the bundled assets, so the WebView never reaches a third party.
@@ -77,16 +77,55 @@ function App() {
     setView("home");
   }, [connectToPeer, appendLog, scanner.active, scanner.busy, scanner.stopScan]);
 
+  // Auto-clear logs after every new connect or clean disconnect
+  const prevStatusRef = useRef(runtime.status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    if (prev !== runtime.status) {
+      if (runtime.status === "connecting") {
+        clearLogs();
+      } else if (runtime.status === "disconnected" && prev !== "disconnected") {
+        clearLogs();
+      }
+      prevStatusRef.current = runtime.status;
+    }
+  }, [runtime.status, clearLogs]);
+
   const exportLogs = useCallback(async (): Promise<boolean> => {
     if (logs.length === 0) return false;
     const text = logs.map((l) => `${new Date(l.ts).toISOString()}\t${l.level}\t${l.message}`).join("\n");
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      appendLog({ level: "warn", message: "Clipboard copy failed" });
-      return false;
+
+    // 1. Try modern clipboard API
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // Fall back to execCommand
+      }
     }
+
+    // 2. Fallback using temporary textarea
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.top = "0";
+      textarea.style.left = "0";
+      textarea.style.opacity = "0";
+      textarea.style.pointerEvents = "none";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const success = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (success) return true;
+    } catch {
+      // Fallback failed
+    }
+
+    appendLog({ level: "warn", message: "Clipboard copy failed" });
+    return false;
   }, [logs, appendLog]);
 
   const activeNav = navigation.find((n) => n.id === view) ?? navigation[0];
