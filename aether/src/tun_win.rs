@@ -8,15 +8,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, NO_ERROR, WIN32_ERROR,
+    ERROR_FILE_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND, NO_ERROR, WIN32_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceAliasToLuid, ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToGuid,
-    ConvertInterfaceLuidToIndex, CreateIpForwardEntry2, DeleteIpForwardEntry2,
-    DeleteUnicastIpAddressEntry, FreeInterfaceDnsSettings, FreeMibTable, GetInterfaceDnsSettings,
-    GetIpForwardTable2, GetIpInterfaceEntry, GetUnicastIpAddressTable, InitializeIpForwardEntry,
-    InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry, SetInterfaceDnsSettings,
-    SetIpInterfaceEntry, SetUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
+    ConvertInterfaceLuidToIndex, CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
+    DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry, FreeInterfaceDnsSettings, FreeMibTable,
+    GetInterfaceDnsSettings, GetIpForwardTable2, GetIpInterfaceEntry, GetUnicastIpAddressTable,
+    InitializeIpForwardEntry, InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry,
+    SetInterfaceDnsSettings, SetIpInterfaceEntry, SetUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
     DNS_INTERFACE_SETTINGS_VERSION1, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
     MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
 };
@@ -598,17 +598,20 @@ fn addresses_on(if_index: u32) -> Result<Vec<Ipv4Addr>> {
 /// host *must* source its tunnel traffic from this address.
 fn set_adapter_address(if_index: u32, ipv4: Ipv4Addr) -> Result<()> {
     let row = unicast_row_for(if_index, ipv4)?;
-    let code = unsafe { SetUnicastIpAddressEntry(&row) };
+    let mut code = unsafe { CreateUnicastIpAddressEntry(&row) };
+    if code == ERROR_OBJECT_ALREADY_EXISTS {
+        code = unsafe { SetUnicastIpAddressEntry(&row) };
+    }
     if code != NO_ERROR {
         return Err(win_err(
             code,
-            &format!("SetUnicastIpAddressEntry({ipv4}/32 IF {if_index})"),
+            &format!("CreateUnicastIpAddressEntry({ipv4}/32 IF {if_index})"),
         ));
     }
     let held = addresses_on(if_index)?;
     if !held.contains(&ipv4) {
         return Err(AetherError::HostState(format!(
-            "IF {if_index} reports {held:?} after SetUnicastIpAddressEntry: {ipv4}/32 is not on it"
+            "IF {if_index} reports {held:?} after CreateUnicastIpAddressEntry: {ipv4}/32 is not on it"
         )));
     }
     Ok(())

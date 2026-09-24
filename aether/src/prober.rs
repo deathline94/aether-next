@@ -198,9 +198,6 @@ pub enum VerifyCost {
 }
 
 /// Per-probe budget floors/ceilings for expensive (QUIC/BoringSSL) verification.
-/// Ceiling on an adaptive scan budget: past this the user is better served by
-/// the Stop button than by a scan that keeps running.
-const MAX_SCAN_DEADLINE: Duration = Duration::from_secs(300);
 /// Connect-flow deadline ceiling: kept comfortably below the 90 s supervisor
 /// watchdog so the prober finishes and returns a structured error or hit before
 /// the watchdog triggers.
