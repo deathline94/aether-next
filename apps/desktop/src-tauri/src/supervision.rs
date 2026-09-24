@@ -870,10 +870,7 @@ pub(crate) fn connect_blocking(
                     "0"
                 },
             )
-            .env(
-                "AETHER_MASQUE_H2_FRAGMENT",
-                "0",
-            )
+            .env("AETHER_MASQUE_H2_FRAGMENT", "0")
             .env(
                 "AETHER_QUIC_INITIAL_FRAG",
                 if settings.quic_initial_frag {

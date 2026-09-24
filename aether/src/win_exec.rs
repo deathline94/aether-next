@@ -123,7 +123,10 @@ mod tests {
     #[test]
     fn powershell_resolves_to_system_powershell() {
         let p = system_exe("powershell").expect("powershell exists on every supported Windows");
-        assert!(p.to_string_lossy().to_ascii_lowercase().ends_with("powershell.exe"));
+        assert!(p
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with("powershell.exe"));
         assert!(p.is_file());
         assert!(p.starts_with(system_dir().unwrap()));
     }

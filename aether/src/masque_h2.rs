@@ -192,7 +192,10 @@ impl FragmentConfig {
     /// Defaults: chunks 16-32 bytes, delay 2-10 ms. Can be disabled via AETHER_MASQUE_H2_FRAGMENT=0/false/off.
     fn from_env() -> Self {
         let enabled = match crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT") {
-            Some(v) => !is_falsy(&v) && (v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")),
+            Some(v) => {
+                !is_falsy(&v)
+                    && (v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            }
             None => false,
         };
         if !enabled {

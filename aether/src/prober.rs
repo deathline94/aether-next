@@ -1500,11 +1500,7 @@ pub const MASQUE_SEEDS: &[&str] = &[
 ];
 
 /// Cloudflare MASQUE H3 QUIC endpoints only listen on these specific VIPs across `MASQUE_PORTS`.
-pub const MASQUE_H3_SEEDS: &[&str] = &[
-    "162.159.198.1",
-    "162.159.198.2",
-    "162.159.198.3",
-];
+pub const MASQUE_H3_SEEDS: &[&str] = &["162.159.198.1", "162.159.198.2", "162.159.198.3"];
 
 /// Ports ordered by priority: primary web TLS first, then secondary, then legacy.
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
@@ -1576,7 +1572,11 @@ impl MasqueProbe {
             },
             cidrs_v4: if is_h2 { &["162.159.198.0/24"] } else { &[] },
             cidrs_v6: if is_h2 { MASQUE_CIDRS_V6 } else { &[] },
-            cidr_weights_v4: if is_h2 { &[("162.159.198.0/24", 10)] } else { &[] },
+            cidr_weights_v4: if is_h2 {
+                &[("162.159.198.0/24", 10)]
+            } else {
+                &[]
+            },
             seeds_v4: MASQUE_H3_SEEDS,
             seeds_v6: if is_h2 { MASQUE_SEEDS_V6 } else { &[] },
             cache_kind: CacheKind::Masque,
@@ -2288,7 +2288,10 @@ mod candidate_tests {
             &verify,
         ));
 
-        assert!(res.is_ok(), "scan must succeed when fewer than target working endpoints exist");
+        assert!(
+            res.is_ok(),
+            "scan must succeed when fewer than target working endpoints exist"
+        );
         let best = res.unwrap();
         // Lower RTT (hit2 = 20ms) must be chosen over hit1 (50ms).
         assert_eq!(best.ip, hit2);
@@ -2296,7 +2299,9 @@ mod candidate_tests {
 
         let cached = crate::cache::get_masque_sorted(&cfg_path);
         assert!(
-            cached.iter().any(|(a, _)| a.ip() == hit2 && a.port() == 443),
+            cached
+                .iter()
+                .any(|(a, _)| a.ip() == hit2 && a.port() == 443),
             "chosen best endpoint must be persisted to cache"
         );
         let _ = std::fs::remove_dir_all(&dir);
