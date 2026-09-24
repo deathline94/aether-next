@@ -194,7 +194,14 @@ fn interface_metric_v4(if_index: u32) -> Result<u32> {
 fn ps(cmd: &str) -> Result<String> {
     run_cmd(
         "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", cmd],
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            cmd,
+        ],
     )
 }
 
@@ -229,12 +236,26 @@ fn prepare_adapter_device(name: &str) -> Result<()> {
     }
     let script = format!(
         "$ErrorActionPreference = 'Stop'\n\
-         Enable-NetAdapter -Name '{name}' -IncludeHidden -Confirm:$false -ErrorAction Stop | Out-Null\n\
-         Disable-NetAdapterBinding -Name '{name}' -IncludeHidden -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop | Out-Null\n\
-         $adapter = Get-NetAdapter -Name '{name}' -IncludeHidden -ErrorAction Stop\n\
-         if ($null -eq $adapter -or $adapter.AdminStatus -ne 'Up') {{ throw 'adapter remains administratively disabled' }}\n\
-         $binding = Get-NetAdapterBinding -Name '{name}' -IncludeHidden -ComponentID ms_tcpip6 -ErrorAction Stop\n\
-         if ($null -eq $binding -or $binding.Enabled) {{ throw 'IPv6 binding remains enabled' }}\n"
+         $success = $false\n\
+         for ($i = 0; $i -lt 10; $i++) {{\n\
+             try {{\n\
+                 Enable-NetAdapter -Name '{name}' -IncludeHidden -Confirm:$false -ErrorAction Stop | Out-Null\n\
+                 Disable-NetAdapterBinding -Name '{name}' -IncludeHidden -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop | Out-Null\n\
+                 $adapter = Get-NetAdapter -Name '{name}' -IncludeHidden -ErrorAction Stop\n\
+                 if ($null -ne $adapter -and $adapter.AdminStatus -eq 'Up') {{\n\
+                     $binding = Get-NetAdapterBinding -Name '{name}' -IncludeHidden -ComponentID ms_tcpip6 -ErrorAction Stop\n\
+                     if ($null -eq $binding -or -not $binding.Enabled) {{\n\
+                         $success = $true\n\
+                         break\n\
+                     }}\n\
+                 }}\n\
+             }} catch {{\n\
+             }}\n\
+             Start-Sleep -Milliseconds 200\n\
+         }}\n\
+         if (-not $success) {{\n\
+             throw 'adapter remains administratively disabled or IPv6 binding remains enabled'\n\
+         }}\n"
     );
     ps(&script).map_err(|e| {
         AetherError::HostState(format!(

@@ -67,7 +67,17 @@ pub fn system_exe(name: &str) -> Result<PathBuf> {
     } else {
         format!("{lowered}.exe")
     };
-    let mut path = system_dir()?;
+    let sys = system_dir()?;
+    if lowered == "powershell" || lowered == "powershell.exe" {
+        let ps_path = sys
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if ps_path.is_file() {
+            return Ok(ps_path);
+        }
+    }
+    let mut path = sys;
     path.push(file);
     if !path.is_file() {
         return Err(AetherError::HostState(format!(
@@ -108,6 +118,14 @@ mod tests {
             "resolved outside the system directory: {}",
             p.display()
         );
+    }
+
+    #[test]
+    fn powershell_resolves_to_system_powershell() {
+        let p = system_exe("powershell").expect("powershell exists on every supported Windows");
+        assert!(p.to_string_lossy().to_ascii_lowercase().ends_with("powershell.exe"));
+        assert!(p.is_file());
+        assert!(p.starts_with(system_dir().unwrap()));
     }
 
     #[test]
