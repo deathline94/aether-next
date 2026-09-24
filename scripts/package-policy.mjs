@@ -4,18 +4,14 @@
 // Why this exists: the same workflow that builds a release-tag app also builds one
 // for every push to main, and it used to do so with `AETHER_ALLOW_UNWITNESSED`
 // switched on by the shape of the ref (`!startsWith(github.ref, 'refs/tags/')`).
-// With the committed anchor still carrying an all-zero digest for aether.exe, that
-// produced a release-profile shell that refuses to start its own engine at launch
-// (apps/desktop/src-tauri/src/trust.rs: `anchor_not_published`), signed by a
-// certificate that exists only inside the runner (`.github/scripts/sign-windows.ps1`
-// tolerated `NotTrusted` for exactly that certificate). A user on a clean machine
-// gets a package that cannot connect, and every CI check in between was green
-// because each one compared the build against itself.
+// With the committed anchor still carrying an all-zero digest for aether.exe,
+// such a package would refuse to start its own engine at launch. The package
+// policy prevents a release without a separately witnessed engine digest.
 //
 // The rule now, in one place:
-//   publishable  = a release run with a complete anchor (real digests, real CN,
-//                  a recorded witness run and artifact), a trusted-ca engine
-//                  signing profile, and a trusted signer selected by this run.
+//   publishable  = a release run with a complete anchor: a reviewed unsigned
+//                  engine digest and artifact pointer, plus the vendor-signed
+//                  WinTUN driver and its certificate pin.
 //   release runs must be publishable or the job fails; a development run may exist,
 //                  gets `-dev` in every artifact name, and is never uploaded to a
 //                  GitHub Release download.
@@ -39,19 +35,15 @@ const PLACEHOLDER = "0".repeat(64);
 const HEX64 = /^[0-9a-f]{64}$/;
 
 const ROLES = [
-  { name: "aether.exe", key: "engine", needsWitnessPointer: true },
-  { name: "wintun.dll", key: "driver", needsWitnessPointer: false },
+  { name: "aether.exe", needsWitnessPointer: true, profile: "unsigned-witnessed" },
+  { name: "wintun.dll", needsWitnessPointer: false, profile: "trusted-ca" },
 ];
 
-/** The two states that may ever be shipped, plus the "nobody has looked yet" one. */
-const TRUSTED_PROFILES = new Set(["trusted-ca"]);
-const KNOWN_PROFILES = new Set(["trusted-ca", "ephemeral-dev", "unwitnessed"]);
-
 /**
- * @param {{ kind?: string, anchor: object, signingMode?: string, allowUnwitnessed?: string }} p
+ * @param {{ kind?: string, anchor: object, allowUnwitnessed?: string }} p
  * @returns {{ problems: string[], warnings: string[], publishable: boolean, anchorComplete: boolean, label: string }}
  */
-export function evaluatePolicy({ kind, anchor, signingMode, allowUnwitnessed }) {
+export function evaluatePolicy({ kind, anchor, allowUnwitnessed }) {
   const problems = [];
   const warnings = [];
   const runKind = (kind ?? "").trim() === "development" ? "development" : "release";
@@ -82,28 +74,20 @@ export function evaluatePolicy({ kind, anchor, signingMode, allowUnwitnessed }) 
     } else if (!HEX64.test(String(entry.file_sha256).toLowerCase())) {
       problems.push(`${role.name}: file_sha256 is not 64 hex characters`);
     }
-    if (entry.cert_sha256 === PLACEHOLDER) {
-      problems.push(`${role.name}: cert_sha256 is the placeholder - the signing identity is unpinned`);
-    } else if (!HEX64.test(String(entry.cert_sha256).toLowerCase())) {
-      problems.push(`${role.name}: cert_sha256 is not 64 hex characters`);
-    }
-    if (!String(entry.issued_cn ?? "").trim()) {
-      problems.push(`${role.name}: issued_cn is empty - the runtime has no publisher to compare against`);
+    if (role.profile === "trusted-ca") {
+      if (entry.cert_sha256 === PLACEHOLDER || !HEX64.test(String(entry.cert_sha256).toLowerCase())) {
+        problems.push(`${role.name}: a trusted certificate digest is required`);
+      }
+      if (!String(entry.issued_cn ?? "").trim()) {
+        problems.push(`${role.name}: issued_cn is empty`);
+      }
+    } else if (entry.cert_sha256 || entry.issued_cn) {
+      problems.push(`${role.name}: an unsigned engine must not claim a signing identity`);
     }
 
     const profile = String(entry.signing_profile ?? "").trim();
-    if (!profile || profile === "unwitnessed") {
-      problems.push(
-        `${role.name}: signing_profile is "${profile || "unset"}" - record which certificate the ` +
-          "witnessed bytes carry before calling any package distributable",
-      );
-    } else if (!KNOWN_PROFILES.has(profile)) {
-      problems.push(`${role.name}: signing_profile "${profile}" is not one of ${[...KNOWN_PROFILES].join(", ")}`);
-    } else if (!TRUSTED_PROFILES.has(profile)) {
-      problems.push(
-        `${role.name}: signed with ${profile} - a certificate only the run that minted it can ` +
-          "verify, which a clean machine's WinVerifyTrust rejects",
-      );
+    if (profile !== role.profile) {
+      problems.push(`${role.name}: signing_profile must be ${role.profile}, got "${profile || "unset"}"`);
     }
 
     if (role.needsWitnessPointer) {
@@ -121,10 +105,6 @@ export function evaluatePolicy({ kind, anchor, signingMode, allowUnwitnessed }) 
   }
 
   const anchorComplete = problems.length === 0;
-  const mode = (signingMode ?? "").trim();
-  if (runKind === "release" && mode !== "trusted") {
-    problems.push(`AETHER_SIGNING_MODE=${mode || "(unset)"}: a release requires the trusted signing identity selected by this run`);
-  }
   if (String(allowUnwitnessed ?? "").trim() && runKind === "release") {
     problems.push(
       "AETHER_ALLOW_UNWITNESSED is set on a release run - the development opt-out may not " +
@@ -155,9 +135,7 @@ function selftest() {
       {
         name: "aether.exe",
         file_sha256: "a".repeat(64),
-        cert_sha256: "b".repeat(64),
-        issued_cn: "CN=deathline94",
-        signing_profile: "trusted-ca",
+        signing_profile: "unsigned-witnessed",
         witnessed_run: "1984213301",
         witnessed_artifact: "engine-witness",
       },
@@ -181,12 +159,12 @@ function selftest() {
     }
   };
 
-  const good = evaluatePolicy({ kind: "release", anchor: witnessed, signingMode: "trusted" });
-  expect("a fully witnessed, trusted-ca anchor is publishable", good.publishable, true);
+  const good = evaluatePolicy({ kind: "release", anchor: witnessed });
+  expect("a witnessed unsigned engine and signed driver are publishable", good.publishable, true);
   expect("  ... and carries no problems", good.problems.length, 0);
   expect("  ... and no -dev label", good.label, "");
 
-  const committed = evaluatePolicy({ kind: "release", anchor: asCommitted, signingMode: "trusted" });
+  const committed = evaluatePolicy({ kind: "release", anchor: asCommitted });
   expect(
     "the committed anchor (placeholder engine witness) is refused for a release",
     committed.publishable,
@@ -202,21 +180,14 @@ function selftest() {
   expect("a development run is not publishable either", devKind.publishable, false);
   expect("  ... and it is labelled -dev", devKind.label, "-dev");
 
-  const completeDev = evaluatePolicy({ kind: "development", anchor: witnessed, signingMode: "ephemeral" });
-  expect("a complete anchor does not make an ephemeral development run publishable", completeDev.publishable, false);
+  const completeDev = evaluatePolicy({ kind: "development", anchor: witnessed });
+  expect("a complete anchor does not make a development run publishable", completeDev.publishable, false);
   expect("  ... but its engine witness can still be used", completeDev.anchorComplete, true);
   expect("  ... and its package remains labelled -dev", completeDev.label, "-dev");
-
-  const missingMode = evaluatePolicy({ kind: "release", anchor: witnessed });
-  expect("a release with no recorded signing mode is refused", missingMode.publishable, false);
-
-  const ephemeral = evaluatePolicy({ kind: "release", anchor: witnessed, signingMode: "ephemeral" });
-  expect("a run that signed with an ephemeral certificate is refused", ephemeral.publishable, false);
 
   const unwitnessedFlag = evaluatePolicy({
     kind: "release",
     anchor: witnessed,
-    signingMode: "trusted",
     allowUnwitnessed: "1",
   });
   expect("AETHER_ALLOW_UNWITNESSED cannot reach a release run", unwitnessedFlag.publishable, false);
@@ -224,19 +195,27 @@ function selftest() {
   for (const [field, why] of [
     ["witnessed_run", "no pointer to the witnessed artifact"],
     ["witnessed_artifact", "a run id with no artifact name"],
-    ["cert_sha256", "an unpinned signing identity"],
-    ["issued_cn", "an empty publisher name"],
     ["signing_profile", "an unknown signing profile"],
   ]) {
     const broken = structuredClone(witnessed);
     broken.files[0][field] = field === "signing_profile" ? "who-knows" : "";
-    const r = evaluatePolicy({ kind: "release", anchor: broken, signingMode: "trusted" });
+    const r = evaluatePolicy({ kind: "release", anchor: broken });
     expect(`${why} is refused`, r.publishable, false);
   }
 
   const swapped = structuredClone(witnessed);
   swapped.files[0].file_sha256 = PLACEHOLDER;
-  expect("a placeholder engine digest survives no policy", evaluatePolicy({ kind: "release", anchor: swapped, signingMode: "trusted" }).publishable, false);
+  expect("a placeholder engine digest survives no policy", evaluatePolicy({ kind: "release", anchor: swapped }).publishable, false);
+
+  for (const field of ["cert_sha256", "issued_cn"]) {
+    const broken = structuredClone(witnessed);
+    broken.files[0][field] = "forged";
+    expect(`unsigned engine cannot claim ${field}`, evaluatePolicy({ kind: "release", anchor: broken }).publishable, false);
+  }
+
+  const badDriver = structuredClone(witnessed);
+  badDriver.files[1].cert_sha256 = PLACEHOLDER;
+  expect("driver certificate stays pinned", evaluatePolicy({ kind: "release", anchor: badDriver }).publishable, false);
 
   const empty = evaluatePolicy({ kind: "release", anchor: { files: [] } });
   expect("an anchor with no entries is a problem, not a pass", empty.publishable, false);
@@ -271,7 +250,6 @@ if (args.includes("--selftest-fail")) {
   const verdict = evaluatePolicy({
     kind,
     anchor: doc,
-    signingMode: process.env.AETHER_SIGNING_MODE ?? "",
     allowUnwitnessed: process.env.AETHER_ALLOW_UNWITNESSED ?? "",
   });
   const runKind = kind.trim() === "development" ? "development" : "release";

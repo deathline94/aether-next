@@ -101,10 +101,11 @@ gh attestation verify AetherNext-android-arm64-v8a.apk  --repo deathline94/aethe
 ```
 
 A pass means these exact bytes were produced by this repository's build workflow at the
-recorded commit. On Windows, right-click → Properties → Digital Signatures must also show
-a valid signature; the shell refuses to launch an engine whose digest is not the one
-committed in `packaging/trust/engine-trust.json`, and that witness is cut by a separate
-reviewed step (`gh workflow run prepare-anchor.yml`), never by the build that uses it.
+recorded commit. Aether's Windows packages are not Authenticode-signed, so Windows may
+show **Unknown publisher**. Compare the downloaded SHA-256 checksum as well. The shell
+refuses to launch an engine whose digest is not committed in
+`packaging/trust/engine-trust.json`; a separate reviewed workflow records that digest
+before a release build uses it. The bundled WinTUN driver keeps its vendor signature.
 
 ## Repairing leftover state
 
@@ -129,7 +130,8 @@ The desktop shell refuses to launch an engine whose bytes are not digested in
 step, so a release cannot vouch for whatever the runner happened to build:
 
 1. `gh workflow run prepare-anchor.yml` (it requires the literal `PUBLISH` confirmation).
-2. It builds and signs the engine, then opens a pull request with the one-line digest change.
+2. It builds the unsigned engine, uploads those exact bytes, then opens a pull
+   request with the measured digest and artifact pointer.
 3. Merge it, then tag. A tag build that finds no committed witness for the engine it
    staged fails, rather than rewriting its own anchor.
 
@@ -158,32 +160,15 @@ no check that would fail without it is not a fix.
 
 ## Build notes
 
-Windows desktop: Rust + Node, then `npm run tauri build` under `apps/desktop` after a release engine build.
+Windows desktop needs Rust and Node. The engine alone builds with
+`cd aether && cargo build --release`. The desktop interface builds with
+`cd apps/desktop && npm ci && npm run build`.
 
-**A release build of the shell is not a plain `cargo build --release`.** `apps/desktop/src-tauri/build.rs`
-embeds `packaging/trust/engine-trust.json` and hard-fails when it still carries the
-all-zero `aether.exe` witness, because a shell that would refuse to spawn the engine it
-ships is worse than a build that stops here. On a fresh clone that file *does* carry the
-placeholder — a signed engine only exists inside a release run — so the documented
-sequence is:
-
-```sh
-# 1. the engine alone (no anchor involved, this always works)
-cd aether && cargo build --release
-
-# 2a. a real release shell: cut the witness first, from the engine you just built
-#     (needs a signed aether.exe; see "Rotating the engine trust anchor" above)
-node ../scripts/publish-engine-trust.mjs --name aether.exe --file ../apps/desktop/src-tauri/resources/aether.exe --cert-sha <leaf-sha256> --cn "CN=deathline94"
-
-# 2b. a dev shell, which asserts nothing about release provenance
-$env:AETHER_ALLOW_UNWITNESSED = "1"   # Windows PowerShell; `export` elsewhere
-npm run tauri build
-```
-
-`AETHER_ALLOW_UNWITNESSED` builds a binary that can never be released: it has no trusted
-engine to start, and the build says so in a `cargo:warning`. CI does not set it on a tag
-build; if the witness is missing there, the release fails and you are pointed at
-`prepare-anchor.yml`.
+A distributable `npm run tauri build` embeds the reviewed engine digest from
+`packaging/trust/engine-trust.json`. On a fresh checkout with the placeholder
+digest, run the **Prepare engine witness** workflow and merge its pull request
+before tagging. `AETHER_ALLOW_UNWITNESSED=1` permits a development build only;
+the release policy refuses to publish it.
 
 Android: Node UI (`npm run sync-www`), Gradle APK under `apps/android/android`, with engine binaries staged into `jniLibs` as `libaether.so`.
 

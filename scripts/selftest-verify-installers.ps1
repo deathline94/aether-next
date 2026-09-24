@@ -7,7 +7,7 @@
 
       1. a package that contains no PE at all - the old "verify all packaged
          Windows binaries" step would have had nothing to check and passed;
-      2. a package whose engine is unsigned and whose digest matches nothing.
+      2. a package whose engine digest matches nothing.
 
     Each must exit non-zero. A third case asserts the positive control is
     reachable, so a script that always returns 1 (a broken call, a thrown
@@ -46,24 +46,40 @@ try {
         Write-Host "ok    an empty package is refused"
     }
 
-    # Fixture 2: an unsigned, unrecorded engine.
-    $bad = Join-Path $tmp "unsigned"
+    # Fixture 2: an unrecorded engine.
+    $bad = Join-Path $tmp "unrecorded"
     New-Item -ItemType Directory -Force -Path $bad | Out-Null
     [System.IO.File]::WriteAllBytes(
         (Join-Path $bad "aether.exe"),
         (@(0x4D, 0x5A) + (1..4096 | ForEach-Object { [byte](($_ * 7) -band 0xFF) })))
     if ((Invoke-Verifier $bad) -eq 0) {
-        Write-Host "FAIL  an unsigned engine was reported as verified"
+        Write-Host "FAIL  an unrecorded engine was reported as verified"
         $problems += 1
     } else {
-        Write-Host "ok    an unsigned engine is refused"
+        Write-Host "ok    an unrecorded engine is refused"
     }
 
-    # Positive control: the shipped wintun.dll is signed by WireGuard LLC and its
-    # digest is in the anchor, so a correct artifact must pass when checked alone.
-    $good = Join-Path $tmp "driveronly"
+    # Positive control: an unsigned engine with a reviewed digest, a desktop
+    # executable, and the vendor-signed driver must pass together.
+    $good = Join-Path $tmp "complete"
     New-Item -ItemType Directory -Force -Path $good | Out-Null
+    Copy-Item (Join-Path $bad "aether.exe") (Join-Path $good "aether.exe")
+    Copy-Item (Join-Path $bad "aether.exe") (Join-Path $good "AetherNext-Desktop.exe")
     Copy-Item (Join-Path $Root "packaging\wintun.dll") (Join-Path $good "wintun.dll")
+    $fixtureAnchor = Join-Path $tmp "engine-trust.json"
+    $fixture = Get-Content $anchor -Raw | ConvertFrom-Json
+    ($fixture.files | Where-Object { $_.name -eq 'aether.exe' }).file_sha256 =
+      (Get-FileHash (Join-Path $good 'aether.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $fixture | ConvertTo-Json -Depth 10 | Set-Content $fixtureAnchor
+    & $verifier -Directory $good -Anchor $fixtureAnchor 2>&1 | Out-String | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL  a complete unsigned package was refused"
+        $problems += 1
+    } else {
+        Write-Host "ok    a complete unsigned package verifies"
+    }
+
+    # The real driver certificate still has to verify on the host.
     $sig = Get-AuthenticodeSignature (Join-Path $good "wintun.dll")
     if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "WireGuard LLC") {
         Write-Host "FAIL  the committed wintun.dll no longer verifies: $($sig.Status) / $($sig.StatusMessage)"

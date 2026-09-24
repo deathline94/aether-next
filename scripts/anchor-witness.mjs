@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Record *provenance* in packaging/trust/engine-trust.json: which run's artifact
-// holds the witnessed bytes, what that artifact is called, and under what signing
-// profile the bytes were signed.
+// holds the witnessed bytes, what that artifact is called, and whether it is
+// unsigned or vendor-signed.
 //
 // Why a second script touches the anchor when scripts/publish-engine-trust.mjs
 // already owns it: the two write different things, and one of them cannot be
-// measured from a file. `file_sha256`/`cert_sha256`/`issued_cn` are digests of
-// bytes on disk, so publish-engine-trust.mjs computes them. `witnessed_run`,
+// measured from a file. `file_sha256` is measured by publish-engine-trust.mjs.
+// `witnessed_run`,
 // `witnessed_artifact` and `signing_profile` are facts about the run that produced
 // those bytes - the engine job cannot know them, and a release that has to guess
 // which artifact to download is a release that will quietly download whatever it
@@ -14,9 +14,9 @@
 // get a script too, with the same surgical rewrite and the same --check.
 //
 //   node scripts/anchor-witness.mjs --name aether.exe --run 1984213301 \
-//         --artifact engine-witness --profile trusted-ca
+//         --artifact engine-witness --profile unsigned-witnessed
 //   node scripts/anchor-witness.mjs --check --name aether.exe --run 1984213301 \
-//         --artifact engine-witness --profile trusted-ca
+//         --artifact engine-witness --profile unsigned-witnessed
 //   node scripts/anchor-witness.mjs --selftest-fail     # proves the rewrite, on a copy
 //
 // Entries stay FLAT: publish-engine-trust.mjs finds one with a no-braces regex, so
@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ANCHOR = join(ROOT, "packaging", "trust", "engine-trust.json");
-const PROFILES = new Set(["trusted-ca", "ephemeral-dev", "unwitnessed"]);
+const PROFILES = new Set(["trusted-ca", "unsigned-witnessed", "ephemeral-dev", "unwitnessed"]);
 const ARTIFACT_NAME = /^[A-Za-z0-9._-]{1,100}$/;
 const FIELDS = ["witnessed_run", "witnessed_artifact", "signing_profile"];
 

@@ -1,6 +1,5 @@
-//! Binary trust: which files may be executed at all, what their digest and
-//! signing certificate have to look like, and the committed anchor those answers
-//! come from.
+//! Binary trust: which files may be executed, their committed digests, and the
+//! vendor signature required for WinTUN.
 //!
 //! The tables below are compiled from `packaging/trust/engine-trust.json` by
 //! `build.rs` — never computed from the artifact being shipped, which is what made
@@ -9,14 +8,10 @@
 //! ## What a pass here guarantees, on Windows
 //!
 //! One open of the canonical path produces one in-memory buffer ([`WitnessedFile`],
-//! opened with a share mode that denies writers and delete-rename for as long as the
-//! handle lives). From *that buffer*: the SHA-256 compared with the anchor
-//! ([`witness_bytes`]) and the signing leaf read out of the PE's own certificate
-//! table ([`authenticode_signer`], a DER walk — no child process is asked who signed
-//! anything, and nothing opens the path a second time). The handle those bytes came
-//! from is the handle `WinVerifyTrust` verifies through, and any nonzero result it
-//! returns is a refusal. "These exact bytes were signed by this pinned leaf" is now
-//! one observation rather than two that happen to name the same path.
+//! opened with a share mode that denies writers and delete-rename while it lives).
+//! The engine's SHA-256 must match the separately reviewed anchor. The unsigned
+//! engine does not claim a Windows publisher identity. For WinTUN, the same buffer
+//! also supplies its signing leaf, and `WinVerifyTrust` checks the vendor signature.
 //!
 //! ## What it does not guarantee
 //!
@@ -273,7 +268,7 @@ impl std::fmt::Display for BinaryTrustError {
                 f,
                 "No trust anchor published for {filename}: packaging/trust/engine-trust.json \
                  still carries its placeholder digest for this artifact, so nothing can be \
-                 compared against. Record the signed build's sha256 there (see that file's \
+                 compared against. Record the engine build's sha256 there (see that file's \
                  $comment and packaging/trust/README.md); this is a release-pipeline gap, not a \
                  damaged install."
             ),
@@ -535,6 +530,16 @@ pub fn subject_names_common_name(subject: &str, expected_cn: &str) -> bool {
     matched || cn_rdn_matches(&subject[start..], expected)
 }
 
+fn is_witnessed_unsigned_engine(entries: &[AnchorEntry], filename: &str) -> bool {
+    filename.eq_ignore_ascii_case("aether.exe")
+        && entries.iter().any(|entry| {
+            entry.name == "aether.exe"
+                && entry.signing_profile.as_deref() == Some("unsigned-witnessed")
+                && entry.cert_sha256.is_none()
+                && entry.issued_cn.is_none()
+        })
+}
+
 fn cn_rdn_matches(rdn: &str, expected: &str) -> bool {
     let Some((name, value)) = rdn.split_once('=') else {
         return false;
@@ -787,6 +792,20 @@ pub fn verify_elevated_binary(
         });
     }
 
+    // Aether's own engine is distributed without Authenticode. Its exact bytes
+    // must match the separately reviewed witness above. Keep the vendor-signed
+    // WinTUN path below unchanged.
+    if label.eq_ignore_ascii_case("aether.exe") {
+        if !policy.enforce_hash_match || is_witnessed_unsigned_engine(&anchor_entries(), filename) {
+            return Ok(source);
+        }
+        if policy.enforce_hash_match {
+            return Err(BinaryTrustError::Validation(
+                "release engine is missing its unsigned-witnessed policy".to_string(),
+            ));
+        }
+    }
+
     // Who signed it, from the reviewed witness rather than from a string compiled
     // into the shell: `pinned_signer` reads the anchor this binary carries, and
     // `expected_publisher_cn` is what a development build falls back to when the
@@ -858,6 +877,20 @@ mod tests {
     fn anchor(files: serde_json::Value) -> Vec<AnchorEntry> {
         let doc = serde_json::json!({ "files": files });
         parse_anchor_entries(doc.to_string().as_bytes()).expect("the fixture is the anchor shape")
+    }
+
+    #[test]
+    fn unsigned_engine_profile_never_applies_to_driver_or_forged_signer() {
+        let good = anchor(serde_json::json!([
+            {"name":"aether.exe","file_sha256":"a".repeat(64),"signing_profile":"unsigned-witnessed"}
+        ]));
+        assert!(is_witnessed_unsigned_engine(&good, "aether.exe"));
+        assert!(!is_witnessed_unsigned_engine(&good, "wintun.dll"));
+
+        let forged = anchor(serde_json::json!([
+            {"name":"aether.exe","file_sha256":"a".repeat(64),"signing_profile":"unsigned-witnessed","issued_cn":"CN=someone"}
+        ]));
+        assert!(!is_witnessed_unsigned_engine(&forged, "aether.exe"));
     }
 
     fn signer(leaf: Option<&str>) -> PinnedSigner {

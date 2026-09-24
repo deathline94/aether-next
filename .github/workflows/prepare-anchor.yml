@@ -1,23 +1,14 @@
-# Cut the engine trust witness for a release.
-#
-# Why this exists as its own job: `packaging/trust/engine-trust.json` is the
-# committed statement of which engine bytes the shell is allowed to run. A tag
-# build must not write it (that is the self-referential check this file
-# replaced), so the digest has to be published by a separate, reviewed step that
-# a human starts. This workflow never pushes to main — it opens a pull request
-# with a one-line diff, and the release job refuses to bundle until that PR is
-# merged. No PR merged, no tagged release. Manual trigger only, on purpose.
-name: Prepare engine anchor
+name: Prepare engine witness
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type PUBLISH to build a witness for this tree'
+        description: 'Type PUBLISH to prepare a release engine'
         required: true
         default: ''
       ref:
-        description: 'Commit SHA (40 hex), tag, or main to build the engine from'
+        description: 'Commit SHA, version tag, or main to build'
         required: true
         default: 'main'
 
@@ -30,48 +21,28 @@ concurrency:
 
 jobs:
   cut:
-    name: Build, sign and witness the engine
+    name: Build and witness the engine
     runs-on: windows-latest
     timeout-minutes: 60
-    # The witness this job writes is the thing the shipped shell refuses to run
-    # without, so the job needs the same protection the release job has. specs/015
-    # research.md R30 claims "an `environment: release` with a required reviewer"
-    # already exists for the paths that mint trust material; for this workflow it did
-    # not, and this job both checks out a caller-supplied ref and pushes a branch.
-    # A required-reviewer environment is what makes "manual trigger only, on purpose"
-    # an actual control instead of a comment.
     environment: trust-anchor
     permissions:
       contents: write
-    env:
-      CONFIRM: ${{ github.event.inputs.confirm }}
-      INPUT_REF: ${{ github.event.inputs.ref }}
+      pull-requests: write
     steps:
-      - name: Refuse to run without confirmation
+      - name: Validate request
         shell: pwsh
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
-          if ($env:CONFIRM -ne 'PUBLISH') { throw "confirm input must be exactly PUBLISH (got a value that is not)" }
-
-      # Free-form `ref` + `contents: write` is the shape this step closes: without a
-      # validation gate the job would happily check out any branch or tag anyone can
-      # name, sign the binary from it, and push the result as a witness PR. Accepted
-      # forms are a full commit SHA, `main`, or a release-looking tag - anything that
-      # can be reviewed before it is witnessed.
-      - name: Validate the requested ref
-        shell: pwsh
-        run: |
-          $ref = $env:INPUT_REF
-          if ($ref -notmatch '^(?:[0-9a-f]{40}|main|v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') {
-            throw "ref must be a 40-character commit SHA, 'main', or a version tag (got '$ref')"
+          if ($env:CONFIRM -ne 'PUBLISH') { throw 'confirm must be PUBLISH' }
+          if ($env:INPUT_REF -notmatch '^(?:[0-9a-f]{40}|main|v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)$') {
+            throw 'ref must be main, a full commit SHA, or a version tag'
           }
-
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event.inputs.ref }}
-          # The only step that needs to write does so with an explicit GH_TOKEN;
-          # checkout's persisted default credentials are dead weight until then.
+          ref: ${{ inputs.ref }}
           persist-credentials: false
-
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: "1.88.0"
@@ -80,156 +51,46 @@ jobs:
       - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
-
       - name: Build engine
         working-directory: aether
         env:
           CMAKE_GENERATOR: Ninja
         run: cargo build --release
-
-      # The identity that signs the witnessed engine is the identity every release
-      # will be checked against, so it comes from the repository's secrets when one
-      # is configured. Without it this job still cuts a witness - of a development
-      # artifact - but it records signing_profile: ephemeral-dev, and
-      # scripts/package-policy.mjs then refuses to publish anything built on those
-      # bytes. That is the honest outcome: the witness describes what it saw, and
-      # the release job packages these same bytes instead of signing its own.
-      - name: Install the code-signing identity
-        id: cert
-        shell: pwsh
-        env:
-          SIGNING_PFX_BASE64: ${{ secrets.AETHER_CODESIGN_PFX_BASE64 }}
-          SIGNING_PFX_PASSWORD: ${{ secrets.AETHER_CODESIGN_PFX_PASSWORD }}
-        run: |
-          if ($env:SIGNING_PFX_BASE64 -and $env:SIGNING_PFX_PASSWORD) {
-            $pfx = Join-Path $env:RUNNER_TEMP "aether-witness.pfx"
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX_BASE64))
-            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation "Cert:\CurrentUser\My" `
-              -Password (ConvertTo-SecureString $env:SIGNING_PFX_PASSWORD -AsPlainText -Force) |
-              Where-Object HasPrivateKey | Select-Object -First 1
-            Remove-Item -LiteralPath $pfx -Force
-            if (-not $cert) { throw "the witness signing PFX holds no key" }
-            if ($cert.Subject -eq $cert.Issuer) {
-              throw "AETHER_CODESIGN_PFX_BASE64 is self-signed ($($cert.Subject)); witness it as ephemeral-dev instead, or fix the secret"
-            }
-            "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            "cn=$($cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            "profile=trusted-ca" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            Write-Host "Witness identity: $($cert.Subject) [$($cert.Thumbprint)]"
-            exit 0
-          }
-          Write-Host "::warning::no AETHER_CODESIGN_PFX_BASE64 secret: the witnessed engine is signed with a run-local self-signed certificate, so the anchor will record signing_profile=ephemeral-dev and no release can be cut from it"
-          $pfxPass = "ci-sign-$([Guid]::NewGuid().ToString('N').Substring(0,16))"
-          $configPath = Join-Path $env:RUNNER_TEMP "aether-anchor.cnf"
-          $keyPath = Join-Path $env:RUNNER_TEMP "aether-anchor.key"
-          $certPath = Join-Path $env:RUNNER_TEMP "aether-anchor.crt"
-          $pfxPath = Join-Path $env:RUNNER_TEMP "aether-anchor.pfx"
-          "[req]`ndefault_bits = 2048`ndistinguished_name = req_dn`nx509_extensions = v3_cs`nprompt = no`n[req_dn]`nCN = deathline94`n[v3_cs]`nkeyUsage = critical,digitalSignature`nextendedKeyUsage = codeSigning`nbasicConstraints = critical,CA:FALSE`nsubjectKeyIdentifier = hash" |
-            Set-Content -LiteralPath $configPath -NoNewline
-          & openssl req -x509 -newkey rsa:2048 -keyout $keyPath -out $certPath -days 1825 -nodes -config $configPath 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "openssl req failed ($LASTEXITCODE)" }
-          & openssl pkcs12 -export -out $pfxPath -inkey $keyPath -in $certPath -passout "pass:$pfxPass" 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "openssl pkcs12 failed ($LASTEXITCODE)" }
-          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation "Cert:\CurrentUser\My" `
-            -Password (ConvertTo-SecureString $pfxPass -AsPlainText -Force) |
-            Where-Object HasPrivateKey | Select-Object -First 1
-          if (-not $cert) { throw "no importable signing certificate" }
-          "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "cn=$($cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "profile=ephemeral-dev" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      # Signed through the same single rule build.yml signs the shipped installer
-      # with, once, here - these are the bytes a release must later package. A
-      # second signing of a second compilation cannot produce this digest, which is
-      # exactly why the release job downloads this run's artifact instead of
-      # rebuilding the engine and demanding a match.
-      - name: Sign the engine once
+      - name: Record the engine digest and build artifact
         shell: pwsh
         run: |
-          $eng = "aether/target/release/aether.exe"
-          $extra = @{}
-          if ('${{ steps.cert.outputs.profile }}' -eq 'ephemeral-dev') { $extra.DevEphemeral = $true }
-          & ".github/scripts/sign-windows.ps1" -Thumbprint "${{ steps.cert.outputs.thumbprint }}" `
-            -Path $eng -ExpectedPublisherCN "${{ steps.cert.outputs.cn }}" @extra
-          $sig = Get-AuthenticodeSignature -LiteralPath $eng
-          if ($null -eq $sig.SignerCertificate) { throw "no signer certificate on $eng after signing" }
-          $sha = (([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$sig.SignerCertificate.RawData) | ForEach-Object { $_.ToString("x2") }) -join "")
-          "ANCHOR_CERT_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ANCHOR_CN=CN=${{ steps.cert.outputs.cn }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Witness the staged engine
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources | Out-Null
-          Copy-Item -Force aether/target/release/aether.exe apps/desktop/src-tauri/resources/aether.exe
-          node scripts/publish-engine-trust.mjs --name aether.exe `
-            --file apps/desktop/src-tauri/resources/aether.exe `
-            --cert-sha $env:ANCHOR_CERT_SHA --cn $env:ANCHOR_CN
-          # Read it straight back: an anchor that does not describe the artifact
-          # it names is the exact failure this pipeline is built to prevent.
-          node scripts/publish-engine-trust.mjs --check --name aether.exe `
-            --file apps/desktop/src-tauri/resources/aether.exe
-
-      # The other half of the witness: which run's artifact holds the bytes the
-      # digest above describes, and under which signing profile. Written by a
-      # script rather than by hand because a reviewer has to be able to see that
-      # the pointer and the digest were produced by the same step, in the same
-      # diff, against the same file.
-      - name: Record the witness pointer in the anchor
-        shell: pwsh
-        env:
-          SIGNING_PROFILE: ${{ steps.cert.outputs.profile }}
-        run: |
-          node scripts/anchor-witness.mjs --name aether.exe `
-            --run "$env:GITHUB_RUN_ID" --artifact engine-witness `
-            --profile $env:SIGNING_PROFILE
-          node scripts/anchor-witness.mjs --check --name aether.exe `
-            --run "$env:GITHUB_RUN_ID" --artifact engine-witness --profile $env:SIGNING_PROFILE
-
-      # The exact file the digest above was measured over, uploaded after the
-      # witness was written and before anything else can touch it. `build.yml`
-      # downloads this and nothing else for a release.
-      - name: Upload the witnessed engine
+          $exe = 'aether/target/release/aether.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'engine build is missing' }
+          node scripts/publish-engine-trust.mjs --name aether.exe --file $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/anchor-witness.mjs --name aether.exe --run "$env:GITHUB_RUN_ID" --artifact engine-witness --profile unsigned-witnessed
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/publish-engine-trust.mjs --check --name aether.exe --file $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/anchor-witness.mjs --check --name aether.exe --run "$env:GITHUB_RUN_ID" --artifact engine-witness --profile unsigned-witnessed
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload witnessed engine
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: engine-witness
           path: aether/target/release/aether.exe
           if-no-files-found: error
           retention-days: 365
-
-      - name: Open the witness pull request
+      - name: Open witness pull request
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          # Never the caller's `ref`: the base has to be a branch, and an input
-          # landing here verbatim is both a `gh pr create --base <sha>` that cannot
-          # work and a second path by which unreviewed text reaches a write API.
-          DEFAULT_BASE: ${{ github.event.repository.default_branch }}
-        shell: pwsh
+          BASE: ${{ github.event.repository.default_branch }}
         run: |
           $branch = "anchor/$(git rev-parse --short HEAD)-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -b $branch
           git add packaging/trust/engine-trust.json
-          if ((git diff --cached --quiet)) { throw "the anchor did not change - nothing to witness" }
-          git commit -m "chore(trust): witness engine bytes from $($env:GITHUB_SHA.Substring(0,7))"
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { throw 'engine witness did not change' }
+          git commit -m "Record engine digest from run $env:GITHUB_RUN_ID"
+          gh auth setup-git
           git push -u origin $branch
-          $body = "Automatically cut by ``.github/workflows/prepare-anchor.yml`` (run $env:RUN_ID)." +
-            "`n`nMerge this before tagging a release: a tag build refuses to bundle an " +
-            "engine whose bytes are not witnessed by the committed anchor." +
-            "`n`nWitnessed artifact: ``engine-witness`` from run $env:RUN_ID " +
-            "(signing profile ``${{ steps.cert.outputs.profile }}``). The release job downloads " +
-            "that artifact and packages those bytes; it does not build or sign an engine." +
-            ($(if ('${{ steps.cert.outputs.profile }}' -eq 'ephemeral-dev') {
-              "`n`n**This witness cannot be released from**: it is signed by a certificate that " +
-              "exists only inside this run, so ``scripts/package-policy.mjs`` will refuse any " +
-              "tag built against it. Add AETHER_CODESIGN_PFX_BASE64 and re-run to witness a " +
-              "distributable engine."
-            } else { "" })) +
-            "`n`nA rotation with no diff here is a pipeline bug, not a no-op."
-          gh pr create --base $env:DEFAULT_BASE `
-            --title "Trust anchor for engine $(git rev-parse --short HEAD)" `
-            --body $body
+          if ($LASTEXITCODE -ne 0) { throw 'could not push the witness branch' }
+          gh pr create --base $env:BASE --title 'Record engine build for release' --body "Engine: unsigned. SHA-256 and artifact pointer were measured in workflow run $env:GITHUB_RUN_ID. Merge before tagging a release."

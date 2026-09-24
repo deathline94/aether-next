@@ -12,12 +12,11 @@
     covers only its own bytes.
 
     So: extract, then check each binary on its own terms.
-      - the engine must be signed by the expected publisher AND match the digest in
-        packaging/trust/engine-trust.json, the same witness the running shell
-        compares against;
+      - the unsigned engine must match the digest in packaging/trust/engine-trust.json,
+        the same witness the running shell compares against;
       - wintun.dll must still carry its WireGuard LLC signature and pinned digest,
         which is also the proof that bundling did not strip or re-sign it;
-      - the GUI exe must be signed by the same publisher;
+      - the GUI exe must actually be present;
       - zero extractable binaries is a failure, not a pass. A gate that finds
         nothing to check has to say so, or it goes green on an empty set forever.
 .EXAMPLE
@@ -33,10 +32,7 @@ param(
     # Validate an already-extracted tree. Used by the CI fixtures test and by anyone
     # reproducing a failure locally.
     [string]$Directory,
-    [string]$ExpectedPublisherCN = "deathline94",
-    [string]$ExpectedGuiCertSha256 = "",
     [switch]$Development,
-    [string]$DevThumbprint = "",
     [string]$DevEngineSha256 = "",
     [string]$EngineName = "aether.exe",
     [string]$DriverName = "wintun.dll",
@@ -89,12 +85,10 @@ function Get-PEFiles([string]$root) {
     }
 }
 
-function Test-Signature([string]$path, [string]$expectCN, [bool]$allowDev, [string]$pin = "") {
+function Test-Signature([string]$path, [string]$expectCN) {
     $helper = Join-Path (Split-Path -Parent $PSCommandPath) "..\.github\scripts\sign-windows.ps1"
-    $extra = @{}
-    if ($allowDev) { $extra.DevEphemeral = $true; $extra.Thumbprint = $DevThumbprint }
     try {
-        & $helper -VerifyOnly -Path $path -ExpectedPublisherCN $expectCN -ExpectedCertSha256 $pin @extra | Out-Null
+        & $helper -VerifyOnly -Path $path -ExpectedPublisherCN $expectCN | Out-Null
         return $null
     } catch {
         return $_.Exception.Message
@@ -122,12 +116,10 @@ if ($Directory) {
 }
 
 try {
-    if ($Development -and -not $DevThumbprint) { throw "development verification needs the run-local certificate thumbprint" }
-    if (-not $Development -and ($DevThumbprint -or $DevEngineSha256)) { throw "development verification inputs may not reach a release" }
+    if (-not $Development -and $DevEngineSha256) { throw "development verification inputs may not reach a release" }
     $anchorDoc = Get-Content $Anchor -Raw | ConvertFrom-Json
     $engineEntry = $anchorDoc.files | Where-Object { $_.name -eq $EngineName } | Select-Object -First 1
     if (-not $engineEntry) { throw "trust anchor has no entry for $EngineName" }
-    $engineCN = $engineEntry.issued_cn -replace '^CN=', ''
     $engineDigest = Get-AnchorDigest $EngineName
     $driverDigest = Get-AnchorDigest $DriverName
     $placeholder = "0" * 64
@@ -156,29 +148,24 @@ try {
             } elseif ($hash -ne $engineDigest) {
                 $failures.Add("$($t.Name): $EngineName is $hash but $Anchor says $engineDigest")
             }
-            $engineIsDev = $Development -and $engineDigest -eq $placeholder
-            $engineExpectedCN = if ($engineIsDev) { $ExpectedPublisherCN } else { $engineCN }
-            $engineCertPin = if ($engineIsDev) { "" } else { $engineEntry.cert_sha256 }
-            $problem = Test-Signature $engine.FullName $engineExpectedCN $engineIsDev $engineCertPin
-            if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
 
         $driver = $pes | Where-Object { $_.Name -ieq $DriverName } | Select-Object -First 1
-        if ($driver) {
+        if (-not $driver) {
+            $failures.Add("$($t.Name): no $DriverName inside")
+        } else {
             $hash = (Get-FileHash $driver.FullName -Algorithm SHA256).Hash.ToLower()
             if ($hash -ne $driverDigest) {
                 $failures.Add("$($t.Name): wintun.dll is $hash but $Anchor says $driverDigest")
             }
             # WireGuard's own signature must survive bundling: a re-signed or stripped
             # driver is a different trust story than the one the anchor describes.
-            $problem = Test-Signature $driver.FullName "WireGuard LLC" $false
+            $problem = Test-Signature $driver.FullName "WireGuard LLC"
             if ($problem) { $failures.Add("$($t.Name): $problem") }
         }
 
-        foreach ($gui in ($pes | Where-Object { $_.Name -like $GuiNamePattern -and $_.Name -ne $EngineName })) {
-            $problem = Test-Signature $gui.FullName $ExpectedPublisherCN ([bool]$Development) $ExpectedGuiCertSha256
-            if ($problem) { $failures.Add("$($t.Name): $problem") }
-        }
+        $guis = @($pes | Where-Object { $_.Name -like $GuiNamePattern -and $_.Name -ne $EngineName })
+        if ($guis.Count -eq 0) { $failures.Add("$($t.Name): no desktop executable inside") }
     }
 
     if (-not $checkedAny) {
@@ -190,7 +177,7 @@ try {
         Write-Host "verify-installers: $($failures.Count) problem(s)"
         exit 1
     }
-    Write-Host "verify-installers: every extracted binary matches its signature and its anchor digest"
+    Write-Host "verify-installers: engine and driver digests match the anchor; driver signature is valid"
     exit 0
 } finally {
     if ($staging -and (Test-Path $staging)) { Remove-Item -Recurse -Force $staging }
