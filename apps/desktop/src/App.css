@@ -417,14 +417,22 @@ code, kbd, pre {
   border: 1px solid var(--emerald-a280);
   background: radial-gradient(circle at 50% 0%, var(--brand-mark-top) 0%, var(--brand-mark-bottom) 100%);
   color: var(--emerald);
-  border-radius: var(--radius-field);
+  border-radius: var(--radius-circle);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.15);
   flex-shrink: 0;
+  overflow: hidden;
+}
+.brand-mark-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: var(--radius-circle);
+  display: block;
 }
 .brand-ambient-glow {
   position: absolute;
   inset: -4px;
-  border-radius: var(--radius-hero);
+  border-radius: var(--radius-circle);
   background: radial-gradient(circle, var(--emerald-a30) 0%, transparent 70%);
   opacity: 0.6;
   filter: blur(6px);

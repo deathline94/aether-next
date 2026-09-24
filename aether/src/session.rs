@@ -713,11 +713,7 @@ async fn select_peer(
                 key_pem: std::sync::Arc::from(identity.key_pem.clone()),
                 ech_config_list: ech_config.clone().map(std::sync::Arc::from),
                 noize: noize_config(),
-                ports: if masque_h2::enabled() {
-                    vec![443]
-                } else {
-                    prober::MASQUE_PORTS.to_vec()
-                },
+                ports: prober::MASQUE_PORTS.to_vec(),
                 ip,
                 local_ipv4,
                 config_path: base_config.to_string(),

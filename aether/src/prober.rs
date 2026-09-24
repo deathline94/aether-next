@@ -1571,24 +1571,20 @@ impl MasqueProbe {
             } else {
                 VerifyCost::Expensive
             },
-            cidrs_v4: if is_h2 { &["162.159.198.0/24"] } else { &[] },
+            cidrs_v4: if is_h2 { MASQUE_CIDRS_V4 } else { &[] },
             cidrs_v6: if is_h2 { MASQUE_CIDRS_V6 } else { &[] },
-            cidr_weights_v4: if is_h2 {
-                &[("162.159.198.0/24", 10)]
-            } else {
-                &[]
-            },
-            seeds_v4: MASQUE_H3_SEEDS,
+            cidr_weights_v4: if is_h2 { MASQUE_CIDR_WEIGHTS } else { &[] },
+            seeds_v4: if is_h2 { MASQUE_SEEDS } else { MASQUE_H3_SEEDS },
             seeds_v6: if is_h2 { MASQUE_SEEDS_V6 } else { &[] },
             cache_kind: CacheKind::Masque,
             label: "gateway",
             config_path: self.config_path.clone(),
             profile: StrategyProfile {
-                turbo_sample: if is_h2 { 16 } else { 3 },
-                balanced_target: if is_h2 { 4 } else { 3 },
-                balanced_sample: if is_h2 { 32 } else { 3 },
+                turbo_sample: if is_h2 { 64 } else { 3 },
+                balanced_target: if is_h2 { 6 } else { 3 },
+                balanced_sample: if is_h2 { 140 } else { 3 },
                 stealth_target: 3,
-                stealth_sample: if is_h2 { 16 } else { 3 },
+                stealth_sample: if is_h2 { 64 } else { 3 },
             },
         }
     }

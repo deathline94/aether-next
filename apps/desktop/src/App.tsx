@@ -1,4 +1,4 @@
-import { Radio, ScrollText, Search, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { Radio, ScrollText, Search, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Self-hosted faces: Vite hashes the woff2 into dist/ so the UI loads them
@@ -206,7 +206,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">
-            <ShieldCheck size={20} strokeWidth={2.2} />
+            <img src="/aether.svg" alt="Aether" className="brand-mark-img" />
             <span className="brand-ambient-glow" aria-hidden="true" />
           </div>
           <div className="brand-text">

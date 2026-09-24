@@ -997,11 +997,20 @@ fn rollback_address_confirmed(if_index: u32) -> StepOutcome {
     }
 }
 
+fn is_not_found(err: &AetherError) -> bool {
+    let s = err.to_string();
+    s.contains("Windows error 1168") || s.contains("Windows error 2")
+}
+
 /// `Set-DnsClientServerAddress -ResetServerAddresses`, natively: an empty
 /// name-server list, confirmed by the read-back that follows it.
 fn reset_dns_confirmed(if_index: u32) -> StepOutcome {
     match write_dns_servers(if_index, &[]).and_then(|_| dns_servers_on(if_index)) {
         Err(e) => {
+            if is_not_found(&e) {
+                log::info!("[tun] IF {if_index} is not present for DNS reset; confirmed");
+                return StepOutcome::Confirmed;
+            }
             log::error!("[tun] the adapter's dns server list could not be reset: {e}");
             StepOutcome::Failed
         }
@@ -1076,12 +1085,22 @@ fn restore_automatic_metric_confirmed(if_index: u32) -> StepOutcome {
     let mut row = match interface_row_v4(if_index) {
         Ok(row) => row,
         Err(e) => {
+            if is_not_found(&e) {
+                log::info!(
+                    "[tun] IF {if_index} interface row is not present (adapter absent); metric release confirmed"
+                );
+                return StepOutcome::Confirmed;
+            }
             log::error!("[tun] the interface row cannot be read to release the metric: {e}");
             return StepOutcome::Failed;
         }
     };
     row.UseAutomaticMetric = true;
     let code = unsafe { SetIpInterfaceEntry(&mut row) };
+    if code == 1168 || code == 2 {
+        log::info!("[tun] IF {if_index} vanished during metric reset; confirmed");
+        return StepOutcome::Confirmed;
+    }
     if code != NO_ERROR {
         log::error!(
             "[tun] SetIpInterfaceEntry could not restore the automatic metric on IF {if_index}: \
@@ -1098,6 +1117,9 @@ fn restore_automatic_metric_confirmed(if_index: u32) -> StepOutcome {
             StepOutcome::Failed
         }
         Err(e) => {
+            if is_not_found(&e) {
+                return StepOutcome::Confirmed;
+            }
             log::error!("[tun] the restored metric cannot be read back: {e}");
             StepOutcome::Failed
         }
@@ -1621,9 +1643,17 @@ fn abandon_install(journal_path: &Path, installed: &[RouteKey], error: AetherErr
 /// failure has the same surface. Preserve the journal until a later attempt can
 /// confirm the DNS and metric state.
 fn adapter_reset_steps() -> Vec<StepOutcome> {
+    if !adapter_exists(ADAPTER_NAME) {
+        log::info!("[tun] adapter {ADAPTER_NAME} does not exist; adapter reset confirmed");
+        return vec![StepOutcome::Confirmed, StepOutcome::Confirmed];
+    }
     let if_index = match interface_index(ADAPTER_NAME) {
         Ok(if_index) => if_index,
         Err(e) => {
+            if is_not_found(&e) {
+                log::info!("[tun] adapter {ADAPTER_NAME} not found; reset confirmed");
+                return vec![StepOutcome::Confirmed, StepOutcome::Confirmed];
+            }
             log::error!("[tun] cannot identify adapter to reset: {e}; keeping route journal");
             return vec![StepOutcome::Failed, StepOutcome::Failed];
         }
