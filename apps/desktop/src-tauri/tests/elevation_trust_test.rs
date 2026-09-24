@@ -290,7 +290,7 @@ fn test_elevation_trust_rejects_missing_hash_when_enforced() {
 }
 
 #[test]
-fn test_elevation_trust_allows_missing_hash_when_not_enforced() {
+fn test_elevation_trust_missing_hash_does_not_override_release_signature_check() {
     let current_exe = std::env::current_exe().expect("current exe");
     let filename_owned = current_exe
         .file_name()
@@ -309,9 +309,15 @@ fn test_elevation_trust_allows_missing_hash_when_not_enforced() {
     };
 
     let res = verify_elevated_binary(&current_exe, filename, &policy);
+    #[cfg(all(windows, not(debug_assertions)))]
+    assert!(
+        res.is_err(),
+        "An arbitrary unsigned binary must not bypass the release signature check"
+    );
+    #[cfg(any(not(windows), debug_assertions))]
     assert!(
         res.is_ok(),
-        "Missing hash must be allowed when enforce_hash_match=false in debug: {res:?}"
+        "Development policy should allow an unwitnessed test binary: {res:?}"
     );
 }
 
