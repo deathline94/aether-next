@@ -98,7 +98,7 @@ pub struct PinSet {
     pub pins: Vec<Pin>,
 }
 
-/// A release-time generated, committed set of trusted release binaries.
+/// A committed set of witnessed release binaries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnchorSet {
     pub version: u32,
@@ -109,10 +109,16 @@ pub struct AnchorSet {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnchorFile {
     pub name: String,
-    /// Lowercase hex SHA-256 of the signed file as published.
+    /// Lowercase hex SHA-256 of the file as published.
     pub file_sha256: String,
-    /// Lowercase hex SHA-256 of the signer's leaf certificate DER.
-    pub cert_sha256: String,
+    /// Lowercase hex SHA-256 of the signer's leaf certificate DER, for signed files.
+    #[serde(default)]
+    pub cert_sha256: Option<String>,
+    pub signing_profile: String,
+    #[serde(default)]
+    pub witnessed_run: Option<String>,
+    #[serde(default)]
+    pub witnessed_artifact: Option<String>,
     /// Subject of the signing certificate, for logs only — never a decision.
     #[serde(default)]
     pub issued_cn: String,
@@ -203,11 +209,31 @@ pub fn load_anchors(json: &str) -> Result<AnchorSet> {
         ));
     }
     for f in &set.files {
-        if !is_hex_sha256(&f.file_sha256) || !is_hex_sha256(&f.cert_sha256) {
+        if !is_hex_sha256(&f.file_sha256) {
             return Err(AetherError::Config(format!(
                 "trust anchor for {:?} has a non-SHA-256 digest",
                 f.name
             )));
+        }
+        match f.name.as_str() {
+            "aether.exe"
+                if f.signing_profile == "unsigned-witnessed"
+                    && f.cert_sha256.is_none()
+                    && f.witnessed_run
+                        .as_deref()
+                        .is_some_and(|run| run.parse::<u64>().is_ok())
+                    && f.witnessed_artifact
+                        .as_deref()
+                        .is_some_and(|artifact| !artifact.is_empty()) => {}
+            "wintun.dll"
+                if f.signing_profile == "trusted-ca"
+                    && f.cert_sha256.as_deref().is_some_and(is_hex_sha256) => {}
+            _ => {
+                return Err(AetherError::Config(format!(
+                    "trust anchor for {:?} has an unsupported signing profile or missing witness",
+                    f.name
+                )));
+            }
         }
     }
     Ok(set)
