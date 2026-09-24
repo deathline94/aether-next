@@ -10,12 +10,12 @@
 //! The refusal rule is a pure function over journal records, so "two owners, one
 //! table" is checked here rather than on a machine with two NICs.
 
-use aether::route_repair::{
-    combine_liveness, decide_owner_exclusivity, liveness_from_tasklist, owner_of,
-    JournalOwner, Liveness, MutationVerdict, OwnershipRecord, RouteJournal,
-};
 #[cfg(windows)]
 use aether::route_repair::journal_path_for;
+use aether::route_repair::{
+    combine_liveness, decide_owner_exclusivity, liveness_from_tasklist, owner_of, JournalOwner,
+    Liveness, MutationVerdict, OwnershipRecord, RouteJournal,
+};
 
 const BOOT: u64 = 0x0000_1f00_2e00_0000;
 
