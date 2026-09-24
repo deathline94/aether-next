@@ -24,7 +24,6 @@ jobs:
     name: Build and witness the engine
     runs-on: windows-latest
     timeout-minutes: 60
-    environment: trust-anchor
     permissions:
       contents: write
       pull-requests: write
@@ -84,8 +83,8 @@ jobs:
           BASE: ${{ github.event.repository.default_branch }}
         run: |
           $branch = "anchor/$(git rev-parse --short HEAD)-$([Guid]::NewGuid().ToString('N').Substring(0,8))"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.name 'deathline94'
+          git config user.email 'deathline94@users.noreply.github.com'
           git checkout -b $branch
           git add packaging/trust/engine-trust.json
           git diff --cached --quiet

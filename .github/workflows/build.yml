@@ -461,8 +461,6 @@ jobs:
     needs: [test, windows-app, android-apk]
     if: ${{ always() && startsWith(github.ref, 'refs/tags/') && needs.test.result == 'success' && needs.windows-app.result == 'success' && needs.android-apk.result == 'success' }}
     runs-on: ubuntu-latest
-    # Configure required reviewers for this environment in repository settings.
-    environment: release
     permissions:
       contents: write
     env:
