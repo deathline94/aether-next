@@ -4,9 +4,9 @@
 // Why this exists: the same workflow that builds a release-tag app also builds one
 // for every push to main, and it used to do so with `AETHER_ALLOW_UNWITNESSED`
 // switched on by the shape of the ref (`!startsWith(github.ref, 'refs/tags/')`).
-// With the committed anchor still carrying an all-zero digest for aether.exe,
-// such a package would refuse to start its own engine at launch. The package
-// policy prevents a release without a separately witnessed engine digest.
+// If an anchor carries an all-zero digest for aether.exe, such a package would
+// refuse to start its own engine. The policy requires a separately witnessed
+// engine digest before publication.
 //
 // The rule now, in one place:
 //   publishable  = a release run with a complete anchor: a reviewed unsigned
@@ -148,7 +148,8 @@ function selftest() {
       },
     ],
   };
-  const asCommitted = JSON.parse(readFileSync(ANCHOR, "utf8"));
+  const asPlaceholder = structuredClone(witnessed);
+  asPlaceholder.files[0].file_sha256 = PLACEHOLDER;
   let failed = 0;
   const expect = (what, got, want) => {
     if (got === want) {
@@ -164,9 +165,9 @@ function selftest() {
   expect("  ... and carries no problems", good.problems.length, 0);
   expect("  ... and no -dev label", good.label, "");
 
-  const committed = evaluatePolicy({ kind: "release", anchor: asCommitted });
+  const committed = evaluatePolicy({ kind: "release", anchor: asPlaceholder });
   expect(
-    "the committed anchor (placeholder engine witness) is refused for a release",
+    "a placeholder engine witness is refused for a release",
     committed.publishable,
     false,
   );
@@ -176,7 +177,7 @@ function selftest() {
     true,
   );
 
-  const devKind = evaluatePolicy({ kind: "development", anchor: asCommitted });
+  const devKind = evaluatePolicy({ kind: "development", anchor: asPlaceholder });
   expect("a development run is not publishable either", devKind.publishable, false);
   expect("  ... and it is labelled -dev", devKind.label, "-dev");
 
