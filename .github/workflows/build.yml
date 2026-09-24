@@ -166,7 +166,6 @@ jobs:
       attestations: write
     env:
       AETHER_PACKAGE_KIND: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || 'development' }}
-      AETHER_ALLOW_UNWITNESSED: ${{ startsWith(github.ref, 'refs/tags/') && '' || '1' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -182,6 +181,10 @@ jobs:
         with:
           node-version: "22"
           package-manager-cache: false
+      - name: Allow an unwitnessed engine only in development
+        if: env.AETHER_PACKAGE_KIND == 'development'
+        shell: pwsh
+        run: '"AETHER_ALLOW_UNWITNESSED=1" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append'
       - name: Decide what this run may ship
         id: policy
         run: node scripts/package-policy.mjs --check

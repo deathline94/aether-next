@@ -41,6 +41,8 @@ const gates = [
       const out = [];
       const job = windowsJob(s.build);
       if (!/AETHER_PACKAGE_KIND:.*startsWith\(github\.ref/.test(job)) out.push("release kind must come from the tag ref");
+      if (/AETHER_ALLOW_UNWITNESSED:.*startsWith\(github\.ref/.test(job)) out.push("release must not receive a development bypass through a falsy workflow expression");
+      if (!/if: env\.AETHER_PACKAGE_KIND == 'development'/.test(job) || !/AETHER_ALLOW_UNWITNESSED=1/.test(job)) out.push("the unwitnessed bypass must be set only in a development step");
       if (!/actions\/download-artifact@/.test(job) || !/run-id: \$\{\{ steps\.witness\.outputs\.run \}\}/.test(job)) out.push("release must download the witnessed engine");
       if (!/publish-engine-trust\.mjs --check --name aether\.exe --file/.test(job)) out.push("downloaded engine must match the committed digest");
       if (!/if: env\.AETHER_PACKAGE_KIND != 'release' && steps\.policy\.outputs\.anchor_complete != 'true'/.test(job)) out.push("engine rebuild must be limited to development without a witness");
