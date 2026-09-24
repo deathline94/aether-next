@@ -129,9 +129,9 @@ jobs:
       # Both locks get checked: the engine and the desktop shell ship different
       # binary trees and share almost none of their graph.
       - name: cargo deny check (engine)
-        run: cargo-deny check --manifest-path aether/Cargo.toml --config deny.toml --locked advisories licenses sources bans
+        run: cargo-deny --manifest-path aether/Cargo.toml --config deny.toml --locked check advisories licenses sources bans
       - name: cargo deny check (desktop shell)
-        run: cargo-deny check --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml --locked advisories licenses sources bans
+        run: cargo-deny --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml --locked check advisories licenses sources bans
       # The exemptions above are generated from the locks, not hand-kept, so a
       # silently-stale deny.toml is itself a failure.
       - name: deny.toml skip block matches the committed locks
@@ -243,8 +243,8 @@ jobs:
           curl -sSfL --retry 3 -o actionlint.tgz "$url"
           echo "${ACTIONLINT_SHA256}  actionlint.tgz" | sha256sum -c -
           tar -xzf actionlint.tgz
-          ./actionlint_${ACTIONLINT_VERSION#v}_linux_amd64/actionlint --version | head -1
-          ./actionlint_${ACTIONLINT_VERSION#v}_linux_amd64/actionlint -color
+          ./actionlint --version | head -1
+          ./actionlint -color
       # zizmor is expected to FIND the historical issues named in specs/015; if it
       # exits clean because it failed to run, this gate is worthless. So: pin the
       # version, assert the binary reports exactly that version, assert a non-empty

@@ -120,8 +120,7 @@ impl WgTunnel {
             cfg.persistent_keepalive,
             0,
             None,
-        )
-        .map_err(|e| AetherError::Other(format!("wireguard tunnel init: {e}")))?;
+        );
 
         Ok(Self {
             tunn: Arc::new(Mutex::new(Box::new(tunn))),
@@ -522,8 +521,7 @@ pub async fn verify_endpoint_keep_session(
         Some(persistent_keepalive_secs()),
         0,
         None,
-    )
-    .map_err(|e| AetherError::Other(format!("tunn init: {e}")))?;
+    );
 
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
