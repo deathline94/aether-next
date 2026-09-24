@@ -51,14 +51,16 @@ impl Default for EngineConfig {
 /// identity. A config path is a security input, so it does not get to depend on
 /// where the process was born.
 pub fn default_config_path() -> String {
+    let process_path = |name: &str| {
+        std::env::vars_os()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| std::path::PathBuf::from(value))
+    };
     #[cfg(windows)]
-    let root = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("LOCALAPPDATA"))
-        .map(std::path::PathBuf::from);
+    let root = process_path("APPDATA").or_else(|| process_path("LOCALAPPDATA"));
     #[cfg(not(windows))]
-    let root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    let root =
+        process_path("XDG_CONFIG_HOME").or_else(|| process_path("HOME").map(|h| h.join(".config")));
     // `temp_dir` is the last resort and is still absolute, unlike a bare relative
     // name: Android's process has neither `HOME` nor `APPDATA`, and its own
     // private temp directory is where a file it must not share belongs.

@@ -507,7 +507,7 @@ jobs:
             echo 'The engine in these files is not covered by a published trust anchor'
             echo 'and cannot be used as a release download.'
             echo 'They remain downloadable from this workflow run; they are not downloads'
-            echo 'for end users. See `packaging/trust/README.md` and run the'
+            echo 'for end users. See packaging/trust/README.md and run the'
             echo '**Prepare engine anchor** workflow to change that.'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::skipping the release upload: this run's package is not distributable"

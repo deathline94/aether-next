@@ -702,7 +702,7 @@ fn open_locked_windows(path: &Path) -> Result<fs::File, String> {
     if module.is_null() {
         return Err(cannot_open(path, std::io::Error::last_os_error()));
     }
-    let address = unsafe { GetProcAddress(module, b"CreateFileW\0".as_ptr()) }
+    let address = unsafe { GetProcAddress(module, c"CreateFileW".as_ptr().cast()) }
         .ok_or_else(|| cannot_open(path, std::io::Error::last_os_error()))?;
     let create_file: CreateFileFn = unsafe { std::mem::transmute(address) };
     let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

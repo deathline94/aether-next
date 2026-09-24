@@ -1355,20 +1355,21 @@ async fn run_wireguard_tunnel(
     // behind a live WireGuard session, and its socket was never confirmed released
     // before the next connect rebound the same port — the "Address already in use"
     // reconnect failure. The interval arm is the progress the heartbeat needs.
-    let mut tunnel_fut = std::pin::pin!(wg_tunnel.run(tints.outbound_rx));
-    let mut supervise = tokio::time::interval(SUPERVISE_TICK);
-    let tunnel_result = loop {
-        tokio::select! {
-            r = &mut tunnel_fut => break r,
-            _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
-            _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
-            _ = supervise.tick() => session_event::mark_progress(),
+    let tunnel_result = {
+        let mut tunnel_fut = std::pin::pin!(wg_tunnel.run(tints.outbound_rx));
+        let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+        loop {
+            tokio::select! {
+                r = &mut tunnel_fut => break r,
+                _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
+                _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+                _ = supervise.tick() => session_event::mark_progress(),
+            }
         }
     };
 
     // Drop the tunnel future first (it owns the socket), then abort AND await the
     // proxies so their listen sockets are gone before a reconnect rebinds.
-    drop(tunnel_fut);
     if let Some(task) = socks_task.take() {
         task.abort();
         let _ = task.await;
@@ -1551,18 +1552,19 @@ async fn run_warp_in_warp(
     // HTTP task was aborted without being awaited so its port could still be held
     // when the next connect rebound it.
     let mut http_task = Some(http_task);
-    let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
-    let mut supervise = tokio::time::interval(SUPERVISE_TICK);
-    let result = loop {
-        tokio::select! {
-            r = &mut socks_fut => break r,
-            _ = outer_task.done() => break Err(AetherError::Other("outer WARP tunnel exited".into())),
-            _ = inner_task.done() => break Err(AetherError::Other("inner WARP tunnel exited".into())),
-            _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
-            _ = supervise.tick() => session_event::mark_progress(),
+    let result = {
+        let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
+        let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+        loop {
+            tokio::select! {
+                r = &mut socks_fut => break r,
+                _ = outer_task.done() => break Err(AetherError::Other("outer WARP tunnel exited".into())),
+                _ = inner_task.done() => break Err(AetherError::Other("inner WARP tunnel exited".into())),
+                _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+                _ = supervise.tick() => session_event::mark_progress(),
+            }
         }
     };
-    drop(socks_fut);
     if let Some(task) = http_task.take() {
         task.abort();
         let _ = task.await;

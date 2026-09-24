@@ -91,7 +91,7 @@ jobs:
           fi
           files="$(git diff --name-only --diff-filter=ACMR "$base" HEAD -- '*.rs' | grep -v '^quiche/' || true)"
           if [ -z "$files" ]; then echo "no non-vendored .rs files touched"; exit 0; fi
-          echo "$files" | sed 's/^/  check /'
+          while IFS= read -r file; do printf '  check %s\n' "$file"; done <<< "$files"
           # shellcheck disable=SC2086
           rustfmt --edition 2021 --check $files
       - name: Whole-tree formatting debt (informational)
