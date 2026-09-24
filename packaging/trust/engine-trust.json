@@ -39,15 +39,15 @@
     "no-braces regex, so a nested object in here silently becomes an entry it cannot find."
   ],
   "version": 1,
-  "generated_unix": 1790031700,
-  "generated_by": "scripts/publish-engine-trust.mjs @ not-a-ci-run",
+  "generated_unix": 1790237778,
+  "generated_by": "scripts/anchor-witness.mjs @ b6d81a835ddb1945ae5d414e2d95cbac5e92e874",
   "files": [
     {
       "name": "aether.exe",
-      "file_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "signing_profile": "unwitnessed",
-      "witnessed_run": "",
-      "witnessed_artifact": ""
+      "file_sha256": "512f2219f8d81c44315218566827798c9a1644366565828cf92283cf3e802d77",
+      "signing_profile": "unsigned-witnessed",
+      "witnessed_run": "35973692013",
+      "witnessed_artifact": "engine-witness"
     },
     {
       "name": "wintun.dll",
