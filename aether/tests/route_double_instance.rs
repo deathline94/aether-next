@@ -11,9 +11,11 @@
 //! table" is checked here rather than on a machine with two NICs.
 
 use aether::route_repair::{
-    combine_liveness, decide_owner_exclusivity, journal_path_for, liveness_from_tasklist, owner_of,
+    combine_liveness, decide_owner_exclusivity, liveness_from_tasklist, owner_of,
     JournalOwner, Liveness, MutationVerdict, OwnershipRecord, RouteJournal,
 };
+#[cfg(windows)]
+use aether::route_repair::journal_path_for;
 
 const BOOT: u64 = 0x0000_1f00_2e00_0000;
 
@@ -97,6 +99,8 @@ fn a_dead_owners_journal_does_not_block_the_newcomer() {
     );
 }
 
+// The journal directory is derived from Windows LOCALAPPDATA or TEMP.
+#[cfg(windows)]
 #[test]
 fn two_owners_get_two_files_and_one_owner_gets_its_own_back() {
     let a = journal_path_for(&owner(111, BOOT)).expect("a state directory");
@@ -136,10 +140,6 @@ fn a_journal_round_trips_its_owner_identity() {
     let encoded = serde_json::to_string(&journal).expect("encode");
     let back: RouteJournal = serde_json::from_str(&encoded).expect("decode");
     assert_eq!(owner_of(&back), owner_of(&journal));
-    assert_eq!(
-        journal_path_for(&owner_of(&back)),
-        journal_path_for(&owner_of(&journal))
-    );
     // A file written before per-owner journals existed decodes to "unknown boot",
     // which is never equal to a real owner.
     let legacy: RouteJournal = serde_json::from_str(r#"{"version":1,"creator_pid":4242}"#)
