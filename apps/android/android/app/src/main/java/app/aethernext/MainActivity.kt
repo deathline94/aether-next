@@ -11,7 +11,12 @@ import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.WebResourceErrorCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
@@ -59,13 +64,30 @@ class MainActivity : AppCompatActivity() {
         // Helpful when diagnosing UI blanks on emulators / LDPlayer.
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
+        // Target SDK 36 draws behind system bars. Keep the WebView viewport inside
+        // the status/navigation bars so its sticky header and bottom tabs cannot
+        // overlap the system UI. Zero the handled insets before they reach WebView:
+        // newer WebView versions also expose them as CSS safe-area values.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         webView = WebView(this).apply {
             // The theme's canvas, not a second copy of the hex: this is the colour
             // visible before the WebView's own stylesheet paints, and a literal
             // here is how the chrome drifted three shades apart.
             setBackgroundColor(getColor(R.color.app_canvas))
         }
-        setContentView(webView)
+        val content = FrameLayout(this).apply {
+            setBackgroundColor(getColor(R.color.app_canvas))
+            addView(webView, FrameLayout.LayoutParams(-1, -1))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+            val types = WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            val bars = insets.getInsets(types)
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.Builder(insets).setInsets(types, Insets.NONE).build()
+        }
+        setContentView(content)
+        ViewCompat.requestApplyInsets(content)
 
         // The sink belongs to *this* WebView, so it is registered per owner: the
         // session is a process singleton, and handing its one emitter to whichever

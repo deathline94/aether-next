@@ -193,11 +193,7 @@ export function ConnectionTab({
         </div>
       )}
 
-      {/* ─── The one connect control ───────────────────────────────────────
-          Everything a user needs to check a session lives below this and above
-          the presets and the secondary telemetry, because on a phone the panel
-          scrolls: the evidence used to sit under four preset cards and a bento
-          grid, several screens below the button it describes. */}
+      {/* The primary connection control. Presets follow it on the phone. */}
       <section className={`connection-stage ${runtime.status}`}>
         <div className="signal-field" aria-hidden="true">
           <span />
@@ -297,13 +293,47 @@ export function ConnectionTab({
         </div>
       )}
 
-      {/* ─── Connection evidence, first thing under the control ─────────────
-          The four answers a user comes back to check: is it on, what does that
-          cover, which server is it on, and the one action that proves it. They
-          sit above the presets, the bento telemetry and the footer because on a
-          phone `.home-view` paints its children in this order, one section to a
-          screen, and the verification a user scrolls for used to be four panels
-          below the button it describes. */}
+      {/* Presets belong with the connect control they configure. */}
+      <section className="profiles-panel" aria-label="Connection presets">
+        <div className="section-heading">
+          <div><p>Presets</p><h3>Change how it connects</h3></div>
+          <Gauge size={20} aria-hidden="true" />
+        </div>
+        <div className="profile-grid">
+          {speedProfiles.map((profile) => {
+            const active = settingsLoaded && profileActive(settings, profile.patch);
+            return (
+              <button
+                key={profile.id}
+                type="button"
+                className={`profile-card ${active ? "active" : ""}`}
+                disabled={settingsLocked}
+                aria-pressed={active}
+                onClick={() => {
+                  if (settingsLocked || active) return;
+                  patchSettings({ ...profile.patch, peer: "" });
+                  appendLog({ level: "info", message: `Applied preset: ${profile.label} — ${profile.hint}` });
+                }}
+              >
+                <div className="profile-card-top">
+                  <strong>{profile.label}</strong>
+                  {active && <small className="profile-active-tag">IN USE</small>}
+                </div>
+                <span>{profile.hint}</span>
+              </button>
+            );
+          })}
+        </div>
+        {!admin && (
+          <p className="profile-note">
+            Every preset here keeps the whole-device VPN mode; Android asks for permission the first time you connect.
+            Switching to the local proxy in Settings routes nothing by itself — an app is covered only once you point
+            it at Aether's ports.
+          </p>
+        )}
+      </section>
+
+      {/* Connection evidence follows the presets, ahead of telemetry. */}
       <section className="test-panel connection-evidence" aria-label="Connection status">
         <div className="section-heading">
           <div><p>right now</p><h3>Connection status</h3></div>
@@ -534,46 +564,6 @@ export function ConnectionTab({
             <small className="bento-subtext">Engine: <strong>bundled Rust binary</strong></small>
           </div>
         </article>
-      </section>
-
-      {/* ─── Presets: configuration, not verification, so below both ──────── */}
-      <section className="profiles-panel" aria-label="Connection presets">
-        <div className="section-heading">
-          <div><p>Presets</p><h3>Change how it connects</h3></div>
-          <Gauge size={20} aria-hidden="true" />
-        </div>
-        <div className="profile-grid">
-          {speedProfiles.map((profile) => {
-            const active = settingsLoaded && profileActive(settings, profile.patch);
-            return (
-              <button
-                key={profile.id}
-                type="button"
-                className={`profile-card ${active ? "active" : ""}`}
-                disabled={settingsLocked}
-                aria-pressed={active}
-                onClick={() => {
-                  if (settingsLocked || active) return;
-                  patchSettings({ ...profile.patch, peer: "" });
-                  appendLog({ level: "info", message: `Applied preset: ${profile.label} — ${profile.hint}` });
-                }}
-              >
-                <div className="profile-card-top">
-                  <strong>{profile.label}</strong>
-                  {active && <small className="profile-active-tag">IN USE</small>}
-                </div>
-                <span>{profile.hint}</span>
-              </button>
-            );
-          })}
-        </div>
-        {!admin && (
-          <p className="profile-note">
-            Every preset here keeps the whole-device VPN mode; Android asks for permission the first time you connect.
-            Switching to the local proxy in Settings routes nothing by itself — an app is covered only once you point
-            it at Aether's ports.
-          </p>
-        )}
       </section>
 
       {/* ─── About ────────────────────────────────────────────────────────── */}

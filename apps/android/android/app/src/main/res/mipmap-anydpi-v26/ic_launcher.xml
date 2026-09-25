@@ -1,10 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Layered adaptive launcher icon (P1-2) — was absent: the app shipped only a
-     single 512px bitmap (the stock Tauri mark) in every density bucket.
-     minSdk is 26, so this anydpi-v26 asset is authoritative on every supported
-     device. The manifest @mipmap/ic_launcher now resolves here. -->
+<!-- The circular desktop badge, inset within Android's adaptive icon safe zone. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <foreground android:drawable="@drawable/aether_launcher_foreground" />
     <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
 </adaptive-icon>

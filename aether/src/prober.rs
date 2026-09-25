@@ -187,6 +187,15 @@ pub enum CacheKind {
     WireGuard,
 }
 
+/// The three independent endpoint pools. H3 has a deliberately fixed IP set;
+/// H2 and WireGuard retain the original Aether CIDR and seed pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointPool {
+    MasqueH3,
+    MasqueH2,
+    WireGuard,
+}
+
 /// How expensive a single verify probe is. QUIC/H3 verification runs a full
 /// handshake + CONNECT-IP + data-plane round-trip and builds a BoringSSL context
 /// per probe, so it needs a longer timeout and a hard concurrency ceiling; TCP/H2
@@ -215,6 +224,7 @@ const SCAN_CONCURRENCY_CEILING: usize = 1000;
 pub struct ProbeConfig {
     /// Cost of one verify probe; drives concurrency/timeout tuning below.
     pub verify_cost: VerifyCost,
+    pub pool: EndpointPool,
     pub cidrs_v4: &'static [&'static str],
     pub cidrs_v6: &'static [&'static str],
     pub cidr_weights_v4: &'static [(&'static str, u8)],
@@ -234,6 +244,7 @@ impl ProbeConfig {
     pub fn for_test() -> Self {
         Self {
             verify_cost: VerifyCost::Cheap,
+            pool: EndpointPool::MasqueH2,
             cidrs_v4: &["10.0.0.0/24"],
             cidrs_v6: &[],
             cidr_weights_v4: &[("10.0.0.0/24", 1)],
@@ -681,7 +692,12 @@ pub async fn hunt_best(
     let cached = if exhaustive {
         Vec::new()
     } else {
-        config.cache_kind.read_sorted(&config.config_path)
+        config
+            .cache_kind
+            .read_sorted(&config.config_path)
+            .into_iter()
+            .filter(|(addr, _)| pool_allows_ip(config.pool, addr.ip()))
+            .collect()
     };
     // M3 fix: the tier-0 race used a hardcoded 600ms budget while expensive
     // (H3) verification needs >=5s — every cached endpoint "failed" on any
@@ -863,7 +879,7 @@ pub async fn hunt_best(
                                     IpAddr::V4(v4) => u128::from(u32::from(v4) & 0xFFFFFF00),
                                     IpAddr::V6(v6) => u128::from(v6) & 0xFFFFFFFFFFFF00000000000000000000,
                                 };
-                                if hot_subnets.insert(sub_key) {
+                                if config.pool != EndpointPool::MasqueH3 && hot_subnets.insert(sub_key) {
                                     log::info!("[🔥] Hot subnet detected near {}! Launching Stage-2 drill-down...", pr.ip);
                                     // The verify closure is not 'static so the wave
                                     // cannot be spawned off — but awaiting it inline
@@ -1146,7 +1162,7 @@ fn build_candidates(
         }
     };
 
-    let is_masque = config.label.contains("gateway");
+    let is_masque = config.pool != EndpointPool::WireGuard;
 
     // ── Port tiering: split ports into T1 (first), T2 (next), T3 (last) ──
     let (t1_ports, t2_ports, t3_ports): (Vec<u16>, Vec<u16>, Vec<u16>) = {
@@ -1212,11 +1228,13 @@ fn build_candidates(
         .seeds_v4
         .iter()
         .filter_map(|s| s.parse().ok())
+        .filter(|a| pool_allows_ip(config.pool, IpAddr::V4(*a)))
         .collect();
     let mut v6_seeds: Vec<Ipv6Addr> = config
         .seeds_v6
         .iter()
         .filter_map(|s| s.parse().ok())
+        .filter(|a| pool_allows_ip(config.pool, IpAddr::V6(*a)))
         .collect();
     v4_seeds.shuffle(&mut rng);
     v6_seeds.shuffle(&mut rng);
@@ -1243,8 +1261,10 @@ fn build_candidates(
     // the known-good seed VIPs (already queued above across all ports) handle alternate ports.
     // Sweeping non-443 ports on thousands of generic CDN hosts causes futile timeouts.
     // WireGuard uses multiple ports across all its prefixes.
-    cidr_pool(config, st, ip, &t1_ports, &mut seen, &mut tier1_out);
-    if !is_masque {
+    if config.pool != EndpointPool::MasqueH3 {
+        cidr_pool(config, st, ip, &t1_ports, &mut seen, &mut tier1_out);
+    }
+    if config.pool == EndpointPool::WireGuard {
         cidr_pool(config, st, ip, &t2_ports, &mut seen, &mut tier2_out);
         cidr_pool(config, st, ip, &t3_ports, &mut seen, &mut tier3_out);
     }
@@ -1502,6 +1522,13 @@ pub const MASQUE_SEEDS: &[&str] = &[
 /// Cloudflare MASQUE H3 QUIC endpoints only listen on these specific VIPs across `MASQUE_PORTS`.
 pub const MASQUE_H3_SEEDS: &[&str] = &["162.159.198.1", "162.159.198.2", "162.159.198.3"];
 
+fn pool_allows_ip(pool: EndpointPool, ip: IpAddr) -> bool {
+    pool != EndpointPool::MasqueH3
+        || MASQUE_H3_SEEDS
+            .iter()
+            .any(|seed| seed.parse::<IpAddr>() == Ok(ip))
+}
+
 /// Ports ordered by priority: primary web TLS first, then secondary, then legacy.
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
@@ -1532,8 +1559,8 @@ pub const MASQUE_CIDR_WEIGHTS: &[(&str, u8)] = &[
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:d0::/48",
-    "2606:4700:d1::/48",
     "2606:4700:102::/48",
+    "2606:4700:d1::/48",
 ];
 
 pub const MASQUE_SEEDS_V6: &[&str] = &[
@@ -1570,6 +1597,11 @@ impl MasqueProbe {
                 VerifyCost::Cheap
             } else {
                 VerifyCost::Expensive
+            },
+            pool: if is_h2 {
+                EndpointPool::MasqueH2
+            } else {
+                EndpointPool::MasqueH3
             },
             cidrs_v4: if is_h2 { MASQUE_CIDRS_V4 } else { &[] },
             cidrs_v6: if is_h2 { MASQUE_CIDRS_V6 } else { &[] },
@@ -1699,13 +1731,7 @@ const WG_CIDR_WEIGHTS: &[(&str, u8)] = &[
     ("188.114.97.0/24", 8),
     ("188.114.98.0/24", 7),
     ("188.114.99.0/24", 7),
-    ("8.34.146.0/24", 5),
-    ("8.39.214.0/24", 5),
-    ("8.39.204.0/24", 4),
-    ("8.6.112.0/24", 3),
-    ("8.35.211.0/24", 3),
-    ("8.39.125.0/24", 2),
-    ("8.47.69.0/24", 2),
+    ("162.159.193.0/24", 5),
 ];
 
 const WG_IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1893,6 +1919,7 @@ impl WgProbe {
     pub fn probe_config(&self) -> ProbeConfig {
         ProbeConfig {
             verify_cost: VerifyCost::Cheap,
+            pool: EndpointPool::WireGuard,
             cidrs_v4: crate::wireguard::WG_PREFIXES_V4,
             cidrs_v6: crate::wireguard::WG_PREFIXES_V6,
             cidr_weights_v4: WG_CIDR_WEIGHTS,
@@ -2035,6 +2062,7 @@ mod candidate_tests {
     fn test_config() -> ProbeConfig {
         ProbeConfig {
             verify_cost: VerifyCost::Cheap,
+            pool: EndpointPool::MasqueH2,
             cidrs_v4: &["10.0.0.0/24", "10.0.1.0/24"],
             cidrs_v6: &[],
             cidr_weights_v4: &[("10.0.0.0/24", 10), ("10.0.1.0/24", 5)],
@@ -2084,6 +2112,95 @@ mod candidate_tests {
         // DPI-blocked 443 still reaches the alt port early.
         assert!(cands.iter().take(4).any(|c| c.1 == 443));
         assert!(cands.iter().take(4).any(|c| c.1 == 500));
+    }
+
+    #[test]
+    fn h3_scan_uses_only_three_vips_on_the_shared_masque_ports() {
+        let mut config = test_config();
+        config.pool = EndpointPool::MasqueH3;
+        config.seeds_v4 = MASQUE_H3_SEEDS;
+        // The test config still carries CIDRs, and this deliberately supplies H2
+        // IPv6 seeds: H3 must reject both even if a caller passes them by mistake.
+        config.seeds_v6 = MASQUE_SEEDS_V6;
+        let candidates = build_candidates(&config, &test_strategy(), MASQUE_PORTS, IpScan::Both);
+        let expected: HashSet<(IpAddr, u16)> = MASQUE_H3_SEEDS
+            .iter()
+            .flat_map(|ip| {
+                MASQUE_PORTS
+                    .iter()
+                    .map(move |port| (ip.parse().unwrap(), *port))
+            })
+            .collect();
+        assert_eq!(candidates.iter().copied().collect::<HashSet<_>>(), expected);
+        assert_eq!(candidates.len(), expected.len());
+        assert!(!pool_allows_ip(
+            EndpointPool::MasqueH3,
+            "162.159.197.1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn h3_scan_does_not_drill_into_neighboring_ips_after_a_hit() {
+        use std::future::Future;
+        use std::pin::Pin;
+
+        let mut config = test_config();
+        config.pool = EndpointPool::MasqueH3;
+        config.seeds_v4 = MASQUE_H3_SEEDS;
+        let dir = std::env::temp_dir().join(format!(
+            "aether-h3-pool-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        config.config_path = dir.join("aether.toml").to_string_lossy().to_string();
+
+        let visited = Arc::new(std::sync::Mutex::new(HashSet::<IpAddr>::new()));
+        let visited_by_verify = Arc::clone(&visited);
+        let hit: IpAddr = MASQUE_H3_SEEDS[0].parse().unwrap();
+        let verify = move |ip: IpAddr,
+                           port: u16,
+                           _timeout: Duration,
+                           _ironclad: bool|
+              -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
+            visited_by_verify.lock().unwrap().insert(ip);
+            Box::pin(async move {
+                (ip == hit).then_some(ProbeResult {
+                    ip,
+                    port,
+                    rtt: Duration::from_millis(10),
+                })
+            })
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(hunt_best(
+            &config,
+            MASQUE_PORTS,
+            IpScan::V4,
+            ScanMode::Turbo,
+            &verify,
+        ));
+        assert!(result.is_ok(), "{result:?}");
+        let seen = visited.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|ip| pool_allows_ip(EndpointPool::MasqueH3, *ip)),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn weighted_sweeps_cover_exactly_the_upstream_h2_and_wireguard_prefixes() {
+        let h2: HashSet<&str> = MASQUE_CIDR_WEIGHTS.iter().map(|(cidr, _)| *cidr).collect();
+        let wg: HashSet<&str> = WG_CIDR_WEIGHTS.iter().map(|(cidr, _)| *cidr).collect();
+        assert_eq!(h2, MASQUE_CIDRS_V4.iter().copied().collect());
+        assert_eq!(
+            wg,
+            crate::wireguard::WG_PREFIXES_V4.iter().copied().collect()
+        );
     }
 
     #[test]

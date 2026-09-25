@@ -3453,6 +3453,9 @@ code, kbd, pre {
     gap: 10px;
     padding: 14px 16px;
   }
+  .profile-card { padding: 12px; }
+  .profile-card-top { align-items: flex-start; }
+  .profile-active-tag { white-space: nowrap; flex-shrink: 0; padding-inline: 4px; }
   .port-field-block,
   .param-field-block {
     flex: 1 1 auto;

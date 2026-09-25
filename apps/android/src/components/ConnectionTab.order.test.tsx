@@ -58,14 +58,14 @@ const positionOf = (container: HTMLElement, selector: string) =>
   sectionOrder(container).findIndex((classes) => classes.includes(selector));
 
 describe("android connection tab section order (item 20)", () => {
-  it("puts the status panel and its test action directly under the connect control", () => {
+  it("puts presets directly under the connect control", () => {
     const { container } = renderTab();
     expect(sectionOrder(container)).toEqual([
       "connection-stage disconnected",
+      "profiles-panel",
       "test-panel connection-evidence",
       "proxy-panel",
       "telemetry-bento",
-      "profiles-panel",
       "about-panel",
     ]);
   });
@@ -81,15 +81,15 @@ describe("android connection tab section order (item 20)", () => {
       "connection-stage error",
       "error-banner",
       "pinned-peer-bar",
+      "profiles-panel",
       "test-panel connection-evidence",
       "proxy-panel",
       "telemetry-bento",
-      "profiles-panel",
       "about-panel",
     ]);
   });
 
-  it("reaches the evidence before any preset, telemetry card or footer at 320 and 390 px", () => {
+  it("reaches presets immediately after the control at 320 and 390 px", () => {
     // The two widths the layout changes at are both above 320 px, so the order a
     // phone sees is this order; the assertion is made at both anyway because the
     // scroll depth claim is about phones, not about the desktop grid.
@@ -99,11 +99,11 @@ describe("android connection tab section order (item 20)", () => {
       const { container } = renderTab({ connected: true, running: true });
       const evidence = positionOf(container, "connection-evidence");
       expect(evidence, `${width}px: no status panel rendered`).toBeGreaterThan(-1);
-      for (const lower of ["profiles-panel", "telemetry-bento", "about-panel"]) {
+      for (const lower of ["telemetry-bento", "about-panel"]) {
         expect(positionOf(container, lower), `${width}px: ${lower} sits above the evidence`).toBeGreaterThan(evidence);
       }
-      // The control and the evidence are neighbours: nothing else is between them.
-      expect(evidence).toBe(positionOf(container, "connection-stage") + 1);
+      expect(positionOf(container, "profiles-panel")).toBe(positionOf(container, "connection-stage") + 1);
+      expect(evidence).toBe(positionOf(container, "profiles-panel") + 1);
     }
   });
 

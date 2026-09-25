@@ -148,7 +148,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">
-            <img src="/aether.svg" alt="Aether" className="brand-mark-img" />
+            <img src="./aether.png" alt="Aether" className="brand-mark-img" />
             <span className="brand-ambient-glow" aria-hidden="true" />
           </div>
           <div className="brand-text">
