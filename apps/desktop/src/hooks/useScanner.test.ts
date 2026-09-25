@@ -194,22 +194,35 @@ describe("desktop useScanner", () => {
     expect(lastScanRunId()).not.toBe(firstRun);
   });
 
-  it("starts a scan with an empty result list", async () => {
+  it("resets only the active protocol's rows on scan start", async () => {
     const emit = captureListener();
     const { result } = renderHook(() => useScanner(appendLog, false));
     await waitFor(() => expect(result.current.scanState !== undefined).toBe(true));
 
     act(() => {
       emit({ type: "scan_hit", addr: "1.1.1.1:443", rtt: "5ms", rttMs: 5, protocol: "wireguard" });
+      emit({ type: "scan_hit", addr: "1.1.1.2:443", rtt: "6ms", rttMs: 6, protocol: "masque-h3" });
     });
-    expect(result.current.endpoints).toHaveLength(1);
+    expect(result.current.endpoints).toHaveLength(2);
 
+    // Starting a masque-h3 scan clears masque-h3 but preserves wireguard
     await act(async () => {
       await result.current.startScan();
     });
 
-    // Rows from a previous run outlive the counters that describe them, so the
-    // table and "N working" disagree until the engine's own scan_start lands.
+    expect(result.current.endpoints).toHaveLength(1);
+    expect(result.current.endpoints[0].protocol).toBe("wireguard");
+
+    // Switching to wireguard and starting a scan clears wireguard too
+    act(() => {
+      result.current.setProtocol("wireguard");
+    });
+    await act(async () => {
+      await result.current.stopScan();
+    });
+    await act(async () => {
+      await result.current.startScan();
+    });
     expect(result.current.endpoints).toHaveLength(0);
   });
 

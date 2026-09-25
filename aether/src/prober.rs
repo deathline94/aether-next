@@ -947,28 +947,30 @@ pub async fn hunt_best(
                                     }
                                 }
 
-                                if st.early_exit_first {
-                                    let final_best = best.unwrap_or(pr);
-                                    let rtt_ms = final_best.rtt.as_millis() as u32;
-                                    config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(final_best.ip, final_best.port), rtt_ms)], measured_as(ironclad));
-                                    return Ok(final_best);
-                                }
+                                if !exhaustive {
+                                    if st.early_exit_first {
+                                        let final_best = best.unwrap_or(pr);
+                                        let rtt_ms = final_best.rtt.as_millis() as u32;
+                                        config.cache_kind.write_with_rtt(&config.config_path, vec![(SocketAddr::new(final_best.ip, final_best.port), rtt_ms)], measured_as(ironclad));
+                                        return Ok(final_best);
+                                    }
 
-                                if st.target_successes > 0 && found >= st.target_successes {
-                                    log::info!("[+] reached target of {} {}, selecting best", st.target_successes, label);
-                                    break;
-                                }
-
-                                if quiet_until.is_none() {
-                                    if !st.quiet_after_first.is_zero() {
-                                        log::info!(
-                                            "[+] found working {}, waiting up to {:?} for faster candidates",
-                                            label,
-                                            st.quiet_after_first
-                                        );
-                                        quiet_until = Some(Instant::now() + st.quiet_after_first);
-                                    } else {
+                                    if st.target_successes > 0 && found >= st.target_successes {
+                                        log::info!("[+] reached target of {} {}, selecting best", st.target_successes, label);
                                         break;
+                                    }
+
+                                    if quiet_until.is_none() {
+                                        if !st.quiet_after_first.is_zero() {
+                                            log::info!(
+                                                "[+] found working {}, waiting up to {:?} for faster candidates",
+                                                label,
+                                                st.quiet_after_first
+                                            );
+                                            quiet_until = Some(Instant::now() + st.quiet_after_first);
+                                        } else {
+                                            break;
+                                        }
                                     }
                                 }
                             }

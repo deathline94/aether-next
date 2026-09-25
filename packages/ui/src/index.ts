@@ -8,6 +8,8 @@
  * while the phone kept working. Anything that both shells need belongs here.
  */
 
+import type { ScanProtocol } from "./enums";
+
 export const DESIGN_TOKENS_VERSION = 1;
 
 /**
@@ -261,3 +263,19 @@ export function resetKeysChanged(
   if (previous.length !== next.length) return true;
   return previous.some((value, index) => !Object.is(value, next[index]));
 }
+
+/**
+ * Whether an endpoint's protocol string matches a given scan protocol.
+ *
+ * Hits from the engine are labelled "MASQUE H3", "MASQUE H2", or "WireGuard".
+ * When starting a new scan on a protocol, previously discovered endpoints
+ * for other protocols are preserved, and only the current protocol's rows are reset.
+ */
+export function isEndpointForProtocol(endpointProtocol: string, protocol: ScanProtocol): boolean {
+  const p = (endpointProtocol ?? "").toLowerCase();
+  if (protocol === "masque-h3") return p.includes("h3");
+  if (protocol === "masque-h2") return p.includes("h2");
+  if (protocol === "wireguard") return p.includes("wireguard") || p.includes("wg");
+  return false;
+}
+

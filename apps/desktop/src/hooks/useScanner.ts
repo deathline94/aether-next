@@ -15,6 +15,7 @@ import { hitAddressKey } from "@aether/ui/logs";
 import {
   clampConcurrency,
   effectiveScanTimeout,
+  isEndpointForProtocol,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
@@ -240,11 +241,10 @@ export function useScanner(
     runIdRef.current = runId;
     clearLogs?.();
     setBusy(true);
-    // The counters and `bestRtt` restart with the run, so the list has to as well:
-    // keeping earlier protocols' rows meant a table of nine under "3 working", and
-    // a heading that described the previous scan rather than this one.
-    endpointsRef.current = [];
-    setEndpoints([]);
+    // Preserve results from other protocols; only reset rows belonging to the active protocol.
+    const preserved = endpointsRef.current.filter((e) => !isEndpointForProtocol(e.protocol, protocol));
+    endpointsRef.current = preserved;
+    setEndpoints(preserved);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     // The two values are clamped before they are both announced and sent, so the
     // log line describes the run the engine will actually perform — and they are

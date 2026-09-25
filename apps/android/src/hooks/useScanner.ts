@@ -8,6 +8,7 @@ import { errorMessage } from "../ipcError";
 import {
   clampConcurrency,
   effectiveScanTimeout,
+  isEndpointForProtocol,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
@@ -174,10 +175,10 @@ export function useScanner(
     if (busy || active) return;
     clearLogs?.();
     setBusy(true);
-    // The counters and `bestRtt` restart with the run, so the list has to as well:
-    // keeping earlier protocols' rows meant a table of nine under "3 working".
-    setEndpoints([]);
-    endpointsRef.current = [];
+    // Preserve results from other protocols; only reset rows belonging to the active protocol.
+    const preserved = endpointsRef.current.filter((e) => !isEndpointForProtocol(e.protocol, protocol));
+    endpointsRef.current = preserved;
+    setEndpoints(preserved);
     setScanState({ ...initialScanState, active: true, phase: "Starting" });
     // Both values are resolved *before* anything is announced, so the log line
     // describes the run the engine will perform rather than the numbers the fields
