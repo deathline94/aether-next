@@ -43,6 +43,7 @@ describe("speed profiles", () => {
     expect(speedProfiles.map((p) => [p.id, p.patch.protocol, p.patch.transport])).toEqual([
       ["masque-h3", "masque", "h3"],
       ["masque-h2", "masque", "h2"],
+      ["mim", "mim", "h3"],
       ["wireguard", "wireguard", "h2"],
       ["gool", "gool", "h2"],
     ]);
@@ -54,6 +55,7 @@ describe("speed profiles", () => {
     }
     expect(speedProfiles.find((p) => p.id === "gool")?.hint).toContain("Gool (WARP-in-WARP)");
     expect(speedProfiles.find((p) => p.id === "masque-h3")?.hint).toContain("MASQUE H3");
+    expect(speedProfiles.find((p) => p.id === "mim")?.hint).toContain("MASQUE-in-MASQUE");
   });
 
   it("leaves no pinned carrier behind on a full-device preset", () => {

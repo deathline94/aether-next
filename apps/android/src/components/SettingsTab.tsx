@@ -148,12 +148,13 @@ export function SettingsTab({
               { value: "masque", label: "MASQUE" },
               { value: "wireguard", label: "WireGuard" },
               { value: "gool", label: "Gool" },
+              { value: "mim", label: "MASQUE-in-MASQUE" },
             ]}
             onChange={(protocol) => patchSettings({ protocol })}
           />
         </div>
 
-        {settings.protocol === "masque" && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">
@@ -175,7 +176,7 @@ export function SettingsTab({
           </div>
         )}
 
-        {settings.protocol === "masque" && settings.transport === "h3" && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">
@@ -193,7 +194,7 @@ export function SettingsTab({
           </div>
         )}
 
-        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && settings.quicInitialFrag && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">
@@ -222,13 +223,13 @@ export function SettingsTab({
               {settings.noize !== "off" && <span className="tactical-chip amber">ACTIVE JUNK</span>}
             </div>
             <span>
-              {settings.protocol === "masque" && settings.transport === "h2"
+              {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h2"
                 ? "UDP junk frames are not applicable for HTTP/2 TCP streams"
                 : "Inject randomized pre-handshake padding to prevent active protocol fingerprinting"}
             </span>
           </div>
           <select
-            disabled={settingsLocked || (settings.protocol === "masque" && settings.transport === "h2")}
+            disabled={settingsLocked || ((settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h2")}
             aria-label="Obfuscation noise profile"
             className="tactical-select"
             value={normalizeNoize(settings.noize) ?? settings.noize}

@@ -167,12 +167,13 @@ export function SettingsTab({
               { value: "masque", label: "MASQUE" },
               { value: "wireguard", label: "WireGuard" },
               { value: "gool", label: "Gool" },
+              { value: "mim", label: "MASQUE-in-MASQUE" },
             ]}
             onChange={(protocol) => patchSettings({ protocol })}
           />
         </div>
 
-        {settings.protocol === "masque" && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">
@@ -194,7 +195,7 @@ export function SettingsTab({
           </div>
         )}
 
-        {settings.protocol === "masque" && settings.transport === "h3" && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">
@@ -212,7 +213,7 @@ export function SettingsTab({
           </div>
         )}
 
-        {settings.protocol === "masque" && settings.transport === "h3" && settings.quicInitialFrag && (
+        {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && settings.quicInitialFrag && (
           <div className="setting-row">
             <div>
               <div className="setting-label-row">

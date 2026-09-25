@@ -64,7 +64,7 @@ export const TUNNEL_PROTOCOL_OPTIONS: readonly { value: TunnelProtocol; label: s
   { value: "masque", label: "MASQUE" },
   { value: "wireguard", label: "WireGuard" },
   { value: "gool", label: "Gool" },
-  { value: "mim", label: "MASQUE-in-MASQUE (mim)" },
+  { value: "mim", label: "MASQUE-in-MASQUE" },
 ];
 
 /** MASQUE inner transport. `TransportKind` in the shell; `auto` is legacy. */
@@ -160,6 +160,13 @@ export const SPEED_PROFILES = [
     hintSubject: "MASQUE H2",
     protocol: "masque",
     transport: "h2",
+  },
+  {
+    id: "mim",
+    label: "MASQUE-in-MASQUE",
+    hintSubject: "MASQUE-in-MASQUE (dual hop)",
+    protocol: "mim",
+    transport: "h3",
   },
   {
     id: "wireguard",
