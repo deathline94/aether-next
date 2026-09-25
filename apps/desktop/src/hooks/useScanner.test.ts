@@ -211,7 +211,7 @@ describe("desktop useScanner", () => {
     });
 
     expect(result.current.endpoints).toHaveLength(1);
-    expect(result.current.endpoints[0].protocol).toBe("wireguard");
+    expect(result.current.endpoints[0]?.protocol).toBe("wireguard");
 
     // Switching to wireguard and starting a scan clears wireguard too
     act(() => {
