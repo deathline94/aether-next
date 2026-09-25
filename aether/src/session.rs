@@ -420,10 +420,11 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             }
             // Feed the real connect outcome into the trust cache so endpoint
             // ranking learns from actual connections, not just scan reachability.
+            let active_transport = crate::cache::active_masque_transport();
             let mutation = if result.is_ok() {
-                crate::cache::record_success(&base_config, peer, true)
+                crate::cache::record_success_for_transport(&base_config, peer, true, active_transport)
             } else {
-                crate::cache::record_failure(&base_config, peer, true)
+                crate::cache::record_failure_for_transport(&base_config, peer, true, active_transport)
             };
             if mutation.was_skipped() {
                 log::warn!(
@@ -696,9 +697,15 @@ async fn select_peer(
             // session instead of handing both of them 172.16.0.2.
             let local_ipv4 = identity.tunnel_ipv4()?;
             let ech_config = resolve_ech().await;
+            let is_h2 = masque_h2::enabled();
+            let active_transport = if is_h2 {
+                crate::cache::TransportKind::H2
+            } else {
+                crate::cache::TransportKind::Quic
+            };
             let mode = prober::ScanMode::parse(&mode_str);
             let probe = prober::MasqueProbe {
-                sni: if masque_h2::enabled() {
+                sni: if is_h2 {
                     consts::CONNECT_SNI.to_string()
                 } else {
                     crate::quic::resolve_h3_sni()
@@ -713,6 +720,7 @@ async fn select_peer(
                 ip,
                 local_ipv4,
                 config_path: base_config.to_string(),
+                transport: active_transport,
             };
 
             // Smart reconnect: re-verify the last working gateway before paying
@@ -722,60 +730,81 @@ async fn select_peer(
             // circuit to one cached endpoint.
             if quick_reconnect_enabled() && !scan_only() {
                 let cache_path = lastconn::cache_path(base_config);
-                if let Some(cached) = lastconn::load(&cache_path) {
+                if let Some(cached) = lastconn::load_for(&cache_path, active_transport) {
                     if let Ok(peer_addr) = cached.peer.parse::<SocketAddr>() {
-                        log::info!("[*] verifying cached gateway {peer_addr} before reuse");
-                        // Verify over the transport the tunnel will actually use.
-                        // This call was always QUIC, so in H2 mode a gateway that
-                        // answers on TCP 443 and never on UDP accumulated three
-                        // strikes from its own health checks and was evicted —
-                        // then every connect paid for a full scan again.
-                        let verified = if masque_h2::enabled() {
-                            let h2cfg = masque_h2::H2TunnelConfig {
-                                peer: masque_h2::h2_peer(peer_addr),
-                                sni: probe.sni.clone(),
-                                authority: probe.authority.clone(),
-                                cert_pem: identity.cert_pem.clone(),
-                                key_pem: identity.key_pem.clone(),
-                                probe_src: Some(local_ipv4),
-                            };
-                            masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
-                        } else {
-                            quick_verify_masque(
-                                identity,
-                                peer_addr,
-                                &probe.sni,
-                                ech_config.as_deref(),
-                            )
-                            .await
+                        // Enforce is_valid_masque_h3_endpoint before quick verification when running H3.
+                        // If ineligible, bypass quick verification without adding failure strikes.
+                        let is_eligible = match active_transport {
+                            crate::cache::TransportKind::Quic => {
+                                prober::is_valid_masque_h3_endpoint(peer_addr)
+                            }
+                            crate::cache::TransportKind::H2 => true,
+                            _ => false,
                         };
-                        if let Ok(rtt) = verified {
-                            log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
-                            if crate::cache::record_success(base_config, peer_addr, true)
+                        if is_eligible {
+                            log::info!("[*] verifying cached gateway {peer_addr} before reuse");
+                            // Verify over the transport the tunnel will actually use.
+                            let verified = if is_h2 {
+                                let h2cfg = masque_h2::H2TunnelConfig {
+                                    peer: masque_h2::h2_peer(peer_addr),
+                                    sni: probe.sni.clone(),
+                                    authority: probe.authority.clone(),
+                                    cert_pem: identity.cert_pem.clone(),
+                                    key_pem: identity.key_pem.clone(),
+                                    probe_src: Some(local_ipv4),
+                                };
+                                masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
+                            } else {
+                                quick_verify_masque(
+                                    identity,
+                                    peer_addr,
+                                    &probe.sni,
+                                    ech_config.as_deref(),
+                                )
+                                .await
+                            };
+                            if let Ok(rtt) = verified {
+                                log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
+                                if crate::cache::record_success_for_transport(
+                                    base_config,
+                                    peer_addr,
+                                    true,
+                                    active_transport,
+                                )
                                 .was_skipped()
-                            {
-                                log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
+                                {
+                                    log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
+                                }
+                                session_event::emit(SessionEvent::EndpointSelected {
+                                    addr: peer_addr.to_string(),
+                                    protocol: "masque".into(),
+                                    rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
+                                });
+                                return Ok(Selection {
+                                    peer: peer_addr,
+                                    rtt: Some(rtt),
+                                });
+                            } else {
+                                log::warn!(
+                                    "[-] cached gateway {peer_addr} no longer works; scanning fresh"
+                                );
+                                // Evict the dead peer from the trust cache so we stop
+                                // trying it first on every reconnect after a network change.
+                                if crate::cache::record_failure_for_transport(
+                                    base_config,
+                                    peer_addr,
+                                    true,
+                                    active_transport,
+                                )
+                                .was_skipped()
+                                {
+                                    log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
+                                }
                             }
-                            session_event::emit(SessionEvent::EndpointSelected {
-                                addr: peer_addr.to_string(),
-                                protocol: "masque".into(),
-                                rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
-                            });
-                            return Ok(Selection {
-                                peer: peer_addr,
-                                rtt: Some(rtt),
-                            });
                         } else {
-                            log::warn!(
-                                "[-] cached gateway {peer_addr} no longer works; scanning fresh"
+                            log::info!(
+                                "[*] cached gateway {peer_addr} is ineligible for {active_transport:?}; bypassing quick reconnect without strikes"
                             );
-                            // Evict the dead peer from the trust cache so we stop
-                            // trying it first on every reconnect after a network change.
-                            if crate::cache::record_failure(base_config, peer_addr, true)
-                                .was_skipped()
-                            {
-                                log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
-                            }
                         }
                     }
                 }
@@ -790,7 +819,7 @@ async fn select_peer(
             );
             let peer = SocketAddr::new(best.ip, best.port);
             // Cache the working gateway so the next session can quick-reconnect.
-            lastconn::save(&lastconn::cache_path(base_config), &peer.to_string(), "");
+            lastconn::save(&lastconn::cache_path(base_config), &peer.to_string(), "", active_transport);
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: "masque".into(),

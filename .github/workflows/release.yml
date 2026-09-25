@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: "temurin"
+          java-version: "21"
+      - name: Build web assets
+        working-directory: apps/android
+        run: |
+          npm ci
+          npm run sync-www
+      - name: Build APKs
+        working-directory: apps/android/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+      - name: Collect Android artifacts
+        run: |
+          mkdir -p dist-android
+          rel=apps/android/android/app/build/outputs/apk/debug
+          cp "$rel"/app-arm64-v8a-debug.apk    dist-android/AetherNext-android-arm64-v8a.apk || true
+          cp "$rel"/app-armeabi-v7a-debug.apk  dist-android/AetherNext-android-armeabi-v7a.apk || true
+          cp "$rel"/app-x86_64-debug.apk       dist-android/AetherNext-android-x86_64.apk || true
+          cp "$rel"/app-universal-debug.apk    dist-android/AetherNext-android-universal.apk || true
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: android-apks
+          path: dist-android/AetherNext-*.apk
+
+  build-windows:
+    name: Build Windows App
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+      - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Build engine and stage
+        shell: pwsh
+        env:
+          CMAKE_GENERATOR: Ninja
+        run: |
+          cargo build --release --manifest-path aether/Cargo.toml
+          node scripts/publish-engine-trust.mjs --name aether.exe --file aether/target/release/aether.exe
+          npm --prefix apps/desktop ci
+          npm --prefix apps/desktop run stage-engine
+          npm --prefix apps/desktop run build
+          npm --prefix apps/desktop run tauri build
+      - name: Collect Windows artifacts
+        shell: pwsh
+        run: |
+          $out = 'dist-windows'
+          New-Item -ItemType Directory -Force -Path $out, "$out/portable/engine" | Out-Null
+          $nsis = Get-ChildItem 'apps/desktop/src-tauri/target/release/bundle/nsis' -Filter '*setup.exe' | Select-Object -First 1
+          if ($nsis) { Copy-Item $nsis.FullName "$out/AetherNext-windows-x64-setup.exe" -Force }
+          $gui = @('apps/desktop/src-tauri/target/release/aether-desktop.exe', 'apps/desktop/src-tauri/target/release/Aether Next.exe') | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($gui) {
+            Copy-Item $gui "$out/portable/AetherNext-Desktop.exe" -Force
+            Copy-Item 'apps/desktop/src-tauri/resources/aether.exe' "$out/portable/engine/aether.exe" -Force
+            Copy-Item 'packaging/wintun.dll' "$out/portable/wintun.dll" -Force
+            Copy-Item 'packaging/wintun.dll' "$out/portable/engine/wintun.dll" -Force
+            Compress-Archive -Path "$out/portable/*" -DestinationPath "$out/AetherNext-portable-windows-x64.zip" -Force
+          }
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: windows-apps
+          path: dist-windows/AetherNext-*
+
+  publish:
+    name: Create Release
+    needs: [build-android, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: android-apks
+          path: release-assets
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        with:
+          name: windows-apps
+          path: release-assets
+      - name: Generate Checksums and Publish Release
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha256sum AetherNext-* > SHA256SUMS.txt
+          VERSION=$(node -p "require('../package.json').version")
+          TAG="v${VERSION}"
+          
+          git config --global user.name "deathline94"
+          git config --global user.email "deathline94@users.noreply.github.com"
+          
+          if ! git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG"; then
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG" || true
+          fi
+          
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" * --clobber
+          else
+            gh release create "$TAG" * --title "$TAG" --notes "Automated release for $TAG" --latest
+          fi

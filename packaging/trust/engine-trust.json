@@ -39,12 +39,12 @@
     "no-braces regex, so a nested object in here silently becomes an entry it cannot find."
   ],
   "version": 1,
-  "generated_unix": 1790324879,
-  "generated_by": "scripts/anchor-witness.mjs @ d1fbdf625a379fcff4e7bb426a85cf8d68c40bbd",
+  "generated_unix": 1790343619,
+  "generated_by": "scripts/publish-engine-trust.mjs @ not-a-ci-run",
   "files": [
     {
       "name": "aether.exe",
-      "file_sha256": "428151f37868f39628d88f6722fa7467760a96b17930167a2ec301983b110d75",
+      "file_sha256": "1c33c5dfb2537bf5b9044d1be0d8b434d641356a423a75f60854912950180cb0",
       "signing_profile": "unsigned-witnessed",
       "witnessed_run": "36112514380",
       "witnessed_artifact": "engine-witness"

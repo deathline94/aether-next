@@ -270,7 +270,7 @@ describe("android connection tab copy (item 21)", () => {
     const copy = container.querySelector(".connection-copy p")?.textContent ?? "";
     expect(copy).toBe(START_HINT);
     expect(copy).toMatch(/Tap the power button to connect/i);
-    expect(copy).toMatch(/the panel below shows what that covers/i);
+    expect(copy).toMatch(/connection status shows what that covers/i);
     // The sentence that used to sit here was operator prose about a "tunnel",
     // "edge telemetry" and "device sockets" — none of it an instruction.
     for (const jargon of ["Initialize the tunnel", "negotiate", "device sockets", "edge telemetry"]) {

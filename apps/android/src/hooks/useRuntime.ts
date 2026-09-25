@@ -39,6 +39,7 @@ export function useRuntime(
   const [settingsLoadError, setSettingsLoadError] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [testBusy, setTestBusy] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState<IpcError | null>(null);
@@ -327,7 +328,8 @@ export function useRuntime(
   }, [settings, settingsLoaded, persistSettings]);
 
   const toggleConnection = useCallback(async () => {
-    if (busy) return;
+    if (busyRef.current || busy) return;
+    busyRef.current = true;
     setBusy(true);
     setTestResult(null);
     try {
@@ -346,12 +348,14 @@ export function useRuntime(
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, running, settings, appendLog, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: Settings["protocol"], transport: Settings["transport"]) => {
-    if (busy) return;
+    if (busyRef.current || busy) return;
+    busyRef.current = true;
     setBusy(true);
     setTestResult(null);
     try {
@@ -372,6 +376,7 @@ export function useRuntime(
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, running, settings, appendLog, safeDisconnect]);

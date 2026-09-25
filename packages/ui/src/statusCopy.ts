@@ -257,7 +257,7 @@ export function endpointClaim(endpoint: string | null, running: boolean): Endpoi
  * an accessibility label that disagrees with the visible text is a second claim.
  */
 export function startHint(platform: PlatformCapabilities): string {
-  return `${platform.actionVerb} the power button to connect. Aether opens a private path to Cloudflare's edge; the panel below shows what that covers on this device.`;
+  return `${platform.actionVerb} the power button to connect. Aether opens a private path to Cloudflare's edge; connection status shows what that covers on this device.`;
 }
 
 /** The same verb, in the one place the switch tells the user what it will do. */

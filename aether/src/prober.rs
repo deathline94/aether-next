@@ -183,7 +183,7 @@ struct Strategy {
 /// Which cache slot to read/write in the endpoint cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
-    Masque,
+    Masque(crate::cache::TransportKind),
     WireGuard,
 }
 
@@ -250,7 +250,7 @@ impl ProbeConfig {
             cidr_weights_v4: &[("10.0.0.0/24", 1)],
             seeds_v4: &["10.0.0.1", "10.0.0.2"],
             seeds_v6: &[],
-            cache_kind: CacheKind::Masque,
+            cache_kind: CacheKind::Masque(crate::cache::TransportKind::H2),
             label: "test",
             config_path: String::new(),
             profile: StrategyProfile {
@@ -267,7 +267,7 @@ impl ProbeConfig {
 impl CacheKind {
     fn read_sorted(&self, config_path: &str) -> Vec<(SocketAddr, u32)> {
         match self {
-            CacheKind::Masque => crate::cache::get_masque_sorted(config_path),
+            CacheKind::Masque(transport) => crate::cache::get_masque_sorted_for(config_path, *transport),
             CacheKind::WireGuard => crate::cache::get_wireguard_sorted(config_path),
         }
     }
@@ -279,8 +279,8 @@ impl CacheKind {
         measurement: crate::cache::Measurement,
     ) -> crate::cache::Mutation {
         match self {
-            CacheKind::Masque => {
-                crate::cache::add_to_masque_with_rtt(config_path, endpoints, measurement)
+            CacheKind::Masque(transport) => {
+                crate::cache::add_to_masque_with_rtt_transport(config_path, endpoints, *transport, measurement)
             }
             CacheKind::WireGuard => {
                 crate::cache::add_to_wireguard_with_rtt(config_path, endpoints, measurement)
@@ -430,10 +430,10 @@ pub async fn host_has_ipv6() -> bool {
 /// Emit a structured scan hit event so the GUI standalone scanner can list
 /// every working endpoint (not just the final best). Protocol is derived from
 /// the probe label + current MASQUE transport.
-fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration) {
+fn emit_scan_hit(label: &str, ip: IpAddr, port: u16, rtt: Duration, is_h2: bool) {
     let protocol = if label.contains("wg") {
         "WireGuard"
-    } else if crate::masque_h2::enabled() {
+    } else if is_h2 {
         "MASQUE H2"
     } else {
         "MASQUE H3"
@@ -682,6 +682,7 @@ pub async fn hunt_best(
     let timeout = st.per_probe_timeout;
     let ironclad = mode == ScanMode::Ironclad;
     let label = config.label;
+    let is_h2 = config.pool == EndpointPool::MasqueH2;
 
     // ── Tier-0: Ultra-fast cache RACE (first-hit-wins, parallel) ──
     // #2: Race top cached endpoints simultaneously. Return the FIRST that
@@ -697,6 +698,13 @@ pub async fn hunt_best(
             .read_sorted(&config.config_path)
             .into_iter()
             .filter(|(addr, _)| pool_allows_ip(config.pool, addr.ip()))
+            .filter(|(addr, _)| {
+                if config.pool == EndpointPool::MasqueH3 {
+                    is_valid_masque_h3_endpoint(*addr)
+                } else {
+                    true
+                }
+            })
             .collect()
     };
     // M3 fix: the tier-0 race used a hardcoded 600ms budget while expensive
@@ -867,7 +875,7 @@ pub async fn hunt_best(
                             Some(pr) => {
                                 if reported.insert((pr.ip, pr.port)) {
                                     log::info!("[+] {} candidate ok {}:{} rtt={:?}", label, pr.ip, pr.port, pr.rtt);
-                                    emit_scan_hit(label, pr.ip, pr.port, pr.rtt);
+                                    emit_scan_hit(label, pr.ip, pr.port, pr.rtt, is_h2);
                                 }
                                 best = Some(match best {
                                     Some(cur) if cur.rtt <= pr.rtt => cur,
@@ -930,7 +938,7 @@ pub async fn hunt_best(
                                             continue;
                                         }
                                         log::info!("[🔥] Hot subnet candidate ok {}:{} rtt={:?}", h_pr.ip, h_pr.port, h_pr.rtt);
-                                        emit_scan_hit(label, h_pr.ip, h_pr.port, h_pr.rtt);
+                                        emit_scan_hit(label, h_pr.ip, h_pr.port, h_pr.rtt, is_h2);
                                         best = Some(match best {
                                             Some(cur) if cur.rtt <= h_pr.rtt => cur,
                                             _ => h_pr,
@@ -1004,7 +1012,7 @@ pub async fn hunt_best(
             // fine but the network is dropping this transport on every port. Say so
             // explicitly so the user doesn't blame the IPs and rescan forever.
             let hint = if label.contains("gateway") {
-                if crate::masque_h2::enabled() {
+                if is_h2 {
                     "no MASQUE/HTTP2 gateway answered on any port; the network may be blocking TLS to Cloudflare (try WireGuard)"
                 } else {
                     "no MASQUE/HTTP3 gateway answered on any port; the network may be blocking QUIC/UDP (try HTTP/2 or WireGuard)"
@@ -1522,6 +1530,21 @@ pub const MASQUE_SEEDS: &[&str] = &[
 /// Cloudflare MASQUE H3 QUIC endpoints only listen on these specific VIPs across `MASQUE_PORTS`.
 pub const MASQUE_H3_SEEDS: &[&str] = &["162.159.198.1", "162.159.198.2", "162.159.198.3"];
 
+/// Validate whether an endpoint is eligible for automatic MASQUE H3 selection:
+/// requires BOTH one of the 3 permitted IPv4 VIPs AND a port in MASQUE_PORTS.
+pub fn is_valid_masque_h3_endpoint(addr: SocketAddr) -> bool {
+    let ip_ok = match addr.ip() {
+        IpAddr::V4(ipv4) => {
+            MASQUE_H3_SEEDS
+                .iter()
+                .any(|seed| seed.parse::<Ipv4Addr>() == Ok(ipv4))
+        }
+        IpAddr::V6(_) => false,
+    };
+    let port_ok = MASQUE_PORTS.contains(&addr.port());
+    ip_ok && port_ok
+}
+
 fn pool_allows_ip(pool: EndpointPool, ip: IpAddr) -> bool {
     pool != EndpointPool::MasqueH3
         || MASQUE_H3_SEEDS
@@ -1586,12 +1609,13 @@ pub struct MasqueProbe {
     pub ip: IpScan,
     pub local_ipv4: Ipv4Addr,
     pub config_path: String,
+    pub transport: crate::cache::TransportKind,
 }
 
 impl MasqueProbe {
     /// Build a [`ProbeConfig`] for MASQUE scanning.
     pub fn probe_config(&self) -> ProbeConfig {
-        let is_h2 = crate::masque_h2::enabled();
+        let is_h2 = self.transport == crate::cache::TransportKind::H2;
         ProbeConfig {
             verify_cost: if is_h2 {
                 VerifyCost::Cheap
@@ -1608,7 +1632,7 @@ impl MasqueProbe {
             cidr_weights_v4: if is_h2 { MASQUE_CIDR_WEIGHTS } else { &[] },
             seeds_v4: if is_h2 { MASQUE_SEEDS } else { MASQUE_H3_SEEDS },
             seeds_v6: if is_h2 { MASQUE_SEEDS_V6 } else { &[] },
-            cache_kind: CacheKind::Masque,
+            cache_kind: CacheKind::Masque(self.transport),
             label: "gateway",
             config_path: self.config_path.clone(),
             profile: StrategyProfile {
@@ -1668,7 +1692,7 @@ impl MasqueProbe {
                     };
                 }
 
-                if crate::masque_h2::enabled() {
+                if self.transport == crate::cache::TransportKind::H2 {
                     let cfg = crate::masque_h2::H2TunnelConfig {
                         peer: SocketAddr::new(ip, port),
                         sni: self.sni.clone(),
@@ -2068,7 +2092,7 @@ mod candidate_tests {
             cidr_weights_v4: &[("10.0.0.0/24", 10), ("10.0.1.0/24", 5)],
             seeds_v4: &["10.0.0.1", "10.0.1.1"],
             seeds_v6: &[],
-            cache_kind: CacheKind::Masque,
+            cache_kind: CacheKind::Masque(crate::cache::TransportKind::Quic),
             label: "gateway",
             config_path: String::new(),
             profile: StrategyProfile {
@@ -2463,7 +2487,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             vec![(gw, 25)],
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             &base,
             Duration::from_secs(1),
             true,
@@ -2486,7 +2510,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             vec![(gw, 25)],
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             &base,
             Duration::from_secs(1),
             false,
@@ -2531,7 +2555,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             vec![(gw, 25)],
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             &base,
             Duration::from_secs(1),
             true,
@@ -2561,7 +2585,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             vec![(gw, 25)],
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             &base2,
             Duration::from_secs(1),
             false,
@@ -2603,7 +2627,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             Vec::new(),
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             "unused",
             Duration::from_millis(50),
             false,
@@ -2635,7 +2659,7 @@ mod tier0_tests {
         let out = race_cached_endpoints(
             vec![("162.159.193.1:443".parse().unwrap(), 25)],
             &verify,
-            &CacheKind::Masque,
+            &CacheKind::Masque(crate::cache::TransportKind::Quic),
             "unused",
             Duration::from_millis(50),
             false,
@@ -2648,7 +2672,7 @@ mod tier0_tests {
 
 #[cfg(test)]
 mod scan_mode_tests {
-    use super::ScanMode;
+    use super::*;
 
     /// One string, one mode. The shell now ships a `ScanMode` enum, so the engine
     /// must not keep a private vocabulary where a typo is a legal alias — that
@@ -2683,7 +2707,7 @@ mod scan_mode_tests {
 /// the same assertion for a while; the ip family had neither the arm nor the test.
 #[cfg(test)]
 mod token_round_trip_tests {
-    use super::{IpScan, ScanMode};
+    use super::*;
 
     #[test]
     fn every_ip_scan_label_parses_back_to_itself() {
@@ -2705,5 +2729,33 @@ mod token_round_trip_tests {
         assert!(matches!(IpScan::parse("v6"), IpScan::V6));
         assert!(matches!(IpScan::parse("both"), IpScan::Both));
         assert!(matches!(ScanMode::parse("balanced"), ScanMode::Balanced));
+    }
+
+    #[test]
+    fn masque_h3_endpoint_validation_rules() {
+        use std::net::SocketAddr;
+
+        // Valid IPv4 seeds (.1, .2, .3) and valid ports
+        assert!(is_valid_masque_h3_endpoint("162.159.198.1:443".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.2:8443".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.3:8095".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.1:500".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.2:1701".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.3:4500".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint("162.159.198.1:4443".parse().unwrap()));
+
+        // Out-of-pool seeds: .4, H2 seeds, arbitrary IPs
+        assert!(!is_valid_masque_h3_endpoint("162.159.198.4:443".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint("162.159.193.1:443".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint("1.1.1.1:443".parse().unwrap()));
+
+        // Invalid ports on valid seeds
+        assert!(!is_valid_masque_h3_endpoint("162.159.198.1:80".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint("162.159.198.2:8080".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint("162.159.198.3:22".parse().unwrap()));
+
+        // IPv6 endpoints are strictly excluded from H3
+        let v6: SocketAddr = "[2606:4700:d0::a29f:c001]:443".parse().unwrap();
+        assert!(!is_valid_masque_h3_endpoint(v6));
     }
 }

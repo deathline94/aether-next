@@ -53,6 +53,7 @@ export function useRuntime(
   const [settingsLoadError, setSettingsLoadError] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [testBusy, setTestBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   // True while a change of ours has not been accepted by the shell: the debounce
@@ -318,7 +319,8 @@ export function useRuntime(
   }, [settings, settingsLoaded, persistSettings]);
 
   const toggleConnection = useCallback(async () => {
-    if (busy) return;
+    if (busyRef.current || busy) return;
+    busyRef.current = true;
     setBusy(true);
     setTestResult(null);
     try {
@@ -333,12 +335,14 @@ export function useRuntime(
       setRuntime(uiState("error", detail));
       appendLog({ level: "error", message: detail });
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, running, settings, appendLog, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
-    if (busy) return;
+    if (busyRef.current || busy) return;
+    busyRef.current = true;
     setBusy(true);
     const previous = settings;
     try {
@@ -362,6 +366,7 @@ export function useRuntime(
       setRuntime(uiState("error", detail));
       appendLog({ level: "error", message: `Direct connect error: ${detail}` });
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, running, settings, appendLog, safeDisconnect]);

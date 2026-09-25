@@ -47,12 +47,20 @@ const MAX_PLAUSIBLE_RTT_MS: u32 = 60_000;
 /// healthy H2 gateway and a dead QUIC one. Sharing one `successes`/`failures`
 /// counter between the two is what evicted working H2 gateways after three
 /// QUIC probes failed, and made every later connect pay for a full scan again.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     #[default]
+    #[serde(alias = "h3")]
     Quic,
+    #[serde(alias = "http2")]
     H2,
+    #[serde(other)]
+    Unlabelled,
+}
+
+fn default_transport_unlabelled() -> TransportKind {
+    TransportKind::Unlabelled
 }
 
 /// The transport the MASQUE tunnel would actually use right now.
@@ -172,10 +180,9 @@ pub struct CachedEndpoint {
     /// evict endpoints that died (e.g. after a network change).
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// Which transport this measurement came from. Entries from another transport
-    /// are not shown to a connect that will not use it — and a legacy entry with
-    /// no field decodes as `Quic`, which is what every pre-v2 file meant.
-    #[serde(default)]
+    /// Which transport this measurement came from. Legacy entries without a
+    /// field decode as `Unlabelled` and are migrated on load.
+    #[serde(default = "default_transport_unlabelled")]
     pub transport: TransportKind,
     /// Which measurement produced `rtt_ms`. Legacy files decode as
     /// `HandshakeProbe`, which is what every pre-existing writer did.
@@ -686,9 +693,60 @@ pub fn load_endpoints(base_config: &str) -> EndpointsCache {
         },
         Err(_) => EndpointsCache::default(),
     };
+    migrate_unlabelled(&mut cache.masque);
     decay_stale(&mut cache.masque);
     decay_stale(&mut cache.wireguard);
     cache
+}
+
+/// Safely migrate legacy entries that lacked an explicit transport field:
+/// - If the endpoint matches `is_valid_masque_h3_endpoint`, retain it for both H2 and Quic.
+/// - If not valid for H3, assign it exclusively to H2 so unlabelled H2 peers never enter H3.
+/// - WireGuard endpoints are never passed here and remain intact.
+pub fn migrate_unlabelled(masque: &mut Vec<CachedEndpoint>) {
+    let mut migrated = Vec::with_capacity(masque.len() * 2);
+    for mut ep in masque.drain(..) {
+        if ep.transport == TransportKind::Unlabelled {
+            if crate::prober::is_valid_masque_h3_endpoint(ep.addr) {
+                let mut quic_ep = ep.clone();
+                quic_ep.transport = TransportKind::Quic;
+                ep.transport = TransportKind::H2;
+                migrated.push(ep);
+                migrated.push(quic_ep);
+            } else {
+                ep.transport = TransportKind::H2;
+                migrated.push(ep);
+            }
+        } else {
+            migrated.push(ep);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    migrated.retain(|e| seen.insert((e.addr, e.transport)));
+    prune_per_transport(&mut migrated, MAX_CACHED);
+    *masque = migrated;
+}
+
+/// Retain up to `limit` entries per transport so H2 and QUIC cache entries
+/// do not evict each other.
+fn prune_per_transport(list: &mut Vec<CachedEndpoint>, limit: usize) {
+    let mut h2_count = 0;
+    let mut quic_count = 0;
+    let mut other_count = 0;
+    list.retain(|e| match e.transport {
+        TransportKind::H2 => {
+            h2_count += 1;
+            h2_count <= limit
+        }
+        TransportKind::Quic => {
+            quic_count += 1;
+            quic_count <= limit
+        }
+        _ => {
+            other_count += 1;
+            other_count <= limit
+        }
+    });
 }
 
 /// Persist the cache atomically. `Err` means the document on disk is *not* this
@@ -728,13 +786,13 @@ fn upsert(
     let now = now_secs();
     for (addr, rtt_ms) in endpoints.into_iter().rev() {
         // Preserve accumulated trust when re-adding a known endpoint — including
-        // the strike counter. Zeroing `consecutive_failures` here meant any scan
-        // that happened to reach a flapping endpoint laundered the record, so the
-        // 3-strike eviction never fired and a peer that had died was offered first
-        // on every reconnect forever. Only a connect that *succeeds*
-        // (`record_success_on`) earns a reset.
-        let prev = list.iter().find(|e| e.addr == addr).cloned();
-        list.retain(|e| e.addr != addr);
+        // the strike counter. Match on (addr, transport) so different transports
+        // for the same address never overwrite each other.
+        let prev = list
+            .iter()
+            .find(|e| e.addr == addr && e.transport == transport)
+            .cloned();
+        list.retain(|e| !(e.addr == addr && e.transport == transport));
         list.insert(
             0,
             CachedEndpoint {
@@ -749,7 +807,7 @@ fn upsert(
             },
         );
     }
-    list.truncate(MAX_CACHED);
+    prune_per_transport(list, MAX_CACHED);
 }
 
 /// Scan hits, measured however `measurement` says.
@@ -758,7 +816,20 @@ pub fn add_to_masque_with_rtt(
     endpoints: Vec<(SocketAddr, u32)>,
     measurement: Measurement,
 ) -> Mutation {
-    let transport = active_masque_transport();
+    add_to_masque_with_rtt_transport(
+        base_config,
+        endpoints,
+        active_masque_transport(),
+        measurement,
+    )
+}
+
+pub fn add_to_masque_with_rtt_transport(
+    base_config: &str,
+    endpoints: Vec<(SocketAddr, u32)>,
+    transport: TransportKind,
+    measurement: Measurement,
+) -> Mutation {
     with_cache_nowait(base_config, move |cache| {
         upsert(&mut cache.masque, endpoints, transport, measurement)
     })
@@ -820,6 +891,15 @@ pub fn record_success(base_config: &str, addr: SocketAddr, is_masque: bool) -> M
     } else {
         TransportKind::default()
     };
+    record_success_for_transport(base_config, addr, is_masque, transport)
+}
+
+pub fn record_success_for_transport(
+    base_config: &str,
+    addr: SocketAddr,
+    is_masque: bool,
+    transport: TransportKind,
+) -> Mutation {
     with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
@@ -859,7 +939,7 @@ fn record_success_on(
                 measurement: Measurement::default(),
             },
         );
-        list.truncate(MAX_CACHED);
+        prune_per_transport(list, MAX_CACHED);
     }
 }
 
@@ -877,6 +957,15 @@ pub fn record_failure(base_config: &str, addr: SocketAddr, is_masque: bool) -> M
     } else {
         TransportKind::default()
     };
+    record_failure_for_transport(base_config, addr, is_masque, transport)
+}
+
+pub fn record_failure_for_transport(
+    base_config: &str,
+    addr: SocketAddr,
+    is_masque: bool,
+    transport: TransportKind,
+) -> Mutation {
     with_cache(base_config, move |cache| {
         let list = if is_masque {
             &mut cache.masque
@@ -987,8 +1076,13 @@ mod tests {
     /// A file written before the discriminator existed carries measurements that
     /// were all taken over QUIC, so it must decode that way rather than be
     /// invisible (or worse, be read as H2 history).
+    /// Legacy entries without an explicit transport field are migrated safely:
+    /// - An unlabelled entry that is not in the MASQUE H3 pool (like 162.159.193.1:443)
+    ///   is migrated to H2 and NEVER to Quic (H3).
+    /// - An unlabelled entry that is in the MASQUE H3 pool (like 162.159.198.1:443)
+    ///   is duplicated to both H2 and Quic.
     #[test]
-    fn a_legacy_entry_without_a_transport_is_a_quic_measurement() {
+    fn a_legacy_entry_without_a_transport_is_migrated_safely() {
         let dir = std::env::temp_dir().join(format!("aether_cache_legacy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -996,13 +1090,85 @@ mod tests {
         // Stamped "now": an old timestamp is pruned as stale before anything can
         // look at its transport, and the test would pass for the wrong reason.
         let doc = format!(
-            r#"{{"version":2,"written_at":{n},"masque":[{{"addr":"162.159.193.1:443","timestamp":{n},"rtt_ms":30,"successes":4,"failures":0,"consecutive_failures":0}}],"wireguard":[]}}"#,
+            r#"{{"version":2,"written_at":{n},"masque":[
+                {{"addr":"162.159.193.1:443","timestamp":{n},"rtt_ms":30,"successes":4,"failures":0,"consecutive_failures":0}},
+                {{"addr":"162.159.198.1:443","timestamp":{n},"rtt_ms":25,"successes":5,"failures":0,"consecutive_failures":0}}
+            ],"wireguard":[]}}"#,
             n = now_secs()
         );
         std::fs::write(cache_path(&base), doc).unwrap();
-        let entries = get_masque_sorted_for(&base, TransportKind::Quic);
-        assert_eq!(entries.len(), 1, "legacy entry must decode, not vanish");
-        assert!(get_masque_sorted_for(&base, TransportKind::H2).is_empty());
+        let h2_entries = get_masque_sorted_for(&base, TransportKind::H2);
+        let quic_entries = get_masque_sorted_for(&base, TransportKind::Quic);
+
+        // 162.159.193.1:443 must NEVER be treated as H3!
+        assert!(
+            quic_entries.iter().all(|(addr, _)| addr.to_string() != "162.159.193.1:443"),
+            "unlabelled H2 gateway must not migrate to Quic"
+        );
+        assert!(
+            h2_entries.iter().any(|(addr, _)| addr.to_string() == "162.159.193.1:443"),
+            "unlabelled H2 gateway must migrate to H2"
+        );
+
+        // 162.159.198.1:443 is valid for H3, so it is present in Quic
+        assert!(
+            quic_entries.iter().any(|(addr, _)| addr.to_string() == "162.159.198.1:443"),
+            "unlabelled H3 gateway migrates to Quic"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h2_and_quic_caches_do_not_evict_each_other() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_noevict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+
+        let mut h2_eps = Vec::new();
+        for i in 1..=10 {
+            h2_eps.push((format!("162.159.193.{i}:443").parse().unwrap(), 30 + i));
+        }
+        add_to_masque_with_rtt_transport(&base, h2_eps, TransportKind::H2, Measurement::HandshakeProbe);
+
+        let mut quic_eps = Vec::new();
+        for port in [443, 500, 1701, 4500, 4443, 8443, 8095] {
+            quic_eps.push((format!("162.159.198.1:{port}").parse().unwrap(), 20));
+        }
+        for port in [443, 500, 1701] {
+            quic_eps.push((format!("162.159.198.2:{port}").parse().unwrap(), 25));
+        }
+        add_to_masque_with_rtt_transport(&base, quic_eps, TransportKind::Quic, Measurement::HandshakeProbe);
+
+        let h2_saved = get_masque_sorted_for(&base, TransportKind::H2);
+        let quic_saved = get_masque_sorted_for(&base, TransportKind::Quic);
+        assert_eq!(h2_saved.len(), 10, "all 10 H2 entries must be retained");
+        assert_eq!(quic_saved.len(), 10, "all 10 Quic entries must be retained");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_address_can_coexist_across_transports() {
+        let dir = std::env::temp_dir().join(format!("aether_cache_coexist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("aether.toml").to_string_lossy().to_string();
+        let addr: SocketAddr = "162.159.198.1:443".parse().unwrap();
+
+        record_success_for_transport(&base, addr, true, TransportKind::H2);
+        record_success_for_transport(&base, addr, true, TransportKind::Quic);
+
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::H2).len(), 1);
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::Quic).len(), 1);
+
+        // Fail Quic 3 times -> evicts Quic only
+        for _ in 0..EVICT_AFTER_CONSECUTIVE_FAILURES {
+            record_failure_for_transport(&base, addr, true, TransportKind::Quic);
+        }
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::Quic).len(), 0);
+        assert_eq!(get_masque_sorted_for(&base, TransportKind::H2).len(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -171,13 +171,9 @@ export function ConnectionTab({
 
         {/* ─── Military-Grade Illuminated Master Switch ───────────────────── */}
         <div className="master-switch-assembly">
-          <div className="switch-ping-rings" aria-hidden="true">
-            {(connected || runtime.status === "connecting") && (
-              <>
-                <div className={`ping-ring ring-primary ${runtime.status}`} />
-                <div className={`ping-ring ring-secondary ${runtime.status}`} />
-              </>
-            )}
+          <div className={`switch-ping-rings ${connected || runtime.status === "connecting" ? "active" : ""}`} aria-hidden="true">
+            <div className={`ping-ring ring-primary ${runtime.status}`} />
+            <div className={`ping-ring ring-secondary ${runtime.status}`} />
           </div>
 
           <div className={`master-switch-chassis ${runtime.status}`}>
@@ -191,11 +187,13 @@ export function ConnectionTab({
               aria-label={powerControlLabel(running)}
             >
               <div className="btn-surface">
-                {busy ? (
-                  <ListRestart className="spin master-icon" size={34} aria-hidden="true" />
-                ) : (
-                  <Power className="master-icon" size={35} aria-hidden="true" />
-                )}
+                <div className="master-icon-slot">
+                  {busy ? (
+                    <ListRestart className="spin master-icon" size={36} aria-hidden="true" />
+                  ) : (
+                    <Power className="master-icon" size={36} aria-hidden="true" />
+                  )}
+                </div>
               </div>
             </button>
           </div>

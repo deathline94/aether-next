@@ -39,6 +39,7 @@ apps/desktop/src-tauri/gen/schemas/
 # keep resources/.gitkeep
 
 # ── Local release drops (produced by package scripts / CI) ────
+release-dist/
 dist-windows/
 dist-android/
 portable/

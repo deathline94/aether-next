@@ -16,6 +16,7 @@ import {
   processStateCopy,
   protocolHeadline,
   roundTripLabel,
+  startHint,
   stateAnswer,
   stateDetail,
   streamLabel,
@@ -199,5 +200,16 @@ describe("the console table", () => {
       expect(label.toLowerCase(), `${id} is its own label`).not.toBe(id);
     }
     expect(ids).toEqual(["milestones", "hits", "errors", "raw"]);
+  });
+});
+
+describe("startHint", () => {
+  it("provides location-independent guidance on what connection covers on all platforms", () => {
+    for (const [, platform] of PLATFORMS) {
+      const hint = startHint(platform);
+      expect(hint).toContain(`${platform.actionVerb} the power button to connect.`);
+      expect(hint).toContain("connection status shows what that covers on this device.");
+      expect(hint).not.toMatch(/below|above|left|right/i);
+    }
   });
 });

@@ -803,25 +803,44 @@ code, kbd, pre {
   grid-template-columns: minmax(0, 1fr) 190px;
   align-items: center;
   gap: 24px;
-  transition: border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), background 0.3s ease;
+  transition: border-color 0.3s ease;
+}
+.connection-stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  z-index: 0;
 }
 .connection-stage.connected {
   border-color: var(--emerald-border);
+}
+.connection-stage.connected::before {
   background: radial-gradient(ellipse at 85% 45%, var(--emerald-a09) 0%, transparent 65%),
-              linear-gradient(135deg, var(--stage-top-connected) 0%, var(--stage-mid-connected) 60%, var(--stage-bottom) 100%);
-  box-shadow: 0 12px 42px rgba(0, 0, 0, 0.5), 0 0 40px var(--emerald-a10), var(--inner-highlight);
+              linear-gradient(135deg, var(--stage-top-connected) 0%, var(--stage-mid-connected) 60%, transparent 100%);
+  box-shadow: inset 0 0 40px var(--emerald-a10);
+  opacity: 1;
 }
 .connection-stage.connecting {
   border-color: var(--yellow-border);
+}
+.connection-stage.connecting::before {
   background: radial-gradient(ellipse at 85% 45%, var(--yellow-a08) 0%, transparent 65%),
-              linear-gradient(135deg, var(--stage-top-connecting) 0%, var(--stage-mid-connecting) 60%, var(--stage-bottom) 100%);
-  box-shadow: 0 12px 42px rgba(0, 0, 0, 0.5), 0 0 40px var(--yellow-a08), var(--inner-highlight);
+              linear-gradient(135deg, var(--stage-top-connecting) 0%, var(--stage-mid-connecting) 60%, transparent 100%);
+  box-shadow: inset 0 0 40px var(--yellow-a08);
+  opacity: 1;
 }
 .connection-stage.error {
   border-color: var(--coral-border);
+}
+.connection-stage.error::before {
   background: radial-gradient(ellipse at 85% 45%, var(--coral-a08) 0%, transparent 65%),
-              linear-gradient(135deg, var(--stage-top-error) 0%, var(--stage-mid-error) 60%, var(--stage-bottom) 100%);
-  box-shadow: 0 12px 42px rgba(0, 0, 0, 0.5), 0 0 40px var(--coral-a08), var(--inner-highlight);
+              linear-gradient(135deg, var(--stage-top-error) 0%, var(--stage-mid-error) 60%, transparent 100%);
+  box-shadow: inset 0 0 40px var(--coral-a08);
+  opacity: 1;
 }
 
 /* Reticle Signal Field */
@@ -917,6 +936,11 @@ code, kbd, pre {
   height: 112px;
   pointer-events: none;
   z-index: var(--z-decor);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.switch-ping-rings.active {
+  opacity: 1;
 }
 .ping-ring {
   position: absolute;
@@ -969,7 +993,7 @@ code, kbd, pre {
               0 0 0 6px rgba(255, 255, 255, 0.05),
               0 18px 40px rgba(0, 0, 0, 0.75),
               inset 0 1px 1px rgba(255, 255, 255, 0.16);
-  transition: color 0.3s var(--ease-spring), background-color 0.3s var(--ease-spring), border-color 0.3s var(--ease-spring), box-shadow 0.3s var(--ease-spring), transform 0.3s var(--ease-spring), opacity 0.3s var(--ease-spring);
+  transition: border-color 0.3s ease;
 }
 .master-switch-chassis.connected {
   border-color: var(--emerald-border);
@@ -1037,8 +1061,20 @@ code, kbd, pre {
   box-shadow: inset 0 2px 2px rgba(255, 255, 255, 0.25),
               inset 0 -2px 5px rgba(0, 0, 0, 0.65),
               0 6px 18px rgba(0, 0, 0, 0.5);
-  transition: transform 0.15s var(--ease-spring), box-shadow 0.2s, background 0.2s, filter 0.2s;
-}@media (hover: hover) and (pointer: fine){
+  transition: transform 0.15s var(--ease-spring), border-color 0.2s ease, color 0.2s ease;
+}
+.master-toggle-btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(circle at 50% 28%, var(--face-stop-top) 0%, var(--face-stop-bottom) 100%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 0;
+}
+@media (hover: hover) and (pointer: fine){
 .master-toggle-btn:hover {
   transform: scale(1.03);
   filter: brightness(1.12);
@@ -1054,9 +1090,12 @@ code, kbd, pre {
 }
 .master-toggle-btn.stop {
   border-color: var(--coral-border);
-  background: radial-gradient(circle at 50% 28%, var(--face-stop-top) 0%, var(--face-stop-bottom) 100%);
   color: var(--coral);
-}@media (hover: hover) and (pointer: fine){
+}
+.master-toggle-btn.stop::after {
+  opacity: 1;
+}
+@media (hover: hover) and (pointer: fine){
 .master-toggle-btn.stop:hover {
   box-shadow: inset 0 2px 2px rgba(255, 255, 255, 0.3),
               inset 0 -2px 5px rgba(0, 0, 0, 0.7),
@@ -1069,11 +1108,20 @@ code, kbd, pre {
 }
 
 .btn-surface {
+  position: relative;
+  z-index: 1;
   display: grid;
   place-items: center;
   width: 100%;
   height: 100%;
   border-radius: var(--radius-circle);
+}
+.master-icon-slot {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
 }
 .master-icon {
   filter: drop-shadow(0 0 8px currentColor);
