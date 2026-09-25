@@ -64,6 +64,42 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mim" | "--masque-in-masque" => {
+                crate::runtime_env::set("AETHER_PROTOCOL", "mim");
+            }
+            "--mim-outer" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    crate::runtime_env::set("AETHER_MIM_OUTER_PEER", &args[i]);
+                }
+            }
+            "--mim-inner" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    crate::runtime_env::set("AETHER_MIM_INNER_PEER", &args[i]);
+                }
+            }
+            "--mim-peers" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    crate::runtime_env::set("AETHER_MIM_PEERS", &args[i]);
+                }
+            }
+            "--protocol" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    crate::runtime_env::set("AETHER_PROTOCOL", &args[i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
     let session = crate::session::run_session(EngineConfig::from_env()?);
     let result = if crate::runtime_env::flag("AETHER_CONTROL_STDIN") {
         tokio::select! {

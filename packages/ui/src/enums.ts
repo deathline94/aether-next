@@ -58,12 +58,13 @@ export const SCAN_MODE_OPTIONS: readonly { value: ScanMode; label: string }[] = 
 ];
 
 /** Tunnel the engine dials. `Protocol` in the shell. */
-export const TUNNEL_PROTOCOLS = ["masque", "wireguard", "gool"] as const;
+export const TUNNEL_PROTOCOLS = ["masque", "wireguard", "gool", "mim"] as const;
 export type TunnelProtocol = (typeof TUNNEL_PROTOCOLS)[number];
 export const TUNNEL_PROTOCOL_OPTIONS: readonly { value: TunnelProtocol; label: string }[] = [
   { value: "masque", label: "MASQUE" },
   { value: "wireguard", label: "WireGuard" },
   { value: "gool", label: "Gool" },
+  { value: "mim", label: "MASQUE-in-MASQUE (mim)" },
 ];
 
 /** MASQUE inner transport. `TransportKind` in the shell; `auto` is legacy. */

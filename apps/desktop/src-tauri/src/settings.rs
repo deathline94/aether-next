@@ -105,6 +105,7 @@ wire_enum! {
         Wireguard = "wireguard",
         Warp = "warp",
         Gool = "gool",
+        Mim = "mim",
     }
     default Masque
 }

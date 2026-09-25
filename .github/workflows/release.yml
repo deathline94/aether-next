@@ -18,6 +18,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
+      - uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        id: ndk
+        with:
+          ndk-version: r27d
+          link-to-sdk: true
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "22"
@@ -26,6 +40,24 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "21"
+      - name: Build Android engine
+        working-directory: aether
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+        run: |
+          cargo install cargo-ndk --version 4.1.2 --locked
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            cargo ndk -t "$abi" --platform 26 build --release
+          done
+          mkdir -p ../apps/android/android/app/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}
+          mkdir -p ../apps/android/android/app/src/main/assets/engine
+          cp target/aarch64-linux-android/release/aether ../apps/android/android/app/src/main/jniLibs/arm64-v8a/libaether.so
+          cp target/armv7-linux-androideabi/release/aether ../apps/android/android/app/src/main/jniLibs/armeabi-v7a/libaether.so
+          cp target/x86_64-linux-android/release/aether ../apps/android/android/app/src/main/jniLibs/x86_64/libaether.so
+          cp target/aarch64-linux-android/release/aether ../apps/android/android/app/src/main/assets/engine/aether
       - name: Build web assets
         working-directory: apps/android
         run: |

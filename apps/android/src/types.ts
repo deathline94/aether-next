@@ -7,7 +7,7 @@ import {
   SCAN_MIN_TIMEOUT_MS,
 } from "@aether/ui";
 import type { RuntimeStatus } from "@aether/ui";
-import type { ScanMode } from "@aether/ui/enums";
+import type { ScanMode, TunnelProtocol } from "@aether/ui/enums";
 import type { LogLevel } from "@aether/ui/enums";
 import { SPEED_PROFILES, speedProfileHint } from "@aether/ui/enums";
 // The cycle with `settingsPayload` (which reads `defaults` for its own fallbacks) is
@@ -49,7 +49,7 @@ export const initialScanState: ScanState = {
 };
 
 export type Settings = {
-  protocol: "masque" | "wireguard" | "gool";
+  protocol: TunnelProtocol;
   transport: "h2" | "h3";
   /**
    * The shared `ScanMode`, not a private four-arm copy: `validateSettings` in the

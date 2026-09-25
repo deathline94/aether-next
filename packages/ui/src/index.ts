@@ -131,7 +131,7 @@ export function effectiveScanTimeout(protocol: string, timeoutMs: number): numbe
  * setting that provably does nothing. One predicate, both places.
  */
 export function noiseIsInert(protocol: string, transport: string): boolean {
-  return protocol === "masque" && transport === "h2";
+  return (protocol === "masque" || protocol === "mim") && transport === "h2";
 }
 
 /**

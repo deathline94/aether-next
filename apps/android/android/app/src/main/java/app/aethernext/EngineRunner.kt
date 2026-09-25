@@ -512,12 +512,13 @@ open class EngineRunner(
                 "wireguard", "wg" -> "wg"
                 "masque", "masque-h2", "masque-h3", "h2", "h3" -> "masque"
                 "gool", "wiw", "warp-in-warp", "warpinwarp" -> "gool"
+                "mim", "m2", "masque-in-masque", "masqueinmasque" -> "mim"
                 // Legacy value a shipped config can still hold; the engine resolves
                 // it to MASQUE and says so, so it is passed through, not rewritten.
                 "warp" -> "warp"
                 else -> throw IllegalArgumentException(
                     "protocol '$protocol' has no engine equivalent; the engine understands " +
-                        "masque|masque-h2|masque-h3|wg|wireguard|gool|warp-in-warp|warp. " +
+                        "masque|masque-h2|masque-h3|wg|wireguard|gool|warp-in-warp|warp|mim. " +
                         "Re-select it in Settings.",
                 )
             }

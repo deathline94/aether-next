@@ -326,7 +326,10 @@ option:disabled { color: var(--muted); }
   letter-spacing: -0.006em;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
 html, body, #root {
   margin: 0;
   min-width: 320px;
@@ -1050,6 +1053,11 @@ code, kbd, pre {
   width: 90px;
   height: 90px;
   border-radius: var(--radius-circle);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  transform: translateZ(0);
   border: 1px solid var(--emerald-border);
   background: radial-gradient(circle at 50% 28%, var(--face-connected-top) 0%, var(--face-connected-bottom) 100%);
   color: var(--emerald);
@@ -1115,6 +1123,9 @@ code, kbd, pre {
   width: 100%;
   height: 100%;
   border-radius: var(--radius-circle);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
 }
 .master-icon-slot {
   width: 36px;

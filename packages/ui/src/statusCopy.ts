@@ -294,6 +294,11 @@ const CARRIER_COPY: Record<
     transport: () => "UDP WireGuard",
     headline: "WireGuard",
   },
+  mim: {
+    chip: (t) => (t === "h3" ? "QUIC/UDP x2" : "H2/TLS x2"),
+    transport: (t) => (t === "h3" ? "MASQUE H3 in MASQUE H3" : "MASQUE H2 in MASQUE H2"),
+    headline: "MASQUE-in-MASQUE",
+  },
 };
 
 export function carrierChip(settings: { protocol: TunnelProtocol; transport: Transport }): string {
@@ -348,7 +353,7 @@ export function fragSettingCopy(settings: {
  * AES-GCM one - and nothing here observes which, so it cannot be asserted.
  */
 export function cipherSettingCopy(protocol: TunnelProtocol): string {
-  return protocol === "masque" ? "Chosen with the server" : "ChaCha20-Poly1305";
+  return protocol === "masque" || protocol === "mim" ? "Chosen with the server" : "ChaCha20-Poly1305";
 }
 
 /**

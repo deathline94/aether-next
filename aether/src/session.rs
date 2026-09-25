@@ -170,6 +170,12 @@ mod protocol_choice_tests {
                 "{name:?} should mean WARP-in-WARP"
             );
         }
+        for name in ["mim", "m2", "masque-in-masque", "MasqueInMasque"] {
+            assert!(
+                matches!(Protocol::try_parse(name), Ok(Protocol::MasqueInMasque)),
+                "{name:?} should mean MASQUE-in-MASQUE"
+            );
+        }
     }
 
     #[test]
@@ -228,6 +234,7 @@ pub enum Protocol {
     Masque,
     WireGuard,
     WarpInWarp,
+    MasqueInMasque,
 }
 
 impl Protocol {
@@ -244,6 +251,7 @@ impl Protocol {
         Ok(match name.as_str() {
             "wg" | "wireguard" => Protocol::WireGuard,
             "gool" | "wiw" | "warp-in-warp" | "warpinwarp" => Protocol::WarpInWarp,
+            "mim" | "m2" | "masque-in-masque" | "masqueinmasque" => Protocol::MasqueInMasque,
             // `warp` is a legacy value a shipped config can still hold; the desktop
             // shell keeps it representable rather than rewriting it, and this engine
             // has always resolved it to MASQUE. Named here instead of arriving
@@ -251,7 +259,7 @@ impl Protocol {
             "warp" | "masque" | "masque-h2" | "masque-h3" | "h3" | "h2" | "" => Protocol::Masque,
             other => {
                 return Err(AetherError::Config(format!(
-                    "unknown protocol {other:?}; expected masque|masque-h2|masque-h3|h2|h3|wg|wireguard|gool|warp-in-warp|warp"
+                    "unknown protocol {other:?}; expected masque|masque-h2|masque-h3|h2|h3|wg|wireguard|gool|warp-in-warp|warp|mim|masque-in-masque"
                 )))
             }
         })
@@ -262,6 +270,7 @@ impl Protocol {
             Protocol::Masque => "MASQUE",
             Protocol::WireGuard => "WireGuard",
             Protocol::WarpInWarp => "WARP-in-WARP (gool)",
+            Protocol::MasqueInMasque => "MASQUE-in-MASQUE (mim)",
         }
     }
 }
@@ -518,6 +527,45 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             session_event::set_phase(session_event::Phase::Handshake);
             run_warp_in_warp(primary, secondary, peer, listen, http_listen).await
         }
+        Protocol::MasqueInMasque => {
+            let primary_path = masque_config_path(&base_config);
+            let secondary_path = derive_sibling_path(&primary_path, "secondary");
+            let primary = load_or_provision_masque(&primary_path).await?;
+            let secondary = load_or_provision_masque(&secondary_path).await?;
+            log::info!(
+                "[+] outer device={} ipv4={} | inner device={} ipv4={}",
+                primary.device_id,
+                primary.ipv4,
+                secondary.device_id,
+                secondary.ipv4
+            );
+            let ech = resolve_ech().await;
+            let selection = select_peer(
+                &primary,
+                Protocol::MasqueInMasque,
+                &base_config,
+                prober::WgSessionCache::new(),
+            )
+            .await?;
+            let peer = selection.peer;
+            log::info!("[+] using cloudflare edge {peer} (outer)");
+            session_event::emit(SessionEvent::EndpointSelected {
+                addr: peer.to_string(),
+                protocol: "mim".into(),
+                rtt_ms: selection.best_rtt_ms(),
+            });
+            if scan_only() {
+                session_event::emit(SessionEvent::ScanDone {
+                    addr: peer.to_string(),
+                    rtt: selection.human_rtt(),
+                    protocol: "mim".into(),
+                    best_rtt_ms: selection.best_rtt_ms(),
+                });
+                return Ok(());
+            }
+            session_event::set_phase(session_event::Phase::Handshake);
+            run_masque_in_masque(primary, secondary, peer, ech, listen, http_listen).await
+        }
     }
 }
 
@@ -672,6 +720,11 @@ async fn select_peer(
         Protocol::WireGuard | Protocol::WarpInWarp => {
             runtime_env::var("AETHER_WG_PEER").or_else(|| runtime_env::var("AETHER_PEER"))
         }
+        Protocol::MasqueInMasque => {
+            runtime_env::var("AETHER_MIM_OUTER_PEER")
+                .or_else(|| mim_endpoints_from_env().ok().and_then(|p| p.outer.map(|a| a.to_string())))
+                .or_else(|| runtime_env::var("AETHER_PEER"))
+        }
     };
 
     if let Some(p) = force_peer {
@@ -690,7 +743,7 @@ async fn select_peer(
     let ip = select_ip_version().await;
 
     match protocol {
-        Protocol::Masque => {
+        Protocol::Masque | Protocol::MasqueInMasque => {
             log::info!("[*] hunting for a working MASQUE gateway (deep connect-ip verification)");
             // Parsed once for the arm: both the probe and the cached-gateway
             // verification bind the same inner address, and a failure now stops the
@@ -1597,6 +1650,422 @@ async fn run_warp_in_warp(
     result
 }
 
+// ─── MASQUE-in-MASQUE runner ───────────────────────────────────────────────
+
+struct TcpForwarderGuard {
+    #[allow(dead_code)]
+    listener_task: AbortOnDrop<()>,
+}
+
+async fn spawn_tcp_forwarder(
+    outer: &netstack::StackHandle,
+    remote: SocketAddr,
+) -> Result<(SocketAddr, TcpForwarderGuard)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let local = listener.local_addr()?;
+    let stack = outer.clone();
+
+    let task = tokio::spawn(async move {
+        let mut clients = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let Ok((sock, _)) = accepted else { break };
+                    let stack = stack.clone();
+                    clients.spawn(async move {
+                        match stack.open_tcp(remote).await {
+                            Ok(conn) => {
+                                let (sender, mut from_stack) = conn.into_split();
+                                let (mut rd, mut wr) = sock.into_split();
+                                let up = tokio::spawn(async move {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut buf = vec![0u8; 16384];
+                                    loop {
+                                        match rd.read(&mut buf).await {
+                                            Ok(0) => {
+                                                sender.close().await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                if sender.send(buf[..n].to_vec()).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                sender.close().await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                use tokio::io::AsyncWriteExt;
+                                while let Some(first) = from_stack.recv().await {
+                                    if wr.write_all(&first).await.is_err() {
+                                        let _ = wr.shutdown().await;
+                                        up.abort();
+                                        break;
+                                    }
+                                }
+                                let _ = wr.shutdown().await;
+                                up.abort();
+                            }
+                            Err(e) => log::warn!(
+                                "[-] the inner hop could not reach {remote} through the outer tunnel: {e}"
+                            ),
+                        }
+                    });
+                }
+                Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            }
+        }
+    });
+
+    Ok((local, TcpForwarderGuard { listener_task: AbortOnDrop(task) }))
+}
+
+#[allow(dead_code)]
+enum ForwarderGuard {
+    Udp(UdpForwarderGuard),
+    Tcp(TcpForwarderGuard),
+}
+
+struct MasqueHop {
+    stack: netstack::StackHandle,
+    tunnel_task: AbortOnDrop<Result<()>>,
+    #[allow(dead_code)]
+    addr_task: AbortOnDrop<()>,
+}
+
+async fn establish_masque(
+    identity: &account::Identity,
+    peer: SocketAddr,
+    ech: Option<Vec<u8>>,
+    h2: bool,
+    mtu: usize,
+    label: &'static str,
+) -> Result<MasqueHop> {
+    let (chans, internals) = quic::channels();
+    let local_ipv4 = identity.tunnel_ipv4()?;
+    let quic::Channels {
+        outbound_tx,
+        inbound_rx,
+    } = chans;
+
+    let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
+
+    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(64);
+    let bridge_stack = stack.clone();
+    let addr_task = tokio::spawn(async move {
+        while let Some(a) = addr_rx.recv().await {
+            let res = match a.ip {
+                IpAddr::V4(v4) => bridge_stack.set_addrs(Some((v4, a.prefix)), None).await,
+                IpAddr::V6(v6) => bridge_stack.set_addrs(None, Some((v6, a.prefix))).await,
+            };
+            if let Err(e) = res {
+                log::warn!("[-] failed to sync edge address into netstack: {e}");
+            }
+        }
+    });
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let probe_src = Some(local_ipv4);
+
+    let tunnel_handle = if h2 {
+        let h2cfg = masque_h2::H2TunnelConfig {
+            peer: if label == "inner" { peer } else { masque_h2::h2_peer(peer) },
+            sni: consts::CONNECT_SNI.to_string(),
+            authority: crate::quic::resolve_h3_authority(),
+            cert_pem: identity.cert_pem.clone(),
+            key_pem: identity.key_pem.clone(),
+            probe_src,
+        };
+        log::info!("[+] [{label}] MASQUE transport: HTTP/2 (TCP) to {}", h2cfg.peer);
+        tokio::spawn(async move { masque_h2::run(h2cfg, internals, Some(addr_tx), ready_tx).await })
+    } else {
+        let cfg = quic::TunnelConfig {
+            peer,
+            sni: crate::quic::resolve_h3_sni(),
+            authority: crate::quic::resolve_h3_authority(),
+            path: crate::quic::resolve_h3_path(),
+            cert_pem: identity.cert_pem.clone(),
+            key_pem: identity.key_pem.clone(),
+            local_ipv4,
+            ech_config_list: ech,
+            noize: if label == "inner" { noize::NoizeConfig::off() } else { noize_config() },
+        };
+        log::info!("[+] [{label}] MASQUE transport: HTTP/3 (QUIC) to {peer}");
+        tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
+    };
+
+    let startup_timeout = if label == "inner" {
+        std::time::Duration::from_secs(12)
+    } else {
+        std::time::Duration::from_secs(20)
+    };
+
+    match tokio::time::timeout(startup_timeout, ready_rx).await {
+        Ok(Ok(())) => Ok(MasqueHop {
+            stack,
+            tunnel_task: AbortOnDrop(tunnel_handle),
+            addr_task: AbortOnDrop(addr_task),
+        }),
+        Ok(Err(_)) => {
+            let joined = tunnel_handle.await;
+            let msg = match joined {
+                Ok(Ok(())) => format!("[{label}] MASQUE tunnel exited before validation"),
+                Ok(Err(e)) => format!("[{label}] MASQUE tunnel failed before validation: {e}"),
+                Err(e) => format!("[{label}] MASQUE tunnel task join error: {e}"),
+            };
+            Err(AetherError::Other(msg))
+        }
+        Err(_) => {
+            tunnel_handle.abort();
+            let _ = tunnel_handle.await;
+            Err(AetherError::Other(format!(
+                "[{label}] MASQUE tunnel startup timed out after {startup_timeout:?}"
+            )))
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct MimEndpoints {
+    pub outer: Option<SocketAddr>,
+    pub inner: Option<SocketAddr>,
+}
+
+fn parse_endpoint(raw: &str) -> Result<SocketAddr> {
+    raw.trim()
+        .parse()
+        .map_err(|e| AetherError::Config(format!("bad endpoint {raw:?}: {e}")))
+}
+
+fn parse_endpoint_list(raw: &str) -> Result<Vec<SocketAddr>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_endpoint)
+        .collect()
+}
+
+fn is_scan_keyword(raw: &str) -> bool {
+    matches!(raw.trim().to_lowercase().as_str(), "auto" | "scan" | "none" | "off" | "0")
+}
+
+pub fn mim_endpoints_from_env() -> Result<MimEndpoints> {
+    let mut chosen = MimEndpoints::default();
+
+    if let Some(list) = crate::runtime_env::var("AETHER_MIM_PEERS") {
+        if !is_scan_keyword(&list) {
+            let peers = parse_endpoint_list(&list)?;
+            chosen.outer = peers.first().copied();
+            chosen.inner = peers.get(1).copied();
+        }
+    }
+
+    if let Some(val) = crate::runtime_env::var("AETHER_MIM_OUTER_PEER") {
+        if !val.trim().is_empty() {
+            chosen.outer = Some(parse_endpoint(&val)?);
+        }
+    }
+
+    if let Some(val) = crate::runtime_env::var("AETHER_MIM_INNER_PEER") {
+        if !val.trim().is_empty() {
+            chosen.inner = Some(parse_endpoint(&val)?);
+        }
+    }
+
+    if let (Some(outer), Some(inner)) = (chosen.outer, chosen.inner) {
+        if outer == inner {
+            return Err(AetherError::Config(
+                "outer and inner MASQUE hops cannot use the same endpoint".into(),
+            ));
+        }
+    }
+
+    Ok(chosen)
+}
+
+fn mim_inner_budget(outer_mtu: usize, inner_peer: SocketAddr, h2: bool) -> (usize, usize) {
+    if h2 {
+        let mtu = outer_mtu.saturating_sub(100).clamp(576, 1500);
+        return (1350, mtu);
+    }
+
+    let headers = if inner_peer.is_ipv4() { 28 } else { 48 };
+    let datagram = outer_mtu
+        .saturating_sub(headers)
+        .clamp(1200, 1350);
+    let mtu = datagram
+        .saturating_sub(70)
+        .clamp(576, 1200);
+    (datagram, mtu)
+}
+
+const MASQUE_INNER_PORT: u16 = 443;
+const MIM_INNER_TRIES: usize = 6;
+
+fn inner_masque_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+
+    if !masque_h2::enabled() {
+        let h3_seeds = [
+            "162.159.198.1:443",
+            "162.159.198.2:443",
+            "162.159.198.3:443",
+            "162.159.198.1:8443",
+            "162.159.198.2:8443",
+            "162.159.198.3:8443",
+            "162.159.198.1:4443",
+            "162.159.198.2:4443",
+            "162.159.198.3:4443",
+        ];
+        let mut candidates: Vec<SocketAddr> = h3_seeds
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .filter(|&a| a != outer)
+            .collect();
+        candidates.shuffle(&mut rng);
+        candidates.truncate(count);
+        return candidates;
+    }
+
+    let mut out: Vec<SocketAddr> = Vec::new();
+    match outer.ip() {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let mut hosts: Vec<u8> = (1..=254u8).filter(|host| *host != octets[3]).collect();
+            hosts.shuffle(&mut rng);
+            for host in hosts.into_iter().take(count) {
+                let ip = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], host);
+                out.push(SocketAddr::new(IpAddr::V4(ip), MASQUE_INNER_PORT));
+            }
+        }
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            let last = segments[7];
+            let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            while out.len() < count && seen.len() < count * 8 {
+                let candidate: u16 = rand::Rng::gen_range(&mut rng, 1..=u16::MAX);
+                if candidate == last || !seen.insert(candidate) {
+                    continue;
+                }
+                segments[7] = candidate;
+                out.push(SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::from(segments)),
+                    MASQUE_INNER_PORT,
+                ));
+            }
+        }
+    }
+    out
+}
+
+async fn run_masque_in_masque(
+    primary: account::Identity,
+    secondary: account::Identity,
+    peer: SocketAddr,
+    ech: Option<Vec<u8>>,
+    listen: SocketAddr,
+    http_listen: SocketAddr,
+) -> Result<()> {
+    let h2 = masque_h2::enabled();
+    let outer_mtu = mtu::resolve_mtu("masque", !primary.ipv6.trim().is_empty()).await;
+    let stack_mtu = if h2 { outer_mtu } else { outer_mtu.min(1280) };
+
+    log::info!("[*] establishing outer MASQUE tunnel to {peer}...");
+    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, "outer").await?;
+    wait_stack_alive(&outer.stack, "outer MASQUE").await?;
+
+    let pinned = mim_endpoints_from_env()?;
+    let candidates = match pinned.inner {
+        Some(inner) => vec![inner],
+        None => inner_masque_candidates(peer, MIM_INNER_TRIES),
+    };
+
+    let (_inner_datagram, inner_mtu) = mim_inner_budget(stack_mtu, peer, h2);
+
+    let mut chosen: Option<(SocketAddr, MasqueHop, ForwarderGuard)> = None;
+
+    for inner_peer in candidates.into_iter().filter(|c| c.ip() != peer.ip()) {
+        let (forwarder, forwarder_guard) = if h2 {
+            let (f, g) = spawn_tcp_forwarder(&outer.stack, inner_peer).await?;
+            (f, ForwarderGuard::Tcp(g))
+        } else {
+            let (f, g) = spawn_udp_forwarder(&outer.stack, inner_peer).await?;
+            (f, ForwarderGuard::Udp(g))
+        };
+
+        log::info!("[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}");
+        match establish_masque(&secondary, forwarder, None, h2, inner_mtu, "inner").await {
+            Ok(hop) => {
+                if let Err(e) = wait_stack_alive(&hop.stack, "inner MASQUE").await {
+                    log::warn!("[-] inner edge {inner_peer} data plane check failed: {e}");
+                    continue;
+                }
+                log::info!("[+] inner MASQUE tunnel established through {inner_peer}");
+                chosen = Some((inner_peer, hop, forwarder_guard));
+                break;
+            }
+            Err(e) => {
+                log::warn!("[-] inner edge {inner_peer} failed through outer tunnel: {e}");
+            }
+        }
+    }
+
+    let Some((inner_peer, inner, _forwarder_guard)) = chosen else {
+        return Err(AetherError::Other(
+            "no inner masque edge answered through the outer tunnel".into(),
+        ));
+    };
+
+    let socks_listener = socks::bind(listen).await?;
+    let http_listener = http_proxy::bind(http_listen).await?;
+    log::info!("[+] socks5 server listening on {listen}");
+    let http_task = tokio::spawn(http_proxy::serve_listener(
+        http_listener,
+        inner.stack.clone(),
+    ));
+
+    session_event::emit(SessionEvent::ProxyReady {
+        socks: listen.to_string(),
+        http: http_listen.to_string(),
+    });
+    session_event::emit(SessionEvent::TunnelReady {
+        transport: "mim".into(),
+    });
+    session_event::set_phase(session_event::Phase::Tunnel);
+    session_event::emit(SessionEvent::Connected {
+        detail: format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)"),
+    });
+
+    let mut http_task = Some(http_task);
+    let mut outer_task = outer.tunnel_task;
+    let mut inner_task = inner.tunnel_task;
+    let inner_stack = inner.stack;
+
+    let result = {
+        let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
+        let mut supervise = tokio::time::interval(SUPERVISE_TICK);
+        loop {
+            tokio::select! {
+                r = &mut socks_fut => break r,
+                _ = outer_task.done() => break Err(AetherError::Other("outer MASQUE tunnel exited".into())),
+                _ = inner_task.done() => break Err(AetherError::Other("inner MASQUE tunnel exited".into())),
+                _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
+                _ = supervise.tick() => session_event::mark_progress(),
+            }
+        }
+    };
+
+    if let Some(task) = http_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    result
+}
+
 // ─── Interactive prompts ────────────────────────────────────────────────────
 
 async fn prompt_line(prompt: &str) -> Option<String> {
@@ -1643,13 +2112,14 @@ async fn select_protocol() -> Result<Protocol> {
     }
 
     let answer = prompt_line(
-        "\nProtocol:\n  [1] MASQUE (modern, QUIC/H3, default)\n  [2] WireGuard (classic, faster)\n  [3] WARP-in-WARP / gool\nChoose [1-3] (default 1): ",
+        "\nProtocol:\n  [1] MASQUE (modern, QUIC/H3, default)\n  [2] WireGuard (classic, faster)\n  [3] WARP-in-WARP / gool\n  [4] MASQUE-in-MASQUE (mim)\nChoose [1-4] (default 1): ",
     )
     .await;
 
     Ok(match answer.as_deref() {
         Some("2") => Protocol::WireGuard,
         Some("3") => Protocol::WarpInWarp,
+        Some("4") => Protocol::MasqueInMasque,
         _ => Protocol::Masque,
     })
 }

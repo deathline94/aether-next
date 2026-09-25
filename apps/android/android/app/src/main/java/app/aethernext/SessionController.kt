@@ -959,7 +959,7 @@ class SessionController(
         private var instance: SessionController? = null
 
         fun validateSettings(s: Settings) {
-            val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg", "gool")
+            val validProtocols = setOf("masque", "masque-h2", "masque-h3", "wireguard", "wg", "gool", "mim")
             if (s.protocol.lowercase() !in validProtocols) {
                 throw SettingRejected("protocol", "Invalid protocol '${s.protocol}'. Allowed: $validProtocols")
             }
