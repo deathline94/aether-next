@@ -168,6 +168,11 @@ export const defaults: Settings = {
   noizeJmin: 50,
   noizeJmax: 128,
   noizeIntervalMs: 0,
+  // Deliberate fork: Android defaults to tun (a VpnService needs no elevation
+  // prompt here) where desktop defaults to system-proxy. Repair semantics fork
+  // too — settingsPayload REFUSES an unreadable payload as corrupt rather than
+  // coercing fields, so a half-understood profile never silently replaces the
+  // user's own.
   routingMode: "tun",
   socksPort: 1819,
   httpPort: 1820,
@@ -262,7 +267,12 @@ export const speedProfiles: { id: string; label: string; hint: string; patch: Pa
     noize: "off",
     scanMode: "balanced",
     ipVersion: "v4",
-    routingMode: "tun",
+    // Deliberate fork: Android defaults to tun (a VpnService needs no elevation
+  // prompt here) where desktop defaults to system-proxy. Repair semantics fork
+  // too — settingsPayload REFUSES an unreadable payload as corrupt rather than
+  // coercing fields, so a half-understood profile never silently replaces the
+  // user's own.
+  routingMode: "tun",
     peer: "",
   },
 }));

@@ -3853,7 +3853,21 @@ const GATES = [
 
           twinAbs = join(ROOT, twin);
 
-          if (!statSync(twinAbs).isFile()) continue;
+          if (!statSync(twinAbs).isFile()) {
+
+            // Single-side modules are exactly where fork-only logic hid: the
+            // parity fixes migrated into files this gate could not see. Each
+            // one must be recorded in SINGLE_SIDE with the reason it has no
+            // twin, or the gate assumes it is drift.
+            if (!SINGLE_SIDE.has(rel(f))) {
+
+              v.push(`${rel(f)}: exists in one frontend only and is not recorded in this gate's SINGLE_SIDE registry — give it a twin, share it through packages/ui, or record it with the reason`);
+
+            }
+
+            continue;
+
+          }
 
         } catch {
 
@@ -4331,6 +4345,57 @@ const GATES = [
 
   {
 
+    name: 'desktop-settings-schema-parity',
+    invariant: 'BC-09',
+    summary: 'every desktop TS Settings field exists in the Rust struct, and vice versa',
+    scan(api) {
+      // The Android pair has had this gate since the schema first forked; the
+      // desktop pair had nothing: a field added to `settings.rs` but not to
+      // `types.ts` (or the other way) was invisible until a value silently
+      // vanished on save or a panel read `undefined`.
+      const rsFile = 'apps/desktop/src-tauri/src/settings.rs';
+      const tsFile = 'apps/desktop/src/types.ts';
+      const rsSrc = api.files('apps/desktop/src-tauri/src', /\.rs$/).find((x) => rel(x).endsWith('/settings.rs'));
+      const tsSrc = api.files('apps/desktop/src', /\.ts$/).find((x) => rel(x).endsWith('/types.ts'));
+      if (!rsSrc || !tsSrc) return [`${rsSrc ? tsFile : rsFile} not found — parity is unverifiable`];
+      const rs = api.read(rsSrc).replace(/\r\n/g, '\n');
+      const ts = api.read(tsSrc).replace(/\r\n/g, '\n');
+
+      const open = rs.indexOf('pub struct Settings {');
+      const close = rs.indexOf('\n}', open);
+      if (open < 0 || close < 0) return ['no `pub struct Settings {...}` in settings.rs — parity is unverifiable'];
+      const camel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      const rust = new Set(
+        [...rs.slice(open, close).matchAll(/^ +pub ([a-z]\w*):/gm)].map((m) => camel(m[1])),
+      );
+      if (!rust.size) return ['settings.rs `Settings` has no fields — parity is unverifiable'];
+
+      const tsOpen = ts.indexOf('export type Settings = {');
+      const tsClose = ts.indexOf('\n};', tsOpen);
+      if (tsOpen < 0 || tsClose < 0) return ['no `export type Settings` in apps/desktop/src/types.ts — parity is unverifiable'];
+      const tsFields = new Set(
+        [...ts.slice(tsOpen, tsClose).matchAll(/^ {2}([A-Za-z]\w*):/gm)].map((m) => m[1]),
+      );
+      if (!tsFields.size) return ['desktop `Settings` has no fields — parity is unverifiable'];
+
+      const v = [];
+      for (const f of tsFields) {
+        if (!rust.has(f)) v.push(`${tsFile}: field "${f}" has no counterpart in settings.rs — the shell drops it on save`);
+      }
+      for (const f of rust) {
+        if (!tsFields.has(f)) v.push(`${rsFile}: field "${f}" is not declared in ${tsFile} — the UI cannot see or set it`);
+      }
+      return v;
+    },
+    inject() {
+      return [
+        { file: 'apps/desktop/src/types.ts', content: 'export type Settings = {\n  ghostField: string;\n};' },
+        { file: 'apps/desktop/src-tauri/src/settings.rs', content: '#[serde(rename_all = "camelCase")]\npub struct Settings {\n    pub ghost_field: String,\n}' },
+      ];
+    },
+  },
+
+  {
     name: 'protocol-tokens-cross-layer',
 
     invariant: 'BC-13',
@@ -4502,6 +4567,39 @@ const GATES = [
 
         }
 
+      }
+
+
+      // Android validation: the whitelist `SessionController.validateSettings`
+      // accepts has to cover every protocol the shared enums offer (a value the
+      // UI stores that Kotlin refuses is a save that can never succeed), and
+      // stay inside what the engine accepts. "mim" lived outside this whitelist
+      // check's reach for a release: every layer it touched named it, and this
+      // was the one comparison that would have caught the gap.
+      const controller = srcOf('apps/android/android/app/src/main/java/app/aethernext', /\.kt$/, 'SessionController.kt');
+
+      const whitelist = controller && between(controller.text, 'val validProtocols = setOf(', ')');
+      if (!controller) {
+        problems.push('SessionController.kt not found, so the Android validation half of the comparison ran on nothing');
+      } else if (!whitelist) {
+        problems.push(`${controller.path}: no \`val validProtocols = setOf(…)\` whitelist to read`);
+      } else {
+        const kotlinAccepts = new Set(literals(whitelist));
+        if (ui) {
+          const tunnelBlock = between(ui.text, 'TUNNEL_PROTOCOLS = [', '] as const');
+          const offeredProtocols = tunnelBlock ? literals(tunnelBlock) : [];
+          if (!offeredProtocols.length) {
+            problems.push(`${ui.path}: TUNNEL_PROTOCOLS not found, so the Kotlin comparison ran on nothing`);
+          } else {
+            const refused = offeredProtocols.filter((tok) => !kotlinAccepts.has(tok));
+            if (refused.length) {
+              problems.push(
+                `${controller.path} would refuse ${refused.map((u) => `"${u}"`).join(', ')}, which TUNNEL_PROTOCOLS offers — a profile carrying it cannot save`,
+              );
+            }
+          }
+        }
+        mustAccept(`${controller.path} validProtocols`, [...kotlinAccepts]);
       }
 
 

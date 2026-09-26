@@ -53,17 +53,23 @@ let drifted = 0;
 for (const rel of SHEETS) {
   const abs = join(ROOT, rel);
   const css = readFileSync(abs, 'utf8');
-  if (!/\/\*==AETHER-TOKENS-START==\*\//.test(css)) {
-    console.error(`sync-tokens: ${rel} is missing the AETHER-TOKENS fence`);
+  // The fence is always exactly one block. A stale second pair anywhere in the
+  // sheet used to be invisible: the non-global replace only ever touched the
+  // first, and in CSS last-definition-wins the stale one won.
+  const fenceRe = /\/\*==AETHER-TOKENS-START==\*\/[\s\S]*?\/\*==AETHER-TOKENS-END==\*\//g;
+  const fences = css.match(fenceRe) ?? [];
+  if (fences.length !== 1) {
+    console.error(`sync-tokens: ${rel} has ${fences.length} AETHER-TOKENS fences (expected exactly 1) — delete the stale block by hand`);
     process.exit(1);
   }
-  const eol = /\r\n/.test(css) ? '\r\n' : '\n';
-  const want = fence(body, eol);
-  const next = css.replace(
-    /\/\*==AETHER-TOKENS-START==\*\/[\s\S]*?\/\*==AETHER-TOKENS-END==\*\//,
-    () => want,
-  );
-  if (next !== css) {
+  // EOL-agnostic on purpose. The generated fence is written LF and drift is
+  // compared with line endings normalized: the file-wide CRLF detection used to
+  // flip the whole fence to CRLF when one stray CRLF appeared, and the check
+  // then flip-flopped between runs instead of settling.
+  const want = fence(body, '\n');
+  const normalized = (s) => s.replace(/\r\n/g, '\n');
+  const next = css.replace(fenceRe, () => want);
+  if (normalized(next) !== normalized(css)) {
     drifted += 1;
     if (CHECK) {
       console.error(`sync-tokens: ${rel} drifts from tokens.css (run: npm run sync-tokens)`);

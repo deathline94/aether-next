@@ -187,6 +187,11 @@ export const defaults: Settings = {
   noizeJmin: 50,
   noizeJmax: 128,
   noizeIntervalMs: 0,
+  // Deliberate fork (recorded in verify-invariants' SINGLE_SIDE/coerce notes):
+  // desktop defaults to system-proxy because it can set the OS proxy without
+  // elevation; Android defaults to tun. Repair semantics fork the same way —
+  // this file COERCES a bad field to its default and reports it (the Rust
+  // validator backstops), while Android refuses the whole payload as corrupt.
   routingMode: "system-proxy",
   socksPort: 1819,
   httpPort: 1820,
