@@ -227,6 +227,191 @@ mod readiness_tests {
     }
 }
 
+/// The MIM endpoint parser is the fail-fast gate for the whole protocol, so its
+/// contract is pinned here rather than discovered in a tunnel log.
+///
+/// All cases run in one test on purpose: `runtime_env` is a process-wide store
+/// shared by parallel test threads, and these three keys have no disjoint
+/// partition, so splitting them across fns would race against itself.
+#[cfg(test)]
+mod mim_endpoint_tests {
+    use super::{mim_endpoints_from_env, MimEndpoints};
+    use crate::runtime_env;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    const KEYS: [&str; 3] = [
+        "AETHER_MIM_PEERS",
+        "AETHER_MIM_OUTER_PEER",
+        "AETHER_MIM_INNER_PEER",
+    ];
+
+    struct CleanEnv;
+    impl CleanEnv {
+        fn new() -> Self {
+            for key in KEYS {
+                runtime_env::remove(key);
+            }
+            Self
+        }
+        fn set(&self, key: &str, val: &str) {
+            runtime_env::set(key, val);
+        }
+    }
+    impl Drop for CleanEnv {
+        fn drop(&mut self) {
+            for key in KEYS {
+                runtime_env::remove(key);
+            }
+        }
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(a, b, c, d), port))
+    }
+
+    fn assert_eq_endpoints(got: MimEndpoints, outer: Option<SocketAddr>, inner: Option<SocketAddr>) {
+        assert_eq!(got.outer, outer, "outer endpoint");
+        assert_eq!(got.inner, inner, "inner endpoint");
+    }
+
+    #[test]
+    fn mim_endpoint_env_contract() {
+        let env = CleanEnv::new();
+
+        // Nothing set: fully automatic, no error.
+        assert_eq_endpoints(mim_endpoints_from_env().expect("unset env parses"), None, None);
+
+        // A scan keyword means "no pinned endpoints", not a parse failure.
+        for keyword in ["auto", "scan", "none", "off", "0"] {
+            env.set("AETHER_MIM_PEERS", keyword);
+            assert_eq_endpoints(
+                mim_endpoints_from_env().expect("scan keyword parses"),
+                None,
+                None,
+            );
+        }
+
+        // A comma list pins outer then inner; whitespace and empty items are
+        // tolerated.
+        env.set("AETHER_MIM_PEERS", " 162.159.198.1:443 , , 162.159.198.2:8443 ");
+        assert_eq_endpoints(
+            mim_endpoints_from_env().expect("peer list parses"),
+            Some(v4(162, 159, 198, 1, 443)),
+            Some(v4(162, 159, 198, 2, 8443)),
+        );
+
+        // The single-endpoint variables override their slice of the list.
+        env.set("AETHER_MIM_OUTER_PEER", "162.159.198.3:4443");
+        assert_eq_endpoints(
+            mim_endpoints_from_env().expect("outer override parses"),
+            Some(v4(162, 159, 198, 3, 4443)),
+            Some(v4(162, 159, 198, 2, 8443)),
+        );
+        env.set("AETHER_MIM_INNER_PEER", "162.159.197.1:500");
+        assert_eq_endpoints(
+            mim_endpoints_from_env().expect("inner override parses"),
+            Some(v4(162, 159, 198, 3, 4443)),
+            Some(v4(162, 159, 197, 1, 500)),
+        );
+
+        // A malformed value is an error, not a silent fallback to automatic —
+        // the session refuses before provisioning, not after the outer tunnel.
+        for bad in ["not-an-endpoint", "162.159.198.1"] {
+            env.set("AETHER_MIM_OUTER_PEER", bad);
+            assert!(
+                mim_endpoints_from_env().is_err(),
+                "{bad:?} must not parse as an endpoint"
+            );
+            env.set("AETHER_MIM_OUTER_PEER", "162.159.198.3:4443");
+        }
+
+        // Identical pinned hops are a config error: an inner hop onto the outer
+        // edge's own socket pinches the tunnel it is supposed to nest through.
+        env.set("AETHER_MIM_INNER_PEER", "162.159.198.3:4443");
+        assert!(mim_endpoints_from_env().is_err(), "outer == inner must refuse");
+    }
+}
+
+/// Pure hop math for the inner MASQUE leg — no env, no I/O, pinned by table.
+#[cfg(test)]
+mod mim_hop_tests {
+    use super::{inner_masque_candidates, mim_inner_mtu, MIM_INNER_TRIES};
+    use crate::prober;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(a, b, c, d), port))
+    }
+
+    /// The H3 inner pool is the designed one — 3 permitted VIPs x 7 MASQUE ports,
+    /// minus the outer endpoint — not a hand-maintained subset.
+    #[test]
+    fn h3_inner_candidates_span_the_full_designed_pool() {
+        let outer = v4(162, 159, 198, 2, 443);
+        let all = inner_masque_candidates(outer, usize::MAX, false);
+        let expected = prober::MASQUE_H3_SEEDS.len() * prober::MASQUE_PORTS.len() - 1;
+        assert_eq!(all.len(), expected, "pool minus the outer endpoint");
+        assert!(all.iter().all(|c| *c != outer));
+        assert!(
+            all.iter().all(|c| prober::is_valid_masque_h3_endpoint(*c)),
+            "every candidate must sit in the designed H3 pool"
+        );
+        // The full pool always fills the per-attempt budget.
+        let tries = inner_masque_candidates(outer, MIM_INNER_TRIES, false);
+        assert_eq!(tries.len(), MIM_INNER_TRIES);
+    }
+
+    /// The MTU math matches the old clamped version wherever the outer path can
+    /// actually carry a QUIC datagram, and refuses below the Initial floor
+    /// instead of clamping a budget the outer path cannot carry.
+    #[test]
+    fn inner_mtu_matches_budget_above_the_quic_floor_and_refuses_below() {
+        let a = v4(162, 159, 198, 1, 443);
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        assert_eq!(mim_inner_mtu(1280, a, false).unwrap(), 1182);
+        assert_eq!(mim_inner_mtu(1280, v6, false).unwrap(), 1162);
+        assert_eq!(mim_inner_mtu(1500, a, false).unwrap(), 1200);
+        assert_eq!(mim_inner_mtu(1500, v6, false).unwrap(), 1200);
+        assert_eq!(mim_inner_mtu(1420, a, true).unwrap(), 1320);
+        // 1200 - 28 = 1172 < the 1200-byte Initial floor: refused, not fabricated.
+        assert!(mim_inner_mtu(1200, a, false).is_err());
+        // 1248 - 28 = 1220 still crosses the outer leg.
+        assert!(mim_inner_mtu(1248, a, false).is_ok());
+    }
+
+    #[test]
+    fn endpoint_lists_tolerate_whitespace_but_not_garbage() {
+        use super::parse_endpoint_list;
+        let parsed =
+            parse_endpoint_list(" 162.159.198.1:443 , , 162.159.198.2:8443 ").expect("parses");
+        assert_eq!(parsed, vec![v4(162, 159, 198, 1, 443), v4(162, 159, 198, 2, 8443)]);
+        assert!(parse_endpoint_list("").expect("empty list is empty").is_empty());
+        assert!(parse_endpoint_list("   ,  ").expect("blank list is empty").is_empty());
+        assert!(parse_endpoint_list("not-an-endpoint").is_err());
+        assert!(parse_endpoint_list("162.159.198.1:443, junk").is_err());
+    }
+
+    #[test]
+    fn sibling_paths_stay_next_to_their_base_config() {
+        use super::derive_sibling_path;
+        assert_eq!(
+            derive_sibling_path("C:/users/me/config.json", "masque"),
+            "C:/users/me/config-masque.json"
+        );
+        assert_eq!(
+            derive_sibling_path("relative/config.json", "secondary"),
+            "relative/config-secondary.json"
+        );
+        assert_eq!(derive_sibling_path("config.json", "masque"), "config-masque.json");
+        // No extension: the suffix attaches to the bare name.
+        assert_eq!(derive_sibling_path("config", "secondary"), "config-secondary");
+        assert_eq!(
+            derive_sibling_path("/var/lib/aether/config", "masque"),
+            "/var/lib/aether/config-masque"
+        );
+    }
+}
+
 // ─── Protocol ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +456,20 @@ impl Protocol {
             Protocol::WireGuard => "WireGuard",
             Protocol::WarpInWarp => "WARP-in-WARP (gool)",
             Protocol::MasqueInMasque => "MASQUE-in-MASQUE (mim)",
+        }
+    }
+
+    /// The short wire tag session events carry for this protocol. Event consumers
+    /// (scanner UIs, log mirrors) match on these strings, so they must spell the
+    /// same vocabulary `Protocol::try_parse` accepts — a hardcoded literal at an
+    /// emit site is how a MASQUE-in-MASQUE session used to announce itself as
+    /// plain "masque" depending on which path picked its gateway.
+    pub fn event_tag(&self) -> &'static str {
+        match self {
+            Protocol::Masque => "masque",
+            Protocol::WireGuard => "wireguard",
+            Protocol::WarpInWarp => "gool",
+            Protocol::MasqueInMasque => "mim",
         }
     }
 }
@@ -357,6 +556,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 protocol,
                 &base_config,
                 prober::WgSessionCache::new(),
+                None,
             )
             .await
             {
@@ -465,6 +665,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                     protocol,
                     &base_config,
                     prober::WgSessionCache::new(),
+                    None,
                 )
                 .await
                 {
@@ -501,13 +702,30 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let selection = select_peer(
+            // Scan-only gool obeys the same contract as the other protocols: a scan
+            // that finds nothing is a completed scan, not a session error.
+            let selection = match select_peer(
                 &primary,
                 Protocol::WireGuard,
                 &base_config,
                 prober::WgSessionCache::new(),
+                None,
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) if scan_only() => {
+                    log::warn!("[-] standalone warp-in-warp scan found no endpoint: {e}");
+                    session_event::emit(SessionEvent::ScanDone {
+                        addr: String::new(),
+                        rtt: String::new(),
+                        protocol: "gool".into(),
+                        best_rtt_ms: None,
+                    });
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let peer = selection.peer;
             log::info!("[+] using cloudflare edge {peer} (outer)");
             session_event::emit(SessionEvent::EndpointSelected {
@@ -528,6 +746,26 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             run_warp_in_warp(primary, secondary, peer, listen, http_listen).await
         }
         Protocol::MasqueInMasque => {
+            // Parse the MIM endpoints exactly once, before identity provisioning or
+            // any tunnel work: a malformed AETHER_MIM_* value is a config error and
+            // must fail the session up front instead of being swallowed here and
+            // resurfacing after the outer tunnel is already established.
+            let mim = match mim_endpoints_from_env() {
+                Ok(m) => m,
+                Err(e) if scan_only() => {
+                    // Standalone scanner: a config failure still ends the scan
+                    // cleanly rather than leaving the GUI waiting on a ScanDone.
+                    log::warn!("[-] standalone masque-in-masque scan could not start: {e}");
+                    session_event::emit(SessionEvent::ScanDone {
+                        addr: String::new(),
+                        rtt: String::new(),
+                        protocol: "mim".into(),
+                        best_rtt_ms: None,
+                    });
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let primary_path = masque_config_path(&base_config);
             let secondary_path = derive_sibling_path(&primary_path, "secondary");
             let primary = load_or_provision_masque(&primary_path).await?;
@@ -540,18 +778,35 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 secondary.ipv4
             );
             let ech = resolve_ech().await;
-            let selection = select_peer(
+            // Scan-only mim obeys the same contract as the other protocols: a scan
+            // that finds nothing is a completed scan, not a session error.
+            let selection = match select_peer(
                 &primary,
                 Protocol::MasqueInMasque,
                 &base_config,
                 prober::WgSessionCache::new(),
+                mim.outer,
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) if scan_only() => {
+                    log::warn!("[-] standalone masque-in-masque scan found no endpoint: {e}");
+                    session_event::emit(SessionEvent::ScanDone {
+                        addr: String::new(),
+                        rtt: String::new(),
+                        protocol: "mim".into(),
+                        best_rtt_ms: None,
+                    });
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let peer = selection.peer;
             log::info!("[+] using cloudflare edge {peer} (outer)");
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: peer.to_string(),
-                protocol: "mim".into(),
+                protocol: Protocol::MasqueInMasque.event_tag().into(),
                 rtt_ms: selection.best_rtt_ms(),
             });
             if scan_only() {
@@ -564,7 +819,7 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
                 return Ok(());
             }
             session_event::set_phase(session_event::Phase::Handshake);
-            run_masque_in_masque(primary, secondary, peer, ech, listen, http_listen).await
+            run_masque_in_masque(primary, secondary, peer, ech, listen, http_listen, mim).await
         }
     }
 }
@@ -714,17 +969,19 @@ async fn select_peer(
     protocol: Protocol,
     base_config: &str,
     wg_sessions: prober::WgSessionCache,
+    mim_outer: Option<SocketAddr>,
 ) -> Result<Selection> {
     let force_peer = match protocol {
         Protocol::Masque => runtime_env::var("AETHER_PEER"),
         Protocol::WireGuard | Protocol::WarpInWarp => {
             runtime_env::var("AETHER_WG_PEER").or_else(|| runtime_env::var("AETHER_PEER"))
         }
-        Protocol::MasqueInMasque => {
-            runtime_env::var("AETHER_MIM_OUTER_PEER")
-                .or_else(|| mim_endpoints_from_env().ok().and_then(|p| p.outer.map(|a| a.to_string())))
-                .or_else(|| runtime_env::var("AETHER_PEER"))
-        }
+        // The MIM endpoints were parsed once by the caller (so a malformed value
+        // fails the session before any tunnel work) and arrive here pre-resolved;
+        // the only remaining fallback is the generic forced-peer variable.
+        Protocol::MasqueInMasque => mim_outer
+            .map(|a| a.to_string())
+            .or_else(|| runtime_env::var("AETHER_PEER")),
     };
 
     if let Some(p) = force_peer {
@@ -830,7 +1087,7 @@ async fn select_peer(
                                 }
                                 session_event::emit(SessionEvent::EndpointSelected {
                                     addr: peer_addr.to_string(),
-                                    protocol: "masque".into(),
+                                    protocol: protocol.event_tag().into(),
                                     rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
                                 });
                                 return Ok(Selection {
@@ -875,7 +1132,7 @@ async fn select_peer(
             lastconn::save(&lastconn::cache_path(base_config), &peer.to_string(), "", active_transport);
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
-                protocol: "masque".into(),
+                protocol: protocol.event_tag().into(),
                 rtt_ms: Some(best.rtt.as_secs_f64() * 1000.0),
             });
             Ok(Selection {
@@ -1723,6 +1980,9 @@ async fn spawn_tcp_forwarder(
     Ok((local, TcpForwarderGuard { listener_task: AbortOnDrop(task) }))
 }
 
+// The inner payload is deliberately never read: the variant exists to pick
+// which forwarder guard outlives the session, and the guard's Drop is the
+// entire point.
 #[allow(dead_code)]
 enum ForwarderGuard {
     Udp(UdpForwarderGuard),
@@ -1742,6 +2002,7 @@ async fn establish_masque(
     ech: Option<Vec<u8>>,
     h2: bool,
     mtu: usize,
+    is_inner: bool,
     label: &'static str,
 ) -> Result<MasqueHop> {
     let (chans, internals) = quic::channels();
@@ -1772,7 +2033,10 @@ async fn establish_masque(
 
     let tunnel_handle = if h2 {
         let h2cfg = masque_h2::H2TunnelConfig {
-            peer: if label == "inner" { peer } else { masque_h2::h2_peer(peer) },
+            // The inner hop dials a local forwarder we already resolved to its
+            // final form; remapping the port is only for the outer leg's
+            // QUIC→H2 port derivation.
+            peer: if is_inner { peer } else { masque_h2::h2_peer(peer) },
             sni: consts::CONNECT_SNI.to_string(),
             authority: crate::quic::resolve_h3_authority(),
             cert_pem: identity.cert_pem.clone(),
@@ -1791,13 +2055,16 @@ async fn establish_masque(
             key_pem: identity.key_pem.clone(),
             local_ipv4,
             ech_config_list: ech,
-            noize: if label == "inner" { noize::NoizeConfig::off() } else { noize_config() },
+            // The outer leg may run the operator's obfuscation profile; the inner
+            // hop is already inside the obfuscated outer tunnel, so obfuscating
+            // again would be waste, not defense.
+            noize: if is_inner { noize::NoizeConfig::off() } else { noize_config() },
         };
         log::info!("[+] [{label}] MASQUE transport: HTTP/3 (QUIC) to {peer}");
         tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
     };
 
-    let startup_timeout = if label == "inner" {
+    let startup_timeout = if is_inner {
         std::time::Duration::from_secs(12)
     } else {
         std::time::Duration::from_secs(20)
@@ -1848,8 +2115,14 @@ fn parse_endpoint_list(raw: &str) -> Result<Vec<SocketAddr>> {
         .collect()
 }
 
+/// Values of `AETHER_MIM_PEERS` that mean "pin nothing, discover endpoints".
+/// Booleans are accepted symmetrically in both spellings so `=false` does not
+/// become a parse failure the way `=off` would not.
 fn is_scan_keyword(raw: &str) -> bool {
-    matches!(raw.trim().to_lowercase().as_str(), "auto" | "scan" | "none" | "off" | "0")
+    matches!(
+        raw.trim().to_lowercase().as_str(),
+        "auto" | "scan" | "none" | "off" | "0" | "false" | "true"
+    )
 }
 
 pub fn mim_endpoints_from_env() -> Result<MimEndpoints> {
@@ -1886,44 +2159,57 @@ pub fn mim_endpoints_from_env() -> Result<MimEndpoints> {
     Ok(chosen)
 }
 
-fn mim_inner_budget(outer_mtu: usize, inner_peer: SocketAddr, h2: bool) -> (usize, usize) {
+/// The netstack MTU the inner MASQUE leg may use, given what the outer tunnel
+/// can carry.
+///
+/// H3: each inner QUIC packet rides one UDP datagram (`headers` = inner IP + UDP)
+/// inside an outer datagram, and the outer QUIC path itself costs ~70 B against
+/// the inner stack. Below a 1200-byte inner datagram the inner QUIC Initial —
+/// which the protocol pads to exactly 1200 — cannot cross the outer leg at all,
+/// so a constrained outer MTU is refused rather than clamped into a budget the
+/// outer path cannot carry (the old clamp floor did exactly that fabrication).
+///
+/// H2: the inner hop rides the TCP forwarder, where segmentation is the
+/// forwarder's problem; the stack MTU is the outer budget minus the TCP/TLS
+/// framing allowance.
+fn mim_inner_mtu(outer_mtu: usize, inner_peer: SocketAddr, h2: bool) -> Result<usize> {
     if h2 {
-        let mtu = outer_mtu.saturating_sub(100).clamp(576, 1500);
-        return (1350, mtu);
+        return Ok(outer_mtu.saturating_sub(100).clamp(576, 1500));
     }
 
     let headers = if inner_peer.is_ipv4() { 28 } else { 48 };
-    let datagram = outer_mtu
-        .saturating_sub(headers)
-        .clamp(1200, 1350);
-    let mtu = datagram
-        .saturating_sub(70)
-        .clamp(576, 1200);
-    (datagram, mtu)
+    let datagram = outer_mtu.saturating_sub(headers);
+    if datagram < 1200 {
+        return Err(AetherError::Other(format!(
+            "outer MTU {outer_mtu} leaves only {datagram} bytes for an inner datagram; \
+             MASQUE-in-MASQUE needs at least {} so the inner QUIC Initial can cross the outer tunnel",
+            1200 + headers
+        )));
+    }
+    Ok((datagram.min(1350) - 70).clamp(576, 1200))
 }
 
 const MASQUE_INNER_PORT: u16 = 443;
 const MIM_INNER_TRIES: usize = 6;
 
-fn inner_masque_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
+fn inner_masque_candidates(outer: SocketAddr, count: usize, h2: bool) -> Vec<SocketAddr> {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
 
-    if !masque_h2::enabled() {
-        let h3_seeds = [
-            "162.159.198.1:443",
-            "162.159.198.2:443",
-            "162.159.198.3:443",
-            "162.159.198.1:8443",
-            "162.159.198.2:8443",
-            "162.159.198.3:8443",
-            "162.159.198.1:4443",
-            "162.159.198.2:4443",
-            "162.159.198.3:4443",
-        ];
-        let mut candidates: Vec<SocketAddr> = h3_seeds
+    if !h2 {
+        // The inner hop runs inside the established outer tunnel, so its candidate
+        // space is the designed MASQUE H3 pool itself — the three permitted H3 VIPs
+        // across every MASQUE port (prober owns that vocabulary for both legs) —
+        // minus the outer edge we arrived on. It used to be a hand-written 9-entry
+        // array covering only 3 of the 7 ports; the pool is 21 by design.
+        let mut candidates: Vec<SocketAddr> = prober::MASQUE_H3_SEEDS
             .iter()
-            .filter_map(|s| s.parse().ok())
+            .filter_map(|seed| seed.parse::<std::net::Ipv4Addr>().ok())
+            .flat_map(|vip| {
+                prober::MASQUE_PORTS
+                    .iter()
+                    .map(move |port| SocketAddr::new(IpAddr::V4(vip), *port))
+            })
             .filter(|&a| a != outer)
             .collect();
         candidates.shuffle(&mut rng);
@@ -1969,44 +2255,84 @@ async fn run_masque_in_masque(
     ech: Option<Vec<u8>>,
     listen: SocketAddr,
     http_listen: SocketAddr,
+    mim: MimEndpoints,
 ) -> Result<()> {
     let h2 = masque_h2::enabled();
     let outer_mtu = mtu::resolve_mtu("masque", !primary.ipv6.trim().is_empty()).await;
     let stack_mtu = if h2 { outer_mtu } else { outer_mtu.min(1280) };
 
     log::info!("[*] establishing outer MASQUE tunnel to {peer}...");
-    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, "outer").await?;
+    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, "outer").await?;
     wait_stack_alive(&outer.stack, "outer MASQUE").await?;
 
-    let pinned = mim_endpoints_from_env()?;
-    let candidates = match pinned.inner {
+    // A pinned inner that lands on the outer edge's own address used to be
+    // silently filtered out of the candidate loop below and reported as
+    // "no inner masque edge answered through the outer tunnel", hiding the
+    // actual problem behind a bogus edge-failure story.
+    if let Some(inner) = mim.inner {
+        if inner.ip() == peer.ip() {
+            return Err(AetherError::Config(format!(
+                "pinned inner MASQUE endpoint {inner} shares its address with the selected outer edge {peer}; the inner hop must terminate on a different edge"
+            )));
+        }
+    }
+    let candidates = match mim.inner {
         Some(inner) => vec![inner],
-        None => inner_masque_candidates(peer, MIM_INNER_TRIES),
+        None => inner_masque_candidates(peer, MIM_INNER_TRIES, h2),
     };
 
-    let (_inner_datagram, inner_mtu) = mim_inner_budget(stack_mtu, peer, h2);
+    let MasqueHop {
+        stack: outer_stack,
+        tunnel_task: mut outer_task,
+        addr_task: _outer_addr_task,
+    } = outer;
 
     let mut chosen: Option<(SocketAddr, MasqueHop, ForwarderGuard)> = None;
 
     for inner_peer in candidates.into_iter().filter(|c| c.ip() != peer.ip()) {
+        // The outer tunnel is not supervised until the select loop below, so a
+        // mid-hopping outer death used to burn the whole candidate list in doomed
+        // attempts before anything noticed. The cheap poll bounds it to one
+        // attempt; the select around the data-plane check below catches the rest.
+        if outer_task.0.is_finished() {
+            return Err(AetherError::Other(
+                "outer MASQUE tunnel exited while seeking an inner edge".into(),
+            ));
+        }
+        let inner_mtu = mim_inner_mtu(stack_mtu, inner_peer, h2)?;
         let (forwarder, forwarder_guard) = if h2 {
-            let (f, g) = spawn_tcp_forwarder(&outer.stack, inner_peer).await?;
+            let (f, g) = spawn_tcp_forwarder(&outer_stack, inner_peer).await?;
             (f, ForwarderGuard::Tcp(g))
         } else {
-            let (f, g) = spawn_udp_forwarder(&outer.stack, inner_peer).await?;
+            let (f, g) = spawn_udp_forwarder(&outer_stack, inner_peer).await?;
             (f, ForwarderGuard::Udp(g))
         };
 
         log::info!("[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}");
-        match establish_masque(&secondary, forwarder, None, h2, inner_mtu, "inner").await {
+        match establish_masque(&secondary, forwarder, None, h2, inner_mtu, true, "inner").await {
             Ok(hop) => {
-                if let Err(e) = wait_stack_alive(&hop.stack, "inner MASQUE").await {
-                    log::warn!("[-] inner edge {inner_peer} data plane check failed: {e}");
-                    continue;
+                // The data-plane check is the unbounded part of an attempt; racing
+                // it against the outer tunnel keeps a dead outer from stretching
+                // the search past this candidate.
+                let alive = tokio::select! {
+                    r = wait_stack_alive(&hop.stack, "inner MASQUE") => Some(r),
+                    _ = outer_task.done() => None,
+                };
+                match alive {
+                    Some(Ok(())) => {
+                        log::info!("[+] inner MASQUE tunnel established through {inner_peer}");
+                        chosen = Some((inner_peer, hop, forwarder_guard));
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        log::warn!("[-] inner edge {inner_peer} data plane check failed: {e}");
+                    }
+                    None => {
+                        return Err(AetherError::Other(
+                            "outer MASQUE tunnel exited while seeking an inner edge".into(),
+                        ));
+                    }
                 }
-                log::info!("[+] inner MASQUE tunnel established through {inner_peer}");
-                chosen = Some((inner_peer, hop, forwarder_guard));
-                break;
             }
             Err(e) => {
                 log::warn!("[-] inner edge {inner_peer} failed through outer tunnel: {e}");
@@ -2041,7 +2367,6 @@ async fn run_masque_in_masque(
     });
 
     let mut http_task = Some(http_task);
-    let mut outer_task = outer.tunnel_task;
     let mut inner_task = inner.tunnel_task;
     let inner_stack = inner.stack;
 
