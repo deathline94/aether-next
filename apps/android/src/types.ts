@@ -277,6 +277,3 @@ export const speedProfiles: { id: string; label: string; hint: string; patch: Pa
   },
 }));
 
-export function profileActive(settings: Settings, patch: Partial<Settings>): boolean {
-  return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);
-}

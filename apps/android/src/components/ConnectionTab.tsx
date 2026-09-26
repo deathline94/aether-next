@@ -5,7 +5,8 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { CopyButton } from "./ui";
-import { profileActive, speedProfiles } from "../types";
+import { speedProfiles } from "../types";
+import { profileActive } from "@aether/ui";
 import type { RuntimeState, Settings } from "../types";
 import type { TestOutcome } from "../hooks/useRuntime";
 import { ipFamilyLabel } from "@aether/ui/enums";

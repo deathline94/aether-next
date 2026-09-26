@@ -7,6 +7,7 @@ import {
 import { CopyButton } from "./ui";
 import type { RuntimeState, Settings } from "../types";
 import { SPEED_PROFILES, ipFamilyLabel, speedProfileHint } from "@aether/ui/enums";
+import { profileActive } from "@aether/ui";
 import {
   cipherSettingCopy,
   connectionTestCopy,
@@ -62,9 +63,6 @@ const speedProfiles: { id: string; label: string; hint: string; patch: Partial<S
   },
 }));
 
-function profileActive(settings: Settings, patch: Partial<Settings>) {
-  return (Object.keys(patch) as (keyof Settings)[]).every((k) => settings[k] === patch[k]);
-}
 
 interface ConnectionTabProps {
   settings: Settings;

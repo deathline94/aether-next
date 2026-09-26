@@ -190,6 +190,21 @@ export function rttBadge(item: RttBadgeSource): { tierClass: string; badgeText: 
   return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY", text };
 }
 
+/**
+ * Whether a speed-preset's patch is fully reflected in the settings — the
+ * "ACTIVE" tag on a preset card. One implementation for both surfaces: the
+ * desktop copy and Android's had drifted in the patch they compare (the phone
+ * also clears the pinned peer, desktop does not), but the *comparison* is the
+ * same every-key-matches rule, and a future third surface should not get to
+ * invent a third answer.
+ */
+export function profileActive(
+  settings: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): boolean {
+  return Object.keys(patch).every((k) => settings[k] === patch[k]);
+}
+
 /** The statuses the interface has copy, colours and a beacon for. */
 export const RUNTIME_STATUSES = ["disconnected", "connecting", "connected", "error"] as const;
 export type RuntimeStatus = (typeof RUNTIME_STATUSES)[number];
