@@ -64,7 +64,13 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    for (key, value) in parse_cli_flags(&std::env::args().collect::<Vec<_>>())? {
+    // argv[0] is this binary's own path, not a flag. The rewritten parser used
+    // to receive the full argv and fail-hard on the program name — every
+    // shipped session then died at startup before the key handoff (the phone
+    // saw EPIPE writing the key, the desktop saw "exit 1"). The old hand-rolled
+    // loop skipped argv[0] with its `i = 1`; the skip survives the rewrite.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    for (key, value) in parse_cli_flags(&cli_args)? {
         crate::runtime_env::set(key, &value);
     }
 
@@ -425,6 +431,24 @@ mod cli_flag_tests {
                 .expect("known bare flags skip")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_binary_path_is_never_parsed_as_a_flag() {
+        // parse_cli_flags receives argv WITHOUT argv[0]; the caller skips it.
+        // This test pins that contract: if the program name ever reaches the
+        // parser again (the v1.3.14 regression — every session died at startup
+        // with "unknown argument <path>"), the contract breaks loudly here.
+        let program = if cfg!(windows) { r"C:ppsether.exe" } else { "/usr/bin/aether" };
+        let err = parse_cli_flags(&args(&[program])).expect_err("a bare path is not a flag");
+        assert!(
+            !err.to_string().contains(program),
+            "the refusal must be about the flag contract, not echo the path"
+        );
+
+        // And the real sequence the shells use — program name only, no flags.
+        let quiet = parse_cli_flags(&args(&[])).expect("no flags at all is valid");
+        assert!(quiet.is_empty());
     }
 
     #[test]
