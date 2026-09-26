@@ -93,11 +93,23 @@ export function ActivityTab({
     overscan: 10,
   });
 
+  // Each programmatic write dispatches exactly one scroll event, but the event
+  // fires in the rendering step — after the task that wrote it. Under a burst
+  // append (three-plus rows in one frame) the scroll event for write N could
+  // dispatch after write N+1 grew the buffer, so the handler saw a >60 px gap
+  // and paused auto-follow mid-scan. The synchronous latch handles the direct
+  // case; this counter absorbs the queued late events (capped so a no-op write
+  // that fires no event cannot accumulate forever). The tray-hidden problem that
+  // ruled out rAF does not apply: this only ever *ignores* events, never waits
+  // on one to run.
+  const pendingProgrammaticRef = useRef(0);
+
   useEffect(() => {
     // Direct container scroll lock + programmatic scroll guard so daemon log rates
     // never trigger an accidental auto-scroll pause.
     if (autoScroll && consoleRef.current) {
       scrollConsoleToBottom(consoleRef.current, logEndRef.current, isProgrammaticScrollRef);
+      pendingProgrammaticRef.current = Math.min(pendingProgrammaticRef.current + 1, 3);
     }
   }, [visibleLogs, autoScroll, logEndRef]);
 
@@ -108,6 +120,10 @@ export function ActivityTab({
   // Pause auto-scroll on any user gesture away from the bottom; resume at the bottom.
   const handleScroll = () => {
     if (isProgrammaticScrollRef.current) return;
+    if (pendingProgrammaticRef.current > 0) {
+      pendingProgrammaticRef.current -= 1;
+      return;
+    }
     const el = consoleRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;

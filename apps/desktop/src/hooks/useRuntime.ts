@@ -28,6 +28,14 @@ function uiState(status: RuntimeState["status"], detail: string): RuntimeState {
   return { status, detail, pid: null, endpoint: null, handshakeRttMs: null };
 }
 
+/** The port invariant the Rust `save_settings` validator enforces. Shared by the
+ * debounced skip and the unmount flush so neither path puts a profile the shell
+ * will refuse onto the disk. */
+export function portsSaveable(s: Pick<Settings, "socksPort" | "httpPort">): boolean {
+  const ok = (p: number) => Number.isInteger(p) && p >= 1024 && p <= 65535;
+  return s.socksPort !== s.httpPort && ok(s.socksPort) && ok(s.httpPort);
+}
+
 /**
  * Engine-side diagnostics for the activity export: which binary ran, what the
  * process settled on, and whether packets are being dropped. A failure comes
@@ -168,10 +176,22 @@ export function useRuntime(
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
   }, [appendLog]);
 
-  // Cleanup timers on unmount
+  // Cleanup timers on unmount. The save debounce is flushed, not merely cleared:
+  // an edit made within the debounce window of a window close used to die with
+  // the timer, so the last change never reached the disk.
   useEffect(() => () => {
     if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
-    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
+      const pending = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      // Fire-and-forget: the window is going away either way, and a rejection has
+      // no surface left to render on.
+      if (pending && portsSaveable(pending)) {
+        void invoke("save_settings", { settings: pending }).catch(() => {});
+      }
+    }
     if (watchdogRef.current) clearTimeout(watchdogRef.current);
   }, []);
 
@@ -274,13 +294,7 @@ export function useRuntime(
       const toSave = pendingSaveRef.current;
       if (!toSave) return;
       // Skip auto-saving intermediate typing states that violate port invariants
-      if (
-        toSave.socksPort === toSave.httpPort ||
-        toSave.socksPort < 1024 || toSave.socksPort > 65535 ||
-        toSave.httpPort < 1024 || toSave.httpPort > 65535
-      ) {
-        return;
-      }
+      if (!portsSaveable(toSave)) return;
       const mine = ++saveSeqRef.current;
       try {
         await invoke("save_settings", { settings: toSave });
@@ -320,6 +334,11 @@ export function useRuntime(
 
   const toggleConnection = useCallback(async () => {
     if (busyRef.current || busy) return;
+    // Only the connect arm waits for hydration: connect persists the settings it
+    // receives, so a tap before the load lands would push a defaults snapshot at
+    // the shell. Disconnecting a live tunnel must stay possible even when the
+    // load failed.
+    if (!running && !settingsLoaded) return;
     busyRef.current = true;
     setBusy(true);
     setTestResult(null);
@@ -338,10 +357,13 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busyRef.current || busy) return;
+    // Same hydration gate as toggleConnection: this connect persists its
+    // settings, and doing it from a defaults snapshot loses the saved profile.
+    if (!settingsLoaded) return;
     busyRef.current = true;
     setBusy(true);
     const previous = settings;
@@ -369,7 +391,7 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
 
   const runTest = useCallback(async () => {
     setTestBusy(true);

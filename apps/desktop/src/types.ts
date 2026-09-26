@@ -237,6 +237,24 @@ export function parseSettings(raw: unknown): { settings: Settings; corrected: st
     note(field);
     return fallback;
   };
+  /** The interval the Rust validator enforces on save (settings.rs). A port
+      outside it used to hydrate as-is, and then made every subsequent edit a
+      silent save-skip: the dock read "Synchronizing…" forever with nothing to
+      click, because the invalid value only existed on disk. Corrected values
+      land in the same report as every other hydration fix. */
+  const portNumber = (field: keyof Settings, fallback: number): number => {
+    const value = src[field];
+    if (
+      typeof value === "number" &&
+      Number.isInteger(value) &&
+      value >= 1024 &&
+      value <= 65535
+    ) {
+      return value;
+    }
+    note(field);
+    return fallback;
+  };
   const boolean = (field: keyof Settings, fallback: boolean): boolean => {
     const value = src[field];
     if (typeof value === "boolean") return value;
@@ -262,8 +280,8 @@ export function parseSettings(raw: unknown): { settings: Settings; corrected: st
       noizeJmax: finiteNumber("noizeJmax", defaults.noizeJmax),
       noizeIntervalMs: finiteNumber("noizeIntervalMs", defaults.noizeIntervalMs),
       routingMode: enumeration("routingMode", ROUTING_MODES, defaults.routingMode),
-      socksPort: finiteNumber("socksPort", defaults.socksPort),
-      httpPort: finiteNumber("httpPort", defaults.httpPort),
+      socksPort: portNumber("socksPort", defaults.socksPort),
+      httpPort: portNumber("httpPort", defaults.httpPort),
       startMinimized: boolean("startMinimized", defaults.startMinimized),
       launchAtLogin: boolean("launchAtLogin", defaults.launchAtLogin),
       enginePath: text("enginePath", defaults.enginePath),

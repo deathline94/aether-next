@@ -119,7 +119,19 @@ export function useScanner(
   );
   // 6s: at or above the engine's expensive-mode (H3/BoringSSL) per-probe floor so
   // the UI default never silently under-budgets QUIC handshake probes.
-  const [timeoutMs, setTimeoutMs] = useState(6000);
+  const [requestedTimeoutMs, setRequestedTimeoutMs] = useState(6000);
+  // One resolution, shown and sent — the same rule the concurrency lanes follow:
+  // the field, the log line and the request all read *this*, so a value stored
+  // under one protocol's floor (e.g. 3000 ms set on WireGuard) cannot sit in the
+  // box while the hint and the engine both say 6000.
+  const effectiveTimeout = useMemo(
+    () => effectiveScanTimeout(protocol, requestedTimeoutMs),
+    [protocol, requestedTimeoutMs],
+  );
+  const setTimeoutMs = useCallback(
+    (ms: number) => setRequestedTimeoutMs(ms),
+    [],
+  );
   const [noize, setNoize] = useState<NoizeProfile>("off");
   const effectiveNoize = useMemo(() => scanNoizeFor(protocol, noize), [protocol, noize]);
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
@@ -251,7 +263,7 @@ export function useScanner(
     // the resolved values the fields above already show rather than a second
     // clamp that could disagree with the first.
     const workers = effectiveConcurrency;
-    const timeout = effectiveScanTimeout(protocol, timeoutMs);
+    const timeout = effectiveTimeout;
     const noiseProfile = scanNoizeFor(protocol, noize);
     appendLog({
       level: "info",
@@ -275,7 +287,7 @@ export function useScanner(
     } finally {
       setBusy(false);
     }
-  }, [busy, active, protocol, ipScan, effectiveConcurrency, timeoutMs, noize, running, appendLog, clearLogs]);
+  }, [busy, active, protocol, ipScan, effectiveConcurrency, effectiveTimeout, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
     // Retire the run id with the run: without this, a stopped scan's stragglers
@@ -299,7 +311,7 @@ export function useScanner(
     // The lanes this protocol runs, which is the number the field shows; the setter
     // still takes what the user asks for, so a wider transport can carry it.
     concurrency: effectiveConcurrency, setConcurrency: setRequestedConcurrency,
-    timeoutMs, setTimeoutMs,
+    timeoutMs: effectiveTimeout, setTimeoutMs,
     noize: effectiveNoize, setNoize,
     endpoints, active, scanState: displayedScanState, busy,
     startScan, stopScan,

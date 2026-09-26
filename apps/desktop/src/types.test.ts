@@ -4,6 +4,7 @@ import {
   parseRuntimeState,
   parseSettings,
 } from "./types";
+import { portsSaveable } from "./hooks/useRuntime";
 import { isRuntimeStatus } from "@aether/ui";
 
 /** Every field the shell's `RuntimeState` serialises, camelCase. */
@@ -129,3 +130,31 @@ export function shellSettings(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
+
+describe("port hydration", () => {
+  it("corrects out-of-range ports on disk into the reported defaults", () => {
+    // A port outside the Rust validator's interval used to hydrate as-is, and
+    // then made every subsequent edit a silent save-skip: the dock read
+    // "Synchronizing…" forever with no structured error anywhere.
+    const { settings, corrected } = parseSettings({ ...defaults, socksPort: 80, httpPort: 70000 });
+    expect(settings.socksPort).toBe(defaults.socksPort);
+    expect(settings.httpPort).toBe(defaults.httpPort);
+    expect(corrected).toContain("socksPort");
+    expect(corrected).toContain("httpPort");
+  });
+
+  it("keeps ports the Rust validator accepts", () => {
+    const { settings, corrected } = parseSettings({ ...defaults, socksPort: 9050, httpPort: 9051 });
+    expect(settings.socksPort).toBe(9050);
+    expect(settings.httpPort).toBe(9051);
+    expect(corrected).not.toContain("socksPort");
+    expect(corrected).not.toContain("httpPort");
+  });
+
+  it("portsSaveable mirrors the skip predicate the debounced save uses", () => {
+    expect(portsSaveable({ socksPort: 9050, httpPort: 9051 })).toBe(true);
+    expect(portsSaveable({ socksPort: 80, httpPort: 9051 })).toBe(false);
+    expect(portsSaveable({ socksPort: 9050, httpPort: 9050 })).toBe(false);
+    expect(portsSaveable({ socksPort: 65536, httpPort: 9051 })).toBe(false);
+  });
+});

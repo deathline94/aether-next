@@ -40,7 +40,7 @@ const appendLog = (entry: LogInput) => {
 /** The panel as the app mounts it: the hook's output, verbatim, into the control. */
 function ScannerScreen() {
   const scanner = useScanner(appendLog, false);
-  return <ScannerTab {...scanner} connectDirect={() => {}} connectBusy={false} />;
+  return <ScannerTab {...scanner} connectDirect={() => {}} connectBusy={false} running={false} />;
 }
 
 /** Every range the field prints is the minimum, an en dash, the ceiling: `1–`. */

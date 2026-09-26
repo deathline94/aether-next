@@ -43,6 +43,7 @@ function renderTab(over: Partial<Parameters<typeof ScannerTab>[0]> = {}) {
     stopScan: vi.fn(),
     connectDirect: vi.fn(),
     connectBusy: false,
+    running: false,
     ...over,
   };
   render(<ScannerTab {...props} />);
@@ -180,5 +181,33 @@ describe("ScannerTab probe parameters", () => {
     // handful of rows.
     expect(totalPx).toBeLessThan(2000 * 80);
     expect(screen.getByText(/Discovered Gateways \(2000\)/)).toBeTruthy();
+  });
+});
+
+describe("ScannerTab scan start with a live tunnel", () => {
+  it("requires a second click before a scan drops the active tunnel", () => {
+    // startScan silently `disconnect`ed the running session first: one press on
+    // the CTA dropped the VPN with no surface beyond one log line. The first
+    // click now arms a confirm; the second commits.
+    const startScan = vi.fn();
+    renderTab({ running: true, startScan });
+    const cta = () => screen.getByRole("button", { name: /disconnect/i });
+
+    expect(cta().textContent).toMatch(/confirm first/i);
+
+    fireEvent.click(cta());
+    expect(startScan).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toMatch(/disconnects the active tunnel/i);
+    expect(cta().textContent).toMatch(/confirm: disconnect vpn & scan/i);
+
+    fireEvent.click(cta());
+    expect(startScan).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not arm the confirm when no tunnel is running", () => {
+    const startScan = vi.fn();
+    renderTab({ running: false, startScan });
+    fireEvent.click(screen.getByRole("button", { name: /start standalone edge scan/i }));
+    expect(startScan).toHaveBeenCalledTimes(1);
   });
 });

@@ -301,3 +301,26 @@ describe("scanNoizeFor", () => {
     expect(scanNoizeFor("masque-h3", "" as never)).toBe("off");
   });
 });
+
+describe("scanner timeout resolution", () => {
+  it("shows the timeout the engine will run when the stored value sits under a floor", async () => {
+    // The field must display what the engine will run — the rule the concurrency
+    // lanes already follow. A value stored on WireGuard (floor 1 s…3 s) used to
+    // stay printed in the box after switching to MASQUE H3 (floor 6 s), while the
+    // hint and the log line both told the truth about 6000.
+    const { result } = renderHook(() => useScanner(appendLog, false));
+    await waitFor(() => expect(result.current.scanState !== undefined).toBe(true));
+
+    // The hook opens on MASQUE H3 (6 s floor); switch to WireGuard first.
+    act(() => result.current.setProtocol("wireguard"));
+    act(() => result.current.setTimeoutMs(3000));
+    // WireGuard has no 6 s floor, so the requested value is effective as-is.
+    expect(result.current.timeoutMs).toBe(3000);
+
+    act(() => result.current.setProtocol("masque-h3"));
+    expect(result.current.timeoutMs).toBe(6000);
+
+    act(() => result.current.setProtocol("masque-h2"));
+    expect(result.current.timeoutMs).toBe(3000);
+  });
+});
