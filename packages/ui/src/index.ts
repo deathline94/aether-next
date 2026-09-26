@@ -148,6 +148,48 @@ export function scanVerdict(hitCount: number, addr: string, working: number): st
   return hitCount > 0 || working > 0 || Boolean(addr) ? "Verified" : "Completed (0 found)";
 }
 
+/**
+ * A round-trip that can be shown: the engine's own text, or a measured number
+ * formatted. Anything empty or absent is `null`, so a caller keeps the previous
+ * value or says nothing rather than storing `""` and printing it.
+ */
+export function rttLike(value: string | number | null | undefined): string | null {
+  if (typeof value === "number") return Number.isFinite(value) ? `${value} ms` : null;
+  const text = typeof value === "string" ? value.trim() : "";
+  return text.length > 0 ? text : null;
+}
+
+/** The shape of a discovered row this badge reads; both apps' `DiscoveredEndpoint`. */
+export interface RttBadgeSource {
+  rtt: string;
+  rttMs?: number;
+}
+
+/**
+ * The four tier classes, in the order the shell's own thresholds rank them.
+ *
+ * `getRttTier(rttMs)` was called on whatever arrived, and its last arm is a
+ * fallback: a missing or zero measurement — the documented answer for a forced
+ * peer, which the engine never times — came out of it as "HIGH LATENCY", so a
+ * blank row was badged as the worst kind. An absent round-trip is its own
+ * state, with no colour to lean the claim. One implementation for both
+ * surfaces: the phone's copy was still the pre-fix version.
+ */
+export function rttBadge(item: RttBadgeSource): { tierClass: string; badgeText: string; text: string } {
+  const measured =
+    typeof item.rttMs === "number" && Number.isFinite(item.rttMs) && item.rttMs > 0
+      ? item.rttMs
+      : null;
+  // The engine's own wording first, then the number it measured, then nothing.
+  const text = rttLike(item.rtt) ?? (measured === null ? null : rttLike(measured));
+  if (text === null) return { tierClass: "", badgeText: "NOT MEASURED", text: "not measured" };
+  if (measured === null) return { tierClass: "", badgeText: "UNRANKED", text };
+  if (measured < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST", text };
+  if (measured <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL", text };
+  if (measured <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL", text };
+  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY", text };
+}
+
 /** The statuses the interface has copy, colours and a beacon for. */
 export const RUNTIME_STATUSES = ["disconnected", "connecting", "connected", "error"] as const;
 export type RuntimeStatus = (typeof RUNTIME_STATUSES)[number];

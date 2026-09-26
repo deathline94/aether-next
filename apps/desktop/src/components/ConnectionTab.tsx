@@ -1,10 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Activity, Cable, Check, CircleAlert, Copy, Cpu,
+  Activity, Cable, CircleAlert, Cpu,
   FlaskConical, Gauge, Globe2, ListRestart, LockKeyhole, Network,
   Power, Route, ShieldCheck, Sparkles, TerminalSquare, X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { CopyButton } from "./ui";
 import type { RuntimeState, Settings } from "../types";
 import { SPEED_PROFILES, ipFamilyLabel, speedProfileHint } from "@aether/ui/enums";
 import {
@@ -85,38 +85,6 @@ interface ConnectionTabProps {
   runTest: () => void;
   dismissError: () => void;
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void;
-}
-
-/** Copy button that confirms in place — feedback where the user is looking. */
-function CopyButton({ value, label, appendLog }: {
-  value: string;
-  label: string;
-  appendLog: ConnectionTabProps["appendLog"];
-}) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
-
-  return (
-    <button
-      type="button"
-      className="tactile-copy-btn"
-      aria-label={copied ? "Copied" : label}
-      title={copied ? "Copied" : label}
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(value);
-          setCopied(true);
-          if (timer.current) clearTimeout(timer.current);
-          timer.current = setTimeout(() => setCopied(false), 1500);
-        } catch {
-          appendLog({ level: "warn", message: "Clipboard copy failed" });
-        }
-      }}
-    >
-      {copied ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
-    </button>
-  );
 }
 
 export function ConnectionTab({
@@ -347,7 +315,7 @@ export function ConnectionTab({
               SCAN MODE: <strong>{settings.scanMode.toUpperCase()}</strong> · ALGORITHM: <strong>DIRECT CONCURRENT</strong>
             </small>
             {runtime.endpoint && (
-              <CopyButton value={runtime.endpoint} label="Copy gateway endpoint" appendLog={appendLog} />
+              <CopyButton value={runtime.endpoint} label="Copy gateway endpoint" onCopyFailed={() => appendLog({ level: "warn", message: "Clipboard copy failed" })} />
             )}
           </div>
         </article>
@@ -482,7 +450,7 @@ export function ConnectionTab({
             <div><strong>HTTP / HTTPS</strong><span>Windows system proxy</span></div>
           </div>
           <code>127.0.0.1:{settings.httpPort}</code>
-          <CopyButton value={`127.0.0.1:${settings.httpPort}`} label="Copy HTTP proxy address" appendLog={appendLog} />
+          <CopyButton value={`127.0.0.1:${settings.httpPort}`} label="Copy HTTP proxy address" onCopyFailed={() => appendLog({ level: "warn", message: "Clipboard copy failed" })} />
         </div>
         <div className="endpoint-row">
           <div className="endpoint-kind">
@@ -490,7 +458,7 @@ export function ConnectionTab({
             <div><strong>SOCKS5</strong><span>Direct application access</span></div>
           </div>
           <code>127.0.0.1:{settings.socksPort}</code>
-          <CopyButton value={`127.0.0.1:${settings.socksPort}`} label="Copy SOCKS5 proxy address" appendLog={appendLog} />
+          <CopyButton value={`127.0.0.1:${settings.socksPort}`} label="Copy SOCKS5 proxy address" onCopyFailed={() => appendLog({ level: "warn", message: "Clipboard copy failed" })} />
         </div>
       </section>
 

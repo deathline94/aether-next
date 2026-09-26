@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { rttBadge } from "./ScannerTab";
+import { rttBadge } from "@aether/ui";
 import type { DiscoveredEndpoint } from "../types";
 
 const row = (over: Partial<DiscoveredEndpoint>): DiscoveredEndpoint => ({

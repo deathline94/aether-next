@@ -14,7 +14,21 @@ import { normalizeNoize } from "../settingsPayload";
 import { saveDockCopy, saveStateOf } from "../saveState";
 import type { SaveState } from "../saveState";
 import { noiseIsInert } from "@aether/ui";
-import { NOIZE_OPTIONS } from "@aether/ui/enums";
+import {
+  IP_FAMILY_OPTIONS,
+  NOIZE_OPTIONS,
+  ROUTING_MODE_OPTIONS,
+  SCAN_MODE_OPTIONS,
+  TUNNEL_PROTOCOL_OPTIONS,
+  TRANSPORT_OPTIONS,
+} from "@aether/ui/enums";
+
+/** This platform's wording for the shared routing-mode values; the value list
+    itself is `ROUTING_MODE_OPTIONS`, so a new mode still surfaces here. */
+const ROUTING_LABELS: Record<string, string> = {
+  tun: "Full VPN (Android VpnService)",
+  "proxy-only": "Proxy Only (Local Listeners)",
+};
 import { NumberField, Segmented, Toggle } from "./ui";
 import type { IpcError } from "../ipcError";
 
@@ -146,12 +160,7 @@ export function SettingsTab({
             label="Carrier protocol"
             disabled={settingsLocked}
             value={settings.protocol}
-            options={[
-              { value: "masque", label: "MASQUE" },
-              { value: "wireguard", label: "WireGuard" },
-              { value: "gool", label: "Gool" },
-              { value: "mim", label: "MASQUE-in-MASQUE" },
-            ]}
+            options={TUNNEL_PROTOCOL_OPTIONS}
             onChange={(protocol) => patchSettings({ protocol })}
           />
         </div>
@@ -169,10 +178,7 @@ export function SettingsTab({
               label="MASQUE transport"
               disabled={settingsLocked}
               value={settings.transport}
-              options={[
-                { value: "h3", label: "HTTP/3 (QUIC)" },
-                { value: "h2", label: "HTTP/2 (TCP)" },
-              ]}
+              options={TRANSPORT_OPTIONS}
               onChange={(transport) => patchSettings({ transport })}
             />
           </div>
@@ -357,15 +363,11 @@ export function SettingsTab({
             value={settings.scanMode}
             onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}
           >
-            <option value="turbo">Turbo (Fastest startup, high concurrency)</option>
-            <option value="balanced">Balanced (Optimal speed and route fidelity)</option>
-            <option value="thorough">Thorough (Deep probe across extensive pools)</option>
-            <option value="stealth">Stealth (Low rate to minimize traffic anomaly)</option>
-            {/* The fifth rung of the shared `ScanMode`: the shell's own
-                `validateSettings` accepts `ironclad`, so a profile that carries it
-                is readable — and a select with no option for the stored value shows
-                a blank where the user's own setting should be. */}
-            <option value="ironclad">Ironclad (Verify every candidate endpoint)</option>
+            {/* The shared list is the one vocabulary: the phone's Turbo row used
+                to print different words for the same wire value than desktop. */}
+            {SCAN_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
           </select>
         </div>
 
@@ -381,11 +383,7 @@ export function SettingsTab({
             label="IP version"
             disabled={settingsLocked}
             value={settings.ipVersion}
-            options={[
-              { value: "v4", label: "IPv4 Only" },
-              { value: "v6", label: "IPv6 Only" },
-              { value: "both", label: "Dual-Stack" },
-            ]}
+            options={IP_FAMILY_OPTIONS}
             onChange={(ipVersion) => patchSettings({ ipVersion })}
           />
         </div>
@@ -422,21 +420,28 @@ export function SettingsTab({
             value={settings.routingMode}
             onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
           >
-            <option value="tun">Full VPN (Android VpnService)</option>
-            <option value="proxy-only">Proxy Only (Local Listeners)</option>
-            {/* A config written on desktop can carry `system-proxy`, which Android
-                cannot do (no API to set the OS proxy from an app without
-                WRITE_SECURE_SETTINGS). The select used to *render* it as "Full
-                VPN" by coercion, so the stored mode and the label disagreed, and
-                the chip beside it — correctly reading the stored value as not
-                `tun` — said "LOCAL PROXY" on the same row. Showing the stored
-                value honestly, and naming it unsupported, keeps the three
-                widgets telling one story. */}
-            {settings.routingMode === "system-proxy" && (
-              <option value="system-proxy" disabled>
-                System Proxy — stored, not available on Android
-              </option>
-            )}
+            {ROUTING_MODE_OPTIONS.map((option) => {
+              /* A config written on desktop can carry `system-proxy`, which
+                 Android cannot do (no API to set the OS proxy from an app
+                 without WRITE_SECURE_SETTINGS). The select used to *render* it
+                 as "Full VPN" by coercion, so the stored mode and the label
+                 disagreed, and the chip beside it — correctly reading the
+                 stored value as not `tun` — said "LOCAL PROXY" on the same
+                 row. Showing the stored value honestly, and naming it
+                 unsupported, keeps the three widgets telling one story. */
+              if (option.value === "system-proxy") {
+                return settings.routingMode === "system-proxy" ? (
+                  <option key={option.value} value={option.value} disabled>
+                    System Proxy — stored, not available on Android
+                  </option>
+                ) : null;
+              }
+              return (
+                <option key={option.value} value={option.value}>
+                  {ROUTING_LABELS[option.value] ?? option.label}
+                </option>
+              );
+            })}
           </select>
         </div>
 

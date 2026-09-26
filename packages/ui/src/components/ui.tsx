@@ -15,7 +15,9 @@ export function Segmented<T extends string>({
   label,
 }: {
   value: T;
-  options: { value: T; label: string }[];
+  /** Readonly: callers hand over the shared option lists from `@aether/ui/enums`,
+      which are declared `as const`-adjacent readonly, without copying. */
+  options: readonly { value: T; label: string }[];
   onChange: (value: T) => void;
   disabled?: boolean;
   /** Accessible name for the group. */
@@ -61,6 +63,64 @@ export function Segmented<T extends string>({
         </button>
       ))}
     </div>
+  );
+}
+
+/** Lucide's copy icon, inlined: `packages/ui` has no node_modules of its own, so
+    a `lucide-react` import here would not resolve for either app. */
+function CopyIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+/**
+ * Copy button that confirms in place — feedback where the user is looking. One
+ * implementation for both frontends: the two copies were verbatim twins whose
+ * only future difference would have been a fix applied to one of them.
+ */
+export function CopyButton({ value, label, onCopyFailed }: {
+  value: string;
+  label: string;
+  /** Called when the copy fails; the caller owns how the failure surfaces. */
+  onCopyFailed?: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  return (
+    <button
+      type="button"
+      className="tactile-copy-btn"
+      aria-label={copied ? "Copied" : label}
+      title={copied ? "Copied" : label}
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          setCopied(true);
+          if (timer.current) clearTimeout(timer.current);
+          timer.current = setTimeout(() => setCopied(false), 1500);
+        } catch {
+          onCopyFailed?.();
+        }
+      }}
+    >
+      {copied ? <CheckIcon /> : <CopyIcon />}
+    </button>
   );
 }
 

@@ -12,10 +12,27 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { NoizeProfile, Settings } from "../types";
-import { NOIZE_OPTIONS, NOIZE_PROFILES, SCAN_MODE_OPTIONS, oneOf } from "@aether/ui/enums";
+import {
+  IP_FAMILY_OPTIONS,
+  NOIZE_OPTIONS,
+  NOIZE_PROFILES,
+  ROUTING_MODE_OPTIONS,
+  SCAN_MODE_OPTIONS,
+  TUNNEL_PROTOCOL_OPTIONS,
+  TRANSPORT_OPTIONS,
+  oneOf,
+} from "@aether/ui/enums";
 import { noiseIsInert } from "@aether/ui";
 import type { IpcError } from "../ipcError";
 import { NumberField, Segmented, Toggle } from "./ui";
+
+/** This platform's wording for the shared routing-mode values; the value list
+    itself is `ROUTING_MODE_OPTIONS`, so a new mode still surfaces here. */
+const ROUTING_LABELS: Record<string, string> = {
+  "system-proxy": "System Proxy (Standard Windows Proxy)",
+  "proxy-only": "Proxy Only (Local Listeners Only)",
+  tun: "TUN Virtual Device (Elevated System-Wide)",
+};
 
 /**
  * A free-text path commits on blur or Enter, not on every keystroke.
@@ -163,12 +180,7 @@ export function SettingsTab({
             label="Carrier protocol"
             disabled={settingsLocked}
             value={settings.protocol}
-            options={[
-              { value: "masque", label: "MASQUE" },
-              { value: "wireguard", label: "WireGuard" },
-              { value: "gool", label: "Gool" },
-              { value: "mim", label: "MASQUE-in-MASQUE" },
-            ]}
+            options={TUNNEL_PROTOCOL_OPTIONS}
             onChange={(protocol) => patchSettings({ protocol })}
           />
         </div>
@@ -186,10 +198,7 @@ export function SettingsTab({
               label="MASQUE transport"
               disabled={settingsLocked}
               value={settings.transport}
-              options={[
-                { value: "h3", label: "HTTP/3 (QUIC)" },
-                { value: "h2", label: "HTTP/2 (TCP)" },
-              ]}
+              options={TRANSPORT_OPTIONS}
               onChange={(transport) => patchSettings({ transport })}
             />
           </div>
@@ -399,11 +408,7 @@ export function SettingsTab({
             label="IP version"
             disabled={settingsLocked}
             value={settings.ipVersion}
-            options={[
-              { value: "v4", label: "IPv4 Only" },
-              { value: "v6", label: "IPv6 Only" },
-              { value: "both", label: "Dual-Stack" },
-            ]}
+            options={IP_FAMILY_OPTIONS}
             onChange={(ipVersion) => patchSettings({ ipVersion })}
           />
         </div>
@@ -442,9 +447,13 @@ export function SettingsTab({
             value={settings.routingMode}
             onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
           >
-            <option value="system-proxy">System Proxy (Standard Windows Proxy)</option>
-            <option value="proxy-only">Proxy Only (Local Listeners Only)</option>
-            <option value="tun">TUN Virtual Device (Elevated System-Wide)</option>
+            {/* Values come from the shared list so a new routing mode surfaces
+                automatically; the wording is this platform's own. */}
+            {ROUTING_MODE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {ROUTING_LABELS[option.value] ?? option.label}
+              </option>
+            ))}
           </select>
         </div>
 

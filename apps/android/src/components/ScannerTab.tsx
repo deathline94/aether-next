@@ -7,14 +7,18 @@ import { NumberField, Segmented } from "./ui";
 // this field used to offer 1-2000 while the shell clamped to 500, so the "Workers
 // Active" chip contradicted the input the user had just filled in.
 import {
+  isEndpointForProtocol,
   nextOptionIndex,
+  rttBadge,
   SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
   scanConcurrencyCeiling,
   scanTimeoutFloor,
 } from "@aether/ui";
+import { IP_FAMILY_OPTIONS, SCAN_PROTOCOL_OPTIONS } from "@aether/ui/enums";
+import type { ScanProtocolFilter } from "@aether/ui/enums";
 
-type ProtoFilter = "all" | "masque-h3" | "masque-h2" | "wireguard";
+type ProtoFilter = ScanProtocolFilter;
 
 /** One row plus its gap: 12+12 padding, one line of content, 2 px of border, 10 px stride. */
 const ESTIMATED_ENDPOINT_PX = 56;
@@ -42,13 +46,6 @@ interface ScannerTabProps {
   stopScan: () => void;
   connectDirect: (item: DiscoveredEndpoint) => void;
   connectBusy: boolean;
-}
-
-function getRttTier(rttMs: number): { tierClass: string; badgeText: string } {
-  if (rttMs < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST" };
-  if (rttMs <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL" };
-  if (rttMs <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL" };
-  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY" };
 }
 
 function CopyIpButton({ addr }: { addr: string }) {
@@ -102,20 +99,20 @@ export function ScannerTab({
   const filteredEndpoints = useMemo(() => {
     if (protoFilter === "all") return endpoints;
     return endpoints.filter((e) => {
-      const p = e.protocol.toLowerCase();
-      if (protoFilter === "wireguard") return p.includes("wireguard") || p.includes("wg");
-      if (protoFilter === "masque-h3") return p.includes("h3");
-      if (protoFilter === "masque-h2") return p.includes("h2");
-      return false;
+      // The shared predicate — the same matching the scan start uses to preserve
+      // other protocols' rows — so a filter and a fresh scan can never disagree
+      // about what belongs to the current protocol.
+      return isEndpointForProtocol(e.protocol, protoFilter);
     });
   }, [endpoints, protoFilter]);
 
+  // The shared predicate, like the filter below and the desktop twin's counters.
   const h3Count = useMemo(
-    () => endpoints.filter((e) => e.protocol.toLowerCase().includes("h3")).length,
+    () => endpoints.filter((e) => isEndpointForProtocol(e.protocol, "masque-h3")).length,
     [endpoints]
   );
   const h2Count = useMemo(
-    () => endpoints.filter((e) => e.protocol.toLowerCase().includes("h2")).length,
+    () => endpoints.filter((e) => isEndpointForProtocol(e.protocol, "masque-h2")).length,
     [endpoints]
   );
   const wgCount = useMemo(
@@ -295,11 +292,7 @@ export function ScannerTab({
           <Segmented
             label="Target protocol"
             value={protocol}
-            options={[
-              { value: "masque-h3", label: "MASQUE H3" },
-              { value: "masque-h2", label: "MASQUE H2" },
-              { value: "wireguard", label: "WireGuard" },
-            ]}
+            options={SCAN_PROTOCOL_OPTIONS}
             onChange={setProtocol}
             disabled={active}
           />
@@ -313,11 +306,7 @@ export function ScannerTab({
           <Segmented
             label="IP family"
             value={ipScan}
-            options={[
-              { value: "v4", label: "IPv4 Only" },
-              { value: "v6", label: "IPv6 Only" },
-              { value: "both", label: "Dual-Stack" },
-            ]}
+            options={IP_FAMILY_OPTIONS}
             onChange={setIpScan}
             disabled={active}
           />
@@ -458,7 +447,7 @@ export function ScannerTab({
               {endpointRows.getVirtualItems().map((row) => {
                 const item = filteredEndpoints[row.index];
                 if (!item) return null;
-                const { tierClass, badgeText } = getRttTier(item.rttMs);
+                const { tierClass, badgeText, text } = rttBadge(item);
                 return (
                   <div
                     key={`${item.addr}|${item.protocol}`}
@@ -483,7 +472,10 @@ export function ScannerTab({
                       <div className="discovered-actions">
                         <span className={`rtt-badge ${tierClass}`} title={badgeText}>
                           <span className="rtt-dot" />
-                          <span className="tabular-nums">{item.rtt}</span>
+                          {/* The badge's normalized text, not the raw engine
+                              string: a blank row used to render an empty chip
+                              that the old tier function had already mis-ranked. */}
+                          <span className="tabular-nums">{text}</span>
                         </span>
                         <button
                           type="button"

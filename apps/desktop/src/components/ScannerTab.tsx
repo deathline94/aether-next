@@ -2,16 +2,17 @@ import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
-import { NOIZE_PROFILES, oneOf } from "@aether/ui/enums";
+import { NOIZE_PROFILES, SCAN_PROTOCOL_OPTIONS, oneOf } from "@aether/ui/enums";
 import type { IpFamily, ScanProtocol, ScanProtocolFilter } from "@aether/ui/enums";
 import {
   nextOptionIndex,
   SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
+  isEndpointForProtocol,
+  rttBadge,
   scanConcurrencyCeiling,
   scanTimeoutFloor,
 } from "@aether/ui";
-import { rttLike } from "../hooks/useScanner";
 import { NumberField, Segmented } from "./ui";
 
 interface ScannerTabProps {
@@ -37,30 +38,6 @@ interface ScannerTabProps {
   stopScan: () => void;
   connectDirect: (item: DiscoveredEndpoint) => void;
   connectBusy: boolean;
-}
-
-/**
- * The four tier classes, in the order the shell's own thresholds put them.
- *
- * `getRttTier(rttMs)` was called on whatever arrived, and its last arm is a
- * fallback: a missing or zero measurement — the documented answer for a forced
- * peer, which the engine never times — came out of it as "HIGH LATENCY", so a
- * blank row was badged as the worst kind. An absent round-trip is now its own
- * state, with no colour to lean the claim.
- */
-export function rttBadge(item: DiscoveredEndpoint): { tierClass: string; badgeText: string; text: string } {
-  const measured =
-    typeof item.rttMs === "number" && Number.isFinite(item.rttMs) && item.rttMs > 0
-      ? item.rttMs
-      : null;
-  // The engine's own wording first, then the number it measured, then nothing.
-  const text = rttLike(item.rtt) ?? (measured === null ? null : rttLike(measured));
-  if (text === null) return { tierClass: "", badgeText: "NOT MEASURED", text: "not measured" };
-  if (measured === null) return { tierClass: "", badgeText: "UNRANKED", text };
-  if (measured < 20) return { tierClass: "rtt-ultra-green", badgeText: "ULTRA FAST", text };
-  if (measured <= 60) return { tierClass: "rtt-optimal-cyan", badgeText: "OPTIMAL", text };
-  if (measured <= 100) return { tierClass: "rtt-acceptable-amber", badgeText: "NORMAL", text };
-  return { tierClass: "rtt-high-coral", badgeText: "HIGH LATENCY", text };
 }
 
 function CopyIpButton({ addr }: { addr: string }) {
@@ -130,10 +107,11 @@ export function ScannerTab({
     let h2 = 0;
     let wg = 0;
     for (const e of endpoints) {
-      const p = e.protocol.toLowerCase();
-      if (p.includes("h3")) h3 += 1;
-      if (p.includes("h2")) h2 += 1;
-      if (p.includes("wireguard") || p.includes("wg")) wg += 1;
+      // The shared predicate — the same one the filter and the scan start use —
+      // so counting, filtering and preservation can never disagree.
+      if (isEndpointForProtocol(e.protocol, "masque-h3")) h3 += 1;
+      if (isEndpointForProtocol(e.protocol, "masque-h2")) h2 += 1;
+      if (isEndpointForProtocol(e.protocol, "wireguard")) wg += 1;
     }
     return { h3Count: h3, h2Count: h2, wgCount: wg };
   }, [endpoints]);
@@ -319,11 +297,7 @@ export function ScannerTab({
           <Segmented
             label="Target protocol"
             value={protocol}
-            options={[
-              { value: "masque-h3", label: "MASQUE H3" },
-              { value: "masque-h2", label: "MASQUE H2" },
-              { value: "wireguard", label: "WireGuard" },
-            ]}
+            options={SCAN_PROTOCOL_OPTIONS}
             onChange={setProtocol}
             disabled={active}
           />

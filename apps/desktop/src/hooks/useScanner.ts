@@ -53,11 +53,9 @@ export { clampConcurrency };
  * formatted. Anything empty or absent is `null`, so a caller keeps the previous
  * value or says nothing rather than storing `""` and printing it.
  */
-export function rttLike(value: string | number | null | undefined): string | null {
-  if (typeof value === "number") return Number.isFinite(value) ? `${value} ms` : null;
-  const text = typeof value === "string" ? value.trim() : "";
-  return text.length > 0 ? text : null;
-}
+import { rttLike } from "@aether/ui";
+
+export { rttLike };
 
 /**
  * The completion line, without the brackets that used to be empty.

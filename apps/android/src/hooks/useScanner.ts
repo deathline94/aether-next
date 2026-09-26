@@ -13,6 +13,7 @@ import {
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
 import { hitAddressKey } from "@aether/ui/logs";
+import type { IpFamily, ScanProtocol } from "@aether/ui/enums";
 import type { DiscoveredEndpoint, LogInput, ScanState } from "../types";
 
 /**
@@ -25,8 +26,8 @@ export function useScanner(
   running: boolean,
   clearLogs?: () => void,
 ) {
-  const [protocol, setProtocol] = useState<"masque-h3" | "masque-h2" | "wireguard">("masque-h3");
-  const [ipScan, setIpScan] = useState<"v4" | "v6" | "both">("v4");
+  const [protocol, setProtocol] = useState<ScanProtocol>("masque-h3");
+  const [ipScan, setIpScan] = useState<IpFamily>("v4");
   // What the user asked for, which is not necessarily what this protocol can run.
   // The field used to open at 250 — a cheap H2/WireGuard width — on a scan that
   // opens on H3 and stops at 16, so the control advertised lanes the engine would
