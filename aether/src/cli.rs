@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use crate::engine_config::EngineConfig;
-use crate::error::Result;
+use crate::error::{AetherError, Result};
 use crate::session_event::SessionEvent;
 
 pub async fn run() -> Result<()> {
@@ -64,40 +64,8 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--mim" | "--masque-in-masque" => {
-                crate::runtime_env::set("AETHER_PROTOCOL", "mim");
-            }
-            "--mim-outer" => {
-                if i + 1 < args.len() {
-                    i += 1;
-                    crate::runtime_env::set("AETHER_MIM_OUTER_PEER", &args[i]);
-                }
-            }
-            "--mim-inner" => {
-                if i + 1 < args.len() {
-                    i += 1;
-                    crate::runtime_env::set("AETHER_MIM_INNER_PEER", &args[i]);
-                }
-            }
-            "--mim-peers" => {
-                if i + 1 < args.len() {
-                    i += 1;
-                    crate::runtime_env::set("AETHER_MIM_PEERS", &args[i]);
-                }
-            }
-            "--protocol" => {
-                if i + 1 < args.len() {
-                    i += 1;
-                    crate::runtime_env::set("AETHER_PROTOCOL", &args[i]);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+    for (key, value) in parse_cli_flags(&std::env::args().collect::<Vec<_>>())? {
+        crate::runtime_env::set(key, &value);
     }
 
     let session = crate::session::run_session(EngineConfig::from_env()?);
@@ -165,6 +133,86 @@ pub async fn run() -> Result<()> {
         std::process::exit(if result.is_err() { 1 } else { 0 });
     }
     result
+}
+
+/// Map CLI flags onto the `AETHER_*` runtime-env pairs the session reads.
+///
+/// Pure so the contract is testable: the caller applies the pairs with
+/// `runtime_env::set`. The parser refuses rather than guesses — the old loop had
+/// a catch-all, so a typo'd flag silently vanished, a value flag at the end of
+/// argv was silently ignored, and `--mim` after `--protocol wg` silently
+/// overrode the protocol the operator asked for by order alone. For a tool whose
+/// flags *are* its configuration, those silences are the failures that reach
+/// support threads as "I asked for X and got Y".
+fn parse_cli_flags(args: &[String]) -> Result<Vec<(&'static str, String)>> {
+    // Consumed earlier by dedicated entry points; skipped so the parser stays
+    // order-independent about them (notably `--repair-routes`, which only
+    // short-circuits on Windows).
+    const KNOWN_BARE: &[&str] = &["--version", "-V", "--diagnostics", "--repair-routes"];
+    const VALUE_FLAGS: &[(&str, &str)] = &[
+        ("--protocol", "AETHER_PROTOCOL"),
+        ("--mim-outer", "AETHER_MIM_OUTER_PEER"),
+        ("--mim-inner", "AETHER_MIM_INNER_PEER"),
+        ("--mim-peers", "AETHER_MIM_PEERS"),
+    ];
+    const SUPPORTED: &str =
+        "--protocol <p>, --mim, --mim-outer <a>, --mim-inner <a>, --mim-peers <list>";
+
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut protocol_flag: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        i += 1;
+        if KNOWN_BARE.contains(&arg) {
+            continue;
+        }
+        if arg == "--mim" || arg == "--masque-in-masque" {
+            if let Some(prev) = protocol_flag {
+                return Err(AetherError::Config(format!(
+                    "{prev} and {arg} both choose the protocol; pass only one"
+                )));
+            }
+            protocol_flag = Some(arg);
+            out.push(("AETHER_PROTOCOL", "mim".to_string()));
+            continue;
+        }
+        // `--flag value` or `--flag=value`; the value may itself look like a flag.
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (arg, None),
+        };
+        if let Some((_, key)) = VALUE_FLAGS.iter().find(|(flag, _)| *flag == name) {
+            let value = match inline {
+                Some(v) => v,
+                None => match args.get(i) {
+                    Some(v) => {
+                        i += 1;
+                        v.clone()
+                    }
+                    None => {
+                        return Err(AetherError::Config(format!(
+                            "{name} needs a value; supported: {SUPPORTED}"
+                        )))
+                    }
+                },
+            };
+            if *key == "AETHER_PROTOCOL" {
+                if let Some(prev) = protocol_flag {
+                    return Err(AetherError::Config(format!(
+                        "{prev} and {name} both choose the protocol; pass only one"
+                    )));
+                }
+                protocol_flag = Some(name);
+            }
+            out.push((key, value));
+            continue;
+        }
+        return Err(AetherError::Config(format!(
+            "unknown argument {arg:?}; supported: {SUPPORTED}, --version, --diagnostics"
+        )));
+    }
+    Ok(out)
 }
 
 /// The only thing that ends the control wait: an explicit `shutdown` token.
@@ -329,5 +377,65 @@ mod tests {
         assert!(!is_netstack_panic("build/smoltcp-helpers/src/lib.rs"));
         assert!(!is_netstack_panic("my_smoltcp_fork.rs"));
         assert!(!is_netstack_panic(""));
+    }
+}
+
+/// Flag parsing is the tool's front door; these pin the refusal contract.
+#[cfg(test)]
+mod cli_flag_tests {
+    use super::parse_cli_flags;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn known_flags_map_onto_runtime_env() {
+        assert_eq!(
+            parse_cli_flags(&args(&["--mim"])).expect("parses"),
+            vec![("AETHER_PROTOCOL", "mim".to_string())]
+        );
+        assert_eq!(
+            parse_cli_flags(&args(&["--masque-in-masque"])).expect("parses"),
+            vec![("AETHER_PROTOCOL", "mim".to_string())]
+        );
+        assert_eq!(
+            parse_cli_flags(&args(&["--protocol", "wg", "--mim-inner", "1.2.3.4:443"]))
+                .expect("parses"),
+            vec![
+                ("AETHER_PROTOCOL", "wg".to_string()),
+                ("AETHER_MIM_INNER_PEER", "1.2.3.4:443".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn equals_form_and_bare_flags_are_accepted() {
+        assert_eq!(
+            parse_cli_flags(&args(&["--protocol=mim"])).expect("parses"),
+            vec![("AETHER_PROTOCOL", "mim".to_string())]
+        );
+        assert_eq!(
+            parse_cli_flags(&args(&["--mim-peers=1.2.3.4:443,5.6.7.8:500"])).expect("parses"),
+            vec![("AETHER_MIM_PEERS", "1.2.3.4:443,5.6.7.8:500".to_string())]
+        );
+        // Consumed earlier by dedicated entry points; must stay order-independent.
+        assert!(
+            parse_cli_flags(&args(&["--version", "--diagnostics", "--repair-routes"]))
+                .expect("known bare flags skip")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn structure_errors_refuse_instead_of_guessing() {
+        // A value flag at the end of argv is an error, not a silent no-op.
+        assert!(parse_cli_flags(&args(&["--mim-inner"])).is_err());
+        // Unknown flags error instead of vanishing into a catch-all.
+        assert!(parse_cli_flags(&args(&["--mim2"])).is_err());
+        assert!(parse_cli_flags(&args(&["--protocol=mim", "--wat"])).is_err());
+        // Two protocol choices conflict instead of last-flag-wins.
+        assert!(parse_cli_flags(&args(&["--protocol", "wg", "--mim"])).is_err());
+        assert!(parse_cli_flags(&args(&["--mim", "--protocol=wg"])).is_err());
     }
 }
