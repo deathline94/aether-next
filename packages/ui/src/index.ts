@@ -144,6 +144,19 @@ export function noiseIsInert(protocol: string, transport: string): boolean {
  * desktop guarded it, Android set `phase: "Verified"` on every `scan_done`, so a
  * scan that found nothing on the phone reported a verified route (T199).
  */
+/**
+ * The phase words the scanner state machine reports. Both hooks used to spell
+ * them inline — six literals a side — so a wording change landed twice or once.
+ */
+export const SCAN_PHASES = {
+  starting: "Starting",
+  probing: "Probing Pool",
+  verified: "Verified",
+  failed: "Failed",
+  error: "Error",
+  stopped: "Stopped",
+} as const;
+
 export function scanVerdict(hitCount: number, addr: string, working: number): string {
   return hitCount > 0 || working > 0 || Boolean(addr) ? "Verified" : "Completed (0 found)";
 }
@@ -252,6 +265,28 @@ export function parseRuntimeCore(payload: unknown): RuntimeCore | null {
  * "Standby" beside "disconnected" — two vocabularies for the same fact, one of
  * them an implementation identifier.
  */
+/**
+ * The sidebar beacon's one-word answer to "what is my traffic doing right now".
+ * Both shells carried a verbatim copy of this ternary; the routing wording is
+ * the same one the Connection hero resolves from `routingMode`.
+ */
+export function beaconStatusText(
+  connected: boolean,
+  running: boolean,
+  routingMode: string,
+  status: string,
+): string {
+  return connected
+    ? routingMode === "tun"
+      ? "Routed"
+      : "Local proxy"
+    : running
+      ? "Connecting"
+      : status === "error"
+        ? "Error"
+        : "Standby";
+}
+
 export const RUNTIME_STATUS_TAGS: Record<RuntimeStatus, string> = {
   disconnected: "STANDBY",
   connecting: "HANDSHAKE",

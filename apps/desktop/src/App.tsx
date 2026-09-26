@@ -1,6 +1,6 @@
 import { Radio, ScrollText, Search, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { RUNTIME_STATUS_TAGS } from "@aether/ui";
+import { beaconStatusText, RUNTIME_STATUS_TAGS } from "@aether/ui";
 // Self-hosted faces: Vite hashes the woff2 into dist/ so the UI loads them
 // same-origin under `font-src 'self'` and never asks a third party pre-tunnel.
 import "@fontsource-variable/geist";
@@ -191,15 +191,7 @@ function App() {
   // was a blanket claim in every connected mode, while a local-proxy connection only
   // carries apps pointed at Aether's own ports. `routingMode` is the same value the
   // Connection panel resolves its copy from, so the two surfaces cannot disagree.
-  const statusText = connected
-    ? settings.routingMode === "tun"
-      ? "Routed"
-      : "Local proxy"
-    : running
-      ? "Connecting"
-      : runtime.status === "error"
-        ? "Error"
-        : "Standby";
+  const statusText = beaconStatusText(connected, running, settings.routingMode, runtime.status);
 
   return (
     <main className="app-shell">

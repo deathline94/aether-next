@@ -16,6 +16,7 @@ import {
   clampConcurrency,
   effectiveScanTimeout,
   isEndpointForProtocol,
+  SCAN_PHASES,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
@@ -170,7 +171,7 @@ export function useScanner(
             concurrency: ev.concurrency,
             scanned: 0,
             working: 0,
-            phase: "Probing Pool",
+            phase: SCAN_PHASES.probing,
           });
           break;
         case "scan_progress":
@@ -227,7 +228,7 @@ export function useScanner(
           break;
         }
         case "scan_failed":
-          setScanState((prev) => ({ ...prev, active: false, phase: "Failed" }));
+          setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.failed }));
           appendLog({ level: "error", message: `Scan failed: ${ev.message}` });
           break;
       }
@@ -255,7 +256,7 @@ export function useScanner(
     const preserved = endpointsRef.current.filter((e) => !isEndpointForProtocol(e.protocol, protocol));
     endpointsRef.current = preserved;
     setEndpoints(preserved);
-    setScanState({ ...initialScanState, active: true, phase: "Starting" });
+    setScanState({ ...initialScanState, active: true, phase: SCAN_PHASES.starting });
     // The two values are clamped before they are both announced and sent, so the
     // log line describes the run the engine will actually perform — and they are
     // the resolved values the fields above already show rather than a second
@@ -281,7 +282,7 @@ export function useScanner(
       });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
-      setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
+      setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.error }));
     } finally {
       setBusy(false);
     }
@@ -294,11 +295,11 @@ export function useScanner(
     // Ask the engine first — only report "Stopped" once it actually is.
     try {
       await invoke("stop_scan");
-      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+      setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.stopped }));
       appendLog({ level: "info", message: "Scan stopped." });
     } catch (error) {
       // Engine may have already finished; don't leave the UI stuck either way.
-      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+      setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.stopped }));
       appendLog({ level: "warn", message: `Stop scan: ${errorMessage(error)}` });
     }
   }, [appendLog]);

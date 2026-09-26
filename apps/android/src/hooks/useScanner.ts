@@ -9,6 +9,7 @@ import {
   clampConcurrency,
   effectiveScanTimeout,
   isEndpointForProtocol,
+  SCAN_PHASES,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
@@ -101,7 +102,7 @@ export function useScanner(
             scanned: 0,
             working: 0,
             bestRtt: null,
-            phase: "Probing Pool",
+            phase: SCAN_PHASES.probing,
           });
           break;
         case "scan_progress":
@@ -150,7 +151,7 @@ export function useScanner(
           if (ev.addr) appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
           break;
         case "scan_failed":
-          setScanState((prev) => ({ ...prev, active: false, phase: "Failed" }));
+          setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.failed }));
           appendLog({ level: "error", message: `Scan failed: ${ev.message}` });
           break;
       }
@@ -180,7 +181,7 @@ export function useScanner(
     const preserved = endpointsRef.current.filter((e) => !isEndpointForProtocol(e.protocol, protocol));
     endpointsRef.current = preserved;
     setEndpoints(preserved);
-    setScanState({ ...initialScanState, active: true, phase: "Starting" });
+    setScanState({ ...initialScanState, active: true, phase: SCAN_PHASES.starting });
     // Both values are resolved *before* anything is announced, so the log line
     // describes the run the engine will perform rather than the numbers the fields
     // happened to hold: `concurrency` used to be printed and sent raw while the
@@ -204,7 +205,7 @@ export function useScanner(
       await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency: workers, timeoutMs: effectiveTimeout, noize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
-      setScanState((prev) => ({ ...prev, active: false, phase: "Error" }));
+      setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.error }));
     } finally {
       setBusy(false);
     }
@@ -218,7 +219,7 @@ export function useScanner(
     } catch (error) {
       appendLog({ level: "warn", message: `Stop scan: ${errorMessage(error)}` });
     } finally {
-      setScanState((prev) => ({ ...prev, active: false, phase: "Stopped" }));
+      setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.stopped }));
     }
   }, [appendLog]);
 
