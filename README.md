@@ -33,7 +33,7 @@ Grab the latest release from the [Releases page](https://github.com/deathline94/
 
 ## Features
 
-- **Multiple Protocols**: MASQUE (HTTP/2 & HTTP/3 via QUIC), WireGuard, and nested WireGuard (Gool).
+- **Multiple Protocols**: MASQUE (HTTP/2 & HTTP/3 via QUIC), WireGuard, nested WireGuard (Gool), and MASQUE-in-MASQUE (a second MASQUE hop tunneled through the first).
 - **Automated Endpoint Discovery**: High-concurrency scanner with Turbo, Balanced, Thorough, and Stealth discovery modes.
 - **Flexible Routing**:
   - **Full Tunnel**: Device-wide TUN interface using WinTUN on Windows and native VpnService on Android.

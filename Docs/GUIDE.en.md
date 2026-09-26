@@ -32,6 +32,27 @@ Lean and fast when the path allows classic WG packets.
 
 WG inside WG. Heavier, sometimes more stable when single-layer WG is not enough.
 
+### MASQUE-in-MASQUE (mim)
+
+A second, independent MASQUE tunnel established *through* the first one: the outer
+hop reaches Cloudflare's edge as usual, and the inner hop dials its own edge over
+the outer tunnel. Heavier than plain MASQUE (two layers of encapsulation), but the
+inner leg's traffic pattern is decoupled from the local network's view of the
+outer hop.
+
+- The outer hop follows the transport setting (h3/h2) like plain MASQUE; the inner
+  hop follows the same choice (h3 rides the outer tunnel as UDP datagrams, h2 as
+  TCP through a local forwarder).
+- The inner edge is discovered automatically from the designed MASQUE H3 pool
+  (3 permitted VIPs across every MASQUE port). You can pin both hops instead —
+  see the environment variables below.
+- The **Scanner** tab deliberately does not list mim: a standalone scan can only
+  probe the outer hop, which is the same pool MASQUE H3/H2 already cover, so a mim
+  row would claim a certainty about the inner leg it cannot have. Connect-time
+  scanning verifies the outer hop and the data plane proves the inner one.
+- An inner hop that shares its address with the outer edge is refused: the inner
+  tunnel would pinch through the edge it is nested in.
+
 ## Scan
 
 Endpoints are discovered at runtime (not hard-coded forever). Modes:
@@ -69,6 +90,14 @@ Presets map protocol + transport + noise + scan so you do not have to hand-tune 
 | `AETHER_IP` | IPv4 / IPv6 / both |
 | `AETHER_MASQUE_HTTP2` | `1` = force MASQUE over h2 |
 | `AETHER_PEER` | force endpoint, skip scan |
+| `AETHER_MIM_PEERS` | pin both mim hops: `outer:port,inner:port`. `auto` / `off` / `false` / `0` = discover the inner edge automatically |
+| `AETHER_MIM_OUTER_PEER` | pin the mim outer hop only (overrides the outer half of `AETHER_MIM_PEERS`) |
+| `AETHER_MIM_INNER_PEER` | pin the mim inner hop only; must land on a different edge than the outer hop |
+
+CLI flags (manual runs): `--mim` selects the transport, `--mim-outer <addr>`,
+`--mim-inner <addr>`, `--mim-peers <list>` pin the hops, `--protocol <name>`
+matches `AETHER_PROTOCOL`. Unknown flags, missing values and conflicting
+protocol choices are refused, not silently ignored.
 | `AETHER_CONFIG` | config file path |
 | `AETHER_TUN` | enable full-tunnel path where supported |
 | `AETHER_WG_NO_PROFILE_RETRY` | skip extra WG profile retries |
