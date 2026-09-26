@@ -287,7 +287,16 @@ export function ConnectionTab({
             <span>{PINNED_PEER_LABEL}</span>
             <code>{settings.peer}</code>
           </div>
-          <button type="button" className="pinned-peer-clear-btn" onClick={() => patchSettings({ peer: "" })}>
+          <button
+            type="button"
+            className="pinned-peer-clear-btn"
+            onClick={() => patchSettings({ peer: "" })}
+            // Parity with the desktop twin: patchSettings is a no-op while a
+            // session runs or before hydration, and a visible button that does
+            // nothing is worse than a disabled one that says why.
+            disabled={settingsLocked}
+            title={settingsLocked ? "Disconnect the tunnel to change the target endpoint" : "Stop targeting this endpoint"}
+          >
             {PINNED_PEER_CLEAR_LABEL}
           </button>
         </div>
@@ -317,7 +326,7 @@ export function ConnectionTab({
               >
                 <div className="profile-card-top">
                   <strong>{profile.label}</strong>
-                  {active && <small className="profile-active-tag">IN USE</small>}
+                  {active && <small className="profile-active-tag">ACTIVE</small>}
                 </div>
                 <span>{profile.hint}</span>
               </button>

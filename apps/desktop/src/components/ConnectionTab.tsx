@@ -133,7 +133,6 @@ export function ConnectionTab({
   // The only latency this app has is the shell's measurement of the probe that
   // proved the endpoint; `testResult` is a sentence, not a reading.
   const displayLatency = roundTripLabel(runtime.handshakeRttMs);
-  const displayLoss = "not measured";
   const engine = processStateCopy(runtime.pid);
 
   return (
@@ -284,7 +283,7 @@ export function ConnectionTab({
                 onClick={() => {
                   if (settingsLocked || active) return;
                   patchSettings({ ...profile.patch, peer: "" });
-                  appendLog({ level: "info", message: `Applied profile: ${profile.label} — ${profile.hint}` });
+                  appendLog({ level: "info", message: `Applied preset: ${profile.label} — ${profile.hint}` });
                 }}
               >
                 <div className="profile-card-top">
@@ -329,10 +328,6 @@ export function ConnectionTab({
                   <Activity size={11} aria-hidden="true" /> ROUND-TRIP LATENCY
                 </span>
                 <span className="stat-value tabular-nums">{displayLatency}</span>
-              </div>
-              <div className="stat-unit">
-                <span className="stat-label">PACKET LOSS</span>
-                <span className="stat-value tabular-nums">{displayLoss}</span>
               </div>
               <div className="stat-unit">
                 <span className="stat-label">IP STACK</span>

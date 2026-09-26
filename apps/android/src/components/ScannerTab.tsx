@@ -35,6 +35,9 @@ interface ScannerTabProps {
   active: boolean;
   scanState: ScanState;
   busy: boolean;
+  /** Whether a tunnel session is live: a scan start disconnects it, so the CTA
+      becomes a two-step confirm instead of dropping the VPN on one click. */
+  running: boolean;
   startScan: () => void;
   stopScan: () => void;
   connectDirect: (item: DiscoveredEndpoint) => void;
@@ -82,10 +85,18 @@ export function ScannerTab({
   timeoutMs, setTimeoutMs,
   noize, setNoize,
   endpoints, active, scanState, busy,
+  running,
   startScan, stopScan,
   connectDirect, connectBusy,
 }: ScannerTabProps) {
   const [protoFilter, setProtoFilter] = useState<ProtoFilter>("all");
+  // First click arms the confirmation, second commits — parity with the desktop
+  // twin: the scan start silently `disconnect`s a live tunnel, which used to
+  // drop the VPN on a single press with no surface beyond one log line.
+  const [confirmTunnelDrop, setConfirmTunnelDrop] = useState(false);
+  useEffect(() => {
+    if (active || !running) setConfirmTunnelDrop(false);
+  }, [active, running]);
   const listRef = useRef<HTMLDivElement | null>(null);
 
   const filteredEndpoints = useMemo(() => {
@@ -219,15 +230,39 @@ export function ScannerTab({
         {/* Master Scan CTA Button */}
         <div className="scanner-action-bar">
           {!active ? (
-            <button
-              type="button"
-              className="primary-cta connect"
-              onClick={startScan}
-              disabled={busy}
-            >
-              <Zap size={18} aria-hidden="true" />
-              <span>{busy ? "Engaging Scanner Engine…" : "Start Standalone Edge Scan"}</span>
-            </button>
+            <>
+              {running && confirmTunnelDrop && (
+                <div className="error-banner" role="alert">
+                  <div className="error-banner-content">
+                    <span>Starting a scan disconnects the active tunnel.</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="banner-action"
+                    onClick={() => setConfirmTunnelDrop(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+              <button
+                type="button"
+                className="primary-cta connect"
+                onClick={() => (running && !confirmTunnelDrop ? setConfirmTunnelDrop(true) : startScan())}
+                disabled={busy}
+              >
+                <Zap size={18} aria-hidden="true" />
+                <span>
+                  {busy
+                    ? "Engaging Scanner Engine…"
+                    : running && !confirmTunnelDrop
+                      ? "Scan (disconnects the VPN) — confirm first"
+                      : running
+                        ? "Confirm: Disconnect VPN & Scan"
+                        : "Start Standalone Edge Scan"}
+                </span>
+              </button>
+            </>
           ) : (
             <button
               type="button"

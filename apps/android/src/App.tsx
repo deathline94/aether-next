@@ -285,6 +285,7 @@ function App() {
               noize={scanner.noize} setNoize={scanner.setNoize}
               endpoints={scanner.endpoints} active={scanner.active}
               scanState={scanner.scanState} busy={scanner.busy}
+              running={running}
               startScan={scanner.startScan} stopScan={scanner.stopScan}
               connectDirect={connectDirect} connectBusy={busy}
             />

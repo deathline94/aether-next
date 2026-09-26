@@ -110,6 +110,7 @@ describe("android a11y (axe)", () => {
       stopScan: () => {},
       connectDirect: () => {},
       connectBusy: false,
+    running: false,
     };
     const endpoints: DiscoveredEndpoint[] = [
       { addr: "162.159.193.1:443", rtt: "18 ms", rttMs: 18, protocol: "masque-h3" },

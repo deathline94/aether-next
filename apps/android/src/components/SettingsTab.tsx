@@ -13,6 +13,8 @@ import type { Settings } from "../types";
 import { normalizeNoize } from "../settingsPayload";
 import { saveDockCopy, saveStateOf } from "../saveState";
 import type { SaveState } from "../saveState";
+import { noiseIsInert } from "@aether/ui";
+import { NOIZE_OPTIONS } from "@aether/ui/enums";
 import { NumberField, Segmented, Toggle } from "./ui";
 import type { IpcError } from "../ipcError";
 
@@ -220,31 +222,28 @@ export function SettingsTab({
           <div>
             <div className="setting-label-row">
               <strong>Handshake Obfuscation</strong>
-              {settings.noize !== "off" && <span className="tactical-chip amber">ACTIVE JUNK</span>}
+              {settings.noize !== "off" && !noiseIsInert(settings.protocol, settings.transport) && <span className="tactical-chip amber">ACTIVE JUNK</span>}
             </div>
             <span>
-              {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h2"
+              {noiseIsInert(settings.protocol, settings.transport)
                 ? "UDP junk frames are not applicable for HTTP/2 TCP streams"
                 : "Inject randomized pre-handshake padding to prevent active protocol fingerprinting"}
             </span>
           </div>
           <select
-            disabled={settingsLocked || ((settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h2")}
+            disabled={settingsLocked || noiseIsInert(settings.protocol, settings.transport)}
             aria-label="Obfuscation noise profile"
             className="tactical-select"
             value={normalizeNoize(settings.noize) ?? settings.noize}
             onChange={(e) => patchSettings({ noize: e.target.value })}
           >
-            <option value="off">Off — Zero Noise</option>
-            <option value="light">Light — Subtle Disruption</option>
-            <option value="medium">Medium — Standard Defense</option>
-            <option value="high">High — Heavy Resistance</option>
-            <option value="max">Max — Maximum Entropy</option>
-            <option value="custom">Custom — Parameter Matrix</option>
+            {NOIZE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
           </select>
         </div>
 
-        {settings.noize === "custom" && settings.transport !== "h2" && (
+        {settings.noize === "custom" && !noiseIsInert(settings.protocol, settings.transport) && (
           <div className="custom-noise-matrix">
             <div className="matrix-title">
               <SlidersHorizontal size={14} aria-hidden="true" />
