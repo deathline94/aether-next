@@ -1241,6 +1241,14 @@ fn ech_related(err: &AetherError) -> bool {
 }
 
 async fn resolve_ech() -> Option<Vec<u8>> {
+    // One resolution per process: the answer depends only on AETHER_ECH, and a
+    // MiM session used to resolve twice — once for endpoint selection and once
+    // for the tunnel — paying two DNS round trips for the same bytes.
+    static CACHE: tokio::sync::OnceCell<Option<Vec<u8>>> = tokio::sync::OnceCell::const_new();
+    CACHE.get_or_init(resolve_ech_uncached).await.clone()
+}
+
+async fn resolve_ech_uncached() -> Option<Vec<u8>> {
     match crate::runtime_env::var("AETHER_ECH") {
         Some(v)
             if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("disable") =>
@@ -1909,6 +1917,10 @@ async fn run_warp_in_warp(
 
 // ─── MASQUE-in-MASQUE runner ───────────────────────────────────────────────
 
+/** Concurrent tunneled TCP forwards one inner hop will carry before new
+ * local clients wait for a permit. */
+const TCP_FORWARDER_LIMIT: usize = 64;
+
 struct TcpForwarderGuard {
     #[allow(dead_code)]
     listener_task: AbortOnDrop<()>,
@@ -1921,6 +1933,9 @@ async fn spawn_tcp_forwarder(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let local = listener.local_addr()?;
     let stack = outer.clone();
+    // A local runaway client used to be able to open unbounded tunneled
+    // connections; past this many concurrent forwards, new ones wait.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(TCP_FORWARDER_LIMIT));
 
     let task = tokio::spawn(async move {
         let mut clients = tokio::task::JoinSet::new();
@@ -1929,7 +1944,12 @@ async fn spawn_tcp_forwarder(
                 accepted = listener.accept() => {
                     let Ok((sock, _)) = accepted else { break };
                     let stack = stack.clone();
+                    let permits = permits.clone();
                     clients.spawn(async move {
+                        let _permit = match permits.acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        };
                         match stack.open_tcp(remote).await {
                             Ok(conn) => {
                                 let (sender, mut from_stack) = conn.into_split();

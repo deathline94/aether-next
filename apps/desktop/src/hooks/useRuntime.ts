@@ -250,18 +250,21 @@ export function useRuntime(
     const controller = new AbortController();
     fetch(UPDATE_CHECK_URL, { signal: controller.signal })
       .then((res) => res.json())
-      .then((data) => {
+      .then((data: unknown) => {
         if (controller.signal.aborted) return;
-        if (data?.tag_name) {
-          const latest = String(data.tag_name).replace(/^v/, "");
-          if (semverGt(latest, appVersion)) {
-            setUpdateAvailable({
-              version: data.tag_name,
-              url: typeof data.html_url === "string"
-                ? data.html_url
-                : "https://github.com/deathline94/aether-next/releases/latest",
-            });
-          }
+        // Shape guard, not trust: this is third-party JSON, and String(undefined)
+        // once produced a "version" that compared nonsense.
+        const payload = data as { tag_name?: unknown; html_url?: unknown } | null;
+        const tag = typeof payload?.tag_name === "string" ? payload.tag_name : null;
+        if (!payload || tag === null || tag.length === 0) return;
+        const latest = tag.replace(/^v/, "");
+        if (semverGt(latest, appVersion)) {
+          setUpdateAvailable({
+            version: tag,
+            url: typeof payload.html_url === "string" && payload.html_url.length > 0
+              ? payload.html_url
+              : "https://github.com/deathline94/aether-next/releases/latest",
+          });
         }
       })
       // Advisory: a failure, a rate limit or an abort means no banner, nothing else.
