@@ -329,6 +329,13 @@ export function useRuntime(
 
   const toggleConnection = useCallback(async () => {
     if (busyRef.current || busy) return;
+    // Settings hydration is a load, not a formality: the shell's connect
+    // persists the settings it receives (SessionController.connect stores them),
+    // so a tap before hydration lands would overwrite the user's saved profile
+    // with factory defaults — the exact reason the settings rows are locked on
+    // `settingsLocked`. Disconnecting stays available even when the load failed;
+    // only the connect arm is gated.
+    if (!running && !settingsLoaded) return;
     busyRef.current = true;
     setBusy(true);
     setTestResult(null);
@@ -351,10 +358,13 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: Settings["protocol"], transport: Settings["transport"]) => {
     if (busyRef.current || busy) return;
+    // Same hydration gate as toggleConnection: this connect would persist its
+    // settings, and doing that from a defaults snapshot loses the saved profile.
+    if (!settingsLoaded) return;
     busyRef.current = true;
     setBusy(true);
     setTestResult(null);
@@ -379,7 +389,7 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
 
   const runTest = useCallback(async () => {
     setTestBusy(true);

@@ -626,7 +626,7 @@ class SessionController(
         val s = settings
         val pathReady = when {
             engineAssertedConnected.get() -> true
-            s.protocol.lowercase().startsWith("masque") -> socksSeen.get() && tunnelSeen.get()
+            isMasqueFamily(s.protocol) -> socksSeen.get() && tunnelSeen.get()
             else -> socksSeen.get()
         }
         if (!pathReady) return
@@ -635,8 +635,7 @@ class SessionController(
     }
 
     /** MASQUE-family protocols carry the user's traffic inside the QUIC tunnel. */
-    private fun requiresTunnelPath(protocol: String): Boolean =
-        protocol.lowercase().startsWith("masque")
+    private fun requiresTunnelPath(protocol: String): Boolean = isMasqueFamily(protocol)
 
     private fun maybeStartVpn() {
         if (settings.routingMode != "tun") return
@@ -845,10 +844,20 @@ class SessionController(
                 .put("rtt", src.optString("rtt"))
                 .put("rttMs", src.optDouble("rtt_ms", 0.0))
                 .put("protocol", src.optString("protocol"))
-            "scan_done" -> out
-                .put("addr", src.optString("addr"))
-                .put("rtt", src.optString("rtt"))
-                .put("protocol", src.optString("protocol"))
+            "scan_done" -> {
+                // `best_rtt_ms` is an `Option` in the engine; absent and null both
+                // mean "not measured" and are simply not forwarded, matching the
+                // payload parser's contract. The field used to be dropped
+                // unconditionally, making the shell the one producer that could
+                // never send it.
+                out.put("addr", src.optString("addr"))
+                    .put("rtt", src.optString("rtt"))
+                    .put("protocol", src.optString("protocol"))
+                if (src.has("best_rtt_ms") && !src.isNull("best_rtt_ms")) {
+                    out.put("bestRttMs", src.optDouble("best_rtt_ms"))
+                }
+                out
+            }
         }
         emitScan(out)
     }
@@ -945,6 +954,22 @@ class SessionController(
 
     companion object {
         private const val TAG = "SessionController"
+
+        /**
+         * MASQUE-family protocols nest the user's traffic inside an encrypted
+         * tunnel whose `proxy_ready` can precede the tunnel itself, so readiness
+         * and VPN bring-up must wait for `tunnel_ready`. This must stay in step
+         * with the engine's `Protocol` vocabulary (masque side only): "mim" used
+         * to fall through the startsWith("masque") check this replaces and take
+         * the WireGuard readiness arm — the exact early-tunnel blackhole the
+         * fail-closed gate (T129) was built to prevent.
+         */
+        fun isMasqueFamily(protocol: String): Boolean =
+            when (protocol.lowercase().trim()) {
+                "masque", "masque-h2", "masque-h3", "h2", "h3", "warp",
+                "mim", "m2", "masque-in-masque", "masqueinmasque" -> true
+                else -> false
+            }
 
         /** The UI's own caps for the custom noise profile; a save beyond them is junk input. */
         const val NOIZE_JC_MAX = 64

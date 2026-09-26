@@ -238,7 +238,9 @@ export function ConnectionTab({
               type="button"
               className={`master-toggle-btn ${running ? "stop" : ""}`}
               onClick={toggleConnection}
-              disabled={busy}
+              // Disconnecting must stay possible even while settings have not
+              // loaded (or failed to load); only the connect arm waits.
+              disabled={busy || (!running && !settingsLoaded)}
               aria-label={powerControlLabel(running)}
             >
               <div className="btn-surface">

@@ -68,21 +68,38 @@ function App() {
     const proto = item.protocol.toLowerCase();
     const protocol = proto.includes("wireguard") || proto.includes("wg") ? "wireguard" : "masque";
     const transport = proto.includes("h3") ? "h3" : "h2";
+    // A tap that would do nothing must say so: connectToPeer refuses silently
+    // while a transition is already in flight or settings are still loading, and
+    // a silent no-op read as a dead button.
+    if (busy) {
+      appendLog({ level: "warn", message: "A connect or scan stop is already in flight; wait for it to settle." });
+      return;
+    }
+    if (!settingsLoaded) {
+      appendLog({ level: "warn", message: "Settings are still loading; try the direct connect again in a moment." });
+      return;
+    }
     appendLog({ level: "info", message: `Direct connecting to gateway: ${item.addr} (${item.protocol})` });
     if (scanner.active || scanner.busy) {
+      // The Kotlin scan lane already enforces stopAndWait before the engine is
+      // reused, so a fixed sleep after stopScan only added latency.
       await scanner.stopScan();
-      await new Promise((r) => setTimeout(r, 200));
     }
     void connectToPeer(item.addr, protocol, transport);
     setView("home");
-  }, [connectToPeer, appendLog, scanner.active, scanner.busy, scanner.stopScan]);
+  }, [busy, settingsLoaded, connectToPeer, appendLog, scanner.active, scanner.busy, scanner.stopScan]);
 
-  // Auto-clear logs after every new connect or clean disconnect
+  // Auto-clear logs when a *fresh* session starts (from an idle status) or a
+  // clean disconnect lands. The shell reuses "connecting" for supervised tunnel
+  // recovery, and clearing on every entry into "connecting" wiped the diagnostic
+  // record of the very failure being recovered from — the evidence died with the
+  // recovery. Only a transition out of an idle status is a user-initiated start.
   const prevStatusRef = useRef(runtime.status);
   useEffect(() => {
     const prev = prevStatusRef.current;
     if (prev !== runtime.status) {
-      if (runtime.status === "connecting") {
+      const idle = prev === "disconnected" || prev === "error";
+      if (runtime.status === "connecting" && idle) {
         clearLogs();
       } else if (runtime.status === "disconnected" && prev !== "disconnected") {
         clearLogs();
@@ -287,6 +304,12 @@ function App() {
               retrySettings={retrySettings}
               saved={saved} saveError={saveError} admin={admin}
               patchSettings={patchSettings}
+              // ITEM 10's last visible piece, finally wired: the panel the user
+              // navigates to in order to fix a corrupt profile has to agree with
+              // this banner, or it is the one screen that says nothing is wrong.
+              corrupt={settingsCorrupt
+                ? { notice: settingsCorruptionNotice ?? "", busy: resetSettingsBusy, onReset: () => void resetSettings() }
+                : undefined}
             />
           </ErrorBoundary>
         )}

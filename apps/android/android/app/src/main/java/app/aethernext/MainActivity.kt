@@ -46,6 +46,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Runs the post-consent reconnect off the main thread; see [retryConnect].
+     * Single thread so re-drive attempts stay ordered behind each other.
+     */
+    private val connectExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "aether-connect").apply { isDaemon = true }
+    }
+
+    /**
      * The document currently loaded, captured on the UI thread in `onPageStarted`
      * and read from the JavaBridge thread by [AetherBridge]. `WebView.getUrl()`
      * must not be called off the UI thread, so the shell keeps its own volatile
@@ -83,8 +91,21 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
             val types = WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             val bars = insets.getInsets(types)
-            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
-            WindowInsetsCompat.Builder(insets).setInsets(types, Insets.NONE).build()
+            // The keyboard is consumed into the same padding: with decor-fits off,
+            // adjustResize no longer resizes the window, so nothing else shrank the
+            // WebView and the Settings tab's port fields and sticky save dock sat
+            // behind the soft keyboard. Max with the nav bar so an open IME replaces
+            // the navigation inset rather than stacking on top of it.
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            val bottom = maxOf(bars.bottom, ime.bottom)
+            view.setPadding(bars.left, bars.top, bars.right, bottom)
+            // Zero the consumed types before they reach WebView: newer WebView
+            // versions also expose them as CSS safe-area values, and both the bar
+            // and the keyboard inset have already been turned into padding here.
+            WindowInsetsCompat.Builder(insets)
+                .setInsets(types, Insets.NONE)
+                .setInsets(WindowInsetsCompat.Type.ime(), Insets.NONE)
+                .build()
         }
         setContentView(content)
         ViewCompat.requestApplyInsets(content)
@@ -365,14 +386,30 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Re-drive the connect that was interrupted by the VPN consent sheet.
+     *
+     * [SessionController.connect] forks the engine process and can block for
+     * seconds (KeyStore handoff retries, `stopAndWait` on a stopping child), and
+     * both callers — the onActivityResult callback and the already-prepared
+     * branch of [requestVpnPermission] — run on the main thread. Doing this
+     * inline is how a fresh install ANRs at the exact moment the user grants
+     * consent; the work belongs on [connectExecutor], with the state emission
+     * posted back to the UI thread for the WebView.
+     */
     private fun retryConnect() {
-        val s = session.getSettings()
-        val err = session.connect(s)
-        if (err != null && err != "VPN_PERMISSION_REQUIRED") {
-            emitToJs(
-                "session://state",
-                RuntimeState(status = "error", detail = err, pid = null, endpoint = null).toJson(),
-            )
+        val controller = session
+        connectExecutor.execute {
+            val s = controller.getSettings()
+            val err = controller.connect(s)
+            if (err != null && err != "VPN_PERMISSION_REQUIRED") {
+                runOnUiThread {
+                    emitToJs(
+                        "session://state",
+                        RuntimeState(status = "error", detail = err, pid = null, endpoint = null).toJson(),
+                    )
+                }
+            }
         }
     }
 

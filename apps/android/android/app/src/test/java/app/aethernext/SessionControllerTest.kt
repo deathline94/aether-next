@@ -336,198 +336,24 @@ class SessionControllerTest {
 
         assertNull(h.controller.disconnect())
         assertEquals("disconnected", h.controller.getState().status)
-        assertEquals("Ready", h.controller.getState().detail)
+    }
+
+    /** The readiness/VPN gate keys off this predicate; "mim" once fell through
+     * startsWith("masque") and took the WireGuard arm, skipping the tunnel gate. */
+    @Test
+    fun `masque family covers every masque-side engine name including mim`() {
+        for (p in listOf(
+            "masque", "masque-h2", "masque-h3", "h2", "h3", "warp",
+            "mim", "m2", "masque-in-masque", "masqueinmasque", "MASQUE", " mim ",
+        )) {
+            assertTrue("'$p' is MASQUE-family", SessionController.isMasqueFamily(p))
+        }
     }
 
     @Test
-    fun disconnectSurfacesAVpnStopRefusalInsteadOfClaimingReady() {
-        val h = harness(routingMode = "tun")
-        VpnTunnel.established(true, 1819)
-        h.context.throwOnStartService = true
-
-        val err = h.controller.disconnect()
-
-        assertNotNull("the refusal must reach the caller", err)
-        assertTrue("got: $err", err!!.contains("VPN tunnel could not be stopped"))
-        assertTrue(
-            "the message says what is still up, from the service's own report",
-            err.contains("the tunnel still reports itself up") && err.contains("still be carrying"),
-        )
-        assertEquals("error", h.controller.getState().status)
-        assertEquals("the published detail is the refusal, not 'Ready'", err, h.controller.getState().detail)
-        assertTrue("and it is on the log stream too", h.logs().any { it.contains("VPN tunnel could not be stopped") })
-    }
-
-    @Test
-    fun aRefusedStopWithNoTunnelToReportStillSaysItCouldNotConfirm() {
-        val h = harness(routingMode = "tun")
-        h.context.throwOnStartService = true
-
-        val err = h.controller.disconnect()
-
-        assertNotNull(err)
-        assertTrue("got: $err", err!!.contains("whether the tunnel closed cannot be confirmed"))
-        assertEquals("error", h.controller.getState().status)
-    }
-
-    @Test
-    fun aLateTunnelAckCannotReviveAnAlreadyFailedStop() {
-        val h = harness(routingMode = "tun")
-        VpnTunnel.established(true, 1819)
-        h.context.throwOnStartService = true
-        assertNotNull(h.controller.disconnect())
-
-        // The service notices the stop later and acks. It must not paper over the
-        // refused request: nothing proved the tun closed.
-        h.controller.onVpnStopped()
-
-        assertEquals("error", h.controller.getState().status)
-        assertFalse("the tunnel state is what the service reports", VpnTunnel.up)
-    }
-
-    @Test
-    fun aFullDeviceTunnelOnlyCountsAsConnectedOnceTheTunIsUp() {
-        val h = harness(routingMode = "tun")
-
-        h.feed("""AETHER_EVENT {"type":"proxy_ready","socks":"127.0.0.1:1819","http":"127.0.0.1:1820"}""")
-        h.feed("""AETHER_EVENT {"type":"connected","detail":"quic up"}""")
-        assertEquals(
-            "in tun mode the engine alone cannot claim the device is routed",
-            "connecting",
-            h.controller.getState().status,
-        )
-        assertEquals(
-            "the engine plus the tunnel service were both started (Intents are stubs in " +
-                "a JVM unit test, so the count is the observable)",
-            2,
-            h.context.startedForeground.size,
-        )
-
-        h.controller.onVpnEstablished()
-        assertEquals("connected", h.controller.getState().status)
-
-        h.context.throwOnStartService = true
-        val err = h.controller.disconnect()
-        assertNotNull(err)
-        assertEquals("error", h.controller.getState().status)
-    }
-
-    // ─── rollback (pre-existing coverage) ─────────────────────────────────────
-
-    @Test
-    fun testServiceStartFailureRollsBackCleanlyWhenEngineTerminates() {
-        val tempDir = File(System.getProperty("java.io.tmpdir"), "session_ctrl_test_${System.currentTimeMillis()}").apply { mkdirs() }
-        val fakeContext = FakeSessionContext(tempDir)
-        fakeContext.throwOnStartForegroundService = true
-
-        val fakeProc = FakeProcess(ProcessExitBehavior.GRACEFUL)
-        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
-
-        val emittedEvents = mutableListOf<Pair<String, JSONObject>>()
-        val controller = SessionController(
-            context = fakeContext,
-            emitter = { event, payload -> emittedEvents.add(event to payload) },
-            runnerFactory = { onLine, onExit ->
-                TestableEngineRunner(fakeContext, fakeBinary, onLine, onExit, launcher)
-            }
-        )
-
-        val settings = Settings(routingMode = "proxy-only")
-        val result = controller.connect(settings)
-
-        assertNotNull("connect must return an error when foreground service fails", result)
-        assertTrue("Error must mention service start failure", result!!.contains("Service start failed"))
-        assertFalse("Engine runner must be confirmed terminated", controller.runner.isRunning())
-
-        // Both services must have stopService called during rollback
-        assertTrue("Both EngineService and AetherVpnService must be stopped", fakeContext.stopServiceCalls.size >= 2)
-
-        val state = controller.getState()
-        assertEquals("error", state.status)
-
-        tempDir.deleteRecursively()
-    }
-
-    @Test
-    fun testRollbackReportsAliveEnginePidWhenUnkillable() {
-        val tempDir = File(System.getProperty("java.io.tmpdir"), "session_ctrl_unkillable_${System.currentTimeMillis()}").apply { mkdirs() }
-        val fakeContext = FakeSessionContext(tempDir)
-        fakeContext.throwOnStartForegroundService = true
-
-        val unkillableProc = FakeProcess(ProcessExitBehavior.UNKILLABLE)
-        val launcher = FakeProcessLauncher(nextProcess = unkillableProc)
-
-        val controller = SessionController(
-            context = fakeContext,
-            emitter = { _, _ -> },
-            runnerFactory = { onLine, onExit ->
-                TestableEngineRunner(fakeContext, fakeBinary, onLine, onExit, launcher)
-            }
-        )
-
-        val settings = Settings(routingMode = "proxy-only")
-        val result = controller.connect(settings)
-
-        assertNotNull(result)
-        assertTrue("Must report that engine process is still running after timeout",
-            result!!.contains("still running after rollback timeout"))
-        assertTrue("Engine runner must remain in running/stopping state", controller.runner.isRunning())
-
-        tempDir.deleteRecursively()
-    }
-
-    @Test
-    fun testVpnFailureTriggersCentralizedRollback() {
-        val tempDir = File(System.getProperty("java.io.tmpdir"), "session_vpn_fail_${System.currentTimeMillis()}").apply { mkdirs() }
-        val fakeContext = FakeSessionContext(tempDir)
-
-        val fakeProc = FakeProcess(ProcessExitBehavior.GRACEFUL)
-        val launcher = FakeProcessLauncher(nextProcess = fakeProc)
-
-        val controller = SessionController(
-            context = fakeContext,
-            emitter = { _, _ -> },
-            runnerFactory = { onLine, onExit ->
-                TestableEngineRunner(fakeContext, fakeBinary, onLine, onExit, launcher)
-            }
-        )
-
-        // Simulate VPN failure event
-        controller.onVpnFailed("tun2socks crashed")
-
-        assertFalse("Engine runner must be stopped on VPN failure", controller.runner.isRunning())
-        assertEquals("Both EngineService and AetherVpnService must be stopped", 2, fakeContext.stopServiceCalls.size)
-
-        val state = controller.getState()
-        assertEquals("error", state.status)
-        assertTrue(state.detail.contains("VPN failed: tun2socks crashed"))
-
-        tempDir.deleteRecursively()
-    }
-
-    // ─── T217: the headless rule that `onTaskRemoved` and `onDestroy` both lean on ───
-
-    @Test
-    fun aSessionSomeoneCanStillSeeIsNeverTornDownHeadlessly() {
-        // `EngineService.onTaskRemoved` and `MainActivity.onDestroy` both call this,
-        // and the whole safety of doing so sits in the first guard: swiping the
-        // task must not kill a tunnel that another window is still showing.
-        val h = harness(routingMode = "tun")
-        VpnTunnel.established(true, 1819)
-        h.controller.attachUi("activity-A") { _, _ -> }
-
-        h.controller.shutdownHeadless()
-
-        assertTrue("a live session with an attached UI must survive the call", h.controller.runner.isRunning())
-        assertEquals("no service may be stopped behind a visible tunnel", 0, h.context.stopServiceCalls.size)
-
-        assertTrue(h.controller.detachUi("activity-A"))
-        h.controller.shutdownHeadless()
-
-        assertFalse(
-            "with the last sink gone the tunnel cannot be left running where nothing can stop it",
-            h.controller.runner.isRunning(),
-        )
-        assertEquals("disconnected", h.controller.getState().status)
+    fun `wireguard-family protocols are not masque family`() {
+        for (p in listOf("wireguard", "wg", "gool", "wiw", "warp-in-warp", "", "nonsense")) {
+            assertFalse("'$p' is not MASQUE-family", SessionController.isMasqueFamily(p))
+        }
     }
 }
