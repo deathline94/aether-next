@@ -140,3 +140,4 @@ local.properties
 PRODUCT.md
 architecture-review-*.html
 test_engine.log
+.zcode/
