@@ -1,5 +1,5 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, ScanState } from "../types";
 import { NumberField, Segmented } from "./ui";
@@ -75,7 +75,7 @@ function CopyIpButton({ addr }: { addr: string }) {
   );
 }
 
-export function ScannerTab({
+function ScannerTabImpl({
   protocol, setProtocol,
   ipScan, setIpScan,
   concurrency, setConcurrency,
@@ -498,3 +498,7 @@ export function ScannerTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ScannerTab = memo(ScannerTabImpl);

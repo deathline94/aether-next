@@ -17,6 +17,7 @@ import {
   effectiveScanTimeout,
   isEndpointForProtocol,
   SCAN_PHASES,
+  SCAN_MAX_DISCOVERED,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
 } from "@aether/ui";
@@ -202,8 +203,13 @@ export function useScanner(
           // RTT of whichever transport happened to answer first.
           const current = endpointsRef.current;
           if (current.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) break;
+          // The list is kept sorted by RTT, so once it is full a new hit slower
+          // than the stored worst is dropped instead of appended.
+          const worst = current[current.length - 1];
+          if (current.length >= SCAN_MAX_DISCOVERED && worst && ev.rttMs >= worst.rttMs) break;
           const next = [...current, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }]
-            .sort((a, b) => a.rttMs - b.rttMs);
+            .sort((a, b) => a.rttMs - b.rttMs)
+            .slice(0, SCAN_MAX_DISCOVERED);
           endpointsRef.current = next;
           setEndpoints(next);
           break;

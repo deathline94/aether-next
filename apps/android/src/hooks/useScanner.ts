@@ -9,6 +9,7 @@ import {
   clampConcurrency,
   effectiveScanTimeout,
   isEndpointForProtocol,
+  SCAN_MAX_DISCOVERED,
   SCAN_PHASES,
   scanVerdict,
   SCAN_DEFAULT_CONCURRENCY,
@@ -128,9 +129,15 @@ export function useScanner(
           // Keyed on addr + protocol: one address answers the h2 and the h3 handshake
           // and keying on the address alone threw the second one away.
           if (!current.some((e) => e.addr === ev.addr && e.protocol === ev.protocol)) {
+            // Same bound as the desktop twin: full buffer + slower-than-stored
+            // hit is dropped, not appended.
+            const worst = current[current.length - 1];
+            if (current.length >= SCAN_MAX_DISCOVERED && worst && ev.rttMs >= worst.rttMs) {
+              break;
+            }
             const next = [...current, { addr: ev.addr, rtt: ev.rtt, rttMs: ev.rttMs, protocol: ev.protocol }].sort(
               (a, b) => a.rttMs - b.rttMs,
-            );
+            ).slice(0, SCAN_MAX_DISCOVERED);
             endpointsRef.current = next;
             setEndpoints(next);
             // `bestRtt` is derived from the run's own rows, fastest first — not from

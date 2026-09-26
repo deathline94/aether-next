@@ -46,6 +46,13 @@ export const SCAN_MAX_CONCURRENCY_H3 = 16;
  * H3 ceiling instead of restating it, so the default cannot drift from the ladder.
  */
 export const SCAN_DEFAULT_CONCURRENCY = SCAN_MAX_CONCURRENCY_H3;
+/**
+ * The discovered-endpoint buffer's ceiling. A dual-stack run can report
+ * thousands of candidates; the panel ranks and shows the fastest, so once the
+ * buffer is full a slower-than-stored hit is dropped rather than appended —
+ * without this the array, and the copy+sort per hit, grew without bound.
+ */
+export const SCAN_MAX_DISCOVERED = 2000;
 
 /**
  * Whether a scan's probes are QUIC handshakes — the only condition under which

@@ -3,7 +3,7 @@ import {
   FlaskConical, Gauge, Globe2, ListRestart, LockKeyhole, Network,
   Power, Route, ShieldCheck, Sparkles, TerminalSquare, WifiOff, X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { CopyButton } from "./ui";
 import { speedProfiles } from "../types";
 import { profileActive } from "@aether/ui";
@@ -129,7 +129,7 @@ interface ConnectionTabProps {
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void;
 }
 
-export function ConnectionTab({
+function ConnectionTabImpl({
   settings, runtime, busy, testBusy, connected, running, settingsLocked, settingsLoaded,
   admin, online, testResult, appVersion,
   toggleConnection, patchSettings, runTest, dismissError, appendLog,
@@ -557,3 +557,7 @@ export function ConnectionTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ConnectionTab = memo(ConnectionTabImpl);

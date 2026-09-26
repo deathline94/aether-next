@@ -10,7 +10,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { NoizeProfile, Settings } from "../types";
 import {
   IP_FAMILY_OPTIONS,
@@ -83,7 +83,7 @@ interface SettingsTabProps {
   patchSettings: (patch: Partial<Settings>) => void;
 }
 
-export function SettingsTab({
+function SettingsTabImpl({
   settings,
   settingsLocked,
   settingsLoaded,
@@ -634,3 +634,7 @@ export function SettingsTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const SettingsTab = memo(SettingsTabImpl);

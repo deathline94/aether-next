@@ -2590,7 +2590,8 @@ code, kbd, pre {
   padding: 14px 20px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  /* No `gap`: the list is virtualized, so rows are absolutely positioned and
+     the spacing lives in the row's own paddingBottom. */
   max-height: 420px;
   overflow-y: auto;
   /* Reserve the gutter: the list gains its scrollbar somewhere between the 20th

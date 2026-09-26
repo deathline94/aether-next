@@ -8,7 +8,7 @@ import {
   Terminal,
 } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { nextOptionIndex } from "@aether/ui";
 import {
   LOG_FILTER_HINT,
@@ -62,7 +62,7 @@ export function scrollConsoleToBottom(
   }
 }
 
-export function ActivityTab({
+function ActivityTabImpl({
   visibleLogs,
   hasMore,
   filterCounts,
@@ -91,6 +91,9 @@ export function ActivityTab({
     getScrollElement: () => consoleRef.current,
     estimateSize: () => ESTIMATED_ROW_PX,
     overscan: 10,
+    // `.tactical-terminal-screen` pads the scroll container vertically (10px
+    // top); without scrollMargin the row offsets are off by that much.
+    scrollMargin: 10,
   });
 
   // Each programmatic write dispatches exactly one scroll event, but the event
@@ -376,3 +379,7 @@ export function ActivityTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ActivityTab = memo(ActivityTabImpl);

@@ -85,7 +85,9 @@ interface ConnectionTabProps {
   appendLog: (entry: { level: "info" | "warn" | "error"; message: string }) => void;
 }
 
-export function ConnectionTab({
+import { memo } from "react";
+
+function ConnectionTabImpl({
   settings, runtime, busy, testBusy, connected, running, settingsLocked, settingsLoaded,
   admin, testResult, appVersion, updateAvailable, dismissUpdate,
   toggleConnection, patchSettings, runTest, dismissError, appendLog,
@@ -492,3 +494,6 @@ export function ConnectionTab({
   );
 }
 
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ConnectionTab = memo(ConnectionTabImpl);

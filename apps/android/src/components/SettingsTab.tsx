@@ -60,7 +60,9 @@ interface SettingsTabProps {
   patchSettings: (patch: Partial<Settings>) => void;
 }
 
-export function SettingsTab({
+import { memo } from "react";
+
+function SettingsTabImpl({
   settings,
   settingsLocked,
   settingsLoaded,
@@ -601,3 +603,7 @@ export function SettingsTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const SettingsTab = memo(SettingsTabImpl);

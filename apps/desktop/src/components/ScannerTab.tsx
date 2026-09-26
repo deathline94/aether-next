@@ -1,5 +1,5 @@
 import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, DisplayedScanState, NoizeProfile } from "../types";
 import { NOIZE_PROFILES, SCAN_PROTOCOL_OPTIONS, oneOf } from "@aether/ui/enums";
@@ -72,7 +72,7 @@ function CopyIpButton({ addr }: { addr: string }) {
 const ESTIMATED_ENDPOINT_PX = 56;
 const ENDPOINT_GAP_PX = 10;
 
-export function ScannerTab({
+function ScannerTabImpl({
   protocol, setProtocol,
   ipScan, setIpScan,
   concurrency, setConcurrency,
@@ -135,6 +135,9 @@ export function ScannerTab({
     getScrollElement: () => listRef.current,
     estimateSize: () => ESTIMATED_ENDPOINT_PX,
     overscan: 8,
+    // `.discovered-list` pads the scroll container vertically (14px top);
+    // without scrollMargin every item's measured offset is off by that much.
+    scrollMargin: 14,
   });
 
   const protoTabs: { id: ScanProtocolFilter; label: string; count: number }[] = useMemo(
@@ -517,3 +520,6 @@ export function ScannerTab({
   );
 }
 
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ScannerTab = memo(ScannerTabImpl);

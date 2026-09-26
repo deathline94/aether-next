@@ -7,7 +7,7 @@ import {
   Sparkles,
   Terminal,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { nextOptionIndex } from "@aether/ui";
 import {
   LOG_FILTER_HINT,
@@ -58,7 +58,7 @@ export function scrollConsoleToBottom(
   }
 }
 
-export function ActivityTab({
+function ActivityTabImpl({
   visibleLogs,
   hasMore,
   filterCounts,
@@ -339,3 +339,7 @@ export function ActivityTab({
     </div>
   );
 }
+
+// Memoized at the boundary: the log and scan buffers live in App, so every
+// appended line re-rendered all four tabs even when nothing they read changed.
+export const ActivityTab = memo(ActivityTabImpl);
