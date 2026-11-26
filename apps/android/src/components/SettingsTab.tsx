@@ -69,7 +69,7 @@ function SettingsTabImpl({
   saveError,
   corrupt,
   admin,
-  appVersion = "1.3.19",
+  appVersion = "1.3.20",
   isDark = false,
   onToggleTheme,
   updateInfo = null,

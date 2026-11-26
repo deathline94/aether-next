@@ -83,7 +83,7 @@ function SettingsTabImpl({
   saved,
   dirty = false,
   saveError,
-  appVersion = "1.3.19",
+  appVersion = "1.3.20",
   isDark = false,
   onToggleTheme,
   updateInfo = null,

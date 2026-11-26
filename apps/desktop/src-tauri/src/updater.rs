@@ -584,10 +584,6 @@ pub(crate) fn download_and_install_blocking(
 
     #[cfg(windows)]
     if is_portable_zip {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-
         let current_exe = std::env::current_exe().map_err(|e| {
             CommandError::new(
                 "portable_exe_unknown",
@@ -629,77 +625,16 @@ pub(crate) fn download_and_install_blocking(
         let _ = crate::supervision::disconnect_blocking(app.clone());
 
         let script_path = dir.join("apply-portable-update.ps1");
-        let script = r#"param(
-    [Parameter(Mandatory=$true)][int]$ParentPid,
-    [Parameter(Mandatory=$true)][string]$ZipPath,
-    [Parameter(Mandatory=$true)][string]$TargetDir,
-    [Parameter(Mandatory=$true)][string]$LaunchExe
-)
-$ErrorActionPreference = 'Stop'
-for ($i = 0; $i -lt 80; $i++) {
-    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 250
-}
-Start-Sleep -Milliseconds 250
-$stage = Join-Path ([System.IO.Path]::GetDirectoryName($ZipPath)) ('stage-' + [System.Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
-try {
-    Expand-Archive -LiteralPath $ZipPath -DestinationPath $stage -Force
-    $srcRoot = $stage
-    $topExes = @(Get-ChildItem -LiteralPath $stage -Filter '*.exe' -File)
-    if ($topExes.Count -eq 0) {
-        $subDirs = @(Get-ChildItem -LiteralPath $stage -Directory)
-        if ($subDirs.Count -eq 1) { $srcRoot = $subDirs[0].FullName }
-    }
-    $hasExe = @(Get-ChildItem -LiteralPath $srcRoot -Filter '*.exe' -File).Count -gt 0
-    if (-not $hasExe) { throw 'Portable update archive contains no executable.' }
-    $copied = $false
-    for ($try = 0; $try -lt 15; $try++) {
-        try {
-            Copy-Item -Path (Join-Path $srcRoot '*') -Destination $TargetDir -Recurse -Force -ErrorAction Stop
-            $copied = $true
-            break
-        } catch {
-            Start-Sleep -Milliseconds 300
-        }
-    }
-    if (-not $copied) { throw 'Timed out replacing portable update files.' }
-    $toLaunch = if (Test-Path -LiteralPath $LaunchExe) {
-        $LaunchExe
-    } else {
-        $firstExe = Get-ChildItem -LiteralPath $TargetDir -Filter '*.exe' -File | Select-Object -First 1
-        if ($firstExe) { $firstExe.FullName } else { $LaunchExe }
-    }
-    if (Test-Path -LiteralPath $toLaunch) {
-        Start-Process -FilePath $toLaunch -WorkingDirectory $TargetDir
-    }
-} finally {
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
-}
-"#;
-        fs::write(&script_path, script.as_bytes()).map_err(CommandError::from)?;
+        fs::write(&script_path, PORTABLE_UPDATE_SCRIPT.as_bytes()).map_err(CommandError::from)?;
 
-        let powershell = crate::acl::system32(r"WindowsPowerShell\v1.0\powershell.exe")?;
-        let mut cmd = std::process::Command::new(&powershell);
-        cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script_path)
-        .args(["-ParentPid", &std::process::id().to_string()])
-        .arg("-ZipPath")
-        .arg(&dest)
-        .arg("-TargetDir")
-        .arg(target_dir)
-        .arg("-LaunchExe")
-        .arg(&current_exe)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        let mut cmd = build_portable_updater_command(
+            &script_path,
+            std::process::id(),
+            &dest,
+            target_dir,
+            &current_exe,
+            false,
+        )?;
         cmd.spawn().map_err(|e| {
             let msg = format!("Could not start portable updater helper: {e}");
             emit_progress(&app, "error", 0, 0, &msg);
@@ -746,6 +681,135 @@ try {
         status: "restarting".to_string(),
         path: dest_str,
     })
+}
+
+#[cfg(windows)]
+const PORTABLE_UPDATE_SCRIPT: &str = r#"param(
+    [Parameter(Mandatory=$true)][int]$ParentPid,
+    [Parameter(Mandatory=$true)][string]$ZipPath,
+    [Parameter(Mandatory=$true)][string]$TargetDir,
+    [Parameter(Mandatory=$true)][string]$LaunchExe,
+    [switch]$NoLaunch
+)
+$ErrorActionPreference = 'Stop'
+$updatesDir = [System.IO.Path]::GetDirectoryName($ZipPath)
+$logPath = Join-Path $updatesDir 'portable-update.log'
+function Write-Log([string]$msg) {
+    $ts = [DateTime]::UtcNow.ToString('o')
+    Add-Content -LiteralPath $logPath -Value "[$ts] $msg" -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+Set-Content -LiteralPath $logPath -Value "[$(([DateTime]::UtcNow).ToString('o'))] Starting portable update (ParentPid=$ParentPid)" -Encoding UTF8 -ErrorAction SilentlyContinue
+$stage = Join-Path $updatesDir ('stage-' + [System.Guid]::NewGuid().ToString('N'))
+try {
+    for ($i = 0; $i -lt 120; $i++) {
+        if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Start-Sleep -Milliseconds 300
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $stage)
+
+    $srcRoot = $stage
+    $topExes = @(Get-ChildItem -LiteralPath $stage -Filter '*.exe' -File)
+    if ($topExes.Count -eq 0) {
+        $subDirs = @(Get-ChildItem -LiteralPath $stage -Directory)
+        if ($subDirs.Count -eq 1) { $srcRoot = $subDirs[0].FullName }
+    }
+    $hasExe = @(Get-ChildItem -LiteralPath $srcRoot -Filter '*.exe' -File).Count -gt 0
+    if (-not $hasExe) { throw 'Portable update archive contains no executable.' }
+
+    $srcPrefix = $srcRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $files = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File)
+    foreach ($file in $files) {
+        $rel = $file.FullName.Substring($srcPrefix.Length)
+        $destPath = Join-Path $TargetDir $rel
+        $destDir = [System.IO.Path]::GetDirectoryName($destPath)
+        [System.IO.Directory]::CreateDirectory($destDir) | Out-Null
+        $copied = $false
+        $lastErr = $null
+        for ($try = 0; $try -lt 30; $try++) {
+            try {
+                [System.IO.File]::Copy($file.FullName, $destPath, $true)
+                $copied = $true
+                break
+            } catch {
+                $lastErr = $_
+                Start-Sleep -Milliseconds 300
+            }
+        }
+        if (-not $copied) {
+            throw ("Timed out replacing portable file '$rel': " + $lastErr.Exception.Message)
+        }
+    }
+
+    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+    Write-Log "Portable update applied ($($files.Count) files)."
+
+    if (-not $NoLaunch) {
+        $toLaunch = if (Test-Path -LiteralPath $LaunchExe) {
+            $LaunchExe
+        } else {
+            $firstExe = Get-ChildItem -LiteralPath $TargetDir -Filter '*.exe' -File | Select-Object -First 1
+            if ($firstExe) { $firstExe.FullName } else { $LaunchExe }
+        }
+        if (Test-Path -LiteralPath $toLaunch) {
+            Start-Process -FilePath $toLaunch -WorkingDirectory $TargetDir
+            Write-Log "Relaunched $toLaunch."
+        } else {
+            Write-Log "Executable not found after update: $toLaunch"
+        }
+    }
+} catch {
+    Write-Log ("ERROR: " + $_.Exception.Message + "`n" + $_.ScriptStackTrace)
+    throw
+} finally {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#;
+
+#[cfg(windows)]
+fn build_portable_updater_command(
+    script_path: &Path,
+    parent_pid: u32,
+    zip_path: &Path,
+    target_dir: &Path,
+    launch_exe: &Path,
+    no_launch: bool,
+) -> Result<std::process::Command, CommandError> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let powershell = crate::acl::system32(r"WindowsPowerShell\v1.0\powershell.exe")?;
+    let mut cmd = std::process::Command::new(&powershell);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ])
+    .arg(script_path)
+    .args(["-ParentPid", &parent_pid.to_string()])
+    .arg("-ZipPath")
+    .arg(zip_path)
+    .arg("-TargetDir")
+    .arg(target_dir)
+    .arg("-LaunchExe")
+    .arg(launch_exe);
+    if no_launch {
+        cmd.arg("-NoLaunch");
+    }
+    // Never combine DETACHED_PROCESS with CREATE_NO_WINDOW: PowerShell 5.1 exits 0 without running -File.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -859,5 +923,158 @@ mod tests {
         );
         assert_ne!(hex, "0".repeat(64));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[cfg(windows)]
+    fn write_store_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut out = Vec::new();
+        let mut central_dir = Vec::new();
+
+        for (name, data) in entries {
+            let name_bytes = name.as_bytes();
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            let offset = out.len() as u32;
+
+            // Local file header
+            out.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            // Central directory header
+            central_dir.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+            central_dir.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            central_dir.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            central_dir.extend_from_slice(&crc.to_le_bytes());
+            central_dir.extend_from_slice(&size.to_le_bytes());
+            central_dir.extend_from_slice(&size.to_le_bytes());
+            central_dir.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // disk number
+            central_dir.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central_dir.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central_dir.extend_from_slice(&offset.to_le_bytes());
+            central_dir.extend_from_slice(name_bytes);
+        }
+
+        let cd_offset = out.len() as u32;
+        let cd_size = central_dir.len() as u32;
+        out.extend_from_slice(&central_dir);
+
+        // End of central directory
+        let count = entries.len() as u16;
+        out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        out.extend_from_slice(&0u16.to_le_bytes()); // start disk
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+        fs::write(path, out).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_updater_helper_replaces_nested_files_and_cleans_up() {
+        let base =
+            std::env::temp_dir().join(format!("aether-portable-update-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let target_dir = base.join("target");
+        let updates_dir = base.join("updates");
+        fs::create_dir_all(target_dir.join("engine")).unwrap();
+        fs::create_dir_all(&updates_dir).unwrap();
+
+        fs::write(target_dir.join("AetherNext-Desktop.exe"), b"v1-desktop").unwrap();
+        fs::write(target_dir.join("wintun.dll"), b"v1-wintun").unwrap();
+        fs::write(target_dir.join("engine").join("aether.exe"), b"v1-engine").unwrap();
+        fs::write(
+            target_dir.join("engine").join("wintun.dll"),
+            b"v1-engine-wintun",
+        )
+        .unwrap();
+
+        let zip_path = updates_dir.join("AetherNext-portable-windows-x64.zip");
+        write_store_zip(
+            &zip_path,
+            &[
+                ("AetherNext-Desktop.exe", b"v2-desktop"),
+                ("wintun.dll", b"v2-wintun"),
+                ("engine/aether.exe", b"v2-engine"),
+                ("engine/wintun.dll", b"v2-engine-wintun"),
+            ],
+        );
+
+        let script_path = updates_dir.join("apply-portable-update.ps1");
+        fs::write(&script_path, PORTABLE_UPDATE_SCRIPT.as_bytes()).unwrap();
+
+        let launch_exe = target_dir.join("AetherNext-Desktop.exe");
+        let mut cmd = build_portable_updater_command(
+            &script_path,
+            999_999_999,
+            &zip_path,
+            &target_dir,
+            &launch_exe,
+            true,
+        )
+        .unwrap();
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "helper exited with {status}");
+
+        assert_eq!(
+            fs::read(target_dir.join("AetherNext-Desktop.exe")).unwrap(),
+            b"v2-desktop"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("wintun.dll")).unwrap(),
+            b"v2-wintun"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("engine").join("aether.exe")).unwrap(),
+            b"v2-engine"
+        );
+        assert_eq!(
+            fs::read(target_dir.join("engine").join("wintun.dll")).unwrap(),
+            b"v2-engine-wintun"
+        );
+        assert!(!target_dir.join("engine").join("engine").exists());
+        assert!(!zip_path.exists());
+
+        let log = fs::read_to_string(updates_dir.join("portable-update.log")).unwrap();
+        assert!(
+            log.contains("Portable update applied"),
+            "unexpected portable-update.log:\n{log}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
