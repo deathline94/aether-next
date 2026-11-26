@@ -136,11 +136,10 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 const REP_OK: u8 = 0x00;
 const REP_GENERAL: u8 = 0x01;
-/// RFC 1928 §6: 0x02 is "command not supported", 0x07 is "address type not
-/// supported". Answering a refused *command* with 0x07 tells the client its
-/// address was the problem, which sends it looking in the wrong place.
-const REP_CMD_NOT_SUPPORTED: u8 = 0x02;
-const REP_ATYP_NOT_SUPPORTED: u8 = 0x07;
+/// RFC 1928 §6: 0x07 is "Command not supported", 0x08 is "Address type not
+/// supported".
+const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 const CMD_BIND: u8 = 0x02;
 
 /// RFC 1928 / RFC 1929 authentication identifiers.
@@ -216,6 +215,7 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     log::info!("socks5 listening on {listen}");
 
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CLIENTS));
+    let refusal_permits = Arc::new(tokio::sync::Semaphore::new(32));
     let mut transient = 0u32;
     loop {
         let (sock, peer) = match listener.accept().await {
@@ -238,12 +238,15 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
             // T163: at the limit the accepted socket used to be dropped unseen,
             // which reaches the client as a bare RST with no SOCKS reply and no
             // clue. Say no in protocol terms instead, off the accept loop so a
-            // slow client cannot stall it.
+            // slow client cannot stall it (bounded by `refusal_permits`).
             Err(_) => {
                 log::warn!("socks5 at the {MAX_CLIENTS}-session limit; refusing {peer}");
-                tokio::spawn(async move {
-                    let _ = refuse_over_capacity(sock).await;
-                });
+                if let Ok(r_permit) = refusal_permits.clone().try_acquire_owned() {
+                    tokio::spawn(async move {
+                        let _r = r_permit;
+                        let _ = refuse_over_capacity(sock).await;
+                    });
+                }
                 continue;
             }
         };
@@ -306,7 +309,7 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack).await,
+        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, target, port, stack).await,
         CMD_BIND => {
             // BIND is not implemented; refuse it with the command code and close
             // instead of falling through to a protocol-mislabelled reply.
@@ -366,6 +369,7 @@ fn select_auth_method(methods: &[u8], creds_required: bool) -> u8 {
 /// RFC 1929 subnegotiation, then the `0x01, 0x00` success / `0x01, 0x01` failure
 /// reply. The caller has already committed to this method in the greeting.
 async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) -> Result<()> {
+    use zeroize::Zeroize;
     let mut head = [0u8; 2];
     sock.read_exact(&mut head).await?;
     if head[0] != USERPASS_VER {
@@ -379,8 +383,14 @@ async fn authenticate_userpass(sock: &mut TcpStream, want: &(String, String)) ->
     let mut pass = vec![0u8; plen[0] as usize];
     sock.read_exact(&mut pass).await?;
 
-    let ok = secret_eq(&user, want.0.as_bytes()) && secret_eq(&pass, want.1.as_bytes());
-    sock.write_all(&[USERPASS_VER, u8::from(ok)]).await?;
+    let user_ok = secret_eq(&user, want.0.as_bytes());
+    let pass_ok = secret_eq(&pass, want.1.as_bytes());
+    user.zeroize();
+    pass.zeroize();
+    let ok = user_ok & pass_ok;
+    // RFC 1929 §2: status 0x00 indicates success, non-zero (0x01) indicates failure.
+    let status = if ok { 0x00 } else { 0x01 };
+    sock.write_all(&[USERPASS_VER, status]).await?;
     if ok {
         Ok(())
     } else {
@@ -581,9 +591,10 @@ pub fn dns_servers_for_adapter(list: &[SocketAddr]) -> Vec<Ipv4Addr> {
 }
 
 fn valid_dns_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_DNS_NAME_LEN
-        && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+    let trimmed = name.strip_suffix('.').unwrap_or(name);
+    !trimmed.is_empty()
+        && trimmed.len() <= MAX_DNS_NAME_LEN
+        && trimmed.split('.').all(|l| !l.is_empty() && l.len() <= 63)
 }
 
 pub async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
@@ -679,7 +690,7 @@ fn build_dns_query(name: &str, qtype: u16) -> Result<(u16, Vec<u8>)> {
     q.extend_from_slice(&[0x01, 0x00]);
     q.extend_from_slice(&[0x00, 0x01]);
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    for label in name.split('.') {
+    for label in name.strip_suffix('.').unwrap_or(name).split('.') {
         if label.is_empty() || label.len() > 63 {
             // Dropping the label would ask for `example.com` when the client
             // asked for `<64+-byte-label>.example.com`.
@@ -712,6 +723,14 @@ fn parse_dns_answer_id(
             return None;
         }
     }
+    // Require QR=1 (response) and RCODE=0 (no error), and not truncated (TC=0).
+    if resp[2] & 0x80 == 0 || resp[3] & 0x0f != 0 || resp[2] & 0x02 != 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+    if qd != 1 {
+        return None;
+    }
     // M11 fix: the response's question name must echo what we asked. Without
     // this, a same-socket stray/mismatched reply (only qid was checked before)
     // could be parsed as an answer for a different domain.
@@ -721,11 +740,6 @@ fn parse_dns_answer_id(
             return None;
         }
     }
-    // Truncated (TC bit) — refuse; caller may retry or fail.
-    if resp[2] & 0x02 != 0 {
-        return None;
-    }
-    let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
     let an = u16::from_be_bytes([resp[6], resp[7]]) as usize;
     let mut pos = 12;
 
@@ -785,6 +799,10 @@ fn decode_qname(buf: &[u8], mut pos: usize) -> Option<String> {
             }
             pos = ptr;
             continue;
+        }
+        if len & 0xc0 != 0 {
+            // Reserved DNS label type bits (0x40 / 0x80) are invalid here.
+            return None;
         }
         if len == 0 {
             if labels.is_empty() || labels.len() > 127 {
@@ -864,7 +882,7 @@ async fn handle_connect(
     let (sender, mut from_stack) = conn.into_split();
     let (mut rd, mut wr) = sock.into_split();
 
-    let up = tokio::spawn(async move {
+    let _up = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY_BUF];
         loop {
             match rd.read(&mut buf).await {
@@ -873,6 +891,7 @@ async fn handle_connect(
                     break;
                 }
                 Ok(n) => {
+                    crate::counters::bump_by(&crate::counters::BYTES_UP, n as u64);
                     if sender.send(buf[..n].to_vec()).await.is_err() {
                         break;
                     }
@@ -883,7 +902,7 @@ async fn handle_connect(
                 }
             }
         }
-    });
+    }));
 
     while let Some(first) = from_stack.recv().await {
         // Coalesce queued chunks into fewer write syscalls on bulk download.
@@ -895,9 +914,9 @@ async fn handle_connect(
                         // Flush current then keep the overflow as next batch base.
                         if wr.write_all(&batch).await.is_err() {
                             let _ = wr.shutdown().await;
-                            up.abort();
                             return Ok(());
                         }
+                        crate::counters::bump_by(&crate::counters::BYTES_DOWN, batch.len() as u64);
                         batch = more;
                     } else {
                         batch.extend_from_slice(&more);
@@ -909,10 +928,10 @@ async fn handle_connect(
         if wr.write_all(&batch).await.is_err() {
             break;
         }
+        crate::counters::bump_by(&crate::counters::BYTES_DOWN, batch.len() as u64);
     }
 
     let _ = wr.shutdown().await;
-    up.abort();
     Ok(())
 }
 
@@ -946,7 +965,21 @@ async fn relay_bind_addr(control: SocketAddr, peer: SocketAddr) -> Result<Socket
     }
 }
 
-async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
+/// Does a datagram source belong to the client the association is pinned to?
+///
+/// Loopback clients are matched by IP only: a browser opens a fresh UDP socket
+/// (new port) per request, and every loopback client is the same local user.
+/// A non-loopback client must match address and port exactly.
+fn udp_source_matches(allowed: SocketAddr, from: SocketAddr) -> bool {
+    allowed == from || (allowed.ip() == from.ip() && from.ip().is_loopback())
+}
+
+async fn handle_udp_associate(
+    mut sock: TcpStream,
+    declared_target: Target,
+    declared_port: u16,
+    stack: StackHandle,
+) -> Result<()> {
     let control = sock.local_addr()?;
     let peer = sock.peer_addr()?;
     let bind_ip = relay_bind_addr(control, peer).await?;
@@ -965,7 +998,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     let routes: Arc<Mutex<HashMap<SocketAddr, (SocketAddr, Instant)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let resolver_routes = routes.clone();
-    tokio::spawn(async move {
+    let _resolver = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
         while let Some((name, port, payload, from)) = res_rx.recv().await {
             match tokio::time::timeout(Duration::from_secs(4), dns_resolve(&stack, &name)).await {
                 Ok(Ok(ip)) => {
@@ -979,10 +1012,22 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                 _ => log::debug!("[socks-udp] resolve failed for {name}; dropping datagram"),
             }
         }
-    });
+    }));
 
-    // First UDP packet pins the authorized client; later packets from others are dropped.
-    let mut client: Option<SocketAddr> = None;
+    // RFC 1928 §4/§7: if the client declared a non-zero UDP endpoint on the
+    // same IP as its TCP control connection, pin directly to it. Otherwise
+    // (common `0.0.0.0:0` association), pin on the first UDP datagram received
+    // from `peer.ip()` rather than comparing UDP source port against the TCP
+    // control socket's ephemeral port.
+    let declared_ip = match declared_target {
+        Target::Ip(ip) if !ip.is_unspecified() => ip,
+        _ => peer.ip(),
+    };
+    let mut client: Option<SocketAddr> = if declared_port != 0 && declared_ip == peer.ip() {
+        Some(SocketAddr::new(declared_ip, declared_port))
+    } else {
+        None
+    };
     let mut cbuf = vec![0u8; 65535];
     let mut ctrl = [0u8; 256];
     // Reaper state (T136): an association whose client vanished used to hold a
@@ -993,22 +1038,28 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
         tokio::select! {
             r = relay.recv_from(&mut cbuf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => break };
-                match client {
-                    None => client = Some(from),
-                    Some(allowed) if allowed == from => {}
-                    Some(allowed)
-                        if allowed.ip() == from.ip() && from.ip().is_loopback() =>
-                    {
-                        // Same loopback host, new ephemeral port (common for
-                        // multi-socket clients). Restricted to loopback so a
-                        // non-loopback source can never rebind the session (L2 fix).
-                        log::debug!("socks udp client rebind {allowed} -> {from}");
-                        client = Some(from);
+                let pinned = match client {
+                    Some(c) => {
+                        if !udp_source_matches(c, from) {
+                            continue;
+                        }
+                        if from != c {
+                            log::debug!("socks udp client rebind {c} -> {from}");
+                            client = Some(from);
+                        }
+                        from
                     }
-                    Some(_) => continue, // reject any other source
-                }
-                last_activity = Instant::now();
+                    None => {
+                        if from.ip() != peer.ip() {
+                            continue;
+                        }
+                        client = Some(from);
+                        from
+                    }
+                };
+                let _ = pinned;
                 let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) else { continue };
+                last_activity = Instant::now();
                 match dst {
                     Target::Ip(ip) => {
                         if ip.is_ipv6() && is_ipv4_only() {
@@ -1031,7 +1082,6 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
 
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
-                last_activity = Instant::now();
                 // Reply filtering, not forwarding: a datagram from a peer the
                 // client never sent to is dropped, and so is one whose origin
                 // has aged out. There is deliberately no fallback to `client`.
@@ -1039,12 +1089,19 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
                     let mut map = routes.lock();
                     origin_target(&mut map, src, Instant::now())
                 };
-                if target_client.is_none() {
-                    log::debug!("socks udp: dropping unsolicited datagram from {src}");
-                }
-                if let Some(c) = target_client {
-                    let pkt = build_udp_reply(src, &data);
-                    let _ = relay.send_to(&pkt, c).await;
+                match target_client {
+                    // Only a datagram that is actually delivered is liveness;
+                    // an unsolicited stream used to keep a dead association open
+                    // for MAX_SESSION.
+                    Some(c) => {
+                        let pkt = build_udp_reply(src, &data);
+                        if relay.send_to(&pkt, c).await.is_ok() {
+                            last_activity = Instant::now();
+                        }
+                    }
+                    None => {
+                        log::debug!("socks udp: dropping unsolicited datagram from {src}");
+                    }
                 }
             }
 
@@ -1220,15 +1277,49 @@ mod tests {
     use super::{
         association_expired, build_dns_query, check_listener_bind, decode_qname, evict_lru,
         note_origin, parse_dns_answer_id, parse_domain_name, parse_udp_request, proxy_credentials,
-        secret_eq, select_auth_method, session_cap_message, DnsCache, AUTH_NONE,
-        AUTH_NO_ACCEPTABLE, AUTH_USERPASS, DNS_CACHE_MAX, MAX_SESSION, SOCKS_GREETING_REFUSAL,
-        UDP_ASSOC_IDLE, UDP_ASSOC_TICK, UDP_ORIGIN_MAX, VER,
+        secret_eq, select_auth_method, session_cap_message, udp_source_matches, DnsCache,
+        AUTH_NONE, AUTH_NO_ACCEPTABLE, AUTH_USERPASS, DNS_CACHE_MAX, MAX_SESSION,
+        SOCKS_GREETING_REFUSAL, UDP_ASSOC_IDLE, UDP_ASSOC_TICK, UDP_ORIGIN_MAX, VER,
     };
     use std::{
         collections::HashMap,
         net::{IpAddr, SocketAddr},
         time::{Duration, Instant},
     };
+
+    /// The association is pinned to the TCP client, not the first sender: an
+    /// unauthenticated LAN host that reaches the relay port first must not be
+    /// able to claim (and then consume) an authenticated client's association.
+    #[test]
+    fn udp_association_belongs_to_the_tcp_client() {
+        let client: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+        assert!(
+            udp_source_matches(client, client),
+            "the client itself always matches"
+        );
+        let stranger: SocketAddr = "192.0.2.66:40000".parse().unwrap();
+        assert!(
+            !udp_source_matches(client, stranger),
+            "another host must not claim it"
+        );
+        let same_host_other_port: SocketAddr = "192.0.2.10:40001".parse().unwrap();
+        assert!(
+            !udp_source_matches(client, same_host_other_port),
+            "a non-loopback client must keep its port"
+        );
+
+        let loopback: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let loopback_next: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        assert!(
+            udp_source_matches(loopback, loopback_next),
+            "a loopback client may change ephemeral port"
+        );
+        let other_family_loopback: SocketAddr = "[::1]:50001".parse().unwrap();
+        assert!(
+            !udp_source_matches(loopback, other_family_loopback),
+            "v4 and v6 loopback are distinct clients"
+        );
+    }
 
     /// The TUN path used to hardcode `1.1.1.1`/`1.0.0.1` on the adapter while the
     /// proxy path honoured `AETHER_DNS`, so the same setting worked in one mode

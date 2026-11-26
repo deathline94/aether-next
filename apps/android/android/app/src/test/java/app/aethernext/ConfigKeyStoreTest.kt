@@ -6,7 +6,7 @@ import android.content.SharedPreferences
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -185,6 +185,40 @@ class ConfigKeyStoreTest {
             context.fakePrefs.map.containsKey("wrapped_staging"),
         )
         assertTrue("the identity must not have been quarantined", tomlFile.exists())
+        dir.deleteRecursively()
+    }
+
+    /**
+     * A device restored from a backup, or one whose keystore was wiped, has the
+     * wrapping but not the alias that opens it. `keyFor()` used to throw
+     * IllegalStateException, which is neither transient nor corrupt, so every
+     * load rethrew and the app could never recover. The wrapping is useless on
+     * this device, so it must rotate and say the identity is re-provisioned —
+     * without touching settings that have nothing to do with it.
+     */
+    @Test
+    fun aWrappingWhoseKeyStoreAliasIsGoneRotatesInsteadOfBrickingTheApp() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "aether_ks_noalias_${System.currentTimeMillis()}").apply { mkdirs() }
+        val context = FakeKeyStoreContext(dir)
+        val configDir = File(context.filesDir, "config").apply { mkdirs() }
+        val tomlFile = File(configDir, "aether.toml")
+        tomlFile.writeText("device_id = \"unopenable\"")
+        context.fakePrefs.map["unrelated_setting"] = "keep"
+
+        val first = ConfigKeyStore.loadOrCreate(context)
+        mockKeyStore.deleteEntry("aether-config-wrap-v1")
+
+        val recovered = ConfigKeyStore.loadOrCreate(context)
+
+        assertNotEquals("the envelope can never be opened again", first, recovered)
+        assertEquals("and the recovered key is what a second load gets", recovered, ConfigKeyStore.loadOrCreate(context))
+        assertNotNull("a fresh wrapping must be committed", context.fakePrefs.map["wrapped"])
+        assertFalse("the identity encrypted under the lost key is quarantined", tomlFile.exists())
+        assertEquals(
+            "settings that are not part of the key envelope must survive",
+            "keep",
+            context.fakePrefs.map["unrelated_setting"],
+        )
         dir.deleteRecursively()
     }
 

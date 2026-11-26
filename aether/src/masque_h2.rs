@@ -6,12 +6,12 @@ use boring::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslVersion};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
-use rand::Rng;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::consts;
 use crate::error::{AetherError, Result};
+use crate::fragment::{FragmentConfig, FragmentingStream};
 use crate::masque::{self, Capsule, CapsuleParser};
 use crate::quic::{AssignedAddr, Internals};
 use crate::tunnel::AbortOnDrop;
@@ -20,24 +20,24 @@ use crate::tunnel::AbortOnDrop;
 const H2_ALPN: &[u8] = b"\x02h2";
 const CHROME_GROUPS: &str = "X25519:P-256:P-384";
 
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct H2TunnelConfig {
+    #[zeroize(skip)]
     pub peer: SocketAddr,
+    #[zeroize(skip)]
     pub sni: String,
+    #[zeroize(skip)]
     pub authority: String,
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     /// Preferred IPv4 source for data-plane DNS probe (edge-assigned / identity).
+    #[zeroize(skip)]
     pub probe_src: Option<std::net::Ipv4Addr>,
 }
 
 pub fn enabled() -> bool {
-    match crate::runtime_env::var("AETHER_MASQUE_HTTP2") {
-        Some(v) => {
-            let v = v.trim().to_lowercase();
-            v == "1" || v == "true" || v == "h2" || v == "yes" || v == "on"
-        }
-        None => false,
-    }
+    crate::runtime_env::var("AETHER_MASQUE_HTTP2")
+        .is_some_and(|v| crate::runtime_env::truthy(&v) || v.trim().eq_ignore_ascii_case("h2"))
 }
 
 pub fn h2_peer(quic_peer: SocketAddr) -> SocketAddr {
@@ -132,255 +132,12 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
 
 // ─── ClientHello fragmentation ──────────────────────────────────────────────
 
-/// TCP wrapper that splits the FIRST write (the TLS ClientHello from
-/// tokio-boring) across multiple TCP segments with optional inter-segment
-/// delays. This defeats DPI boxes that fingerprint JA3/JA4 from a single
-/// segment by introducing randomness into segment sizes and timing.
-///
-/// Two env control surfaces (composable):
-///   - AETHER_H2_FRAG_CH=1                  legacy on/off toggle (simple 1/3 split)
-///   - AETHER_MASQUE_H2_FRAGMENT={1|true}   full random-fragmentation mode
-///   - AETHER_MASQUE_H2_FRAGMENT_SIZE=lo-hi byte range per chunk (default 16-32)
-///   - AETHER_MASQUE_H2_FRAGMENT_DELAY=lo-hi ms between chunks (default 2-10)
-struct FragFirstWrite {
-    inner: TcpStream,
-    /// Once true, all further writes pass through unchanged (only the first
-    /// ClientHello-sized write is split).
-    done: bool,
-    /// Resolved fragment config (active only for the first write).
-    cfg: FragmentConfig,
-    /// Instant at which the next chunk may be written; None when fragmentation
-    /// is idle. Stored as a plain Instant (Unpin) instead of `Pin<Sleep>` so
-    /// the struct stays `Unpin` — `tokio_boring::connect` + `h2::handshake`
-    /// require the inner stream to be `Unpin`.
-    next_chunk_at: Option<std::time::Instant>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FragmentConfig {
-    enabled: bool,
-    size_min: usize,
-    size_max: usize,
-    delay_min_ms: u64,
-    delay_max_ms: u64,
-}
-
-impl FragmentConfig {
-    /// Legacy 1/3 split (no delay) when only `AETHER_H2_FRAG_CH=1` is set.
-    fn legacy_on() -> Self {
-        Self {
-            enabled: true,
-            size_min: 0,
-            size_max: 0,
-            delay_min_ms: 0,
-            delay_max_ms: 0,
-        }
-    }
-
-    fn disabled() -> Self {
-        Self {
-            enabled: false,
-            size_min: 0,
-            size_max: 0,
-            delay_min_ms: 0,
-            delay_max_ms: 0,
-        }
-    }
-
-    /// Full random-fragmentation mode driven by AETHER_MASQUE_H2_FRAGMENT* env vars.
-    /// Enabled by default to defeat DPI ClientHello SNI blocking.
-    /// Defaults: chunks 16-32 bytes, delay 2-10 ms. Can be disabled via AETHER_MASQUE_H2_FRAGMENT=0/false/off.
-    fn from_env() -> Self {
-        let enabled = match crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT") {
-            Some(v) => {
-                !is_falsy(&v)
-                    && (v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
-            }
-            None => false,
-        };
-        if !enabled {
-            return Self::disabled();
-        }
-        let (size_min, size_max) = parse_range(
-            &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").unwrap_or_default(),
-            (16, 32),
-        );
-        let (delay_min_ms, delay_max_ms) = parse_range(
-            &crate::runtime_env::var("AETHER_MASQUE_H2_FRAGMENT_DELAY").unwrap_or_default(),
-            (2, 10),
-        );
-        let size_min = (size_min.max(1) as usize).max(1);
-        let size_max = (size_max.max(size_min as u64) as usize).max(1);
-        Self {
-            enabled: true,
-            size_min,
-            size_max,
-            delay_min_ms,
-            delay_max_ms: delay_max_ms.max(delay_min_ms),
-        }
-    }
-
-    fn pick_chunk_len(&self, remaining: usize) -> usize {
-        if self.size_max == 0 {
-            // Legacy mode: split at one-third of the first write.
-            return (remaining / 3)
-                .max(90)
-                .min(remaining.saturating_sub(1))
-                .max(1);
-        }
-        let mut rng = rand::thread_rng();
-        let hi = self.size_max.min(remaining);
-        let lo = self.size_min.min(hi);
-        if lo >= hi {
-            hi
-        } else {
-            rng.gen_range(lo..=hi)
-        }
-    }
-
-    fn pick_delay(&self) -> std::time::Duration {
-        if self.delay_max_ms == 0 {
-            return std::time::Duration::ZERO;
-        }
-        let mut rng = rand::thread_rng();
-        let ms = if self.delay_max_ms <= self.delay_min_ms {
-            self.delay_min_ms
-        } else {
-            rng.gen_range(self.delay_min_ms..=self.delay_max_ms)
-        };
-        std::time::Duration::from_millis(ms)
-    }
-}
-
-fn is_falsy(v: &str) -> bool {
-    matches!(
-        v.trim().to_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
-
-fn parse_range(spec: &str, default: (u64, u64)) -> (u64, u64) {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return default;
-    }
-    match spec.split_once('-') {
-        Some((a, b)) => {
-            let lo = a.trim().parse().unwrap_or(default.0);
-            let hi = b.trim().parse().unwrap_or(default.1);
-            if hi < lo {
-                (hi, lo)
-            } else {
-                (lo, hi)
-            }
-        }
-        None => {
-            let v = spec.parse().unwrap_or(default.0);
-            (v, v)
-        }
-    }
-}
-
-impl tokio::io::AsyncRead for FragFirstWrite {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for FragFirstWrite {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        // After the first write, OR if fragmentation disabled, OR slice too
-        // small to fragment: forward untouched.
-        if this.done || !this.cfg.enabled || buf.len() < 16 {
-            this.done = true;
-            return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
-        }
-
-        // If an inter-chunk delay is pending, wait until its deadline elapses.
-        // Poll a throwaway tokio Sleep future scoped to THIS poll cycle only —
-        // storing a `Pin<Sleep>` in the struct would make it `!Unpin` and break
-        // tokio_boring::connect / h2::handshake (both require `Unpin`). The
-        // deadline (an Unpin `Instant`) is what we persist.
-        if let Some(deadline) = this.next_chunk_at {
-            let now = std::time::Instant::now();
-            if now < deadline {
-                let mut sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
-                    deadline,
-                )));
-                if std::future::Future::poll(sleep.as_mut(), cx) != std::task::Poll::Ready(()) {
-                    return std::task::Poll::Pending;
-                }
-            }
-            this.next_chunk_at = None;
-        }
-
-        // First write only — split one chunk, let caller re-poll the remainder.
-        // Multi-chunk fragmentation emerges naturally: tokio-boring keeps
-        // calling poll_write with the leftover bytes; each call sends one chunk.
-        // We flip `done` only when the final chunk is about to be sent so the
-        // pattern terminates deterministically.
-        let chunk_len = this.cfg.pick_chunk_len(buf.len());
-        // Once the remaining buffer fits in a single chunk, mark done after this
-        // write so subsequent writes pass straight through (post-ClientHello).
-        if buf.len() - chunk_len < this.cfg.size_min.max(1) {
-            this.done = true;
-        }
-        match std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[..chunk_len]) {
-            std::task::Poll::Ready(Ok(n)) => {
-                if n > 0 {
-                    let delay = this.cfg.pick_delay();
-                    if !delay.is_zero() {
-                        this.next_chunk_at = Some(std::time::Instant::now() + delay);
-                    }
-                }
-                std::task::Poll::Ready(Ok(n))
-            }
-            other => other,
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
-    }
-}
-
-/// Connect TLS with optional ClientHello fragmentation.
+/// Connect TLS with optional SNI-aware ClientHello fragmentation.
 async fn connect_tls(
     config: ConnectConfiguration,
     sni: &str,
     tcp: TcpStream,
-) -> Result<tokio_boring::SslStream<FragFirstWrite>> {
-    // ClientHello fragmentation is opt-in: it can break strict TLS servers and
-    // middleboxes, so H2 stays standards-compliant by default. Two control paths:
-    //
-    //   legacy simple 1/3 split:  AETHER_H2_FRAG_CH=1        (default: off)
-    //   full random-fragmentation:  AETHER_MASQUE_H2_FRAGMENT=1 plus optional
-    //     AETHER_MASQUE_H2_FRAGMENT_SIZE=lo-hi  (bytes per chunk, default 16-32)
-    //     AETHER_MASQUE_H2_FRAGMENT_DELAY=lo-hi (ms between chunks, default 2-10)
-    //
-    // Full random takes precedence over the legacy toggle if both are set.
+) -> Result<tokio_boring::SslStream<FragmentingStream<TcpStream>>> {
     let mut cfg = FragmentConfig::from_env();
     if !cfg.enabled {
         let legacy = crate::runtime_env::var("AETHER_H2_FRAG_CH")
@@ -394,16 +151,16 @@ async fn connect_tls(
         }
     }
 
-    let wrapper = FragFirstWrite {
-        inner: tcp,
-        done: !cfg.enabled,
-        cfg,
-        next_chunk_at: None,
-    };
-
-    tokio_boring::connect(config, sni, wrapper)
-        .await
-        .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))
+    let wrapper = FragmentingStream::new(tcp, cfg);
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio_boring::connect(config, sni, wrapper),
+    )
+    .await
+    .map_err(|_| AetherError::Tls("h2 tls handshake timeout".into()))?
+    .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
+    stream.get_mut().stop_fragmenting();
+    Ok(stream)
 }
 
 fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
@@ -503,7 +260,7 @@ pub async fn run(
     // can raise the stream window up to a hard cap of 32 MiB for high-BDP links.
     let win_mb = crate::runtime_env::var("AETHER_H2_WINDOW_MB")
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(4)
+        .unwrap_or(8)
         .clamp(1, 32);
     let stream_window = win_mb * 1024 * 1024;
     let conn_window = stream_window.saturating_mul(2);
@@ -556,8 +313,17 @@ pub async fn run(
     let probe_src = cfg
         .probe_src
         .unwrap_or_else(|| std::net::Ipv4Addr::new(198, 18, 0, 1));
-    verify_dataplane(&mut send_stream, &mut recv_body, &mut capsules, probe_src).await?;
-    log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h2\"}}");
+    verify_dataplane(
+        &mut send_stream,
+        &mut recv_body,
+        &mut capsules,
+        probe_src,
+        &addr_tx,
+    )
+    .await?;
+    crate::session_event::emit(crate::session_event::SessionEvent::TunnelReady {
+        transport: "h2".into(),
+    });
     let _ = ready_tx.send(());
 
     // H3 fix: one shared "last traffic" stamp let a dead receive side be kept
@@ -588,7 +354,10 @@ pub async fn run(
                     }
                     // Keep-alive: small DNS probe so half-open links fail fast.
                     if last_send.elapsed() > Duration::from_secs(25) {
-                        let probe = crate::dns::build_dataplane_probe(probe_src_ka, std::net::Ipv4Addr::new(8, 8, 8, 8));
+                        let probe = crate::dns::build_dataplane_probe(
+                            probe_src_ka,
+                            crate::dns::dataplane_probe_target(),
+                        );
                         if let Err(e) = send_ip_batch(&mut send_stream, vec![probe]).await {
                             log::debug!("[h2] keepalive: {e}");
                             return Err(e);
@@ -660,17 +429,17 @@ pub async fn run(
     // Hold the handles by reference so they survive the select, then abort both:
     // whichever task ends first must take its sibling down with it instead of
     // leaving a detached half-tunnel behind.
-    let mut send_task = send_task;
-    let mut recv_task = recv_task;
+    let mut send_task = AbortOnDrop(send_task);
+    let mut recv_task = AbortOnDrop(recv_task);
     let result = tokio::select! {
-        r = &mut send_task => {
+        r = &mut send_task.0 => {
             match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(AetherError::Masque(format!("h2 send task: {e}"))),
             }
         }
-        r = &mut recv_task => {
+        r = &mut recv_task.0 => {
             match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
@@ -678,8 +447,6 @@ pub async fn run(
             }
         }
     };
-    send_task.abort();
-    recv_task.abort();
     result
 }
 
@@ -688,6 +455,7 @@ async fn verify_dataplane(
     recv_body: &mut h2::RecvStream,
     capsules: &mut CapsuleParser,
     mut probe_src: std::net::Ipv4Addr,
+    addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     // The probe and the acceptance test have to name the same resolver, so both
@@ -729,20 +497,24 @@ async fn verify_dataplane(
                         }
                         Ok(Some(Capsule::AddressAssign(addrs))) => {
                             for a in addrs {
-                                if a.ip_version == 4 && a.address.len() == 4 {
-                                    let new_ip = std::net::Ipv4Addr::new(
-                                        a.address[0],
-                                        a.address[1],
-                                        a.address[2],
-                                        a.address[3],
-                                    );
-                                    if new_ip != probe_src {
-                                        log::info!(
-                                            "[h2] edge assigned ipv4 {}, updating probe_src",
-                                            new_ip
-                                        );
-                                        probe_src = new_ip;
-                                        resend_at = Instant::now();
+                                if let Some(ip) =
+                                    crate::tunnel::bytes_to_ip(a.ip_version, &a.address)
+                                {
+                                    if let Some(tx) = addr_tx {
+                                        let _ = tx.try_send(AssignedAddr {
+                                            ip,
+                                            prefix: a.prefix_len,
+                                        });
+                                    }
+                                    if let std::net::IpAddr::V4(new_ip) = ip {
+                                        if new_ip != probe_src {
+                                            log::info!(
+                                                "[h2] edge assigned ipv4 {}, updating probe_src",
+                                                new_ip
+                                            );
+                                            probe_src = new_ip;
+                                            resend_at = Instant::now();
+                                        }
                                     }
                                 }
                             }

@@ -80,6 +80,8 @@ export type Settings = {
   quicInitialFragSize: number;
 };
 
+export type { SessionStats } from "@aether/ui";
+
 export type RuntimeState = {
   status: Status;
   detail: string;

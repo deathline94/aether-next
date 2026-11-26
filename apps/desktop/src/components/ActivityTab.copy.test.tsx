@@ -116,11 +116,10 @@ describe("the desktop console renders the shared table", () => {
       status="connected"
     />);
     const copy = scanProgressCopy(scanState);
-    const card = container.querySelector(".tactical-scan-card");
-    expect(text(card?.querySelector(".scan-title strong"))).toBe(copy.headline);
-    expect(text(card?.querySelector(".badge.concurrency"))).toBe(copy.concurrency);
-    expect(text(card?.querySelector(".badge.working"))).toBe(copy.working);
-    expect(text(card?.querySelector(".badge.rtt"))).toBe(copy.fastest ?? "");
+    const card = container.querySelector('section[aria-label="Active scan progress"]');
+    expect(text(card?.querySelector(".scan-headline"))).toBe(copy.headline);
+    const stats = Array.from(card?.querySelectorAll(".scan-inline-stats .tactical-chip") ?? []).map(text);
+    expect(stats).toEqual([copy.concurrency, copy.working, copy.fastest]);
     expect(text(card?.querySelector(".scan-card-footer small"))).toBe(copy.progressLabel);
     // The old words, which named the fields instead of answering with them.
     expect(card?.textContent ?? "").not.toMatch(/workers|candidates|Probed|Active Engine Scan/i);

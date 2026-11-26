@@ -47,13 +47,14 @@ export function ipFamilyLabel(ipVersion: IpFamily): string {
 }
 
 /** Probe velocity profile. `ScanMode` in the shell. */
-export const SCAN_MODES = ["turbo", "balanced", "thorough", "stealth", "ironclad"] as const;
+export const SCAN_MODES = ["turbo", "balanced", "thorough", "stealth", "verified", "ironclad"] as const;
 export type ScanMode = (typeof SCAN_MODES)[number];
 export const SCAN_MODE_OPTIONS: readonly { value: ScanMode; label: string }[] = [
   { value: "turbo", label: "Turbo (Highest concurrency, fastest startup)" },
   { value: "balanced", label: "Balanced (Optimal speed and route fidelity)" },
   { value: "thorough", label: "Thorough (Deep probe across extensive pools)" },
   { value: "stealth", label: "Stealth (Low rate to minimize traffic anomaly)" },
+  { value: "verified", label: "Verified (Measured Cloudflare gateways only)" },
   { value: "ironclad", label: "Ironclad (Verify every candidate endpoint)" },
 ];
 

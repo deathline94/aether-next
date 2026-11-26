@@ -11,8 +11,8 @@ android {
         applicationId = "app.aethernext"
         minSdk = 26
         targetSdk = 36
-        versionCode = 67
-        versionName = "1.3.15"
+        versionCode = 68
+        versionName = "1.3.16"
     }
 
     // Per-ABI APKs + one fat universal (all engines inside).

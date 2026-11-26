@@ -48,15 +48,16 @@ export interface DiscoveredEndpoint {
  * `DisplayedScanState`. Storing it as well as deriving it is how the "Best" chip
  * ended up naming a slower endpoint than the first row beneath it.
  */
-export interface ScanState {
+export type ScanState = {
   active: boolean;
   mode: string;
   scanned: number;
   total: number;
   concurrency: number;
   working: number;
+  bestRtt?: string | null;
   phase: string;
-}
+};
 
 export type DisplayedScanState = ScanState & { bestRtt: string | null };
 
@@ -98,6 +99,8 @@ export type Settings = {
   /** H3 anti-DPI: bytes of ClientHello in the first Initial (16–512). */
   quicInitialFragSize: number;
 };
+
+export type { SessionStats } from "@aether/ui";
 
 export type RuntimeState = {
   status: Status;

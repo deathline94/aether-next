@@ -45,9 +45,21 @@ beforeEach(() => {
   mocks.settings.routingMode = "proxy-only";
 });
 
-function beacon(): Element {
-  const node = document.querySelector(".beacon-status-text");
-  if (!node) throw new Error("the header renders no .beacon-status-text");
+function statusPill(): Element {
+  const node = document.querySelector(".status-rtt-pill");
+  if (!node) throw new Error("the hero renders no .status-rtt-pill");
+  return node;
+}
+
+function heroTitle(): Element {
+  const node = document.querySelector(".mobile-hero-title");
+  if (!node) throw new Error("the hero renders no .mobile-hero-title");
+  return node;
+}
+
+function heroSubtitle(): Element {
+  const node = document.querySelector('.mobile-hero-subtitle[aria-live="polite"]');
+  if (!node) throw new Error("the hero renders no .mobile-hero-subtitle");
   return node;
 }
 
@@ -69,33 +81,43 @@ async function connect(routingMode: string): Promise<void> {
 describe("App status line follows the routing mode (items 8, 21)", () => {
   it("does not claim a blanket protection for a local-proxy session", async () => {
     await connect("proxy-only");
-    const text = beacon().textContent?.trim() ?? "";
-    expect(text).toBe("Local proxy");
-    expect(text).not.toMatch(/protected/i);
+    const headline = heroTitle().textContent?.trim() ?? "";
+    const subtitle = heroSubtitle().textContent?.trim() ?? "";
+    expect(headline).toBe("Connected");
+    expect(headline).not.toMatch(/protected/i);
+    expect(subtitle).toMatch(/local proxy/i);
+    expect(subtitle).not.toMatch(/every app|protected/i);
   });
 
   it("says the device is routed only when the VPN mode is what is running", async () => {
     await connect("tun");
-    const text = beacon().textContent?.trim() ?? "";
-    expect(text).toBe("Routed");
-    expect(text).not.toMatch(/local proxy/i);
+    const headline = heroTitle().textContent?.trim() ?? "";
+    const subtitle = heroSubtitle().textContent?.trim() ?? "";
+    expect(headline).toBe("Protected");
+    expect(subtitle).toMatch(/every app routed/i);
+    expect(subtitle).not.toMatch(/local proxy/i);
   });
 
   it("reads the stored mode, not an assumption about the default", async () => {
     // `system-proxy` is the shipped default, and on Android it behaves as a local
-    // listener set: an app cannot write the system proxy, so the beacon must not
+    // listener set: an app cannot write the system proxy, so Android must not
     // imply device-wide routing for it either.
     await connect("system-proxy");
-    expect(beacon().textContent?.trim()).toBe("Local proxy");
+    expect(heroTitle().textContent?.trim()).toBe("Connected");
+    expect(heroTitle().textContent?.trim()).not.toMatch(/protected/i);
+    expect(heroSubtitle().textContent?.trim()).toMatch(/local proxy/i);
   });
 
   it("still names the non-connected states in text", async () => {
     await connect("tun");
     emitFrame({ status: "disconnected", detail: "Idle", pid: null, endpoint: null });
-    expect(beacon().textContent?.trim()).toBe("Standby");
+    expect(statusPill().textContent?.trim()).toBe("Standby");
+    expect(heroTitle().textContent?.trim()).toBe("Standby");
     emitFrame({ status: "connecting", detail: "…", pid: null, endpoint: null });
-    expect(beacon().textContent?.trim()).toBe("Connecting");
+    expect(statusPill().textContent?.trim()).toBe("Connecting");
+    expect(heroTitle().textContent?.trim()).toBe("Connecting…");
     emitFrame({ status: "error", detail: "engine died", pid: null, endpoint: null });
-    expect(beacon().textContent?.trim()).toBe("Error");
+    expect(statusPill().textContent?.trim()).toBe("Error");
+    expect(heroTitle().textContent?.trim()).toBe("Connection Failed");
   });
 });

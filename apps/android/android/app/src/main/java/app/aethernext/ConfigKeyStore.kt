@@ -53,6 +53,15 @@ object ConfigKeyStore {
         Exception(message, cause)
 
     /**
+     * A wrapping is stored but the keystore has no key under [ALIAS] — a restored
+     * backup, a wiped keystore, or an OS key reset. No retry can bring the alias
+     * back, and the old envelope cannot be opened on this device: the only way
+     * forward is rotation and re-provisioning the identity.
+     */
+    class MissingMasterKeyException(message: String, cause: Throwable? = null) :
+        Exception(message, cause)
+
+    /**
      * Transient = the keystore provider, its process, or the key service was
      * briefly unavailable. Nothing is wrong with the stored key.
      */
@@ -79,12 +88,9 @@ object ConfigKeyStore {
         while (t != null) {
             if (t is javax.crypto.BadPaddingException ||
                 t is java.security.InvalidAlgorithmParameterException ||
+                t is java.security.InvalidKeyException ||
+                t is IllegalArgumentException ||
                 t is CorruptWrappingException
-            ) {
-                return true
-            }
-            if (t is IllegalArgumentException &&
-                t.message?.contains("too short", ignoreCase = true) == true
             ) {
                 return true
             }
@@ -93,22 +99,25 @@ object ConfigKeyStore {
         return false
     }
 
-    /**
-     * Load, generating on first use.
-     *
-     * Any exception used to fall into `rotateAndRecover()`, which deletes the
-     * master key and quarantines the identity: one transient `keystore2` hiccup
-     * after a system update cost the user their device permanently, and they
-     * would not even know it had happened until a reprovision. Transient faults
-     * are retried and then surfaced; only a genuinely unreadable wrapping is
-     * allowed to trigger rotation.
-     */
+    @Synchronized
     fun loadOrCreate(context: Context): String {
         var last: Exception? = null
         for (attempt in 0..RETRY_DELAYS_MS.size) {
             try {
                 return getOrGenerate(context)
             } catch (e: Exception) {
+                // The wrapping outlived the key it was wrapped under. Retrying is
+                // pointless and has no other recovery, so rotate like a corrupt
+                // wrapping — the old identity cannot be opened on this device.
+                if (e is MissingMasterKeyException) {
+                    Log.w(
+                        TAG,
+                        "config wrapping is present but its keystore alias is gone; " +
+                            "rotating and re-provisioning the identity: ${e.message}",
+                        e,
+                    )
+                    return rotateAndRecover(context)
+                }
                 if (isCorruptWrapping(e)) {
                     Log.w(TAG, "config key wrapping is unreadable; rotating: ${e.message}", e)
                     return rotateAndRecover(context)
@@ -132,6 +141,7 @@ object ConfigKeyStore {
         throw last ?: IllegalStateException("key store unavailable")
     }
 
+    @Synchronized
     fun rotateAndRecover(context: Context): String {
         try {
             val ks = getKeyStore()
@@ -178,22 +188,32 @@ object ConfigKeyStore {
         return getOrGenerate(context)
     }
 
+    private val keyAad = "aether-config-key-v1".toByteArray(Charsets.UTF_8)
+
     private fun unwrap(key: Key, saved: String): ByteArray {
         val b = Base64.getDecoder().decode(saved)
         if (b.size < 12 + 16) {
-            // 12-byte IV + 16-byte GCM tag at minimum. Throwing the classified
-            // exception is what lets `loadOrCreate` tell a truncated blob apart
-            // from a service that is merely busy.
             throw CorruptWrappingException("wrapped config key is truncated (${b.size} bytes)")
         }
+        val iv = b.copyOfRange(0, 12)
+        val ciphertext = b.copyOfRange(12, b.size)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, b.copyOfRange(0, 12)))
-        return cipher.doFinal(b.copyOfRange(12, b.size))
+        return try {
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            cipher.updateAAD(keyAad)
+            cipher.doFinal(ciphertext)
+        } catch (aadErr: javax.crypto.AEADBadTagException) {
+            // Legacy wrappings created before AAD was added must still open.
+            val legacy = Cipher.getInstance("AES/GCM/NoPadding")
+            legacy.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            legacy.doFinal(ciphertext)
+        }
     }
 
     private fun wrap(key: Key, raw: ByteArray): String {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key)
+        cipher.updateAAD(keyAad)
         return Base64.getEncoder().encodeToString(cipher.iv + cipher.doFinal(raw))
     }
 
@@ -204,31 +224,34 @@ object ConfigKeyStore {
         }
     }
 
+    private fun encodeAndZero(raw: ByteArray): String {
+        return try {
+            Base64.getEncoder().encodeToString(raw)
+        } finally {
+            java.util.Arrays.fill(raw, 0.toByte())
+        }
+    }
+
     private fun getOrGenerate(context: Context): String {
         val ks = getKeyStore()
         val p = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-        // A committed wrapping is read *before* any key is generated: the old
-        // order could mint a fresh master key, then discover the stored blob, and
-        // leave the two permanently unable to agree.
         val keyFor: () -> Key = {
-            ks.getKey(ALIAS, null) ?: throw IllegalStateException("KeyStore key missing for alias $ALIAS")
+            ks.getKey(ALIAS, null)
+                ?: throw MissingMasterKeyException("KeyStore key missing for alias $ALIAS")
         }
         val saved = p.getString(KEY_WRAPPED, null)
         if (saved != null) {
-            return Base64.getEncoder().encodeToString(unwrap(keyFor(), saved))
+            return encodeAndZero(unwrap(keyFor(), saved))
         }
 
-        // The authoritative slot is gone but the staging copy survived: that is an
-        // interrupted promotion, not a new install. Recover it rather than
-        // generating a second key that orphans the config encrypted under the first.
         val staged = p.getString(KEY_WRAPPED_STAGING, null)
         if (staged != null) {
             val raw = unwrap(keyFor(), staged)
             commit(p, KEY_WRAPPED, staged)
             p.edit().remove(KEY_WRAPPED_STAGING).apply()
             Log.i(TAG, "recovered the config key from the staging slot after an interrupted promotion")
-            return Base64.getEncoder().encodeToString(raw)
+            return encodeAndZero(raw)
         }
 
         if (!ks.containsAlias(ALIAS)) {
@@ -241,15 +264,17 @@ object ConfigKeyStore {
         val key = keyFor()
         val freshKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val wrapped = wrap(key, freshKey)
-        // Read the wrapping back through the keystore key before either slot is
-        // trusted: a copy that cannot be decrypted here is not a copy at all.
-        if (!unwrap(key, wrapped).contentEquals(freshKey)) {
+        val roundtrip = unwrap(key, wrapped)
+        val matches = roundtrip.contentEquals(freshKey)
+        java.util.Arrays.fill(roundtrip, 0.toByte())
+        if (!matches) {
+            java.util.Arrays.fill(freshKey, 0.toByte())
             throw CorruptWrappingException("freshly wrapped config key failed its read-back check")
         }
         commit(p, KEY_WRAPPED_STAGING, wrapped)
         commit(p, KEY_WRAPPED, wrapped)
         p.edit().remove(KEY_WRAPPED_STAGING).apply()
-        return Base64.getEncoder().encodeToString(freshKey)
+        return encodeAndZero(freshKey)
     }
 
     private fun generateMasterKey() {

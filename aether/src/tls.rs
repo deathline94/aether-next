@@ -100,6 +100,10 @@ pub fn install_pin_verification(
         )));
     }
     let require_chain = set.require_chain;
+    let require_hostname = set.require_hostname;
+    if require_chain {
+        let _ = builder.set_default_verify_paths();
+    }
     if !require_chain {
         // Loud, once, per process: "chain validation is off for this host" is a
         // property of the shipped trust file that a reader has to be able to see
@@ -131,6 +135,10 @@ pub fn install_pin_verification(
             log::error!("[tls] empty certificate chain for {host:?}");
             return false;
         };
+        if require_hostname && !leaf_matches_hostname(leaf, host) {
+            log::error!("[tls] {host:?}: leaf certificate SAN/CN does not match hostname");
+            return false;
+        }
         accept_pinned_leaf(leaf, &pins, now, host)
     });
     Ok(())
@@ -170,6 +178,39 @@ pub fn accept_pinned_leaf(
         );
     }
     matched
+}
+
+fn host_matches_pattern(pattern: &str, host: &str) -> bool {
+    if pattern.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        if let Some((_, rest)) = host.split_once('.') {
+            return !rest.is_empty() && suffix.eq_ignore_ascii_case(rest);
+        }
+    }
+    false
+}
+
+fn leaf_matches_hostname(leaf: &boring::x509::X509Ref, host: &str) -> bool {
+    if let Some(sans) = leaf.subject_alt_names() {
+        let mut saw_dns = false;
+        for name in sans.iter() {
+            if let Some(dns) = name.dnsname() {
+                saw_dns = true;
+                if host_matches_pattern(dns, host) {
+                    return true;
+                }
+            }
+        }
+        if saw_dns {
+            return false;
+        }
+    }
+    leaf.subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+        .filter_map(|e| e.data().as_utf8().ok())
+        .any(|cn| host_matches_pattern(&cn, host))
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
@@ -254,15 +295,19 @@ pub fn build_config(params: &TlsParams) -> Result<quiche::Config> {
         .set_alpn_protos(&alpn)
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    let cert = X509::from_pem(params.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
-    let key =
-        PKey::private_key_from_pem(params.key_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_certificate(&cert)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_private_key(&key)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    if !matches!(params.policy, crate::trust::VerifyPolicy::ReadOnlyProbe)
+        && !params.cert_pem.is_empty()
+    {
+        let cert = X509::from_pem(params.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
+        let key = PKey::private_key_from_pem(params.key_pem)
+            .map_err(|e| AetherError::Tls(e.to_string()))?;
+        builder
+            .set_certificate(&cert)
+            .map_err(|e| AetherError::Tls(e.to_string()))?;
+        builder
+            .set_private_key(&key)
+            .map_err(|e| AetherError::Tls(e.to_string()))?;
+    }
 
     // Verification is decided by an explicit policy passed by the caller, never
     // by an ambient environment variable. The two former TLS kill-switch env

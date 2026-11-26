@@ -65,7 +65,7 @@ impl NoizeConfig {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.jc_before_hs > 0 || self.jc_after_i1 > 0 || self.i1.is_some()
+        self.jc_before_hs > 0 || self.jc_after_i1 > 0 || self.i1.is_some() || self.i2.is_some()
     }
 }
 

@@ -18,6 +18,15 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use zeroize::Zeroize;
 
+/// The kill-on-close job object holding the running scan child.
+///
+/// Closing the handle kills whatever is still inside it, which is the point: a
+/// scan launched outside a job outlives a crashed GUI and keeps probing with
+/// nothing left able to stop it. A static rather than a field on `AppState`
+/// because this module is the only owner and the tunnel's job is already there.
+#[cfg(windows)]
+static SCAN_JOB: Mutex<Option<crate::engine_job::Job>> = Mutex::new(None);
+
 /// `scan`'s body: it takes the operation lock, stops the running scan (up to the
 /// cancel grace window), runs `icacls`, unwraps the DPAPI key and hashes the
 /// engine, so it cannot run on the UI thread.
@@ -35,34 +44,11 @@ pub(crate) fn scan_blocking(
     // Before the lock and before the running scan is stopped: a parameter this
     // command refuses must not be able to take down the scan already in flight.
     let noize = validated_noize(noize.as_deref())?;
-    // Serialize with connect/disconnect/stop_scan (QA-5) so two engine processes
-    // can't spawn concurrently (double device registration + proxy-port contention).
-    let _operation = state.operation.lock();
-    // A tunnel and a scan must not run at once. The frontend disconnects first,
-    // but guard here too in case that flow is bypassed.
-    if state.child.lock().is_some() {
-        return Err("Disconnect before starting a scan.".into());
-    }
-    // Clamp scan parameters defensively: the UI clamps too, but a replayed/direct
-    // invoke could pass out-of-range values. 500 keeps even cheap-mode (WireGuard)
-    // bursts sane; the engine additionally enforces its own expensive-mode ceiling.
-    let concurrency = concurrency.clamp(1, 500);
-    let timeout_ms = timeout_ms.clamp(3_000, 30_000);
-    // Gracefully stop any existing scan first (persist its best-so-far).
-    stop_scan_child(&state.scan_child);
-
-    let settings = load_settings_file(&app)?;
-    let executable = engine_path(&app, &settings)?;
-    let dir = config_dir(&app)?;
-    fs::create_dir_all(&dir).map_err(CommandError::from)?;
-    restrict_directory_acl(&dir)?;
-
-    // Translate the scan's protocol name, refuse anything unmappable: the
-    // catch-all this replaces answered "masque" to a request for gool, and the
-    // engine no longer papers over a name it does not know.
-    let engine_protocol = match protocol.as_str() {
+    let is_h2 = matches!(protocol.as_str(), "masque-h2" | "h2");
+    let canonical_protocol = match protocol.as_str() {
         "wireguard" | "wg" => "wireguard",
-        "masque" | "masque-h2" | "masque-h3" | "h2" | "h3" => "masque",
+        "masque-h2" | "h2" => "masque-h2",
+        "masque" | "masque-h3" | "h3" => "masque-h3",
         other => {
             return Err(format!(
                 "scan protocol {other:?} has no engine equivalent; expected masque-h3|masque-h2|wireguard"
@@ -70,21 +56,43 @@ pub(crate) fn scan_blocking(
             .into());
         }
     };
+    let engine_protocol = match canonical_protocol {
+        "wireguard" => "wireguard",
+        _ => "masque",
+    };
+
+    // Stop any previous scan outside `state.operation` so we don't stall event pumps
+    // across a 15-second child exit grace period.
+    stop_scan_child(&state.scan_child);
+
+    let _operation = state.operation.lock();
+    if state.exiting.load(Ordering::SeqCst) {
+        return Err("Aether is shutting down.".into());
+    }
+    if state.tearing_down.load(Ordering::SeqCst) {
+        return Err("Aether is still finishing the previous disconnect; try again.".into());
+    }
+    if state.child.lock().is_some() || state.connecting.load(Ordering::SeqCst) {
+        return Err("Disconnect before starting a scan.".into());
+    }
+    let concurrency = concurrency.clamp(1, 500);
+    let timeout_ms = timeout_ms.clamp(3_000, 30_000);
+
+    let settings = load_settings_file(&app)?;
+    let executable = engine_path(&app, &settings)?;
+    let dir = config_dir(&app)?;
+    fs::create_dir_all(&dir).map_err(CommandError::from)?;
+    restrict_directory_acl(&dir)?;
 
     let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
-    let engine_guard = verify_engine_or_refuse(&executable)?;
-    let mut command = Command::new(&executable);
+    let canonical_exe = executable.canonicalize().unwrap_or(executable);
+    let engine_guard = verify_engine_or_refuse(&canonical_exe)?;
+    let mut command = Command::new(&canonical_exe);
     scrub_ambient_engine_env(&mut command);
     command
-        .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+        .current_dir(canonical_exe.parent().unwrap_or(std::path::Path::new(".")))
         .env("AETHER_CONFIG_KEY_STDIN", "1")
         .env("AETHER_PROTOCOL", engine_protocol)
-        // T161: the profile the user picked, not a hardcoded one. This used to
-        // read `"balanced"` whatever the Settings row said, so "Probe Velocity
-        // Profile" changed the banner (the engine echoes its own mode back in
-        // `scan_start`) and nothing else — the scan ran at the same rate either
-        // way. Same channel as every other setting here: the child's environment,
-        // which `engine_config::from_env` reads through `runtime_env`.
         .env("AETHER_SCAN", settings.scan_mode.as_str())
         .env("AETHER_SCAN_EXHAUSTIVE", "1")
         .env("AETHER_IP", ip_version.as_str())
@@ -94,10 +102,7 @@ pub(crate) fn scan_blocking(
         .env("AETHER_SCAN_CONCURRENCY", concurrency.to_string())
         .env("AETHER_SCAN_TIMEOUT_MS", timeout_ms.to_string())
         .env("AETHER_WG_NO_PROFILE_RETRY", "1")
-        .env(
-            "AETHER_MASQUE_HTTP2",
-            if protocol == "masque-h2" { "1" } else { "0" },
-        )
+        .env("AETHER_MASQUE_HTTP2", if is_h2 { "1" } else { "0" })
         .env("AETHER_MASQUE_H2_FRAGMENT", "0")
         .env(
             "AETHER_QUIC_INITIAL_FRAG",
@@ -107,12 +112,21 @@ pub(crate) fn scan_blocking(
                 "0".to_string()
             },
         )
-        // Control channel so Stop can cooperatively cancel (persist best-so-far)
-        // instead of SIGKILL mid cache-write.
         .env("AETHER_CONTROL_STDIN", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if noize.eq_ignore_ascii_case("custom") {
+        command
+            .env("AETHER_NOIZE_JC", settings.noize_jc.to_string())
+            .env("AETHER_NOIZE_JMIN", settings.noize_jmin.to_string())
+            .env("AETHER_NOIZE_JMAX", settings.noize_jmax.to_string())
+            .env(
+                "AETHER_NOIZE_INTERVAL_MS",
+                settings.noize_interval_ms.to_string(),
+            );
+    }
 
     #[cfg(windows)]
     {
@@ -120,11 +134,43 @@ pub(crate) fn scan_blocking(
         command.creation_flags(0x08000000);
     }
 
+    // The same kill-on-close containment the tunnel gives its engine: build the
+    // job before the spawn and refuse to launch without it. `eprintln!` is not a
+    // user-visible failure in a `windows_subsystem = "windows"` binary, and a scan
+    // that outlives the shell keeps probing and writing the endpoint cache.
+    #[cfg(windows)]
+    let job = crate::engine_job::Job::create().map_err(|error| {
+        CommandError::new(
+            "job_unavailable",
+            format!(
+                "Cannot start the scan: the kill-on-close job object could not be created \
+                 ({error}); refusing to launch a process that could outlive this window"
+            ),
+        )
+    })?;
+
     let mut child = command.spawn().map_err(|e| {
         dpapi_key.zeroize();
         format!("Could not start scan: {e}")
     })?;
     drop(engine_guard);
+    #[cfg(windows)]
+    if let Err(error) = job.assign_child(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        dpapi_key.zeroize();
+        return Err(CommandError::new(
+            "job_unavailable",
+            format!(
+                "Cannot start the scan: the spawned process could not be placed in the \
+                 kill-on-close job object ({error}); it has been terminated"
+            ),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        *SCAN_JOB.lock() = Some(job);
+    }
     // A scan child never brings the tunnel up, so it gets the key line and no
     // driver line — the engine only waits for the second when AETHER_TUN is on.
     if let Err(e) = handoff_preamble(&mut child, &dpapi_key, None) {
@@ -188,10 +234,23 @@ pub(crate) fn scan_blocking(
             let mut slot = state.scan_child.lock();
             if let Some(child) = slot.as_mut() {
                 if child.id() == scan_pid {
-                    match child.try_wait() {
-                        Ok(Some(_)) | Err(_) => *slot = None,
-                        // Still running: leave it for `stop_scan`.
-                        Ok(None) => {}
+                    // Brief reap wait after stdout/stderr EOF: on Windows the kernel
+                    // finishes tearing down the process slightly after pipe closure.
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) | Err(_) => {
+                                *slot = None;
+                                #[cfg(windows)]
+                                SCAN_JOB.lock().take();
+                                break;
+                            }
+                            Ok(None) if std::time::Instant::now() < reap_deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                            }
+                            Ok(None) => break,
+                        }
                     }
                 }
             }
@@ -393,6 +452,17 @@ fn pump_scan_stream(
                                     }),
                                 );
                             }
+                            EngineEvent::Error { message } => {
+                                terminal_sent.store(true, Ordering::SeqCst);
+                                emit_scan_event(
+                                    &app,
+                                    &run_id,
+                                    serde_json::json!({
+                                        "type": "scan_error",
+                                        "error": message,
+                                    }),
+                                );
+                            }
                             // Session-level events on a scan child are not this
                             // stream's business; the scan process does not emit them.
                             EngineEvent::IdentityReady { .. }
@@ -401,7 +471,7 @@ fn pump_scan_stream(
                             | EngineEvent::TunnelReady { .. }
                             | EngineEvent::TunReady
                             | EngineEvent::Connected { .. }
-                            | EngineEvent::Error { .. }
+                            | EngineEvent::Stats { .. }
                             | EngineEvent::Heartbeat { .. } => {}
                         }
                     }
@@ -416,40 +486,40 @@ fn pump_scan_stream(
 /// best endpoint found so far), wait briefly, then kill as a fallback. Does not
 /// touch the `operation` lock, so callers already holding it won't deadlock.
 pub(crate) fn stop_scan_child(scan_child: &Mutex<Option<Child>>) {
-    let mut child = match scan_child.lock().take() {
-        Some(c) => c,
-        None => return,
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(b"cancel\n");
-        let _ = stdin.flush();
-    }
-    // A cancelled scan is mid-write to the endpoint cache more often than a
-    // tunnel teardown is, and the whole point of `cancel` (rather than `kill`)
-    // is that it finishes persisting best-so-far. Four seconds cut that short.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            _ => {
-                eprintln!("[aether] scan child outlived the 15s cancel grace; forcing exit");
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+    if let Some(mut child) = scan_child.lock().take() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"cancel\n");
+            let _ = stdin.flush();
+        }
+        // A cancelled scan is mid-write to the endpoint cache more often than a
+        // tunnel teardown is, and the whole point of `cancel` (rather than `kill`)
+        // is that it finishes persisting best-so-far. Four seconds cut that short.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                _ => {
+                    eprintln!("[aether] scan child outlived the 15s cancel grace; forcing exit");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
             }
         }
     }
+    // The job goes with the child. Closing the handle also kills anything the
+    // cancel/kill above could not reach, and every later scan creates its own.
+    #[cfg(windows)]
+    SCAN_JOB.lock().take();
 }
 
-/// `stop_scan`'s body. `stop_scan_child` busy-waits up to the full cancel grace
-/// window, so this must not run on the UI thread.
+/// `stop_scan`'s body. `stop_scan_child` takes the child out without holding
+/// `state.operation` across the up-to-15 s wait so other pumps are never stalled.
 pub(crate) fn stop_scan_blocking(app: AppHandle) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
-    // Serialize with connect/disconnect (QA-5) and cancel gracefully (QA-1).
-    let _operation = state.operation.lock();
     stop_scan_child(&state.scan_child);
     Ok(())
 }

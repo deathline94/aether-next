@@ -1,28 +1,23 @@
-import { Check, Copy, Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
+import { Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react";
 import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, ScanState } from "../types";
-import { NumberField, Segmented } from "./ui";
-// The ceiling the engine will actually run, not the number the slider was set to:
-// this field used to offer 1-2000 while the shell clamped to 500, so the "Workers
-// Active" chip contradicted the input the user had just filled in.
+import { CopyButton, NumberField, Segmented } from "./ui";
 import {
   isEndpointForProtocol,
   nextOptionIndex,
   rttBadge,
-  SCAN_MIN_CONCURRENCY,
   SCAN_MAX_TIMEOUT_MS,
+  SCAN_MIN_CONCURRENCY,
   scanConcurrencyCeiling,
   scanTimeoutFloor,
 } from "@aether/ui";
-import { IP_FAMILY_OPTIONS, SCAN_PROTOCOL_OPTIONS } from "@aether/ui/enums";
+import { IP_FAMILY_OPTIONS, NOIZE_PROFILES, oneOf, SCAN_PROTOCOL_OPTIONS } from "@aether/ui/enums";
 import type { ScanProtocolFilter } from "@aether/ui/enums";
 
 type ProtoFilter = ScanProtocolFilter;
-
-/** One row plus its gap: 12+12 padding, one line of content, 2 px of border, 10 px stride. */
-const ESTIMATED_ENDPOINT_PX = 56;
-const ENDPOINT_GAP_PX = 10;
+const ESTIMATED_ENDPOINT_PX = 60;
+const ENDPOINT_GAP_PX = 8;
 
 interface ScannerTabProps {
   protocol: "masque-h3" | "masque-h2" | "wireguard";
@@ -39,8 +34,6 @@ interface ScannerTabProps {
   active: boolean;
   scanState: ScanState;
   busy: boolean;
-  /** Whether a tunnel session is live: a scan start disconnects it, so the CTA
-      becomes a two-step confirm instead of dropping the VPN on one click. */
   running: boolean;
   startScan: () => void;
   stopScan: () => void;
@@ -48,48 +41,28 @@ interface ScannerTabProps {
   connectBusy: boolean;
 }
 
-function CopyIpButton({ addr }: { addr: string }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
-
-  return (
-    <button
-      type="button"
-      className="tactile-copy-btn"
-      title={copied ? "Copied" : "Copy IP address"}
-      aria-label={copied ? "Copied" : "Copy IP address"}
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(addr);
-          setCopied(true);
-          if (timer.current) clearTimeout(timer.current);
-          timer.current = setTimeout(() => setCopied(false), 1500);
-        } catch {
-          // Clipboard fallback
-        }
-      }}
-    >
-      {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
-    </button>
-  );
-}
-
 function ScannerTabImpl({
-  protocol, setProtocol,
-  ipScan, setIpScan,
-  concurrency, setConcurrency,
-  timeoutMs, setTimeoutMs,
-  noize, setNoize,
-  endpoints, active, scanState, busy,
+  protocol,
+  setProtocol,
+  ipScan,
+  setIpScan,
+  concurrency,
+  setConcurrency,
+  timeoutMs,
+  setTimeoutMs,
+  noize,
+  setNoize,
+  endpoints,
+  active,
+  scanState,
+  busy,
   running,
-  startScan, stopScan,
-  connectDirect, connectBusy,
+  startScan,
+  stopScan,
+  connectDirect,
+  connectBusy,
 }: ScannerTabProps) {
   const [protoFilter, setProtoFilter] = useState<ProtoFilter>("all");
-  // First click arms the confirmation, second commits — parity with the desktop
-  // twin: the scan start silently `disconnect`s a live tunnel, which used to
-  // drop the VPN on a single press with no surface beyond one log line.
   const [confirmTunnelDrop, setConfirmTunnelDrop] = useState(false);
   useEffect(() => {
     if (active || !running) setConfirmTunnelDrop(false);
@@ -98,30 +71,20 @@ function ScannerTabImpl({
 
   const filteredEndpoints = useMemo(() => {
     if (protoFilter === "all") return endpoints;
-    return endpoints.filter((e) => {
-      // The shared predicate — the same matching the scan start uses to preserve
-      // other protocols' rows — so a filter and a fresh scan can never disagree
-      // about what belongs to the current protocol.
-      return isEndpointForProtocol(e.protocol, protoFilter);
-    });
+    return endpoints.filter((e) => isEndpointForProtocol(e.protocol, protoFilter));
   }, [endpoints, protoFilter]);
 
-  // The shared predicate, like the filter below and the desktop twin's counters.
   const h3Count = useMemo(
     () => endpoints.filter((e) => isEndpointForProtocol(e.protocol, "masque-h3")).length,
-    [endpoints]
+    [endpoints],
   );
   const h2Count = useMemo(
     () => endpoints.filter((e) => isEndpointForProtocol(e.protocol, "masque-h2")).length,
-    [endpoints]
+    [endpoints],
   );
   const wgCount = useMemo(
-    () =>
-      endpoints.filter((e) => {
-        const p = e.protocol.toLowerCase();
-        return p.includes("wireguard") || p.includes("wg");
-      }).length,
-    [endpoints]
+    () => endpoints.filter((e) => isEndpointForProtocol(e.protocol, "wireguard")).length,
+    [endpoints],
   );
 
   const protoTabs: { id: ProtoFilter; label: string; count: number }[] = [
@@ -132,7 +95,6 @@ function ScannerTabImpl({
   ];
 
   const resultsId = useId();
-
   const endpointRows = useVirtualizer({
     count: filteredEndpoints.length,
     getScrollElement: () => listRef.current,
@@ -141,9 +103,6 @@ function ScannerTabImpl({
   });
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
-  // `role="tablist"` is a promise about the keyboard: one stop in the tab order,
-  // arrows between the tabs, and a panel each tab names. The desktop copy got the
-  // handler; this one announced four tabs that only a mouse could move between.
   const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const selected = Math.max(0, protoTabs.findIndex((t) => t.id === protoFilter));
     const next = nextOptionIndex(selected, event.key, protoTabs.length);
@@ -155,53 +114,36 @@ function ScannerTabImpl({
     tabRefs.current[next]?.focus();
   };
 
-  const progressPct = scanState.total > 0
-    ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100))
-    : 0;
+  const progressPct =
+    scanState.total > 0 ? Math.min(100, Math.round((scanState.scanned / scanState.total) * 100)) : 0;
 
   return (
     <div className="scanner-view">
-      {/* ─── Scanner Radar HUD Panel ───────────────────────────────────────── */}
-      <section className="settings-section radar-hud-container" aria-label="Edge Radar Prober">
+      <section className="nordic-card" aria-label="Edge Scanner">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">STANDALONE ENGINE PROBER</p>
-            <h3>Cloudflare Edge Scanner</h3>
+            <p className="panel-eyebrow">EDGE DISCOVERY</p>
+            <h2 className="nordic-card-title">Cloudflare Edge Scanner</h2>
           </div>
-          <Radio size={20} className={active ? "spin-icon" : ""} aria-hidden="true" />
+          <span className={`tactical-chip ${active ? "emerald" : ""}`}>
+            <Radio size={13} className={active ? "spin-icon" : ""} aria-hidden="true" />
+            <span>{scanState.phase}</span>
+          </span>
         </div>
 
-        {/* Tactical HUD Header */}
-        <div className="radar-telemetry-banner">
-          <div className="radar-radar-scope" aria-hidden="true">
-            <div className={`radar-sweep-reticle ${active ? "active-sweep" : ""}`}>
-              <div className="radar-crosshair-h" />
-              <div className="radar-crosshair-v" />
-              <div className="radar-circle circle-1" />
-              <div className="radar-circle circle-2" />
-              {active && <div className="radar-sweep-beam" />}
-            </div>
-          </div>
-          <div className="radar-scope-meta">
-            <div className="scope-status-line">
-              <span className={`scope-led ${active ? "active" : ""}`} />
-              <strong>{active ? `PROBING POOL (${scanState.mode.toUpperCase()})` : "RADAR ENGINE DORMANT"}</strong>
-              <span className="scope-phase-tag">{scanState.phase}</span>
-            </div>
-            <p>
-              {active
-                ? `Dispatching concurrent datagram probes across Cloudflare ${ipScan.toUpperCase()} edge ranges.`
-                : "Probe Cloudflare IP pools directly to find zero-loss, low-latency edge endpoints before establishing the tunnel."}
-            </p>
-          </div>
-        </div>
+        <p className="section-subcopy">
+          {active
+            ? `Probing Cloudflare ${ipScan.toUpperCase()} ranges across ${scanState.concurrency} workers.`
+            : "Test Cloudflare edge ranges directly on your mobile network to locate fast endpoints."}
+        </p>
 
-        {/* Scan Progress Bar & Live Telemetry */}
         {(scanState.active || scanState.scanned > 0) && (
           <div className="scan-inline-progress">
             <div className="scan-progress-header">
-              <span className="progress-label">PROBE PROGRESS</span>
-              <span className="progress-metric tabular-nums">{progressPct}% ({scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()})</span>
+              <span>Progress</span>
+              <span className="tabular-nums">
+                {progressPct}% ({scanState.scanned.toLocaleString()} / {scanState.total.toLocaleString()})
+              </span>
             </div>
             <div
               className="scan-progress-bar-bg"
@@ -211,20 +153,16 @@ function ScannerTabImpl({
               aria-valuemax={scanState.total}
               aria-valuenow={scanState.scanned}
             >
-              <div
-                className={`scan-progress-bar-fill ${active ? "active-glow" : ""}`}
-                style={{ width: `${progressPct}%` }}
-              />
+              <div className="scan-progress-bar-fill" style={{ width: `${progressPct}%` }} />
             </div>
             <div className="scan-inline-stats">
-              <span className="stat-chip-pill workers">{scanState.concurrency} Workers Active</span>
-              <span className="stat-chip-pill hits">{scanState.working} Healthy Gateways</span>
-              {scanState.bestRtt && <span className="stat-chip-pill best">Best: {scanState.bestRtt}</span>}
+              <span className="tactical-chip">{scanState.concurrency} Workers</span>
+              <span className="tactical-chip emerald">{scanState.working} Working</span>
+              {scanState.bestRtt && <span className="tactical-chip cyan">Best: {scanState.bestRtt}</span>}
             </div>
           </div>
         )}
 
-        {/* Master Scan CTA Button */}
         <div className="scanner-action-bar">
           {!active ? (
             <>
@@ -233,27 +171,23 @@ function ScannerTabImpl({
                   <div className="error-banner-content">
                     <span>Starting a scan disconnects the active tunnel.</span>
                   </div>
-                  <button
-                    type="button"
-                    className="banner-action"
-                    onClick={() => setConfirmTunnelDrop(false)}
-                  >
+                  <button type="button" className="banner-action" onClick={() => setConfirmTunnelDrop(false)}>
                     Cancel
                   </button>
                 </div>
               )}
               <button
                 type="button"
-                className="primary-cta connect"
+                className="primary-cta mobile-full-cta"
                 onClick={() => (running && !confirmTunnelDrop ? setConfirmTunnelDrop(true) : startScan())}
                 disabled={busy}
               >
-                <Zap size={18} aria-hidden="true" />
+                <Zap size={16} aria-hidden="true" />
                 <span>
                   {busy
-                    ? "Engaging Scanner Engine…"
+                    ? "Starting Scanner…"
                     : running && !confirmTunnelDrop
-                      ? "Scan (disconnects the VPN) — confirm first"
+                      ? "Scan (disconnects VPN) — confirm first"
                       : running
                         ? "Confirm: Disconnect VPN & Scan"
                         : "Start Standalone Edge Scan"}
@@ -261,33 +195,27 @@ function ScannerTabImpl({
               </button>
             </>
           ) : (
-            <button
-              type="button"
-              className="primary-cta disconnect"
-              onClick={stopScan}
-            >
-              <X size={18} aria-hidden="true" />
-              <span>Halt Active Probe</span>
+            <button type="button" className="primary-cta disconnect mobile-full-cta" onClick={stopScan}>
+              <X size={16} aria-hidden="true" />
+              <span>Stop Scan</span>
             </button>
           )}
         </div>
       </section>
 
-      {/* ─── Probe Parameters Configuration Card ───────────────────────────── */}
-      <section className="settings-section" aria-label="Probe Parameters">
+      <section className="nordic-card" aria-label="Probe Parameters">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">PROBE PARAMETERS</p>
-            <h3>Engine Handshake Configuration</h3>
+            <p className="panel-eyebrow">PARAMETERS</p>
+            <h2 className="nordic-card-title">Scan Configuration</h2>
           </div>
-          <SlidersHorizontal size={20} className="panel-head-icon" aria-hidden="true" />
+          <SlidersHorizontal size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
-        {/* Configuration Controls */}
         <div className="setting-row">
           <div>
             <strong>Target Protocol</strong>
-            <span>Service carrier used for probing edge handshakes</span>
+            <span>Protocol used to verify each candidate IP</span>
           </div>
           <Segmented
             label="Target protocol"
@@ -301,7 +229,7 @@ function ScannerTabImpl({
         <div className="setting-row">
           <div>
             <strong>IP Family</strong>
-            <span>Address family pool to enumerate and probe</span>
+            <span>Address family pool to probe</span>
           </div>
           <Segmented
             label="IP family"
@@ -315,10 +243,10 @@ function ScannerTabImpl({
         <div className="setting-row input-row">
           <div className="param-field-block">
             <label htmlFor="field-concurrency-workers">
-              <div className="field-meta">
-                <strong>Concurrency (Workers)</strong>
-                <span className="field-hint">{SCAN_MIN_CONCURRENCY}–{scanConcurrencyCeiling(protocol)} lanes</span>
-              </div>
+              <strong>Concurrency (Workers)</strong>
+              <span className="field-hint">
+                {SCAN_MIN_CONCURRENCY}–{scanConcurrencyCeiling(protocol)} lanes
+              </span>
             </label>
             <NumberField
               id="field-concurrency-workers"
@@ -333,10 +261,10 @@ function ScannerTabImpl({
           </div>
           <div className="param-field-block">
             <label htmlFor="field-timeout-ms">
-              <div className="field-meta">
-                <strong>Timeout (ms)</strong>
-                <span className="field-hint">{scanTimeoutFloor(protocol)}–{SCAN_MAX_TIMEOUT_MS} ms</span>
-              </div>
+              <strong>Timeout (ms)</strong>
+              <span className="field-hint">
+                {scanTimeoutFloor(protocol)}–{SCAN_MAX_TIMEOUT_MS} ms
+              </span>
             </label>
             <NumberField
               id="field-timeout-ms"
@@ -354,14 +282,18 @@ function ScannerTabImpl({
         <div className="setting-row">
           <div>
             <strong>Handshake Obfuscation</strong>
-            <span>{protocol === "masque-h2" ? "UDP noise is not applicable for H2 (TCP)" : "Anti-DPI noise profile injected during probe"}</span>
+            <span>
+              {protocol === "masque-h2"
+                ? "UDP noise is not applicable for H2 (TCP)"
+                : "Pre-handshake anti-DPI profile during probes"}
+            </span>
           </div>
           <select
             aria-label="Obfuscation noise profile for probes"
             className="tactical-select"
-            value={protocol === "masque-h2" ? "off" : noize}
+            value={noize}
             disabled={active || protocol === "masque-h2"}
-            onChange={(e) => setNoize(e.target.value)}
+            onChange={(e) => setNoize(oneOf(e.target.value, NOIZE_PROFILES, noize))}
           >
             <option value="off">Off — no noise</option>
             <option value="light">Light — low noise</option>
@@ -373,14 +305,13 @@ function ScannerTabImpl({
         </div>
       </section>
 
-      {/* ─── Discovered Endpoints Section ─────────────────────────────────── */}
-      <section className="discovered-panel">
+      <section className="nordic-card" aria-label="Discovered Endpoints">
         <div className="section-heading">
           <div>
-            <p>TELEMETRY RESULTS</p>
-            <h3>Discovered Gateways ({endpoints.length})</h3>
+            <p className="panel-eyebrow">RESULTS</p>
+            <h2 className="nordic-card-title">Discovered Gateways ({endpoints.length})</h2>
           </div>
-          <Network size={20} aria-hidden="true" />
+          <Network size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
         {endpoints.length > 0 && (
@@ -407,27 +338,23 @@ function ScannerTabImpl({
           </div>
         )}
 
-        {filteredEndpoints.length === 0 ? (
+        {endpoints.length === 0 ? (
+          <div className="empty-logs">
+            <Search size={24} aria-hidden="true" />
+            <strong>No endpoints scanned yet</strong>
+            <span>Run a scan above to discover reachable low-latency Cloudflare servers.</span>
+          </div>
+        ) : filteredEndpoints.length === 0 ? (
           <div
             className="empty-logs"
-            // The chips beside this still say they control it: `aria-controls`
-            // named `resultsId`, and an empty result dropped the only element that
-            // carried that id, so every tab pointed at nothing exactly when the
-            // filter had something to report.
             id={resultsId}
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
             tabIndex={0}
           >
-            <Search size={28} aria-hidden="true" />
-            <strong>
-              {endpoints.length === 0 ? "No edge gateways discovered yet" : "No endpoints found for this protocol"}
-            </strong>
-            <span>
-              {endpoints.length === 0
-                ? "Launch a standalone scan above to locate the fastest Cloudflare IP candidates."
-                : "Select another protocol filter or launch a new scan."}
-            </span>
+            <Search size={24} aria-hidden="true" />
+            <strong>No endpoints found for {protoFilter.toUpperCase()}</strong>
+            <span>Switch to All Protocols or run a scan for this protocol.</span>
           </div>
         ) : (
           <div
@@ -436,13 +363,8 @@ function ScannerTabImpl({
             role="tabpanel"
             aria-labelledby={`proto-tab-${protoFilter}`}
             ref={listRef}
-            // A hundred rows in a fixed-height panel cannot be reached without this.
             tabIndex={0}
           >
-            {/* Same window as the desktop panel: a thorough scan streams hundreds
-                of endpoints and each row is a copy control, a badge and a Connect
-                button. Only the visible window is mounted, inside a spacer of the
-                full height so the scrollbar still describes the whole result. */}
             <div style={{ height: endpointRows.getTotalSize(), position: "relative", width: "100%" }}>
               {endpointRows.getVirtualItems().map((row) => {
                 const item = filteredEndpoints[row.index];
@@ -464,24 +386,20 @@ function ScannerTabImpl({
                   >
                     <div className="discovered-row">
                       <div className="discovered-info">
-                        <CopyIpButton addr={item.addr} />
-                        <code className="tabular-nums">{item.addr}</code>
-                        <span className="discovered-proto">{item.protocol.toUpperCase()}</span>
+                        <CopyButton value={item.addr} label={`Copy ${item.addr}`} />
+                        <code className="font-mono tabular-nums">{item.addr}</code>
+                        <span className="tactical-chip">{item.protocol.toUpperCase()}</span>
                       </div>
-
                       <div className="discovered-actions">
                         <span className={`rtt-badge ${tierClass}`} title={badgeText}>
                           <span className="rtt-dot" />
-                          {/* The badge's normalized text, not the raw engine
-                              string: a blank row used to render an empty chip
-                              that the old tier function had already mis-ranked. */}
                           <span className="tabular-nums">{text}</span>
                         </span>
                         <button
                           type="button"
                           className="connect-direct-btn"
                           disabled={connectBusy || active}
-                          title={active ? "Stop the active scan before connecting" : "Lock this endpoint for tunnel connection"}
+                          title={active ? "Stop the active scan before connecting" : "Connect directly to this endpoint"}
                           onClick={() => connectDirect(item)}
                         >
                           Connect Direct
@@ -499,6 +417,4 @@ function ScannerTabImpl({
   );
 }
 
-// Memoized at the boundary: the log and scan buffers live in App, so every
-// appended line re-rendered all four tabs even when nothing they read changed.
 export const ScannerTab = memo(ScannerTabImpl);

@@ -53,6 +53,10 @@ counters! {
     /// Hot-subnet drill-down waves abandoned by cancellation or the scan deadline
     /// before they finished their neighbour list.
     DRILL_DOWN_WAVES_ABANDONED => "drill_down_waves_abandoned",
+    /// Total upstream bytes forwarded through active tunnel flows.
+    BYTES_UP => "bytes_up",
+    /// Total downstream bytes received through active tunnel flows.
+    BYTES_DOWN => "bytes_down",
 }
 
 fn peek(c: &AtomicU64) -> u64 {
@@ -68,6 +72,16 @@ pub fn bump(c: &AtomicU64) -> u64 {
 /// Bump by a batch count — for a routine that rejects several records per call.
 pub fn bump_by(c: &AtomicU64, n: u64) -> u64 {
     c.fetch_add(n, Ordering::Relaxed) + n
+}
+
+pub fn reset_traffic() {
+    BYTES_UP.store(0, Ordering::Relaxed);
+    BYTES_DOWN.store(0, Ordering::Relaxed);
+}
+
+/// Read a counter's current value.
+pub fn get(c: &AtomicU64) -> u64 {
+    peek(c)
 }
 
 #[cfg(test)]

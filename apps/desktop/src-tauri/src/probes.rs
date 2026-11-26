@@ -19,10 +19,25 @@ use tauri::{AppHandle, Manager};
 /// The child writes a small JSON document and exits; anything past this is a
 /// hang, and `Command::output()` (what this replaced) waits forever on one.
 const DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DIAGNOSTICS_MAX_BYTES: usize = 256 * 1024;
+
+fn read_bounded_pipe<R: std::io::Read>(handle: Option<R>) -> Vec<u8> {
+    let Some(handle) = handle else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut handle.take(DIAGNOSTICS_MAX_BYTES as u64), &mut bytes);
+    bytes
+}
 
 pub(crate) fn diagnostics_blocking(app: AppHandle) -> Result<serde_json::Value, CommandError> {
     let state = app.state::<AppState>();
-    if state.child.lock().is_some() || state.scan_child.lock().is_some() {
+    let _operation = state.operation.lock();
+    if state.connecting.load(std::sync::atomic::Ordering::SeqCst)
+        || state.tearing_down.load(std::sync::atomic::Ordering::SeqCst)
+        || state.child.lock().is_some()
+        || state.scan_child.lock().is_some()
+    {
         return Err(CommandError::new(
             "busy",
             "Stop the running session or scan before exporting diagnostics.",
@@ -30,40 +45,38 @@ pub(crate) fn diagnostics_blocking(app: AppHandle) -> Result<serde_json::Value, 
     }
     let settings = load_settings_or_defaults(&app);
     let executable = engine_path(&app, &settings)?;
-    let engine_guard = verify_engine_or_refuse(&executable)?;
+    let canonical_exe = executable.canonicalize().unwrap_or(executable);
+    let engine_guard = verify_engine_or_refuse(&canonical_exe)?;
 
-    let mut command = Command::new(&executable);
+    let mut command = Command::new(&canonical_exe);
     scrub_ambient_engine_env(&mut command);
     command
         .arg("--diagnostics")
-        .current_dir(executable.parent().unwrap_or(Path::new(".")))
+        .current_dir(canonical_exe.parent().unwrap_or(Path::new(".")))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    #[cfg(windows)]
+    let job = crate::engine_job::Job::create()?;
     let mut child = command
         .spawn()
         .map_err(|e| CommandError::new("spawn_failed", format!("Could not run the engine: {e}")))?;
     drop(engine_guard);
-    // Read both pipes on their own threads so a child that fills one of them
-    // cannot deadlock against the wait below, and give the wait a deadline: an
-    // engine that wedges inside `--diagnostics` used to hold this command — and,
-    // because it was synchronous, the UI thread — open indefinitely.
+    #[cfg(windows)]
+    if let Err(err) = job.assign_child(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
-    let stdout_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut handle) = stdout_handle {
-            let _ = std::io::Read::read_to_end(&mut handle, &mut bytes);
-        }
-        bytes
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut handle) = stderr_handle {
-            let _ = std::io::Read::read_to_end(&mut handle, &mut bytes);
-        }
-        bytes
-    });
+    let stdout_thread = std::thread::spawn(move || read_bounded_pipe(stdout_handle));
+    let stderr_thread = std::thread::spawn(move || read_bounded_pipe(stderr_handle));
     let deadline = std::time::Instant::now() + DIAGNOSTICS_TIMEOUT;
     let status = loop {
         match child.try_wait() {

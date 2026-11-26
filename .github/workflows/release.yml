@@ -126,9 +126,13 @@ jobs:
           name: windows-apps
           path: dist-windows/AetherNext-*
 
+  ci:
+    name: Pre-release gate
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Create Release
-    needs: [build-android, build-windows]
+    needs: [build-android, build-windows, ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -140,13 +144,16 @@ jobs:
         with:
           name: windows-apps
           path: release-assets
+      - name: Read the version from the checked-out manifest
+        id: version
+        run: echo "value=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
       - name: Generate Checksums and Publish Release
         working-directory: release-assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sha256sum AetherNext-* > SHA256SUMS.txt
-          VERSION=$(node -p "require('../package.json').version")
+          VERSION="${{ steps.version.outputs.value }}"
           TAG="v${VERSION}"
           
           git config --global user.name "deathline94"

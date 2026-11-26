@@ -17,38 +17,31 @@ import org.json.JSONObject
  * shipped, using the URL captured on the UI thread in `onPageStarted`.
  */
 class AetherBridge(
-    private val activity: MainActivity,
+    activity: MainActivity,
     private val session: SessionController,
-    private val originTrusted: () -> Boolean = { activity.isBridgeOriginTrusted() },
+    private val originTrusted: (() -> Boolean)? = null,
 ) {
-    /**
-     * Commands that do not answer in milliseconds, and therefore may not run on the
-     * thread that answers them.
-     *
-     * A `@JavascriptInterface` method with a return value is executed on the WebView's
-     * JavaBridge thread, and Chromium's rendered JS waits on it: `connect` paid up to
-     * 4.2 s of keystore retry (`ConfigKeyStore`) plus a 3 s process poll
-     * (`EngineRunner.stopAndWait`) with the UI frozen, and `test_connection` a 12 s
-     * blocking OkHttp call. The frozen page was not a slow spinner — `evaluateJavascript`
-     * posts from the session queued up behind it, so the state stream arrived late or
-     * after the thing it described had already changed.
-     *
-     * These now run on a worker, answer a token immediately, and the web layer polls
-     * `get_result` for the settled envelope. Fast reads (`get_state` included) stay
-     * synchronous so the UI can keep watching while a slow command is in flight.
-     */
+    private val activityRef = java.lang.ref.WeakReference(activity)
+    private val effectiveOriginTrusted: () -> Boolean =
+        originTrusted ?: { activityRef.get()?.isBridgeOriginTrusted() ?: false }
+
     internal val commandWorker = java.util.concurrent.Executors.newCachedThreadPool { r ->
         Thread(r, "aether-bridge-cmd").apply { isDaemon = true }
     }
 
-    private val pendingResults = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
-    private val resultAge = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private data class SettledResult(val envelope: JSONObject, val settledAt: Long)
+    private val pendingResults = java.util.concurrent.ConcurrentHashMap<String, SettledResult>()
     private val sequence = java.util.concurrent.atomic.AtomicLong(0)
+
+    internal fun shutdown() {
+        commandWorker.shutdownNow()
+        pendingResults.clear()
+    }
 
     @JavascriptInterface
     fun invoke(cmd: String, argsJson: String): String {
         val trusted = try {
-            originTrusted()
+            effectiveOriginTrusted()
         } catch (e: Exception) {
             Log.w(TAG, "origin check threw, treating the caller as untrusted: ${e.message}")
             false
@@ -118,10 +111,8 @@ class AetherBridge(
         return envelope.toString()
     }
 
-    /** Publish a settled envelope for [id]. Visible for tests, which never start a WebView. */
     internal fun settle(id: String, envelope: JSONObject) {
-        pendingResults[id] = envelope
-        resultAge[id] = System.currentTimeMillis()
+        pendingResults[id] = SettledResult(envelope, System.currentTimeMillis())
     }
 
     internal fun pendingResultIds(): Set<String> = pendingResults.keys.toSet()
@@ -129,23 +120,13 @@ class AetherBridge(
     private fun handleGetResult(args: JSONObject): Any {
         val id = args.optString("id")
         pruneResults()
-        val envelope = if (id.isEmpty()) null else pendingResults.remove(id)
-        if (envelope == null) return JSONObject().put("state", "pending")
-        resultAge.remove(id)
-        return JSONObject().put("state", "done").put("envelope", envelope)
+        val entry = if (id.isEmpty()) null else pendingResults.remove(id)
+        if (entry == null) return JSONObject().put("state", "pending")
+        return JSONObject().put("state", "done").put("envelope", entry.envelope)
     }
 
-    /**
-     * A result nobody collected — a reload mid-command, a killed tab — must not
-     * accumulate for the life of the process.
-     */
     private fun pruneResults(now: Long = System.currentTimeMillis()) {
-        for ((id, at) in resultAge) {
-            if (now - at > RESULT_TTL_MS) {
-                resultAge.remove(id)
-                pendingResults.remove(id)
-            }
-        }
+        pendingResults.entries.removeIf { now - it.value.settledAt > RESULT_TTL_MS }
     }
 
     internal fun handleGetSettings(): Any =
@@ -157,11 +138,6 @@ class AetherBridge(
         return JSONObject.NULL
     }
 
-    /**
-     * Discard an unreadable settings blob on the user's explicit word, and answer with the
-     * settings that are on disk now — so the page leaves its error state in the same
-     * round-trip instead of guessing that the reset took.
-     */
     internal fun handleResetSettings(): Any = session.resetSettings().toJson()
 
     internal fun handleConnect(args: JSONObject): Any {
@@ -173,8 +149,7 @@ class AetherBridge(
         val err = session.connect(s)
         return when {
             err == "VPN_PERMISSION_REQUIRED" -> {
-                activity.requestVpnPermission()
-                // Permission pending - not a hard failure
+                activityRef.get()?.requestVpnPermission()
                 JSONObject.NULL
             }
             err != null -> throw BridgeError("connect_failed", err)
@@ -183,9 +158,6 @@ class AetherBridge(
     }
 
     internal fun handleDisconnect(): Any {
-        // T206: "I asked the tunnel to stop" is not "the tunnel stopped". The
-        // message says what is still up and what to do about it, and it travels as
-        // a coded rejection so the UI can show it instead of a green "Ready".
         val err = session.disconnect()
         if (err != null) throw BridgeError("stop_failed", err)
         return JSONObject.NULL
@@ -193,11 +165,11 @@ class AetherBridge(
 
     internal fun handleScan(args: JSONObject): Any {
         val protocol = args.optString("protocol", "masque-h3")
-        val ipVersion = args.optString("ipVersion", "v4")
+        val ipVersion = args.optString("ipVersion", "v4").lowercase()
+        if (ipVersion !in setOf("v4", "v6", "dual", "both")) {
+            throw SettingRejected("ipVersion", "Invalid ipVersion '$ipVersion'")
+        }
         val concurrency = ScanLimits.clampConcurrency(args.optInt("concurrency", ScanLimits.MAX_CONCURRENCY_H3), protocol)
-        // The single clamp. The UI used to advertise 100-30000 ms while this line
-        // quietly coerced the number to >=3000 (>=6000 for MASQUE), so the two sides
-        // disagreed about what the user had asked for; both now read [ScanLimits].
         val timeoutMs = ScanLimits.clampTimeout(args.optInt("timeoutMs", 6000), protocol)
         val noize = args.optString("noize", "off")
         val err = session.scan(protocol, ipVersion, concurrency, timeoutMs, noize, args.optString("runId", ""))

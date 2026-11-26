@@ -48,24 +48,69 @@ async fn query_ech(server: SocketAddr, host: &str) -> Result<Vec<u8>> {
     sock.send(&query).await?;
 
     // A UDP datagram can carry up to 65535 bytes, and an HTTPS RR with an
-    // ECHConfigList regularly exceeds 4 KB. Read the whole frame: a buffer that
-    // is too small does not fail, it truncates, and `parse_https_ech` then
-    // reports "no ech svcparam" for a resolver that answered perfectly.
+    // ECHConfigList regularly exceeds 512 bytes. Read until a matching qid
+    // arrives within the shared deadline, and fall back to TCP when TC=1.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut buf = vec![0u8; 65535];
-    let n = timeout(Duration::from_secs(3), sock.recv(&mut buf))
-        .await
-        .map_err(|_| AetherError::Ech("dns timeout".into()))??;
+    loop {
+        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf))
+            .await
+            .map_err(|_| AetherError::Ech("dns timeout".into()))??;
+        let reply = &buf[..n];
+        if reply.len() >= 12 && u16::from_be_bytes([reply[0], reply[1]]) == qid {
+            if is_truncated_reply(reply, qid) {
+                log::debug!(
+                    "ech dns udp reply from {server} was truncated (TC=1); retrying over tcp"
+                );
+                let tcp_reply = query_tcp(server, &query).await?;
+                return parse_https_ech(&tcp_reply, qid, host)
+                    .ok_or_else(|| AetherError::Ech("no ech svcparam".into()));
+            }
+            return parse_https_ech(reply, qid, host)
+                .ok_or_else(|| AetherError::Ech("no ech svcparam".into()));
+        }
+        log::debug!("discarding udp ech reply with mismatched transaction id");
+    }
+}
 
-    parse_https_ech(&buf[..n], qid, host).ok_or_else(|| AetherError::Ech("no ech svcparam".into()))
+fn is_truncated_reply(msg: &[u8], qid: u16) -> bool {
+    msg.len() >= 12
+        && u16::from_be_bytes([msg[0], msg[1]]) == qid
+        && (u16::from_be_bytes([msg[2], msg[3]]) & 0x8200) == 0x8200
+}
+
+async fn query_tcp(server: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(server),
+    )
+    .await
+    .map_err(|_| AetherError::Ech("dns tcp connect timeout".into()))??;
+    let len_prefix =
+        u16::try_from(query.len()).map_err(|_| AetherError::Ech("dns query too large".into()))?;
+    timeout(Duration::from_secs(3), async {
+        stream.write_all(&len_prefix.to_be_bytes()).await?;
+        stream.write_all(query).await?;
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr).await?;
+        let resp_len = u16::from_be_bytes(hdr) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).await?;
+        Ok::<Vec<u8>, std::io::Error>(resp)
+    })
+    .await
+    .map_err(|_| AetherError::Ech("dns tcp reply timeout".into()))?
+    .map_err(Into::into)
 }
 
 fn build_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
-    let mut q = Vec::with_capacity(32 + name.len());
+    let mut q = Vec::with_capacity(44 + name.len());
     let id: u16 = rand::random();
     q.extend_from_slice(&id.to_be_bytes());
-    q.extend_from_slice(&[0x01, 0x00]);
-    q.extend_from_slice(&[0x00, 0x01]);
-    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    q.extend_from_slice(&[0x01, 0x00]); // RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]); // ARCOUNT=1 (EDNS0 OPT)
     for label in name.split('.') {
         if label.is_empty() {
             continue;
@@ -75,7 +120,11 @@ fn build_query(name: &str, qtype: u16) -> (u16, Vec<u8>) {
     }
     q.push(0x00);
     q.extend_from_slice(&qtype.to_be_bytes());
-    q.extend_from_slice(&[0x00, 0x01]);
+    q.extend_from_slice(&[0x00, 0x01]); // IN
+                                        // EDNS0 OPT RR (RFC 6891): root name, type=41, UDP payload=4096, ext-rcode/flags=0, rdlen=0
+    q.extend_from_slice(&[
+        0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
     (id, q)
 }
 
@@ -156,11 +205,12 @@ fn parse_https_ech(msg: &[u8], qid: u16, name: &str) -> Option<Vec<u8>> {
 }
 
 fn parse_svcparams_ech(msg: &[u8], rdata_start: usize, rdlen: usize) -> Option<Vec<u8>> {
-    let end = rdata_start + rdlen;
-    if rdata_start + 2 > end {
+    let end = rdata_start.checked_add(rdlen)?;
+    if end > msg.len() || rdata_start + 2 > end {
         return None;
     }
-    let mut p = skip_name(msg, rdata_start + 2)?;
+    let rdata = &msg[..end];
+    let mut p = skip_name_uncompressed(rdata, rdata_start + 2)?;
 
     while p + 4 <= end {
         let key = u16::from_be_bytes([msg[p], msg[p + 1]]);
@@ -177,13 +227,30 @@ fn parse_svcparams_ech(msg: &[u8], rdata_start: usize, rdlen: usize) -> Option<V
     None
 }
 
+fn skip_name_uncompressed(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *buf.get(pos)?;
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        pos = pos.checked_add(1 + len as usize)?;
+        if pos > buf.len() {
+            return None;
+        }
+    }
+}
+
 /// Decode an uncompressed wire name. Question-section names are never
-/// compressed, so a pointer here is a forged or malformed reply.
+/// compressed, so a pointer or reserved label bits (`0x40`/`0x80`) indicate a
+/// malformed or forged reply.
 fn read_name(buf: &[u8], mut pos: usize) -> Option<String> {
     let mut labels: Vec<String> = Vec::new();
     loop {
         let len = *buf.get(pos)?;
-        if len & 0xc0 == 0xc0 {
+        if len & 0xc0 != 0 {
             return None;
         }
         if len == 0 {
@@ -203,13 +270,23 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<String> {
 pub(crate) fn skip_name(buf: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *buf.get(pos)?;
-        if len & 0xc0 == 0xc0 {
+        let tag = len & 0xc0;
+        if tag == 0xc0 {
+            if pos + 2 > buf.len() {
+                return None;
+            }
             return Some(pos + 2);
+        }
+        if tag != 0 {
+            return None;
         }
         if len == 0 {
             return Some(pos + 1);
         }
-        pos += 1 + len as usize;
+        pos = pos.checked_add(1 + len as usize)?;
+        if pos > buf.len() {
+            return None;
+        }
     }
 }
 
@@ -404,5 +481,51 @@ mod tests {
         // A pointer in the question section is not legal.
         let ptr = [0xc0, 0x0c];
         assert_eq!(read_name(&ptr, 0), None);
+    }
+
+    #[tokio::test]
+    async fn udp_query_skips_mismatched_qid_and_retries_tcp_when_truncated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        let tcp = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+            assert!(n >= 12);
+            let qid = u16::from_be_bytes([buf[0], buf[1]]);
+
+            // First packet has wrong transaction id; client must skip it.
+            let mut wrong = reply(0x8180, 1, "cloudflare-ech.com");
+            let wrong_qid = qid.wrapping_add(1);
+            wrong[0..2].copy_from_slice(&wrong_qid.to_be_bytes());
+            udp.send_to(&wrong, peer).await.unwrap();
+
+            // Second UDP packet carries matching qid with TC=1 truncated bit set.
+            let mut trunc = reply(0x8380, 1, "cloudflare-ech.com");
+            trunc[0..2].copy_from_slice(&qid.to_be_bytes());
+            udp.send_to(&trunc, peer).await.unwrap();
+
+            // Expect client fallback over TCP.
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut len_hdr = [0u8; 2];
+            stream.read_exact(&mut len_hdr).await.unwrap();
+            let qlen = u16::from_be_bytes(len_hdr) as usize;
+            let mut q = vec![0u8; qlen];
+            stream.read_exact(&mut q).await.unwrap();
+            let mut full = reply(0x8180, 1, "cloudflare-ech.com");
+            full[0..2].copy_from_slice(&q[0..2]);
+            stream
+                .write_all(&(full.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&full).await.unwrap();
+        });
+
+        let ech = super::query_ech(addr, "cloudflare-ech.com").await.unwrap();
+        assert_eq!(ech, vec![0xde, 0xad, 0xbe, 0xef]);
+        server.await.unwrap();
     }
 }

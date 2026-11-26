@@ -8,7 +8,11 @@ import type { SaveState } from "../saveState";
 import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
-import { describeRejectedState } from "@aether/ui";
+import {
+  describeRejectedState,
+  parseSessionStats,
+  type SessionStats,
+} from "@aether/ui";
 
 /**
  * What a connectivity check actually knows.
@@ -38,6 +42,7 @@ export function useRuntime(
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [settingsLoadError, setSettingsLoadError] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
+  const [stats, setStats] = useState<SessionStats | null>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [testBusy, setTestBusy] = useState(false);
@@ -154,6 +159,7 @@ export function useRuntime(
           const next = parseRuntimeState(event.payload);
           if (next) {
             setRuntime(next);
+            if (next.status !== "connected") setStats(null);
             return;
           }
           // Not a state: keep showing the last one that was understood, and say why
@@ -171,6 +177,13 @@ export function useRuntime(
         });
         if (disposed) { unlistenState(); return; }
         cleanup.push(unlistenState);
+
+        const unlistenStats = await listen<unknown>("session://stats", (event) => {
+          const parsedStats = parseSessionStats(event.payload);
+          if (parsedStats) setStats(parsedStats);
+        });
+        if (disposed) { unlistenStats(); return; }
+        cleanup.push(unlistenStats);
 
         const unlistenLog = await listen<{ level: "info" | "warn" | "error"; message: string }>(
           "session://log",
@@ -237,10 +250,21 @@ export function useRuntime(
     return () => { disposed = true; cleanup.forEach((fn) => fn()); };
   }, [appendLog, applyFrame, applyLoadedSettings, blocksHydration, reportUnknownEngineState]);
 
-  // Cleanup timers on unmount.
+  // Cleanup timers on unmount. The save debounce is flushed, not merely cleared: an
+  // edit made within the debounce window of the view going away used to die with the
+  // timer, so the last change never reached the disk.
   useEffect(() => () => {
     if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
-    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
+      const pending = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      // Fire-and-forget: the view is going away either way, and a rejection has no
+      // surface left to render on. This is the payload the debounced write would
+      // have sent, so it gets the same acceptance.
+      if (pending) void invoke("save_settings", { settings: pending }).catch(() => {});
+    }
     if (watchdogRef.current) clearTimeout(watchdogRef.current);
   }, []);
 
@@ -284,7 +308,9 @@ export function useRuntime(
     pendingSaveRef.current = next;
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     saveDebounceRef.current = setTimeout(async () => {
+      saveDebounceRef.current = null;
       const toSave = pendingSaveRef.current;
+      pendingSaveRef.current = null;
       if (!toSave) return;
       const mine = ++saveSeqRef.current;
       setSaveState("saving");
@@ -365,9 +391,15 @@ export function useRuntime(
     // Same hydration gate as toggleConnection: this connect would persist its
     // settings, and doing that from a defaults snapshot loses the saved profile.
     if (!settingsLoaded) return;
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
+      pendingSaveRef.current = null;
+    }
     busyRef.current = true;
     setBusy(true);
     setTestResult(null);
+    const previous = settings;
     try {
       try {
         await invoke("stop_scan");
@@ -379,10 +411,16 @@ export function useRuntime(
       // Pin the chosen endpoint so the engine skips scanning and dials it directly.
       const nextSettings: Settings = { ...settings, protocol, transport, peer };
       setSettings(nextSettings);
-      setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: peer });
+      // No endpoint until the shell reports one: nothing has been reached yet, so
+      // naming `peer` here would present it as the address carrying traffic.
+      setRuntime({ status: "connecting", detail: `Connecting to ${peer}`, pid: null, endpoint: null });
       await invoke("connect", { settings: nextSettings });
     } catch (error) {
       const detail = `Direct connect error: ${errorMessage(error)}`;
+      // Roll the optimistic commit back: this path writes protocol/transport/peer
+      // through the settings effect as well as to the engine, so a failed attempt
+      // must not leave the user's carrier rewritten by a tunnel that never came up.
+      setSettings(previous);
       setRuntime({ status: "error", detail, pid: null, endpoint: null });
       appendLog({ level: "error", message: detail });
     } finally {
@@ -412,6 +450,7 @@ export function useRuntime(
 
   const dismissError = useCallback(async () => {
     try { await invoke("disconnect"); } catch { /* already stopped */ }
+    setStats(null);
     setRuntime(initialRuntime);
   }, []);
 
@@ -451,7 +490,7 @@ export function useRuntime(
     // to the Settings dock, and a dock that can only say "synchronizing" or
     // "synchronized" cannot say "nothing pending". `saveState` is the same value
     // under the name a caller that can pass a second prop should use.
-    settings, runtime, busy, testBusy, saved: saveState, saveState, saveError,
+    settings, runtime, stats, busy, testBusy, saved: saveState, saveState, saveError,
     admin, testResult,
     appVersion: appVersion ?? "…",
     // The stored profile's health and its remedy, as the shell reported them (ITEM 10).

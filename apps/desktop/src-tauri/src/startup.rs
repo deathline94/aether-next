@@ -23,14 +23,8 @@ const FILE_NAME: &str = "aether-startup.log";
 /// wedged in a loop that reports.
 static LINES: AtomicUsize = AtomicUsize::new(0);
 const LINE_LIMIT: usize = 500;
+const MAX_LOG_BYTES: u64 = 256 * 1024;
 
-/// Where the startup log lives: the app's config directory when it can be derived,
-/// the system temp directory otherwise.
-///
-/// The *directory* is resolved once (a `create_dir_all` per line would be a syscall
-/// pile in the middle of the failure path); the file itself is opened per write, so
-/// a quarantine or a rotation between lines is met by a fresh open rather than a
-/// stale handle.
 fn log_file() -> Option<PathBuf> {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let dir = DIR.get_or_init(|| {
@@ -57,7 +51,6 @@ fn log_file() -> Option<PathBuf> {
                 candidates.push(base.join(APP_IDENTIFIER));
             }
         }
-        candidates.push(std::env::temp_dir().join(APP_IDENTIFIER));
         candidates
             .into_iter()
             .find(|dir| std::fs::create_dir_all(dir).is_ok() && dir.is_dir())
@@ -76,16 +69,15 @@ pub(crate) fn note(message: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if let Some(path) = log_file() {
-        // The path is resolved per write on purpose: `OpenOptions::append` against
-        // a rotating/quarantining AV scanner is the failure this file exists to
-        // record, and a cached handle would hide it.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            let rotated = path.with_extension("log.prev");
+            let _ = std::fs::rename(&path, rotated);
+        }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
         {
-            // Seconds since the Unix epoch, stated once so the file is readable
-            // without a formatter and no local-time claim is being made.
             let _ = writeln!(file, "[{stamp}s] {message}");
             let _ = file.flush();
         }

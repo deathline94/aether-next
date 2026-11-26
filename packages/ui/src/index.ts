@@ -378,3 +378,45 @@ export function isEndpointForProtocol(endpointProtocol: string, protocol: ScanPr
   return false;
 }
 
+export type SessionStats = {
+  upBps: number;
+  downBps: number;
+  upBytes: number;
+  downBytes: number;
+  uptimeSecs: number;
+};
+
+export function parseSessionStats(payload: unknown): SessionStats | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const raw = payload as Record<string, unknown>;
+  const num = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
+  const upBps = num(raw.upBps);
+  const downBps = num(raw.downBps);
+  const upBytes = num(raw.upBytes);
+  const downBytes = num(raw.downBytes);
+  const uptimeSecs = num(raw.uptimeSecs);
+  if (upBps === null || downBps === null || upBytes === null || downBytes === null || uptimeSecs === null) {
+    return null;
+  }
+  return { upBps, downBps, upBytes, downBytes, uptimeSecs };
+}
+
+export function formatThroughputRate(bps: number): string {
+  if (!Number.isFinite(bps) || bps < 0) return "—";
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`;
+  if (bps >= 1_000) return `${Math.round(bps / 1_000)} Kbps`;
+  return `${Math.round(bps)} bps`;
+}
+
+export function formatUptimeClock(secs: number): string {
+  if (!Number.isFinite(secs) || secs < 0) return "—";
+  const total = Math.floor(secs);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
+}
+
+export { useOnline } from "./hooks/useOnline";
+

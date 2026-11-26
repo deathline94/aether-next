@@ -113,6 +113,7 @@ class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("aether_settings", Context.MODE_PRIVATE)
 
     /** What the last [load] of *this* store found. Defaults are not a verdict. */
+    @Volatile
     private var state: SettingsReadState = SettingsReadState.Missing
 
     /**

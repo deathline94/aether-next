@@ -149,11 +149,16 @@ export function useScanner(
   const runIdRef = useRef<string>("");
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
+  const busyRef = useRef(false);
   // `bestRtt` on the stored state is never read: the chip is the minimum of the
-  // rows below it, so it is computed here and nowhere else.
+  // current protocol's rows below it, so switching protocols never leaks an older
+  // protocol's RTT into the active banner.
   const displayedScanState = useMemo<DisplayedScanState>(
-    () => ({ ...scanState, bestRtt: bestRttOf(endpoints) }),
-    [scanState, endpoints],
+    () => ({
+      ...scanState,
+      bestRtt: bestRttOf(endpoints.filter((e) => isEndpointForProtocol(e.protocol, protocol))),
+    }),
+    [scanState, endpoints, protocol],
   );
 
   // Listen for structured scan events from the Tauri backend
@@ -248,7 +253,8 @@ export function useScanner(
   }, [appendLog]);
 
   const startScan = useCallback(async () => {
-    if (busy || active) return;
+    if (busyRef.current || busy || active) return;
+    busyRef.current = true;
     // Mint the run id before anything is cleared or awaited. This used to happen
     // after `await invoke("disconnect")`, so the outgoing run's terminal event —
     // still stamped with the id the guard was matching — arrived onto the list
@@ -290,6 +296,7 @@ export function useScanner(
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.error }));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, active, protocol, ipScan, effectiveConcurrency, effectiveTimeout, noize, running, appendLog, clearLogs]);

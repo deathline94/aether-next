@@ -50,6 +50,8 @@ class WebViewHardeningTest {
         assertFalse("a port-spoofed host", isTrustedUiUrl("https://appassets.androidplatform.net.evil.example/assets/www/", APP_HOST, UI_PATH_PREFIX))
         assertFalse("plain http", isTrustedUiUrl("http://appassets.androidplatform.net/assets/www/index.html", APP_HOST, UI_PATH_PREFIX))
         assertFalse("a sibling asset directory", isTrustedUiUrl("https://appassets.androidplatform.net/assets/other/index.html", APP_HOST, UI_PATH_PREFIX))
+        assertFalse("dot-segment traversal", isTrustedUiUrl("https://appassets.androidplatform.net/assets/www/../engine/aether", APP_HOST, UI_PATH_PREFIX))
+        assertFalse("encoded dot traversal", isTrustedUiUrl("https://appassets.androidplatform.net/assets/www/%2e%2e/engine/aether", APP_HOST, UI_PATH_PREFIX))
         assertFalse("the host alone, no path", isTrustedUiUrl("https://appassets.androidplatform.net", APP_HOST, UI_PATH_PREFIX))
         assertFalse("empty", isTrustedUiUrl("", APP_HOST, UI_PATH_PREFIX))
     }

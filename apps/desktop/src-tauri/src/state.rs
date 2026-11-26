@@ -150,6 +150,19 @@ pub(crate) fn emit_state(
     pid: Option<u32>,
     endpoint: Option<String>,
 ) {
+    if !status.eq_ignore_ascii_case("connected") {
+        *state.handshake_rtt_ms.lock() = None;
+        let _ = app.emit(
+            "session://stats",
+            crate::events::StatsEvent {
+                up_bps: 0,
+                down_bps: 0,
+                up_bytes: 0,
+                down_bytes: 0,
+                uptime_secs: 0,
+            },
+        );
+    }
     let value = RuntimeState {
         status: status.into(),
         detail: detail.into(),

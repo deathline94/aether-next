@@ -77,10 +77,6 @@ fun decideLiveness(
     silentWindows: Int = 0,
     probeFailed: Boolean = false,
 ): LivenessDecision {
-    // The budget check comes first: once attempts are spent, nothing else may
-    // schedule another restart, or a flapping network turns into a loop that
-    // keeps re-registering the VPN interface.
-    if (attempt >= MAX_ATTEMPTS) return LivenessDecision.Exhausted
     if (elapsedMs < WINDOW_MS) return LivenessDecision.Alive
 
     val txPackets = now.at(0) - prev.at(0)
@@ -91,15 +87,18 @@ fun decideLiveness(
     val rxDelta = rxPackets.coerceAtLeast(rxBytes)
     val txDelta = txPackets.coerceAtLeast(txBytes)
 
-    return when {
+    // A healthy 3rd restart carrying bidirectional traffic must stay Alive; only a
+    // subsequent dead verdict after all restarts are spent is Exhausted.
+    val deadReason = when {
         rxDelta > 0L && txDelta == 0L && frozenWindows + 1 >= FROZEN_TX_WINDOWS ->
             LivenessDecision.DeadRxOnly
 
         rxDelta == 0L && txDelta == 0L && silentWindows + 1 >= SILENT_WINDOWS && probeFailed ->
             LivenessDecision.DeadSilent
 
-        else -> LivenessDecision.Alive
+        else -> return LivenessDecision.Alive
     }
+    return if (attempt >= MAX_ATTEMPTS) LivenessDecision.Exhausted else deadReason
 }
 
 /**

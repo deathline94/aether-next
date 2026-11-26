@@ -39,8 +39,8 @@ pub use proxy::sanitize_proxy_bypass_host;
 pub use proxy::windows_proxy;
 pub use scan::scan_terminal_event;
 pub use settings::{
-    decode_settings_text, validate_settings, write_atomic, IpVersion, Protocol, RoutingMode,
-    ScanMode, Settings, TransportKind, NOIZE_VOCABULARY,
+    decode_settings_text, save_settings_at, validate_settings, write_atomic, IpVersion, Protocol,
+    RoutingMode, ScanMode, Settings, TransportKind, NOIZE_VOCABULARY,
 };
 pub use supervision::{
     connect_watchdog_action, engine_exit_outcome, heartbeat_stall_action, EngineExit,
@@ -77,18 +77,27 @@ async fn command_blocking<T: Send + 'static>(
 }
 
 #[tauri::command]
-fn get_settings(app: AppHandle) -> Result<Settings, CommandError> {
-    // One of the four boot commands the page issues *after* it has awaited its
-    // `listen()` calls, which is what makes it the readiness signal for the log
-    // lines `setup` emitted too early to be seen.
-    note_webview_ready(&app);
-    settings::load_settings_file(&app)
+async fn get_settings(app: AppHandle) -> Result<Settings, CommandError> {
+    command_blocking("get_settings", move || {
+        note_webview_ready(&app);
+        settings::load_settings_file(&app)
+    })
+    .await
 }
 
 #[tauri::command]
-async fn save_settings(app: AppHandle, settings: Settings) -> Result<(), CommandError> {
+async fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), CommandError> {
     command_blocking("save_settings", move || {
-        settings::save_settings_blocking(app, settings)
+        let parsed = settings::parse_ipc_settings(settings)?;
+        settings::save_settings_blocking(app, parsed)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reset_settings(app: AppHandle) -> Result<Settings, CommandError> {
+    command_blocking("reset_settings", move || {
+        settings::reset_corrupt_settings_blocking(app)
     })
     .await
 }
@@ -125,7 +134,13 @@ async fn connect(app: AppHandle, settings: Settings) -> Result<(), CommandError>
         // The payload came from the window, and that is worth recording: the tray
         // path can only read `settings.json`, so the two drivers of one engine have
         // to be tellable apart afterwards.
-        supervision::connect_blocking(app, settings, "window", "the window's form")
+        supervision::connect_blocking(
+            app,
+            settings,
+            "window",
+            "the window's form",
+            supervision::PersistSettings::Yes,
+        )
     })
     .await
 }
@@ -222,6 +237,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            reset_settings,
             get_state,
             is_admin,
             connect,
@@ -243,3 +259,7 @@ pub fn run() {
         Err(error) => startup::report_and_exit("Aether Next failed to start", &error.to_string()),
     }
 }
+
+#[cfg(all(test, windows))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}

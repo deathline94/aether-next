@@ -125,6 +125,11 @@ impl Rejected {
 /// v4-compatible and 6to4) and covers the whole set, so sharing it also keeps the
 /// two checks from drifting apart again.
 pub fn address_is_plausible(addr: SocketAddr) -> bool {
+    if let std::net::IpAddr::V4(v4) = addr.ip() {
+        if v4.is_private() {
+            return false;
+        }
+    }
     crate::netstack::forbidden_destination(addr.ip()).is_none()
 }
 
@@ -679,19 +684,30 @@ fn with_cache_locked<F: FnOnce(&mut EndpointsCache)>(
 /// operation with side effects, and `get_*_sorted` are called on the connect
 /// path.
 pub fn load_endpoints(base_config: &str) -> EndpointsCache {
+    const MAX_CACHE_BYTES: u64 = 1024 * 1024;
     let path = cache_path(base_config);
-    let mut cache = match std::fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str::<EndpointsCache>(&data) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!(
-                    "[cache] {} is unreadable ({e}); starting empty without touching it",
-                    path.display()
-                );
-                EndpointsCache::default()
-            }
+    let mut cache = match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > MAX_CACHE_BYTES => {
+            log::warn!(
+                "[cache] {} exceeds max size ({} bytes); starting empty",
+                path.display(),
+                meta.len()
+            );
+            EndpointsCache::default()
+        }
+        _ => match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<EndpointsCache>(&data) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!(
+                        "[cache] {} is unreadable ({e}); starting empty without touching it",
+                        path.display()
+                    );
+                    EndpointsCache::default()
+                }
+            },
+            Err(_) => EndpointsCache::default(),
         },
-        Err(_) => EndpointsCache::default(),
     };
     migrate_unlabelled(&mut cache.masque);
     decay_stale(&mut cache.masque);
@@ -727,9 +743,14 @@ pub fn migrate_unlabelled(masque: &mut Vec<CachedEndpoint>) {
     *masque = migrated;
 }
 
-/// Retain up to `limit` entries per transport so H2 and QUIC cache entries
-/// do not evict each other.
+/// Retain up to `limit` highest-trust entries per transport so H2 and QUIC
+/// cache entries do not evict each other and low-trust entries are dropped first.
 fn prune_per_transport(list: &mut Vec<CachedEndpoint>, limit: usize) {
+    list.sort_by(|a, b| {
+        b.trust_score()
+            .partial_cmp(&a.trust_score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut h2_count = 0;
     let mut quic_count = 0;
     let mut other_count = 0;
@@ -1102,17 +1123,23 @@ mod tests {
 
         // 162.159.193.1:443 must NEVER be treated as H3!
         assert!(
-            quic_entries.iter().all(|(addr, _)| addr.to_string() != "162.159.193.1:443"),
+            quic_entries
+                .iter()
+                .all(|(addr, _)| addr.to_string() != "162.159.193.1:443"),
             "unlabelled H2 gateway must not migrate to Quic"
         );
         assert!(
-            h2_entries.iter().any(|(addr, _)| addr.to_string() == "162.159.193.1:443"),
+            h2_entries
+                .iter()
+                .any(|(addr, _)| addr.to_string() == "162.159.193.1:443"),
             "unlabelled H2 gateway must migrate to H2"
         );
 
         // 162.159.198.1:443 is valid for H3, so it is present in Quic
         assert!(
-            quic_entries.iter().any(|(addr, _)| addr.to_string() == "162.159.198.1:443"),
+            quic_entries
+                .iter()
+                .any(|(addr, _)| addr.to_string() == "162.159.198.1:443"),
             "unlabelled H3 gateway migrates to Quic"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1129,7 +1156,12 @@ mod tests {
         for i in 1..=10 {
             h2_eps.push((format!("162.159.193.{i}:443").parse().unwrap(), 30 + i));
         }
-        add_to_masque_with_rtt_transport(&base, h2_eps, TransportKind::H2, Measurement::HandshakeProbe);
+        add_to_masque_with_rtt_transport(
+            &base,
+            h2_eps,
+            TransportKind::H2,
+            Measurement::HandshakeProbe,
+        );
 
         let mut quic_eps = Vec::new();
         for port in [443, 500, 1701, 4500, 4443, 8443, 8095] {
@@ -1138,7 +1170,12 @@ mod tests {
         for port in [443, 500, 1701] {
             quic_eps.push((format!("162.159.198.2:{port}").parse().unwrap(), 25));
         }
-        add_to_masque_with_rtt_transport(&base, quic_eps, TransportKind::Quic, Measurement::HandshakeProbe);
+        add_to_masque_with_rtt_transport(
+            &base,
+            quic_eps,
+            TransportKind::Quic,
+            Measurement::HandshakeProbe,
+        );
 
         let h2_saved = get_masque_sorted_for(&base, TransportKind::H2);
         let quic_saved = get_masque_sorted_for(&base, TransportKind::Quic);

@@ -72,6 +72,7 @@ pub enum ScanMode {
     Balanced,
     Thorough,
     Stealth,
+    Verified,
     Ironclad,
 }
 
@@ -85,6 +86,7 @@ impl ScanMode {
             "balanced" => ScanMode::Balanced,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
             "stealth" | "quiet" => ScanMode::Stealth,
+            "verified" | "proven" => ScanMode::Verified,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,
         }
@@ -96,6 +98,7 @@ impl ScanMode {
             ScanMode::Balanced => "balanced",
             ScanMode::Thorough => "thorough",
             ScanMode::Stealth => "stealth",
+            ScanMode::Verified => "verified",
             ScanMode::Ironclad => "ironclad",
         }
     }
@@ -111,6 +114,7 @@ impl ScanMode {
                 early_exit_first: true,
                 full_subnet: false,
                 sample_per_cidr: profile.turbo_sample,
+                verified_only: false,
             },
             ScanMode::Balanced => Strategy {
                 concurrency: 200,
@@ -121,6 +125,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: profile.balanced_sample,
+                verified_only: false,
             },
             ScanMode::Thorough => Strategy {
                 concurrency: 250,
@@ -131,6 +136,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: true,
                 sample_per_cidr: 0,
+                verified_only: false,
             },
             ScanMode::Stealth => Strategy {
                 concurrency: 8,
@@ -141,6 +147,18 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: profile.stealth_sample,
+                verified_only: false,
+            },
+            ScanMode::Verified => Strategy {
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(8),
+                target_successes: 4,
+                early_exit_first: false,
+                full_subnet: false,
+                sample_per_cidr: 48,
+                verified_only: true,
             },
             ScanMode::Ironclad => Strategy {
                 concurrency: 6,
@@ -151,6 +169,7 @@ impl ScanMode {
                 early_exit_first: false,
                 full_subnet: false,
                 sample_per_cidr: profile.balanced_sample,
+                verified_only: false,
             },
         }
     }
@@ -174,6 +193,7 @@ struct Strategy {
     early_exit_first: bool,
     full_subnet: bool,
     sample_per_cidr: usize,
+    verified_only: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +287,9 @@ impl ProbeConfig {
 impl CacheKind {
     fn read_sorted(&self, config_path: &str) -> Vec<(SocketAddr, u32)> {
         match self {
-            CacheKind::Masque(transport) => crate::cache::get_masque_sorted_for(config_path, *transport),
+            CacheKind::Masque(transport) => {
+                crate::cache::get_masque_sorted_for(config_path, *transport)
+            }
             CacheKind::WireGuard => crate::cache::get_wireguard_sorted(config_path),
         }
     }
@@ -279,9 +301,12 @@ impl CacheKind {
         measurement: crate::cache::Measurement,
     ) -> crate::cache::Mutation {
         match self {
-            CacheKind::Masque(transport) => {
-                crate::cache::add_to_masque_with_rtt_transport(config_path, endpoints, *transport, measurement)
-            }
+            CacheKind::Masque(transport) => crate::cache::add_to_masque_with_rtt_transport(
+                config_path,
+                endpoints,
+                *transport,
+                measurement,
+            ),
             CacheKind::WireGuard => {
                 crate::cache::add_to_wireguard_with_rtt(config_path, endpoints, measurement)
             }
@@ -1240,6 +1265,15 @@ fn build_candidates(
         .filter_map(|s| s.parse().ok())
         .filter(|a| pool_allows_ip(config.pool, IpAddr::V4(*a)))
         .collect();
+    if st.verified_only && config.pool != EndpointPool::WireGuard {
+        for raw in MASQUE_VERIFIED_GATEWAYS {
+            if let Ok(a) = raw.parse::<Ipv4Addr>() {
+                if pool_allows_ip(config.pool, IpAddr::V4(a)) && !v4_seeds.contains(&a) {
+                    v4_seeds.push(a);
+                }
+            }
+        }
+    }
     let mut v6_seeds: Vec<Ipv6Addr> = config
         .seeds_v6
         .iter()
@@ -1264,6 +1298,10 @@ fn build_candidates(
                 }
             }
         }
+    }
+
+    if st.verified_only {
+        return cap_and_order(seeds_out, tier1_out, tier2_out, tier3_out);
     }
 
     // CIDR sweep per tier.
@@ -1529,6 +1567,14 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.193.1",
 ];
 
+/// Cloudflare verified MASQUE gateways measured to answer connect-ip probes.
+pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
+    "162.159.199.1",
+    "162.159.199.2",
+    "162.159.198.2",
+    "162.159.198.1",
+];
+
 /// Cloudflare MASQUE H3 QUIC endpoints only listen on these specific VIPs across `MASQUE_PORTS`.
 pub const MASQUE_H3_SEEDS: &[&str] = &["162.159.198.1", "162.159.198.2", "162.159.198.3"];
 
@@ -1536,11 +1582,9 @@ pub const MASQUE_H3_SEEDS: &[&str] = &["162.159.198.1", "162.159.198.2", "162.15
 /// requires BOTH one of the 3 permitted IPv4 VIPs AND a port in MASQUE_PORTS.
 pub fn is_valid_masque_h3_endpoint(addr: SocketAddr) -> bool {
     let ip_ok = match addr.ip() {
-        IpAddr::V4(ipv4) => {
-            MASQUE_H3_SEEDS
-                .iter()
-                .any(|seed| seed.parse::<Ipv4Addr>() == Ok(ipv4))
-        }
+        IpAddr::V4(ipv4) => MASQUE_H3_SEEDS
+            .iter()
+            .any(|seed| seed.parse::<Ipv4Addr>() == Ok(ipv4)),
         IpAddr::V6(_) => false,
     };
     let port_ok = MASQUE_PORTS.contains(&addr.port());
@@ -2089,10 +2133,10 @@ mod candidate_tests {
         ProbeConfig {
             verify_cost: VerifyCost::Cheap,
             pool: EndpointPool::MasqueH2,
-            cidrs_v4: &["10.0.0.0/24", "10.0.1.0/24"],
+            cidrs_v4: &["198.51.100.0/24", "198.51.101.0/24"],
             cidrs_v6: &[],
-            cidr_weights_v4: &[("10.0.0.0/24", 10), ("10.0.1.0/24", 5)],
-            seeds_v4: &["10.0.0.1", "10.0.1.1"],
+            cidr_weights_v4: &[("198.51.100.0/24", 10), ("198.51.101.0/24", 5)],
+            seeds_v4: &["198.51.100.1", "198.51.101.1"],
             seeds_v6: &[],
             cache_kind: CacheKind::Masque(crate::cache::TransportKind::Quic),
             label: "gateway",
@@ -2117,6 +2161,7 @@ mod candidate_tests {
             early_exit_first: true,
             full_subnet: false,
             sample_per_cidr: 4,
+            verified_only: false,
         }
     }
 
@@ -2124,7 +2169,7 @@ mod candidate_tests {
     fn seeds_come_first_across_all_ports() {
         let cands = build_candidates(&test_config(), &test_strategy(), &[443, 500], IpScan::V4);
         // 2 seeds x 2 tiered ports = 4 seed candidates, ahead of any CIDR sample.
-        let seed_ips: std::collections::HashSet<IpAddr> = ["10.0.0.1", "10.0.1.1"]
+        let seed_ips: std::collections::HashSet<IpAddr> = ["198.51.100.1", "198.51.101.1"]
             .iter()
             .map(|s| s.parse().unwrap())
             .collect();
@@ -2181,7 +2226,7 @@ mod candidate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         config.config_path = dir.join("aether.toml").to_string_lossy().to_string();
 
-        let visited = Arc::new(std::sync::Mutex::new(HashSet::<IpAddr>::new()));
+        let visited = Arc::new(parking_lot::Mutex::new(HashSet::<IpAddr>::new()));
         let visited_by_verify = Arc::clone(&visited);
         let hit: IpAddr = MASQUE_H3_SEEDS[0].parse().unwrap();
         let verify = move |ip: IpAddr,
@@ -2189,7 +2234,7 @@ mod candidate_tests {
                            _timeout: Duration,
                            _ironclad: bool|
               -> Pin<Box<dyn Future<Output = Option<ProbeResult>> + Send>> {
-            visited_by_verify.lock().unwrap().insert(ip);
+            visited_by_verify.lock().insert(ip);
             Box::pin(async move {
                 (ip == hit).then_some(ProbeResult {
                     ip,
@@ -2210,7 +2255,7 @@ mod candidate_tests {
             &verify,
         ));
         assert!(result.is_ok(), "{result:?}");
-        let seen = visited.lock().unwrap();
+        let seen = visited.lock();
         assert!(
             seen.iter()
                 .all(|ip| pool_allows_ip(EndpointPool::MasqueH3, *ip)),
@@ -2330,7 +2375,7 @@ mod candidate_tests {
 
         // The seed VIP verifies and, like a user hitting Stop, requests cancellation
         // on that first hit; every other candidate fails.
-        let hit: IpAddr = "10.0.0.1".parse().unwrap();
+        let hit: IpAddr = "198.51.100.1".parse().unwrap();
         let verify = move |ip: IpAddr,
                            port: u16,
                            _t: Duration,
@@ -2390,8 +2435,8 @@ mod candidate_tests {
         // Target 10 successes, but only 2 exist in the entire pool.
         config.profile.balanced_target = 10;
 
-        let hit1: IpAddr = "10.0.0.1".parse().unwrap();
-        let hit2: IpAddr = "10.0.1.1".parse().unwrap();
+        let hit1: IpAddr = "198.51.100.1".parse().unwrap();
+        let hit2: IpAddr = "198.51.101.1".parse().unwrap();
         let verify = move |ip: IpAddr,
                            port: u16,
                            _t: Duration,
@@ -2687,10 +2732,31 @@ mod scan_mode_tests {
             ScanMode::Balanced,
             ScanMode::Thorough,
             ScanMode::Stealth,
+            ScanMode::Verified,
             ScanMode::Ironclad,
         ] {
             assert_eq!(ScanMode::parse(mode.label()), mode);
         }
+        assert_eq!(ScanMode::parse("proven"), ScanMode::Verified);
+    }
+
+    #[test]
+    fn verified_mode_emits_only_seed_and_verified_gateways_without_cidr_sweep() {
+        let cfg = ProbeConfig::for_test();
+        let st = ScanMode::Verified.strategy(&cfg.profile);
+        let candidates = build_candidates(&cfg, &st, &[443], IpScan::V4);
+        assert!(!candidates.is_empty());
+        for (ip, _) in &candidates {
+            let s = ip.to_string();
+            assert!(
+                cfg.seeds_v4.contains(&s.as_str())
+                    || MASQUE_VERIFIED_GATEWAYS.contains(&s.as_str()),
+                "verified scan leaked non-verified CIDR candidate {s}"
+            );
+        }
+        assert!(candidates
+            .iter()
+            .any(|(ip, _)| !cfg.seeds_v4.contains(&ip.to_string().as_str())));
     }
 
     #[test]
@@ -2738,23 +2804,47 @@ mod token_round_trip_tests {
         use std::net::SocketAddr;
 
         // Valid IPv4 seeds (.1, .2, .3) and valid ports
-        assert!(is_valid_masque_h3_endpoint("162.159.198.1:443".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.2:8443".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.3:8095".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.1:500".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.2:1701".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.3:4500".parse().unwrap()));
-        assert!(is_valid_masque_h3_endpoint("162.159.198.1:4443".parse().unwrap()));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.1:443".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.2:8443".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.3:8095".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.1:500".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.2:1701".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.3:4500".parse().unwrap()
+        ));
+        assert!(is_valid_masque_h3_endpoint(
+            "162.159.198.1:4443".parse().unwrap()
+        ));
 
         // Out-of-pool seeds: .4, H2 seeds, arbitrary IPs
-        assert!(!is_valid_masque_h3_endpoint("162.159.198.4:443".parse().unwrap()));
-        assert!(!is_valid_masque_h3_endpoint("162.159.193.1:443".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint(
+            "162.159.198.4:443".parse().unwrap()
+        ));
+        assert!(!is_valid_masque_h3_endpoint(
+            "162.159.193.1:443".parse().unwrap()
+        ));
         assert!(!is_valid_masque_h3_endpoint("1.1.1.1:443".parse().unwrap()));
 
         // Invalid ports on valid seeds
-        assert!(!is_valid_masque_h3_endpoint("162.159.198.1:80".parse().unwrap()));
-        assert!(!is_valid_masque_h3_endpoint("162.159.198.2:8080".parse().unwrap()));
-        assert!(!is_valid_masque_h3_endpoint("162.159.198.3:22".parse().unwrap()));
+        assert!(!is_valid_masque_h3_endpoint(
+            "162.159.198.1:80".parse().unwrap()
+        ));
+        assert!(!is_valid_masque_h3_endpoint(
+            "162.159.198.2:8080".parse().unwrap()
+        ));
+        assert!(!is_valid_masque_h3_endpoint(
+            "162.159.198.3:22".parse().unwrap()
+        ));
 
         // IPv6 endpoints are strictly excluded from H3
         let v6: SocketAddr = "[2606:4700:d0::a29f:c001]:443".parse().unwrap();

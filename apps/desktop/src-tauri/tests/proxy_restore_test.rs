@@ -210,10 +210,13 @@ fn test_recover_deletes_file_on_restore_success() {
     std::fs::write(&path, data).unwrap();
     assert!(path.exists());
 
-    let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| Ok(()));
+    let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| Ok(true));
 
     assert!(
-        matches!(res, Ok(true)),
+        matches!(
+            res,
+            Ok(aether_desktop_lib::windows_proxy::RecoverOutcome::Restored)
+        ),
         "restored file should report success"
     );
     // File MUST be deleted
@@ -221,6 +224,72 @@ fn test_recover_deletes_file_on_restore_success() {
         !path.exists(),
         "recovery file must be deleted on successful restore"
     );
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// The journal describes a proxy that is no longer in place. It is consumed even
+/// though nothing was written: keeping it would make every later start try the
+/// same clobber against whatever the user has set by then.
+#[test]
+fn a_journal_that_was_left_alone_is_still_consumed() {
+    let dir = std::env::temp_dir().join(format!("test_proxy_recover_skip_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("proxy_recovery.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&snap(0, None, None, None)).unwrap(),
+    )
+    .unwrap();
+
+    let res = aether_desktop_lib::windows_proxy::recover_internal(&path, |_| Ok(false));
+
+    assert!(
+        matches!(
+            res,
+            Ok(aether_desktop_lib::windows_proxy::RecoverOutcome::LeftAlone)
+        ),
+        "a compare-and-swap refusal is not a restore"
+    );
+    assert!(!path.exists(), "the closed journal must not be retried");
+
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// The crash-recovery reader needs the values the dead session applied, not only
+/// the ones it found: without them it cannot tell Aether's dead proxy from one the
+/// user set while Aether was not running.
+#[test]
+fn a_journal_carries_the_applied_values_into_the_restore() {
+    use aether_desktop_lib::windows_proxy::{recover_internal, RecoverOutcome, RecoveryJournal};
+
+    let dir = std::env::temp_dir().join(format!("test_proxy_journal_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("proxy_recovery.json");
+    let journal = RecoveryJournal {
+        snapshot: snap(0, None, None, None),
+        applied: Some(snap(
+            1,
+            Some("http=127.0.0.1:1820;https=127.0.0.1:1820"),
+            Some("localhost;127.*;<local>"),
+            None,
+        )),
+    };
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    let seen = std::cell::Cell::new(false);
+    let res = recover_internal(&path, |parsed| {
+        assert_eq!(
+            parsed, journal,
+            "the applied values have to reach the restore"
+        );
+        seen.set(true);
+        Ok(false)
+    });
+
+    assert!(seen.get(), "the restorer must run");
+    assert!(matches!(res, Ok(RecoverOutcome::LeftAlone)));
+    assert!(!path.exists());
 
     let _ = std::fs::remove_dir(&dir);
 }
@@ -279,6 +348,7 @@ fn the_sweep_only_restores_when_the_file_is_gone_and_the_holder_is_dead() {
         creator_pid: 4242,
         written_unix: 1_700_000_000,
         snapshot: snap(1, Some("http=127.0.0.1:1234"), None, None),
+        applied: None,
     };
 
     assert_eq!(
@@ -315,12 +385,126 @@ fn the_mirror_survives_being_stored_as_one_registry_string() {
             Some("localhost;127.*;<local>"),
             Some("https://corp/proxy.pac"),
         ),
+        // The applied values are what a restore compares the registry with; a
+        // mirror that lost them can only fall back to "already equal to the
+        // snapshot".
+        applied: Some(snap(
+            1,
+            Some("http=127.0.0.1:4321;https=127.0.0.1:4321"),
+            Some("localhost;127.*;<local>"),
+            None,
+        )),
     };
     let json = serde_json::to_string(&mirror).expect("encode");
     let back: JournalMirror = serde_json::from_str(&json).expect("decode");
     assert_eq!(
         back, mirror,
         "a mirror that cannot round-trip cannot restore"
+    );
+}
+
+/// The old restore wrote the snapshot back blind. This is the case that made it a
+/// bug: Aether dies (or is closed) while the proxy journal exists, the user sets
+/// their own proxy, and the next start/disconnect puts the old values back over it.
+#[test]
+fn restoring_requires_the_live_registry_to_still_be_what_aether_applied() {
+    use aether_desktop_lib::windows_proxy::{decide_restore, RestoreDecision};
+
+    let before = snap(0, None, None, None);
+    let applied = snap(
+        1,
+        Some("http=127.0.0.1:1820;https=127.0.0.1:1820"),
+        Some("localhost;127.*;<local>"),
+        None,
+    );
+
+    assert_eq!(
+        decide_restore(&applied, Some(&applied), &before),
+        RestoreDecision::Restore,
+        "unchanged: the session's own values go back"
+    );
+
+    let user = snap(1, Some("http=10.0.0.9:3128"), Some("<local>"), None);
+    assert_eq!(
+        decide_restore(&user, Some(&applied), &before),
+        RestoreDecision::LeaveAlone,
+        "something else set the proxy after Aether applied its own; restoring would clobber it"
+    );
+
+    // One field is enough to tell. The PAC outranks ProxyServer in WinINet, so a
+    // matching server with a new PAC is still the user's route, not Aether's.
+    let pac = snap(
+        1,
+        Some("http=127.0.0.1:1820;https=127.0.0.1:1820"),
+        Some("localhost;127.*;<local>"),
+        Some("https://corp/pac.js"),
+    );
+    assert_eq!(
+        decide_restore(&pac, Some(&applied), &before),
+        RestoreDecision::LeaveAlone
+    );
+
+    // A journal from a build that did not record what it applied: restoring is
+    // allowed only where the registry already equals the snapshot, i.e. where the
+    // write changes nothing.
+    assert_eq!(
+        decide_restore(&before, None, &before),
+        RestoreDecision::Restore
+    );
+    assert_eq!(
+        decide_restore(&user, None, &before),
+        RestoreDecision::LeaveAlone
+    );
+}
+
+/// The repair registered at logon has to name this executable, quoted: a normal
+/// install lives under `C:\Program Files\...`, and an unquoted command line with
+/// spaces is parsed as a different program.
+#[test]
+fn the_at_logon_repair_quotes_an_executable_path_with_spaces() {
+    use aether_desktop_lib::windows_proxy::repair_command;
+
+    let exe = std::path::Path::new(r"C:\Program Files\Aether Next\aether-desktop.exe");
+    let command = repair_command(exe);
+    assert_eq!(
+        command,
+        r#""C:\Program Files\Aether Next\aether-desktop.exe" --repair-proxy --minimized"#
+    );
+    // And a path without spaces is quoted the same way, so there is one shape.
+    assert_eq!(
+        repair_command(std::path::Path::new(r"C:\aether.exe")),
+        r#""C:\aether.exe" --repair-proxy --minimized"#
+    );
+}
+
+/// `--repair-proxy` deliberately bypasses the single-instance plugin, so it can
+/// run beside a live tray session. Consuming that session's journal would restore
+/// the proxy — and delete the journal — out from under a working tunnel.
+#[test]
+fn a_repair_run_refuses_a_live_holders_journal() {
+    use aether_desktop_lib::windows_proxy::{repair_refusal, JournalMirror};
+
+    let mirror = JournalMirror {
+        creator_pid: 4242,
+        written_unix: 1_700_000_000,
+        snapshot: snap(0, None, None, None),
+        applied: Some(snap(1, Some("http=127.0.0.1:1820"), None, None)),
+    };
+
+    assert_eq!(
+        repair_refusal(Some(&mirror), true),
+        Some(4242),
+        "a live holder must stop the repair before it touches the journal"
+    );
+    assert_eq!(
+        repair_refusal(Some(&mirror), false),
+        None,
+        "the holder is dead; the orphan journal is exactly what the repair is for"
+    );
+    assert_eq!(
+        repair_refusal(None, true),
+        None,
+        "no mirror records no holder"
     );
 }
 

@@ -1,0 +1,119 @@
+name: CI
+
+# Gate for pull requests and main. `release.yml` calls this workflow before it
+# publishes, so a green suite is a precondition for a release rather than a
+# habit somebody remembers to run locally.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Engine (fmt, clippy, test)
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+    defaults:
+      run:
+        working-directory: aether
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+          components: rustfmt, clippy
+      - uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: "1.22"
+          cache: false
+      - uses: lukka/get-cmake@5f6e04f5267c8133f1273bf2103583fc72c46b17 # v3.31.5
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - name: Format
+        # Scoped to this crate: the vendored quiche workspace under ../quiche is
+        # not ours to reformat, and `cargo fmt --all` would rewrite it.
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  shell:
+    name: Desktop shell (test)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.88.0"
+          components: clippy
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+      - name: Build the frontend the shell bundles
+        working-directory: apps/desktop
+        run: npm ci && npm run build
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  frontend:
+    name: Frontend (${{ matrix.app }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [desktop, android]
+    defaults:
+      run:
+        working-directory: apps/${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+      - run: npm ci
+      # `tsc` because vitest never typechecks, then the suite.
+      - run: npx tsc -b
+        if: matrix.app == 'android'
+      - run: npx tsc
+        if: matrix.app == 'desktop'
+      - run: npm test
+
+  invariants:
+    name: Invariant gates
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "22"
+      - run: npm run verify-invariants
+
+  android-kotlin:
+    name: Android Kotlin (unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/android/android
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest

@@ -7,7 +7,9 @@ use crate::settings::{
     Settings,
 };
 use crate::state::{emit_log, AppState};
-use crate::supervision::{connect_blocking, disconnect_blocking, spawn_route_repair};
+use crate::supervision::{
+    connect_blocking, disconnect_blocking, spawn_route_repair, PersistSettings,
+};
 use std::sync::atomic::Ordering;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -24,6 +26,20 @@ use crate::proxy::windows_proxy;
 /// [`crate::startup`], because a `windows_subsystem = "windows"` build has no
 /// console for a panic to reach.
 pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // `--repair-proxy` is the one path that can run beside a live tray instance
+    // (`run` deliberately skips the single-instance plugin for it), so before it
+    // touches the config directory, the journal or the engine it has to establish
+    // that no live session owns the proxy it would restore.
+    #[cfg(windows)]
+    if crate::settings::repair_proxy_requested() {
+        if let Some(pid) = windows_proxy::live_holder_pid() {
+            crate::startup::note(&format!(
+                "--repair-proxy: Aether (pid {pid}) is running and owns the system proxy; \
+                 leaving the journal and the proxy alone"
+            ));
+            std::process::exit(0);
+        }
+    }
     let dir = config_dir(app.handle())
         .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error>)?;
     std::fs::create_dir_all(&dir).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -41,62 +57,79 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         let _ = dpapi::get_or_create_dpapi_config_key(&dir);
         spawn_route_repair(app.handle());
     }
+    let mut repair_failed = false;
     #[cfg(windows)]
     {
-        let mut recovered = false;
+        let mut consumed = false;
         if let Ok(path) = crate::settings::proxy_recovery_path(app.handle()) {
             match windows_proxy::recover(&path) {
-                Ok(true) => {
-                    recovered = true;
+                Ok(windows_proxy::RecoverOutcome::Restored) => {
+                    consumed = true;
                     emit_log(
                         app.handle(),
                         "Recovered Windows proxy after interrupted session".into(),
                     );
                 }
-                Ok(false) => {}
-                Err(error) => emit_log(
-                    app.handle(),
-                    format!("Windows proxy recovery failed: {error}"),
-                ),
+                Ok(windows_proxy::RecoverOutcome::LeftAlone) => {
+                    consumed = true;
+                    emit_log(
+                        app.handle(),
+                        "The Windows proxy changed outside Aether while no session was up, so \
+                         the interrupted session's journal was closed without restoring the \
+                         pre-session values"
+                            .into(),
+                    );
+                }
+                Ok(windows_proxy::RecoverOutcome::Nothing) => {}
+                Err(error) => {
+                    repair_failed = true;
+                    emit_log(app.handle(), format!("Windows proxy recovery failed: {error}"));
+                }
             }
         }
-        if !recovered {
-            // The file was gone but HKCU still said a session had changed the
-            // proxy, and the process that did it is dead. Restore from the mirror;
-            // `restore` clears it once the values read back.
-            if let Some(snapshot) = windows_proxy::sweep_orphan() {
-                match windows_proxy::restore(snapshot) {
-                    Ok(()) => emit_log(
-                        app.handle(),
-                        "Restored the Windows proxy from the registry journal: the recovery \
-                         file was missing and the session that set it had ended"
-                            .into(),
-                    ),
-                    Err(error) => emit_log(
+        if !consumed {
+            match windows_proxy::sweep_orphan() {
+                Ok(Some(true)) => emit_log(
+                    app.handle(),
+                    "Restored the Windows proxy from the registry journal: the recovery \
+                     file was missing and the session that set it had ended"
+                        .into(),
+                ),
+                Ok(Some(false)) => emit_log(
+                    app.handle(),
+                    "The Windows proxy changed outside Aether, so the registry journal from an \
+                     interrupted session was closed without restoring it"
+                        .into(),
+                ),
+                Ok(None) => {}
+                Err(error) => {
+                    repair_failed = true;
+                    emit_log(
                         app.handle(),
                         format!("Registry-journal proxy restore failed: {error}"),
-                    ),
+                    );
                 }
             }
         }
     }
     if crate::settings::repair_proxy_requested() {
-        // Everything that can be restored has been: the proxy journal above and
-        // the route journal the engine replays at its own startup. Exit without a
-        // tray, a window or an engine child, so the command is usable as a repair
-        // and not only as a side effect of opening the app.
-        crate::startup::note(if cfg!(windows) {
+        crate::startup::note(if repair_failed {
+            "--repair-proxy: Windows proxy repair encountered an error (see lines above)"
+        } else if cfg!(windows) {
             "--repair-proxy: Windows proxy state restored (see the lines above)"
         } else {
             "--repair-proxy: nothing to do; the system proxy integration is Windows-only"
         });
-        std::process::exit(0);
+        std::process::exit(if repair_failed { 1 } else { 0 });
     }
     crate::supervision::watch_child(app.handle().clone());
     let settings = crate::settings::load_settings_or_defaults(app.handle());
-    if settings.start_minimized || start_minimized_requested() {
-        if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_webview_window("main") {
+        if settings.start_minimized || start_minimized_requested() {
             let _ = window.hide();
+        } else {
+            let _ = window.show();
+            let _ = window.set_focus();
         }
     }
     let show = MenuItem::with_id(app, "show", "Open Aether Next", true, None::<&str>)?;
@@ -104,7 +137,6 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
     let disconnect_item = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &connect_item, &disconnect_item, &quit])?;
-    // Prefer bundled PNG so tray is never a blank/default tile when window icon is missing.
     let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
         .or_else(|_| {
             app.default_window_icon()
@@ -124,6 +156,7 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
                 if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -143,6 +176,7 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
                 }
             ) {
                 if let Some(window) = tray.app_handle().get_webview_window("main") {
+                    let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -164,7 +198,7 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
 fn tray_connect(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let on_disk = match load_settings_file(&app) {
+        let (on_disk, persist) = match load_settings_file(&app) {
             Ok(settings) => {
                 emit_log(
                     &app,
@@ -176,7 +210,7 @@ fn tray_connect(app: &AppHandle) {
                         settings_age(&app),
                     ),
                 );
-                settings
+                (settings, PersistSettings::Yes)
             }
             Err(error) => {
                 emit_log(
@@ -184,17 +218,19 @@ fn tray_connect(app: &AppHandle) {
                     format!(
                         "Tray Connect: settings.json is unusable ({error}), so the built-in \
                          defaults are being used instead ({}) — open the window and check them \
-                         before trusting this session",
+                         before trusting this session. They are not written back to settings.json \
+                         while the file is unreadable",
                         describe_settings(&Settings::default()),
                     ),
                 );
-                Settings::default()
+                (Settings::default(), PersistSettings::No)
             }
         };
         warn_if_disk_disagrees_with_session(&app, &on_disk, "Tray Connect");
         // The blocking body, not the `async` command: this is already off the UI
         // thread and cannot await.
-        if let Err(error) = connect_blocking(app.clone(), on_disk, "tray", "settings.json") {
+        if let Err(error) = connect_blocking(app.clone(), on_disk, "tray", "settings.json", persist)
+        {
             emit_log(
                 &app,
                 format!(
@@ -340,6 +376,8 @@ pub(crate) fn on_run_event(app: &AppHandle, event: RunEvent) {
                     ),
                 );
                 crate::startup::note("exit requested: running the teardown");
+                let state = app.state::<AppState>();
+                crate::scan::stop_scan_child(&state.scan_child);
                 if let Err(error) = disconnect_blocking(app.clone()) {
                     emit_log(
                         &app,

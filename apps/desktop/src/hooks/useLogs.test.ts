@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
 import { act, renderHook } from "@testing-library/react";
-import { hitKeyOf, useLogs } from "./useLogs";
+import { hitKeyOf, redactExport, useLogs } from "./useLogs";
 
 const hit = (message: string) => ({ level: "info" as const, message });
 
@@ -17,6 +17,33 @@ function recomputeHits(logs: { message: string; hitKey?: string }[]): number {
   }
   return count;
 }
+
+describe("redactExport", () => {
+  it("masks an IPv4 address and keeps the port it carried", () => {
+    const out = redactExport("probe 104.16.23.19:443 answered in 12 ms");
+    expect(out).not.toContain("104.16.23.19");
+    expect(out).toContain("192.0.2.0:443");
+  });
+
+  it("masks compressed IPv6 in and out of brackets", () => {
+    expect(redactExport("peer [2001:db8::1]:443")).toContain("[2001:db8::]:443");
+    const bare = redactExport("peer fe80::1ff:fe23:4567:890a");
+    expect(bare).not.toContain("fe80::1ff");
+    expect(bare).toContain("2001:db8::");
+  });
+
+  it("masks the host of a host:port endpoint and of a URL", () => {
+    expect(redactExport("gateway edge.example.net:8443 ready")).toBe("gateway host:8443 ready");
+    expect(redactExport("https://api.github.com/repos/deathline94/aether-next")).toBe(
+      "https://host/repos/deathline94/aether-next",
+    );
+  });
+
+  it("leaves a line with no address alone", () => {
+    const line = "2026-10-01T12:34:56.789Z\tinfo\tengine started in 12s";
+    expect(redactExport(line)).toBe(line);
+  });
+});
 
 describe("useLogs hit counting", () => {
   it("counts an endpoint once however many lines describe it", () => {

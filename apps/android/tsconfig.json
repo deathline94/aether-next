@@ -30,8 +30,8 @@
     "noEmit": true,
     "jsx": "react-jsx",
     "strict": true,
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     /* Same strictness as the desktop app: indexing yields `| undefined`, so a
        missing row or an unknown status cannot render as `undefined` silently. */

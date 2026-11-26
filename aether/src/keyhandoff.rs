@@ -150,19 +150,18 @@ pub fn receive_if_requested() -> Result<()> {
         return Ok(());
     }
     if runtime_env::var(KEY_ENV).is_some() {
-        log::debug!("[keyhandoff] key already present in the environment; ignoring stdin request");
-        return Ok(());
+        log::debug!("[keyhandoff] key already present in the environment; ignoring stdin key line");
+    } else {
+        // `raw` owns the line read off stdin and `key` the base64 text inside it;
+        // both are wiped once the store has its own copy, so the handoff leaves at
+        // most one live copy of the bytes rather than three.
+        let mut raw = read_preamble_line("key")?;
+        let mut key = parse_key_line(&raw)?;
+        raw.zeroize();
+        runtime_env::set(KEY_ENV, &key);
+        key.zeroize();
+        log::debug!("[keyhandoff] configuration key received over stdin");
     }
-
-    // `raw` owns the line read off stdin and `key` the base64 text inside it;
-    // both are wiped once the store has its own copy, so the handoff leaves at
-    // most one live copy of the bytes rather than three.
-    let mut raw = read_preamble_line("key")?;
-    let mut key = parse_key_line(&raw)?;
-    raw.zeroize();
-    runtime_env::set(KEY_ENV, &key);
-    key.zeroize();
-    log::debug!("[keyhandoff] configuration key received over stdin");
 
     // The order is part of the protocol: the GUI writes the key line, then the
     // driver line iff it started the engine in TUN mode. Anything else and the

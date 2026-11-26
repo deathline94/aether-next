@@ -34,6 +34,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("../bridge", () => ({ listen: mocks.listen, invoke: mocks.invoke }));
 
 import { useScanner } from "./useScanner";
+import { SCAN_PHASES } from "@aether/ui";
 import { SCAN_MAX_CONCURRENCY } from "../types";
 import type { LogInput, ScanState } from "../types";
 
@@ -216,6 +217,56 @@ describe("a scan event the interface cannot read is reported, not applied", () =
     emit({ runId: "run-under-test", type: "scan_progress", scanned: 400, total: 400, working: 9 });
     expect(result.current.scanState).toMatchObject({ scanned: 400, working: 9 });
 
+    vi.unstubAllGlobals();
+  });
+
+  /*
+   * The same rule the desktop scanner holds: the run id is minted before the start
+   * path awaits anything, and retired when the run is stopped. Here it was minted
+   * after `await invoke("disconnect")` and never cleared, so a stopped run's late
+   * terminal frame still matched and wrote "finished" onto the next run.
+   */
+  it("cannot let a stopped run's straggler end the run that replaced it", async () => {
+    let n = 0;
+    vi.stubGlobal("crypto", { randomUUID: () => `run-${++n}` });
+    // The second start's teardown hangs; that is the window the straggler arrives in.
+    let releaseTeardown: () => void = () => {};
+    const teardown = new Promise<void>((resolve) => {
+      releaseTeardown = resolve;
+    });
+    let disconnects = 0;
+    mocks.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "disconnect" && ++disconnects === 2) await teardown;
+      return null;
+    });
+
+    const { result } = renderHook(() => useScanner(appendLog, true, undefined));
+    await act(async () => {
+      await result.current.startScan();
+    });
+    await act(async () => {
+      await result.current.stopScan();
+    });
+    expect(result.current.scanState.phase).toBe(SCAN_PHASES.stopped);
+
+    // Retired with the run: a frame from the stopped scan is not this window's news.
+    emit({ runId: "run-1", type: "scan_done", addr: "162.159.193.1:443", rtt: "18ms", protocol: "MASQUE H3" });
+    expect(result.current.scanState.phase).toBe(SCAN_PHASES.stopped);
+
+    let second: Promise<void> = Promise.resolve();
+    act(() => {
+      second = result.current.startScan();
+    });
+    expect(result.current.scanState).toMatchObject({ active: true, phase: SCAN_PHASES.starting });
+
+    // The old run's terminal frame, delivered while the new run waits on teardown.
+    emit({ runId: "run-1", type: "scan_done", addr: "162.159.193.1:443", rtt: "18ms", protocol: "MASQUE H3" });
+    expect(result.current.scanState).toMatchObject({ active: true, phase: SCAN_PHASES.starting });
+
+    await act(async () => {
+      releaseTeardown();
+      await second;
+    });
     vi.unstubAllGlobals();
   });
 });

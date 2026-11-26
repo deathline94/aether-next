@@ -15,7 +15,7 @@ use crate::noize::{self, NoizeConfig};
 use crate::tls::{self, TlsParams};
 use crate::{consts, error::AetherError, error::Result};
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
+pub(crate) const MAX_DATAGRAM_SIZE: usize = 1500;
 /// Outbound IP packets handed to quiche per select wakeup.
 ///
 /// The batch this replaces drained the whole 2048-deep egress queue in one pass,
@@ -122,7 +122,10 @@ fn h3_stage(stage: &str, detail: &str) {
             "stage": stage,
             "detail": detail,
         });
-        log::info!("AETHER_EVENT {payload}");
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "AETHER_EVENT {payload}");
+        let _ = out.flush();
     }
 }
 
@@ -150,7 +153,7 @@ async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             let (dir_task, file_task) = (dir.clone(), file.clone());
             match tokio::task::spawn_blocking(move || {
                 std::fs::create_dir_all(&dir_task)?;
-                std::fs::File::create(&file_task)
+                open_private_file(&file_task, false)
             })
             .await
             {
@@ -163,18 +166,13 @@ async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             }
         }
     }
-    // Standard tooling variable, read from the real environment on purpose.
-    #[allow(clippy::disallowed_methods)]
-    let keylog = std::env::var("SSLKEYLOGFILE").ok();
+    let keylog = crate::runtime_env::var("AETHER_SSLKEYLOGFILE");
     if let Some(path) = keylog {
         let path = path.trim().to_string();
         if !path.is_empty() {
             let shown = path.clone();
             let opened = tokio::task::spawn_blocking(move || {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
+                open_private_file(std::path::Path::new(&path), true)
             })
             .await;
             match opened {
@@ -187,6 +185,22 @@ async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             }
         }
     }
+}
+
+fn open_private_file(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
@@ -600,7 +614,7 @@ pub async fn run(
                         }
                         let info = quiche::RecvInfo { from, to: to_local };
                         let received = conn.recv(&mut data, info);
-                        if matches!(received, Ok(_) | Err(quiche::Error::Done)) {
+                        if received.is_ok() {
                             keepalive.inbound();
                         }
                         if let Err(e) = received {
@@ -776,7 +790,9 @@ pub async fn run(
 
         if h3_ready && dataplane_ok {
             if let Some(tx) = ready_tx.take() {
-                log::info!("AETHER_EVENT {{\"type\":\"tunnel_ready\",\"transport\":\"h3\"}}");
+                crate::session_event::emit(crate::session_event::SessionEvent::TunnelReady {
+                    transport: "h3".into(),
+                });
                 let _ = tx.send(());
             }
         }
@@ -1108,8 +1124,22 @@ fn is_forwardable_ip_packet(pkt: &[u8]) -> bool {
             let proto = pkt[9];
             let payload = &pkt[ihl..];
             match proto {
-                1 => icmp_is_echo_reply(payload),
-                6 | 17 => !payload.is_empty(),
+                1 => icmp_is_echo_reply(1, payload),
+                6 => !payload.is_empty(),
+                17 => {
+                    if payload.is_empty() {
+                        return false;
+                    }
+                    // Reject an echoed outbound DNS query (dst=53, src!=53).
+                    if payload.len() >= 4 {
+                        let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+                        let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+                        if dst_port == 53 && src_port != 53 {
+                            return false;
+                        }
+                    }
+                    true
+                }
                 41 => !payload.is_empty(), // IPv6 encapsulated
                 _ => false,
             }
@@ -1122,8 +1152,21 @@ fn is_forwardable_ip_packet(pkt: &[u8]) -> bool {
             let proto = pkt[6];
             let payload = &pkt[40..];
             match proto {
-                58 => icmp_is_echo_reply(payload),
-                6 | 17 | 43 | 44 => !payload.is_empty(),
+                58 => icmp_is_echo_reply(58, payload),
+                17 => {
+                    if payload.is_empty() {
+                        return false;
+                    }
+                    if payload.len() >= 4 {
+                        let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+                        let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+                        if dst_port == 53 && src_port != 53 {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                6 | 43 | 44 => !payload.is_empty(),
                 _ => false,
             }
         }
@@ -1131,9 +1174,14 @@ fn is_forwardable_ip_packet(pkt: &[u8]) -> bool {
     }
 }
 
-fn icmp_is_echo_reply(payload: &[u8]) -> bool {
-    // type 0 = echo reply. 3/4/11/12 are errors and must not count as proof.
-    matches!(payload.first(), Some(0))
+fn icmp_is_echo_reply(proto: u8, payload: &[u8]) -> bool {
+    // IPv4 ICMP type 0 = echo reply; IPv6 ICMPv6 type 129 = echo reply.
+    // Error types (3/4/11/12 or v6 1..=4) must not count as proof.
+    match proto {
+        1 => matches!(payload.first(), Some(0)),
+        58 => matches!(payload.first(), Some(129)),
+        _ => false,
+    }
 }
 
 async fn drain_datagrams(
@@ -1494,7 +1542,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         // `wait` may be the overall deadline rather than a QUIC timer. Calling
         // `on_timeout()` when quiche did not ask for it would advance its PTO
         // state on a probe that is merely out of time.
-        let timer_is_quic = quic_timeout.is_some_and(|t| wait <= t);
+        let timer_is_quic = quic_timeout.is_some_and(|t| t <= remaining(deadline));
 
         tokio::select! {
             biased;
@@ -1615,14 +1663,17 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                                     if let Ok(Some(ip)) =
                                                                         masque::decode_ip_datagram(&dgram_buf[..dn], sid)
                                                                     {
-                                                                        if is_forwardable_ip_packet(&ip) {
+                                                                        if crate::dns::is_dns_reply(
+                                                                            &ip,
+                                                                            crate::dns::dataplane_probe_target(),
+                                                                        ) {
                                                                             if trace {
                                                                                 h3_stage("inbound_datagram", "quic datagram confirmed");
                                                                             }
                                                                             got_reply = true;
                                                                             break;
                                                                         }
-                                                                        log::debug!("[h3] probe: ignoring a datagram that is not forwardable traffic");
+                                                                        log::debug!("[h3] probe: ignoring a datagram that is not a DNS reply from probe target");
                                                                     }
                                                                 }
                                                                 Err(quiche::Error::Done) => break,
@@ -1646,14 +1697,17 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                                                             loop {
                                                                 match dp_capsules.next() {
                                                                     Ok(Some(masque::Capsule::Datagram(pkt))) => {
-                                                                        if is_forwardable_ip_packet(&pkt) {
+                                                                        if crate::dns::is_dns_reply(
+                                                                            &pkt,
+                                                                            crate::dns::dataplane_probe_target(),
+                                                                        ) {
                                                                             if trace {
                                                                                 h3_stage("inbound_datagram", "capsule datagram confirmed");
                                                                             }
                                                                             got_reply = true;
                                                                             break;
                                                                         }
-                                                                        log::debug!("[h3] probe: ignoring a capsule that is not forwardable traffic");
+                                                                        log::debug!("[h3] probe: ignoring a capsule that is not a DNS reply from probe target");
                                                                     }
                                                                     Ok(Some(_)) => {}
                                                                     Ok(None) | Err(_) => break,

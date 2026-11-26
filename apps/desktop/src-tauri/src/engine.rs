@@ -121,6 +121,8 @@ pub(crate) fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBu
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for rel in [
+                "resources\\aether.exe",
+                "resources/aether.exe",
                 "engine\\aether.exe",
                 "engine/aether.exe",
                 "aether-engine.exe",
@@ -137,27 +139,31 @@ pub(crate) fn engine_path(app: &AppHandle, settings: &Settings) -> Result<PathBu
     if settings.routing_mode == RoutingMode::Tun {
         return Err("aether.exe not found next to app; reinstall or use portable package".into());
     }
-    let repo_build =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../aether/target/release/aether.exe");
-    let Some(path) = repo_build.exists().then_some(repo_build) else {
-        return Err(
-            "aether.exe not found. Build engine or choose it in Settings > Advanced.".into(),
-        );
-    };
-    // The repository-build fallback is a development convenience. `validate_trusted_binary`
-    // tolerates an unsigned local build only in a debug binary (see
-    // `allow_unsigned_for_dev`), so in a release build this path cannot be used
-    // to launch an engine nobody signed.
-    validate_trusted_binary(&path, "aether.exe")?;
-    Ok(path)
+    #[cfg(debug_assertions)]
+    {
+        let repo_build = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../aether/target/release/aether.exe");
+        if repo_build.exists() {
+            validate_trusted_binary(&repo_build, "aether.exe")?;
+            return Ok(repo_build);
+        }
+    }
+    Err("aether.exe not found. Build engine or choose it in Settings > Advanced.".into())
 }
 
 pub(crate) fn wintun_path(app: &AppHandle) -> Option<PathBuf> {
     if let Some(path) = resolve_resource(app, "wintun.dll") {
         return Some(path);
     }
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("wintun.dll")))
-        .filter(|p| p.exists())
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for rel in ["resources\\wintun.dll", "engine\\wintun.dll", "wintun.dll"] {
+                let p = dir.join(rel);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }

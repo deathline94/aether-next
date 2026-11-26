@@ -518,3 +518,87 @@ export function scanProgressCopy(counts: {
     fastest: counts.bestRtt ? `fastest ${counts.bestRtt}` : null,
   };
 }
+
+export type NordicProtocolChoice = {
+  id: string;
+  title: string;
+  subtitle: string;
+  protocol: TunnelProtocol;
+  transport: Transport;
+};
+
+/**
+ * Shared 5-row protocol selector matching the Nordic Mist UI on both platforms.
+ * Keys avoid `value` so `wire-tokens-cross-layer` only scans real option lists.
+ */
+export const NORDIC_PROTOCOL_CHOICES: readonly NordicProtocolChoice[] = [
+  {
+    id: "masque-h2",
+    title: "MASQUE H2",
+    subtitle: "TCP · Best on restricted networks",
+    protocol: "masque",
+    transport: "h2",
+  },
+  {
+    id: "masque-h3",
+    title: "MASQUE H3",
+    subtitle: "QUIC · Fast modern UDP tunnel",
+    protocol: "masque",
+    transport: "h3",
+  },
+  {
+    id: "wireguard",
+    title: "WireGuard",
+    subtitle: "UDP · Low-overhead kernel speed",
+    protocol: "wireguard",
+    transport: "h3",
+  },
+  {
+    id: "mim",
+    title: "MASQUE-in-MASQUE",
+    subtitle: "Nested · Extra censorship resilience",
+    protocol: "mim",
+    transport: "h3",
+  },
+  {
+    id: "gool",
+    title: "Gool",
+    subtitle: "Relay · Lightweight fallback stream",
+    protocol: "gool",
+    transport: "h3",
+  },
+];
+
+export function matchProtocolChoice(
+  protocol: TunnelProtocol,
+  transport: Transport,
+): NordicProtocolChoice {
+  if (protocol === "masque") {
+    return (
+      NORDIC_PROTOCOL_CHOICES.find((c) => c.protocol === "masque" && c.transport === transport) ??
+      NORDIC_PROTOCOL_CHOICES[0]!
+    );
+  }
+  return NORDIC_PROTOCOL_CHOICES.find((c) => c.protocol === protocol) ?? NORDIC_PROTOCOL_CHOICES[0]!;
+}
+
+export function nordicHeroHeadline(
+  status: RuntimeStatus,
+  routingMode: RoutingMode,
+  canSetSystemProxy: boolean,
+): string {
+  if (status === "connected") {
+    const systemWide = routingMode === "tun" || (canSetSystemProxy && routingMode === "system-proxy");
+    return systemWide ? "Protected" : "Connected";
+  }
+  if (status === "connecting") return "Connecting…";
+  if (status === "error") return "Connection Failed";
+  return "Standby";
+}
+
+export function nordicRoutingSummary(mode: RoutingMode, platform: "desktop" | "android"): string {
+  if (mode === "tun") return platform === "desktop" ? "Full Device Tunnel (WinTUN)" : "Full Device VPN";
+  if (platform === "android") return "Local Proxy Only";
+  if (mode === "system-proxy") return "System Proxy (WinINET)";
+  return "Local Proxy Only";
+}

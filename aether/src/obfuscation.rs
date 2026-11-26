@@ -161,7 +161,7 @@ fn apply_custom_noize(mut cfg: NoizeConfig) -> NoizeConfig {
         cfg.jmax = v.max(cfg.jmin);
     }
     if let Some(ms) = env_usize("AETHER_NOIZE_INTERVAL_MS") {
-        cfg.junk_interval = std::time::Duration::from_millis(ms as u64);
+        cfg.junk_interval = std::time::Duration::from_millis((ms as u64).min(5_000));
     }
     cfg
 }
@@ -180,7 +180,7 @@ fn apply_custom_aethernoize(mut cfg: AetherNoizeConfig) -> AetherNoizeConfig {
         cfg.jmax = v.max(cfg.jmin);
     }
     if let Some(ms) = env_usize("AETHER_NOIZE_INTERVAL_MS") {
-        cfg.junk_interval = std::time::Duration::from_millis(ms as u64);
+        cfg.junk_interval = std::time::Duration::from_millis((ms as u64).min(5_000));
     }
     cfg
 }
@@ -236,8 +236,8 @@ pub fn aethernoize_from_name(name: &str) -> AetherNoizeConfig {
     match normalize(name) {
         "off" => AetherNoizeConfig::off(),
         "light" => AetherNoizeConfig::light(),
-        "medium" | "default" => AetherNoizeConfig::balanced(),
-        "high" => AetherNoizeConfig::balanced(),
+        "medium" | "default" => AetherNoizeConfig::firewall(),
+        "high" => AetherNoizeConfig::gfw(),
         "max" => AetherNoizeConfig::aggressive(),
         "custom" => AetherNoizeConfig::balanced(),
         _ => AetherNoizeConfig::balanced(),
@@ -263,7 +263,7 @@ fn parse_range(data: &str) -> usize {
             log::warn!("[obfs] range bound {max_str:?} in {data:?} is not a number; using 0");
             0
         });
-        if max > min && min > 0 {
+        if max >= min && min > 0 {
             return rand::thread_rng().gen_range(min..=max).min(2048);
         }
         // A `MIN-MAX` pair that does not describe a range (`0-16`, `16-8`) keeps
@@ -290,9 +290,10 @@ fn parse_range(data: &str) -> usize {
 /// - `<rc N|MIN-MAX>` — random ASCII alphabetic bytes
 /// - `<rd N|MIN-MAX>` — random ASCII digit bytes
 pub fn parse_cps(spec: &str) -> Vec<u8> {
+    static TAG_REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let mut out = Vec::new();
 
-    let tag_regex = Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap();
+    let tag_regex = TAG_REGEX.get_or_init(|| Regex::new(r"<([a-z]+)\s*([^>]*)>").unwrap());
 
     for cap in tag_regex.captures_iter(spec) {
         let tag_type = cap.get(1).map_or("", |m| m.as_str());
@@ -325,12 +326,10 @@ pub fn parse_cps(spec: &str) -> Vec<u8> {
                 out.extend_from_slice(&ts.to_be_bytes());
             }
             "c" => {
-                let counter = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    % 0xFFFFFFFF) as u32;
-                out.extend_from_slice(&counter.to_be_bytes());
+                static CPS_COUNTER: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(1);
+                let c = CPS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out.extend_from_slice(&c.to_be_bytes());
             }
             "n" => {
                 let nonce: u64 = rand::random();

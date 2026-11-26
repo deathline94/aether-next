@@ -192,8 +192,10 @@ pub fn encrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
     match svc {
         #[cfg(windows)]
         KeyService::Dpapi => {
+            let cb_data = u32::try_from(data.len())
+                .map_err(|_| CommandError::new("internal", "DPAPI plaintext exceeds u32 length"))?;
             let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: data.len() as u32,
+                cbData: cb_data,
                 pbData: data.as_ptr() as *mut u8,
             };
             dpapi_attempt("CryptProtectData", || {
@@ -215,10 +217,17 @@ pub fn encrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
                 if res == 0 {
                     return Err(last_crypto_error());
                 }
-                let encrypted = unsafe {
-                    std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+                let encrypted = if out_blob.pbData.is_null() || out_blob.cbData == 0 {
+                    Vec::new()
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
+                            .to_vec()
+                    }
                 };
-                unsafe { LocalFree(out_blob.pbData as _) };
+                if !out_blob.pbData.is_null() {
+                    unsafe { LocalFree(out_blob.pbData as _) };
+                }
                 Ok(encrypted)
             })
         }
@@ -230,8 +239,10 @@ pub fn decrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
     match svc {
         #[cfg(windows)]
         KeyService::Dpapi => {
+            let cb_data = u32::try_from(data.len())
+                .map_err(|_| CommandError::new("internal", "DPAPI ciphertext exceeds u32 length"))?;
             let in_blob = CRYPT_INTEGER_BLOB {
-                cbData: data.len() as u32,
+                cbData: cb_data,
                 pbData: data.as_ptr() as *mut u8,
             };
             dpapi_attempt("CryptUnprotectData", || {
@@ -253,8 +264,13 @@ pub fn decrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
                 if res == 0 {
                     return Err(last_crypto_error());
                 }
-                let decrypted = unsafe {
-                    std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+                let decrypted = if out_blob.pbData.is_null() || out_blob.cbData == 0 {
+                    Vec::new()
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
+                            .to_vec()
+                    }
                 };
                 unsafe {
                     if !out_blob.pbData.is_null() && out_blob.cbData > 0 {
@@ -264,7 +280,9 @@ pub fn decrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
                         );
                         slice.zeroize();
                     }
-                    LocalFree(out_blob.pbData as _);
+                    if !out_blob.pbData.is_null() {
+                        LocalFree(out_blob.pbData as _);
+                    }
                 };
                 Ok(decrypted)
             })
@@ -283,47 +301,48 @@ pub fn decrypt(data: &[u8]) -> Result<Vec<u8>, CommandError> {
 
 const DPAPI_MAGIC: &[u8] = b"DP01";
 
+fn unwrap_dpapi_config_key(key_file: &Path, raw: &[u8]) -> Result<Zeroizing<String>, CommandError> {
+    use base64::Engine;
+    if !raw.starts_with(DPAPI_MAGIC) {
+        return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()).into());
+    }
+    let decrypted = Zeroizing::new(decrypt(&raw[DPAPI_MAGIC.len()..])?);
+    if decrypted.len() != 32 {
+        return Err(CommandError::new(
+            "key_service_rejected",
+            format!(
+                "the stored master key unwraps to {} bytes, not 32; {} is left in place",
+                decrypted.len(),
+                key_file.display()
+            ),
+        ));
+    }
+    Ok(Zeroizing::new(
+        base64::engine::general_purpose::STANDARD.encode(&*decrypted),
+    ))
+}
+
 /// Derives or retrieves the 32-byte DPAPI-protected configuration master key.
 /// Returns the base64-encoded string representation for `AETHER_CONFIG_KEY`.
-pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, CommandError> {
+pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<Zeroizing<String>, CommandError> {
     use base64::Engine;
     let key_file = app_data_dir.join("config_key.dpapi");
-    if key_file.exists() {
-        let raw = std::fs::read(&key_file)
-            .map_err(|e| format!("failed reading {}: {e}", key_file.display()))?;
-        if !raw.starts_with(DPAPI_MAGIC) {
-            return Err(format!(
-                "invalid DPAPI key envelope header in {}",
-                key_file.display()
-            )
-            .into());
+    // Open directly rather than probing `exists()`: a PermissionDenied or
+    // transient lock on `exists()` must not fall through to creating and
+    // clobbering the live master key.
+    match std::fs::read(&key_file) {
+        Ok(raw) => return unwrap_dpapi_config_key(&key_file, &raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!("failed reading {}: {e}", key_file.display()).into());
         }
-        let decrypted = Zeroizing::new(decrypt(&raw[DPAPI_MAGIC.len()..])?);
-        if decrypted.len() != 32 {
-            // Wrong length is a fact about the bytes, not a bad moment: the file
-            // is reported and left alone, because whatever it is, it is the only
-            // copy of the thing that decrypts the identities on this disk.
-            return Err(CommandError::new(
-                "key_service_rejected",
-                format!(
-                    "the stored master key unwraps to {} bytes, not 32; {} is left in place",
-                    decrypted.len(),
-                    key_file.display()
-                ),
-            ));
-        }
-        return Ok(base64::engine::general_purpose::STANDARD.encode(&*decrypted));
     }
 
-    // Generate new 32-byte key. `Zeroizing` rather than a manual `zeroize()` at
-    // the bottom: half of the paths out of this function are `?`, and a stack
-    // array has no Drop, so every early return used to leave a master key sitting
-    // in the frame of a process that keeps running.
     let mut raw_key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *raw_key);
 
     let ciphertext = encrypt(&*raw_key)?;
-    let mut envelope = Vec::with_capacity(DPAPI_MAGIC.len() + ciphertext.len());
+    let mut envelope = Zeroizing::new(Vec::with_capacity(DPAPI_MAGIC.len() + ciphertext.len()));
     envelope.extend_from_slice(DPAPI_MAGIC);
     envelope.extend_from_slice(&ciphertext);
 
@@ -335,12 +354,6 @@ pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, Com
     std::fs::create_dir_all(app_data_dir)
         .map_err(|e| format!("cannot create dir {}: {e}", app_data_dir.display()))?;
     {
-        // Created exclusively and, off Windows, owner-only from the first
-        // byte: `restrict_directory_acl` is a no-op there, so without an
-        // explicit mode the master key landed with the process umask
-        // (0644 is the common case) while `encrypt()` was the identity
-        // function — every user on the machine could read the thing that
-        // decrypts every identity on disk.
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -368,29 +381,42 @@ pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<String, Com
                 .map_err(|e| format!("cannot flush {}: {e}", tmp_file.display()))?;
         }
     }
-    // Restrict ACL on the tmp file before rename; fail closed and cleanup on failure
     if let Err(e) = super::restrict_directory_acl(&tmp_file) {
         let _ = std::fs::remove_file(&tmp_file);
         return Err(format!("cannot restrict ACL on {}: {e}", tmp_file.display()).into());
     }
 
-    if let Err(e) = std::fs::rename(&tmp_file, &key_file) {
-        let _ = std::fs::remove_file(&tmp_file);
-        return Err(format!("cannot rename to {}: {e}", key_file.display()).into());
+    // Publish non-destructively via `hard_link`: if a concurrent first-run process
+    // created `config_key.dpapi` first, `AlreadyExists` makes us adopt that winner
+    // rather than overwriting it.
+    match std::fs::hard_link(&tmp_file, &key_file) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp_file);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&tmp_file);
+            let raw = std::fs::read(&key_file)
+                .map_err(|re| format!("failed reading {}: {re}", key_file.display()))?;
+            return unwrap_dpapi_config_key(&key_file, &raw);
+        }
+        Err(_) => {
+            // Fallback for filesystems without hard links: re-check NotFound then rename.
+            if let Ok(raw) = std::fs::read(&key_file) {
+                let _ = std::fs::remove_file(&tmp_file);
+                return unwrap_dpapi_config_key(&key_file, &raw);
+            }
+            if let Err(e) = std::fs::rename(&tmp_file, &key_file) {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err(format!("cannot commit {}: {e}", key_file.display()).into());
+            }
+        }
     }
 
-    // The temp file's DACL travels with the rename, so this repeats a
-    // restriction that is normally already in place — and repeating it while
-    // *discarding* the result (`let _ =`) was the defect: where the directory
-    // re-inherits over the file's own DACL, a failure here was silently the
-    // difference between "this user can read the master key" and "everyone
-    // can", against a comment that says fail closed. Report it, but leave the
-    // file in place: deleting a DPAPI master key the user may already have
-    // identities wrapped under is a worse loss than a loud failure.
     super::restrict_directory_acl(&key_file)?;
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&raw_key[..]);
-    Ok(encoded)
+    Ok(Zeroizing::new(
+        base64::engine::general_purpose::STANDARD.encode(&raw_key[..]),
+    ))
 }
 
 #[cfg(test)]

@@ -20,6 +20,24 @@ const SAFE_DEFAULT: usize = 1280;
 /// while v4 keeps working — a configured 1000 is a broken tunnel, not a choice.
 pub const IPV6_MIN_MTU: usize = 1280;
 
+/// Maximum inner tunnel MTU that fits inside one HTTP/3 QUIC DATAGRAM frame
+/// (`MAX_DATAGRAM_SIZE - 50` headroom for QUIC + CONNECT-IP context framing).
+pub const H3_MAX_TUNNEL_MTU: usize = crate::quic::MAX_DATAGRAM_SIZE - 50;
+
+/// Cap an HTTP/3 tunnel MTU so every inner packet fits in one QUIC datagram
+/// while preserving any configured/probed IPv6 floor requirement.
+pub fn cap_for_h3(mtu: usize, ipv6_configured: bool) -> usize {
+    let clamped = clamp_for_ip_families(mtu, ipv6_configured);
+    if clamped > H3_MAX_TUNNEL_MTU {
+        log::warn!(
+            "[-] MASQUE HTTP/3 MTU {clamped} exceeds one QUIC datagram; capping to {H3_MAX_TUNNEL_MTU}"
+        );
+        clamp_for_ip_families(H3_MAX_TUNNEL_MTU, ipv6_configured)
+    } else {
+        clamped
+    }
+}
+
 /// Resolved MTUs, keyed by protocol.
 ///
 /// The single global answer is the bug this replaces: the 1400 that is correct
@@ -190,10 +208,8 @@ async fn auto_probe(protocol: &str, ipv6_configured: bool) -> usize {
 /// chain surface. The reply requirement is the part that removes the false
 /// positive, which was the actual bug ("auto" always answered 1400).
 async fn probe_udp_size(payload: usize) -> bool {
-    let targets: &[SocketAddr] = &[
-        "1.1.1.1:443".parse().unwrap(),
-        "162.159.192.1:443".parse().unwrap(),
-    ];
+    let targets: &[SocketAddr] = &["1.1.1.1:53".parse().unwrap(), "8.8.8.8:53".parse().unwrap()];
+    let udp_len = payload.saturating_sub(28).max(64);
     for dest in targets {
         let sock = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
@@ -202,25 +218,54 @@ async fn probe_udp_size(payload: usize) -> bool {
                 continue;
             }
         };
-        // 28B of IP+UDP header on top, so the on-wire size is the MTU asked about.
-        let buf = vec![0u8; payload.saturating_sub(28).max(64)];
-        if let Err(e) = sock.send_to(&buf, dest).await {
+        let (qid, pkt) = build_padded_dns_probe(udp_len);
+        if let Err(e) = sock.send_to(&pkt, dest).await {
             log::debug!("[mtu] probe send to {dest} failed at {payload}: {e}");
             continue;
         }
         let mut rx = [0u8; 2048];
-        // `recv` would accept a datagram from *anyone* the ephemeral port happens
-        // to receive one from, and the engine would then claim a 1400-byte path it
-        // never measured to that target. The reply has to come from the address we
-        // probed.
-        match tokio::time::timeout(Duration::from_millis(400), sock.recv_from(&mut rx)).await {
-            Ok(Ok((_, from))) if from == *dest => return true,
-            Ok(Ok((_, from))) => log::debug!("[mtu] probe reply from {from}, not {dest}: unasked"),
+        match tokio::time::timeout(Duration::from_millis(450), sock.recv_from(&mut rx)).await {
+            Ok(Ok((n, from))) if from == *dest && n >= 12 && rx[0..2] == qid.to_be_bytes() => {
+                return true;
+            }
+            Ok(Ok((_, from))) if from != *dest => {
+                log::debug!("[mtu] probe reply from {from}, not {dest}: unasked");
+            }
+            Ok(Ok((n, _))) => {
+                log::debug!("[mtu] probe reply from {dest} ({n}B) did not match txid");
+            }
             Ok(Err(e)) => log::debug!("[mtu] probe reply from {dest} failed: {e}"),
             Err(_) => log::debug!("[mtu] probe to {dest} at {payload}: no reply inside window"),
         }
     }
     false
+}
+
+/// Build a valid DNS-over-UDP query for `.` NS padded to `target_len` bytes via
+/// EDNS0 Padding (RFC 7830, option 12) so any recursive resolver answers cleanly
+/// even for 1372-byte path-MTU probes.
+fn build_padded_dns_probe(target_len: usize) -> (u16, Vec<u8>) {
+    let id: u16 = rand::random();
+    let mut pkt = Vec::with_capacity(target_len);
+    pkt.extend_from_slice(&id.to_be_bytes());
+    pkt.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    // QNAME = "." (root), QTYPE = NS (2), QCLASS = IN (1)
+    pkt.extend_from_slice(&[0x00, 0x00, 0x02, 0x00, 0x01]);
+    // OPT header: root, type 41, UDP size 4096, flags 0, RDLEN placeholder
+    let opt_rdlen_offset = pkt.len() + 9;
+    pkt.extend_from_slice(&[
+        0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    let min_with_pad_hdr = pkt.len() + 4;
+    if target_len > min_with_pad_hdr {
+        let pad_len = (target_len - min_with_pad_hdr) as u16;
+        let rdlen = 4 + pad_len;
+        pkt[opt_rdlen_offset..opt_rdlen_offset + 2].copy_from_slice(&rdlen.to_be_bytes());
+        pkt.extend_from_slice(&12u16.to_be_bytes()); // EDNS0 PADDING (12)
+        pkt.extend_from_slice(&pad_len.to_be_bytes());
+        pkt.resize(pkt.len() + pad_len as usize, 0);
+    }
+    (id, pkt)
 }
 
 /// Current MTU for a reader that cannot say which protocol it is on.
@@ -328,5 +373,14 @@ mod tests {
     fn an_ipv4_only_interface_keeps_the_configured_value() {
         assert_eq!(clamp_for_ip_families(576, false), 576);
         assert_eq!(clamp_for_ip_families(1280, false), 1280);
+    }
+
+    #[test]
+    fn an_http3_tunnel_never_asks_for_more_than_one_datagram_carries() {
+        assert_eq!(super::cap_for_h3(1500, false), super::H3_MAX_TUNNEL_MTU);
+        assert_eq!(super::cap_for_h3(1500, true), super::H3_MAX_TUNNEL_MTU);
+        assert_eq!(super::cap_for_h3(1400, false), 1400);
+        assert_eq!(super::cap_for_h3(1280, true), 1280);
+        const { assert!(super::H3_MAX_TUNNEL_MTU >= IPV6_MIN_MTU) };
     }
 }

@@ -113,6 +113,44 @@ impl AetherNoizeConfig {
         }
     }
 
+    pub fn firewall() -> Self {
+        Self {
+            i1: Some("<b 0d0a0d0a><t><rc 24-44>".to_string()),
+            i2: Some("<b 504f5354><c><rd 12-24><rc 24-36>".to_string()),
+            i3: Some("<b 474554><r 30-50>".to_string()),
+            i4: None,
+            i5: None,
+            jc: 7,
+            jc_before_hs: 3,
+            jc_after_i1: 2,
+            jc_after_hs: 2,
+            jmin: 64,
+            jmax: 300,
+            junk_interval: Duration::from_millis(2),
+            handshake_delay: Duration::from_millis(10),
+            allow_zero_size: false,
+        }
+    }
+
+    pub fn gfw() -> Self {
+        Self {
+            i1: Some("<b 16030100><c><rc 48-72>".to_string()),
+            i2: Some("<b 0d0a0d0a><t><rd 20-40><rc 36-60>".to_string()),
+            i3: Some("<b 474554202f20485454502f312e31><rc 40-64>".to_string()),
+            i4: Some("<b 504f5354><c><r 64-110>".to_string()),
+            i5: Some("<rd 24-48><rc 32-56>".to_string()),
+            jc: 12,
+            jc_before_hs: 5,
+            jc_after_i1: 3,
+            jc_after_hs: 4,
+            jmin: 96,
+            jmax: 420,
+            junk_interval: Duration::from_millis(1),
+            handshake_delay: Duration::from_millis(16),
+            allow_zero_size: true,
+        }
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.jc > 0 || self.i1.is_some()
     }

@@ -338,6 +338,47 @@ class SessionControllerTest {
         assertEquals("disconnected", h.controller.getState().status)
     }
 
+    /**
+     * Stop-during-start, made deterministic through the runner seam: `launch` runs
+     * inside `EngineRunner.start()` while its lifecycle lock is held — the same
+     * place a real process spawn sits when the user taps Stop. Without the
+     * teardown epoch the stop publishes "Ready", the connect then launches the
+     * engine it was already past, and publishes "connecting" over the Ready.
+     */
+    @Test
+    fun aStopThatLandsDuringStartDoesNotLeaveAnEngineOrAConnectingUiBehind() {
+        val tempDir = File(System.getProperty("java.io.tmpdir"), "session_race_${System.nanoTime()}").apply { mkdirs() }
+        val fakeContext = FakeSessionContext(tempDir)
+        val emitted = mutableListOf<Pair<String, JSONObject>>()
+        lateinit var controller: SessionController
+
+        val launcher = object : ProcessLauncher {
+            override fun launch(command: List<String>, env: Map<String, String>): Process {
+                // The user's Stop arrives while the engine is being spawned.
+                controller.disconnect()
+                return FakeProcess(ProcessExitBehavior.GRACEFUL)
+            }
+        }
+        controller = SessionController(
+            context = fakeContext,
+            emitter = { event, payload -> emitted.add(event to payload) },
+            runnerFactory = { onLine, onExit ->
+                TestableEngineRunner(fakeContext, fakeBinary, onLine, onExit, launcher)
+            },
+        )
+
+        val err = controller.connect(Settings(routingMode = "proxy-only"))
+
+        assertNotNull("the connect must report that the stop won, got: $err", err)
+        assertEquals("the stop's Ready state is the true one", "disconnected", controller.getState().status)
+        assertFalse("no engine may be left running after the stop", controller.runner.isRunning())
+        assertFalse(
+            "nothing may still claim to be connecting after the engine is gone",
+            emitted.filter { it.first == "session://state" }.last().second.optString("status") == "connecting",
+        )
+        tempDir.deleteRecursively()
+    }
+
     /** The readiness/VPN gate keys off this predicate; "mim" once fell through
      * startsWith("masque") and took the WireGuard arm, skipping the tunnel gate. */
     @Test

@@ -65,7 +65,7 @@ pub fn current_user_sid() -> Result<String> {
             )));
         }
 
-        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let tu = core::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_USER);
         let sid = tu.User.Sid;
         if sid.is_null() {
             return Err(AetherError::HostState("token has no user SID".into()));

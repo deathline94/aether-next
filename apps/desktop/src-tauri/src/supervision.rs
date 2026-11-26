@@ -34,10 +34,32 @@ use crate::engine_job;
 #[cfg(windows)]
 use crate::proxy::windows_proxy;
 
+fn shutdown_with_grace(child: &mut std::process::Child, grace: std::time::Duration) {
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"shutdown\n");
+        let _ = stdin.flush();
+    }
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+}
+
 pub(crate) fn mark_connected(app: &AppHandle, state: &AppState, settings: &Settings) {
     if state.connected_once.swap(true, Ordering::SeqCst) {
         return;
     }
+    *state.connect_since.lock() = None;
     let endpoint = state.runtime.lock().endpoint.clone();
     if settings.routing_mode == RoutingMode::SystemProxy {
         #[cfg(windows)]
@@ -59,25 +81,23 @@ pub(crate) fn mark_connected(app: &AppHandle, state: &AppState, settings: &Setti
                         state.proxy_enabled.store(true, Ordering::SeqCst);
                     }
                     emit_log(app, format!("System proxy failed: {error}"));
-                    // Stop engine so UI is not stuck with orphan child.
+                    state.generation.fetch_add(1, Ordering::SeqCst);
+                    state.connecting.store(false, Ordering::SeqCst);
+                    *state.session_origin.lock() = None;
+                    *state.last_beat.lock() = None;
                     if let Some(mut child) = state.child.lock().take() {
-                        state.generation.fetch_add(1, Ordering::SeqCst);
-                        if let Some(mut stdin) = child.stdin.take() {
-                            let _ = stdin.write_all(b"shutdown\n");
-                            let _ = stdin.flush();
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        shutdown_with_grace(&mut child, std::time::Duration::from_secs(2));
                     }
-                    cleanup_routing(app, state);
-                    emit_state(
-                        app,
-                        state,
-                        "error",
-                        "System proxy setup failed",
-                        None,
-                        endpoint,
-                    );
+                    let problems = cleanup_routing(app, state);
+                    for problem in &problems {
+                        crate::startup::note(&format!("[aether] {problem}"));
+                    }
+                    let detail = if problems.is_empty() {
+                        "System proxy setup failed".to_string()
+                    } else {
+                        format!("System proxy setup failed · {}", problems.join(" · "))
+                    };
+                    emit_state(app, state, "error", &detail, None, endpoint);
                     return;
                 }
             }
@@ -151,15 +171,37 @@ pub(crate) fn cleanup_routing(app: &AppHandle, state: &AppState) -> Vec<String> 
     if state.proxy_enabled.swap(false, Ordering::SeqCst) {
         let mut snapshot = state.proxy_snapshot.lock();
         if let Some(saved) = snapshot.take() {
-            if let Err(error) = windows_proxy::restore(saved.clone()) {
-                *snapshot = Some(saved);
-                state.proxy_enabled.store(true, Ordering::SeqCst);
-                problems.push(format!(
-                    "system proxy restore failed ({error}); Windows is still routing through the \
-                     tunnel's port - reconnect once or run Aether with --repair-proxy"
-                ));
-            } else if let Ok(path) = proxy_recovery_path(app) {
-                let _ = fs::remove_file(path);
+            let applied = state.proxy_applied.lock().clone();
+            match windows_proxy::restore_if_ours(applied.as_ref(), saved.clone()) {
+                Ok(true) => {
+                    if let Ok(path) = proxy_recovery_path(app) {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                // The live registry is no longer what this session wrote, so the
+                // values to put back are the user's, not the snapshot's. The
+                // journal describes a proxy that is gone; closing it keeps every
+                // later start from restoring it over the newer values.
+                Ok(false) => {
+                    if let Ok(path) = proxy_recovery_path(app) {
+                        let _ = fs::remove_file(path);
+                    }
+                    emit_log(
+                        app,
+                        "The Windows proxy was left as it is: it changed outside Aether while \
+                         this session was up, and restoring the pre-session values would have \
+                         overwritten that change"
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    *snapshot = Some(saved);
+                    state.proxy_enabled.store(true, Ordering::SeqCst);
+                    problems.push(format!(
+                        "system proxy restore failed ({error}); Windows is still routing through the \
+                         tunnel's port - reconnect once or run Aether with --repair-proxy"
+                    ));
+                }
             }
         }
     }
@@ -448,6 +490,7 @@ fn check_proxy_coherence(app: &AppHandle, state: &AppState) {
         // response: leaving it means the user thinks their traffic is tunneled
         // while it is going out raw.
         Err(drift) => {
+            let _operation = state.operation.lock();
             if !owned() {
                 return;
             }
@@ -471,15 +514,31 @@ fn check_proxy_coherence(app: &AppHandle, state: &AppState) {
 }
 
 /// What the engine's heartbeat pulses say about the session, right now.
-///
-/// `last_beat` is taken out and put back unless a decision came from it, which is
-/// how "warn once per gap" works: the next pulse re-arms the check.
-fn check_liveness(state: &AppState) -> Option<Liveness> {
+fn check_liveness(
+    state: &AppState,
+    woke_from_sleep: bool,
+    stall_reported: &AtomicBool,
+) -> Option<Liveness> {
     let status = state.runtime.lock().status.clone();
     let armed = state.connecting.load(Ordering::SeqCst)
         || status.eq_ignore_ascii_case("connecting")
         || status.eq_ignore_ascii_case("connected");
-    let beat = state.last_beat.lock().take();
+    if !armed {
+        stall_reported.store(false, Ordering::SeqCst);
+        return None;
+    }
+    if woke_from_sleep {
+        // After OS suspend/resume, grant one heartbeat window from now rather than
+        // immediately killing a session whose monotonic clock jumped while asleep.
+        let now = std::time::Instant::now();
+        let mut beat = state.last_beat.lock();
+        if let Some((_, at)) = beat.as_mut() {
+            *at = now;
+        }
+        stall_reported.store(false, Ordering::SeqCst);
+        return None;
+    }
+    let beat = state.last_beat.lock().clone();
     let session_age = (*state.connect_since.lock()).map(|(_, started)| started.elapsed());
     let stalled = heartbeat_stall_action(
         beat.as_ref()
@@ -490,20 +549,18 @@ fn check_liveness(state: &AppState) -> Option<Liveness> {
         session_age,
     );
     match stalled {
-        // Teardown only on evidence: a session that has pulsed before and went
-        // silent. A *connected* session that has never pulsed at all gets the same
-        // log line but is not stopped from here, because "this engine build does
-        // not pulse while connected" would otherwise read as a wedge and kill
-        // working tunnels.
         Some(detail) if status.eq_ignore_ascii_case("connected") && beat.is_some() => {
             Some(Liveness::StopConnected(detail))
         }
-        Some(detail) => Some(Liveness::Report(detail)),
-        // Not stalled: put the pulse back for the next tick.
-        None => {
-            if let Some((phase, at)) = beat {
-                *state.last_beat.lock() = Some((phase, at));
+        Some(detail) => {
+            if !stall_reported.swap(true, Ordering::SeqCst) {
+                Some(Liveness::Report(detail))
+            } else {
+                None
             }
+        }
+        None => {
+            stall_reported.store(false, Ordering::SeqCst);
             None
         }
     }
@@ -551,27 +608,21 @@ fn connect_watchdog_expired(state: &AppState, session: u64) -> bool {
 fn stop_stalled_session(app: &AppHandle, state: &AppState, reason: &str, session: u64) {
     let child = {
         let _operation = state.operation.lock();
-        // Re-check the session identity *under* the claim lock. The decision was
-        // taken a few microseconds ago without it, and a connect that has since
-        // started would otherwise be stopped for the last session's silence.
-        if state.generation.load(Ordering::SeqCst) != session {
+        if state.generation.load(Ordering::SeqCst) != session
+            || state.tearing_down.load(Ordering::SeqCst)
+        {
             return;
         }
         state.generation.fetch_add(1, Ordering::SeqCst);
         state.connecting.store(false, Ordering::SeqCst);
+        state.tearing_down.store(true, Ordering::SeqCst);
         *state.connect_since.lock() = None;
         *state.session_origin.lock() = None;
+        *state.last_beat.lock() = None;
         state.child.lock().take()
     };
-    // Outside the lock, and only now: the grace to close its own routes first, then
-    // the kill this path is authorised to give.
     if let Some(mut child) = child {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(b"shutdown\n");
-            let _ = stdin.flush();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        shutdown_with_grace(&mut child, std::time::Duration::from_secs(2));
     }
     let endpoint = state.runtime.lock().endpoint.clone();
     let problems = cleanup_routing(app, state);
@@ -584,22 +635,23 @@ fn stop_stalled_session(app: &AppHandle, state: &AppState, reason: &str, session
         format!("{reason} · {}", problems.join(" · "))
     };
     emit_state(app, state, "error", &detail, None, endpoint);
+    {
+        let _operation = state.operation.lock();
+        state.tearing_down.store(false, Ordering::SeqCst);
+    }
 }
 
-/// The supervisor: the only thing in this process that notices a session has gone
-/// wrong without being told.
-///
-/// Four jobs per tick — proxy coherence, heartbeat stall, connect timeout, child
-/// reap — and none of them may queue behind another's I/O, because the engine's
-/// output lines are read on threads that take `operation` per line.
 pub(crate) fn watch_child(app: AppHandle) {
     #[cfg(windows)]
     let mut last_coherence = std::time::Instant::now();
+    let stall_reported = AtomicBool::new(false);
+    let mut last_tick = std::time::Instant::now();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
+        let tick_gap = last_tick.elapsed();
+        last_tick = std::time::Instant::now();
+        let woke_from_sleep = tick_gap > std::time::Duration::from_secs(5);
         let state = app.state::<AppState>();
-        // The session this tick is reasoning about. Every teardown below has to
-        // re-check it under the lock before acting.
         let session = state.generation.load(Ordering::SeqCst);
 
         #[cfg(windows)]
@@ -608,11 +660,7 @@ pub(crate) fn watch_child(app: AppHandle) {
             check_proxy_coherence(&app, &state);
         }
 
-        // Heartbeat stall. During a connect this is a diagnostic the 90 s timeout
-        // then enforces; once *connected* it is the only liveness signal this
-        // process has, because a running-but-stopped-responding engine satisfies
-        // every "does the process exist" check in the file.
-        match check_liveness(&state) {
+        match check_liveness(&state, woke_from_sleep, &stall_reported) {
             Some(Liveness::StopConnected(detail)) => {
                 emit_log(
                     &app,
@@ -646,9 +694,6 @@ pub(crate) fn watch_child(app: AppHandle) {
             stop_stalled_session(&app, &state, detail, session);
         }
 
-        // Reap. `try_wait` is non-blocking, so it needs no lifecycle lock; taking
-        // the child out of the slot is the claim, and the same three-line retirement
-        // every other teardown path performs follows it.
         let (reaped, uncertain_child) = {
             let mut child_slot = state.child.lock();
             match child_slot.as_mut() {
@@ -662,14 +707,8 @@ pub(crate) fn watch_child(app: AppHandle) {
                             (Reaped::Failed(status.code()), None)
                         }
                     }
-                    // Still running: nothing else here is interesting this tick.
                     Ok(None) => continue,
-                    Err(error) => {
-                        // An unreadable exit status does not mean the process
-                        // exited. Keep the verified driver locked until we have
-                        // tried to terminate and wait for this child.
-                        (Reaped::Lost(error.to_string()), child_slot.take())
-                    }
+                    Err(error) => (Reaped::Lost(error.to_string()), child_slot.take()),
                 },
             }
         };
@@ -677,15 +716,22 @@ pub(crate) fn watch_child(app: AppHandle) {
             let _ = child.kill();
             let _ = child.wait();
         }
-        state.connecting.store(false, Ordering::SeqCst);
-        state.generation.fetch_add(1, Ordering::SeqCst);
-        *state.connect_since.lock() = None;
-        *state.session_origin.lock() = None;
-        let ever_connected = state.connected_once.load(Ordering::SeqCst);
+        let ever_connected = {
+            let _operation = state.operation.lock();
+            if state.generation.load(Ordering::SeqCst) != session
+                || state.tearing_down.load(Ordering::SeqCst)
+            {
+                continue;
+            }
+            state.connecting.store(false, Ordering::SeqCst);
+            state.generation.fetch_add(1, Ordering::SeqCst);
+            *state.connect_since.lock() = None;
+            *state.session_origin.lock() = None;
+            *state.last_beat.lock() = None;
+            state.connected_once.load(Ordering::SeqCst)
+        };
         let problems = cleanup_routing(&app, &state);
         if state.runtime.lock().status.eq_ignore_ascii_case("error") {
-            // A structured error event already set the banner and knows the reason;
-            // exiting is that event's own teardown finishing.
             for problem in &problems {
                 crate::startup::note(&format!("[aether] {problem}"));
             }
@@ -730,6 +776,19 @@ pub(crate) fn watch_child(app: AppHandle) {
     });
 }
 
+/// Whether a connect may replace `settings.json` with the settings it was given.
+///
+/// The window's form and a tray read that succeeded are the user's configuration
+/// and replace the file as they always have. A tray read that failed fills the gap
+/// with `Settings::default()` only so a session can start; those built-in defaults
+/// must never become the file the user opens next, or the corrupt file they could
+/// have repaired is gone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistSettings {
+    Yes,
+    No,
+}
+
 /// `connect`'s body: icacls, DPAPI, a multi-megabyte SHA-256, a signed-binary
 /// PowerShell query and the engine spawn. Always runs off the UI thread — via
 /// [`crate::command_blocking`] for the IPC path, and on a dedicated thread for the
@@ -744,13 +803,14 @@ pub(crate) fn connect_blocking(
     settings: Settings,
     source: &'static str,
     provenance: &'static str,
+    persist: PersistSettings,
 ) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
     let _operation = state.operation.lock();
+    if state.exiting.load(Ordering::SeqCst) {
+        return Err("Aether is shutting down.".into());
+    }
     if state.tearing_down.load(Ordering::SeqCst) {
-        // M7 (see `disconnect`): a connect that lands inside another session's
-        // teardown window ends up having its system-proxy state torn down by that
-        // teardown, and its UI status overwritten with "disconnected".
         return Err("Aether is still finishing the previous disconnect; try again".into());
     }
     if state
@@ -761,32 +821,30 @@ pub(crate) fn connect_blocking(
         return Err("Aether is already running".into());
     }
     let result = (|| -> Result<(), CommandError> {
-        // A scan and a tunnel must not run at once: stop any active scan first
-        // (gracefully, persisting its best-so-far) before bringing up the tunnel.
         stop_scan_child(&state.scan_child);
         if state.child.lock().is_some() {
             return Err("Aether is already running".into());
         }
         validate_settings(&settings)?;
-        save_settings_file(&app, &settings)?;
-        #[cfg(windows)]
-        autostart::set(settings.launch_at_login)?;
+        if persist == PersistSettings::Yes {
+            save_settings_file(&app, &settings)?;
+            #[cfg(windows)]
+            autostart::set(settings.launch_at_login)?;
+        }
 
         if settings.routing_mode == RoutingMode::Tun {
             #[cfg(windows)]
             {
-                // Prefer Admin session for TUN (Wintun + routes). No whole-GUI auto-relaunch.
-                // Run Aether as Administrator once, or accept UAC when engine elevates via helper later.
                 if !elevation::is_elevated() {
                     return Err(CommandError::new(
                         "permission_denied",
-                        "Full-device TUN needs Administrator. Right-click Aether → Run as administrator, then Connect.",
+                        "Full-device TUN needs Administrator. Quit Aether Next from the system tray, then right-click → Run as administrator.",
                     ));
                 }
                 if wintun_path(&app).is_none() {
                     return Err(CommandError::new(
                         "not_found",
-                        "wintun.dll not found. Reinstall Aether or place wintun.dll next to the app.",
+                        "wintun.dll not found. Reinstall Aether Next or place wintun.dll next to the app.",
                     ));
                 }
             }
@@ -801,10 +859,6 @@ pub(crate) fn connect_blocking(
         fs::create_dir_all(&dir).map_err(CommandError::from)?;
         restrict_directory_acl(&dir)?;
 
-        // In TUN mode the driver is not optional, and neither is verifying it.
-        // `if let Some(wintun) = wintun_path(&app)` skipped the whole check
-        // precisely in the case that matters: the packaged DLL missing, silently
-        // renamed, or shadowed by one the user dropped next to the exe.
         let mut wintun_for_handoff: Option<PathBuf> = None;
         #[cfg(windows)]
         let mut wintun_guard: Option<fs::File> = None;
@@ -819,11 +873,6 @@ pub(crate) fn connect_blocking(
             let wintun_policy = TrustedBinaryPolicy::for_wintun();
             let verified_driver = verify_elevated_binary(&wintun, "wintun.dll", &wintun_policy)
                 .map_err(CommandError::from)?;
-            // Optional pin: set AETHER_WINTUN_SHA256 to require an exact file
-            // hash. Read from the ambient environment on purpose, and note
-            // that it can only ever *add* verification — leaving it unset
-            // still requires a passing Authenticode chain, so there is no
-            // value this key can take that weakens the check.
             #[allow(clippy::disallowed_methods)]
             if let Ok(expected) = std::env::var("AETHER_WINTUN_SHA256") {
                 let expected = expected.trim().to_ascii_lowercase();
@@ -837,7 +886,7 @@ pub(crate) fn connect_blocking(
                     }
                 }
             }
-            wintun_for_handoff = Some(wintun);
+            wintun_for_handoff = Some(wintun.canonicalize().unwrap_or(wintun));
             #[cfg(windows)]
             {
                 wintun_guard = Some(verified_driver);
@@ -845,11 +894,12 @@ pub(crate) fn connect_blocking(
         }
 
         let mut dpapi_key = dpapi::get_or_create_dpapi_config_key(&dir)?;
-        let engine_guard = verify_engine_or_refuse(&executable)?;
-        let mut command = Command::new(&executable);
+        let canonical_exe = executable.canonicalize().unwrap_or(executable);
+        let engine_guard = verify_engine_or_refuse(&canonical_exe)?;
+        let mut command = Command::new(&canonical_exe);
         scrub_ambient_engine_env(&mut command);
         command
-            .current_dir(executable.parent().unwrap_or(std::path::Path::new(".")))
+            .current_dir(canonical_exe.parent().unwrap_or(std::path::Path::new(".")))
             .env("AETHER_CONFIG_KEY_STDIN", "1")
             .env("AETHER_PROTOCOL", settings.protocol.as_str())
             .env("AETHER_SCAN", settings.scan_mode.as_str())
@@ -1045,38 +1095,31 @@ pub(crate) fn connect_blocking(
 
 pub(crate) fn disconnect_blocking(app: AppHandle) -> Result<(), CommandError> {
     let state = app.state::<AppState>();
+    let mut child = {
+        let _operation = state.operation.lock();
+        if state.tearing_down.swap(true, Ordering::SeqCst) {
+            // A disconnect is already running; do not drop its Job handle or clear
+            // `tearing_down` underneath its 15s route-teardown grace window.
+            drop(_operation);
+            while state.tearing_down.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            return Ok(());
+        }
+        state.generation.fetch_add(1, Ordering::SeqCst);
+        state.connecting.store(false, Ordering::SeqCst);
+        *state.connect_since.lock() = None;
+        *state.last_beat.lock() = None;
+        *state.session_origin.lock() = None;
+        state.child.lock().take()
+    };
     let outcome = (|| -> Result<(), CommandError> {
-        // Take the child and retire the generation under `operation`, then
-        // RELEASE it before waiting. M7 asked for the lock to span the whole
-        // teardown and it did — that was the bug: the output pumps acquire
-        // `operation` for every single line (`stream_output`), so holding it
-        // across the 15 s grace window meant nobody drained the pipes. A chatty
-        // engine filled its stdout buffer, blocked writing, never reached its own
-        // route-teardown path, and was force-killed at the end of the window —
-        // exactly the outcome that leaves journaled routes installed and the
-        // Windows proxy pointing at a dead port. The `tearing_down` gate is what
-        // keeps a concurrent connect out of this window, not the lock.
-        let mut child = {
-            let _operation = state.operation.lock();
-            state.generation.fetch_add(1, Ordering::SeqCst);
-            state.connecting.store(false, Ordering::SeqCst);
-            state.tearing_down.store(true, Ordering::SeqCst);
-            // The session is over the moment it is claimed, so what it was started
-            // with stops being the configuration in force with the next line.
-            *state.session_origin.lock() = None;
-            state.child.lock().take()
-        };
         let mut problems: Vec<String> = Vec::new();
         if let Some(child) = child.as_mut() {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(b"shutdown\n");
                 let _ = stdin.flush();
             }
-            // Fifteen seconds, and never silently. The engine uses this window to
-            // close the tunnel, drop the routes it journaled and reset the adapter;
-            // five was routinely too short on a slow link, so the shell killed it
-            // mid-teardown and the machine kept routes to a dead adapter — with no
-            // log line saying a kill happened.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 match child.try_wait() {
@@ -1098,58 +1141,61 @@ pub(crate) fn disconnect_blocking(app: AppHandle) -> Result<(), CommandError> {
                 }
             }
         }
-        // `child` is dropped here, closing its handles; the job object is dropped
-        // by `cleanup_routing`, which is what kills anything still inside it.
         problems.extend(cleanup_routing(&app, &state));
 
         if problems.is_empty() {
             emit_state(&app, &state, "disconnected", "Ready", None, None);
             return Ok(());
         }
-        // Partial failure is reported as partial failure. The tunnel *is* down, so the
-        // status says so, but "Ready" would claim the host was put back together when
-        // the teardown path knows it was not.
         let detail = problems.join(" · ");
         eprintln!("[aether] disconnect incomplete: {detail}");
         emit_state(&app, &state, "disconnected", &detail, None, None);
         Err(CommandError::new("disconnect_incomplete", detail))
     })();
     {
-        // Under `operation`, so a connect either sees the gate and refuses, or
-        // starts after every byte of host state has been put back.
         let _operation = state.operation.lock();
         state.tearing_down.store(false, Ordering::SeqCst);
     }
     outcome
 }
 
-/// Sweep routes a previous crash left behind, at GUI startup rather than only
-/// when someone opens TUN mode. Abandoned-route recovery used to be reachable
-/// exclusively from the TUN bring-up path, so a session that died in proxy mode
-/// left the machine pointed at a tunnel that no longer existed until the user
-/// happened to enable TUN again. The engine owns the journal and the deletion
-/// rules; the shell only launches it — verified, with the inherited environment
-/// scrubbed — and does not wait for it.
 #[cfg(windows)]
 pub(crate) fn spawn_route_repair(app: &AppHandle) {
     let settings = load_settings_or_defaults(app);
     let Ok(executable) = engine_path(app, &settings) else {
-        return; // No resolvable engine yet; connect will report the real reason.
+        return;
     };
-    let engine_guard = match verify_engine_or_refuse(&executable) {
-        Ok(guard) => guard,
-        Err(_) => return,
+    let canonical_exe = executable.canonicalize().unwrap_or(executable);
+    let Ok(engine_guard) = verify_engine_or_refuse(&canonical_exe) else {
+        return;
     };
-    let mut command = Command::new(&executable);
+    let Ok(job) = engine_job::Job::create() else {
+        return;
+    };
+    let mut command = Command::new(&canonical_exe);
     scrub_ambient_engine_env(&mut command);
     command
         .arg("--repair-routes")
-        .current_dir(executable.parent().unwrap_or(Path::new(".")))
+        .current_dir(canonical_exe.parent().unwrap_or(Path::new(".")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Err(e) = command.spawn() {
-        emit_log(app, format!("Could not start the route repair: {e}"));
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
     }
-    drop(engine_guard);
+    match command.spawn() {
+        Ok(mut child) => {
+            drop(engine_guard);
+            let _ = job.assign_child(&child);
+            std::thread::spawn(move || {
+                let _job = job;
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            drop(engine_guard);
+            emit_log(app, format!("Could not start the route repair: {e}"));
+        }
+    }
 }

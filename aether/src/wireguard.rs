@@ -52,15 +52,18 @@ fn clear_reserved_field(pkt: &mut [u8]) {
     pkt[1..4].copy_from_slice(&[0u8; 3]);
 }
 
-#[derive(Clone)]
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct WgConfig {
     pub local_private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
+    #[zeroize(skip)]
     pub peer_endpoint: SocketAddr,
     /// Carried from the profile because the callers that build this config still
     /// resolve it; never written to the wire — see [`clear_reserved_field`].
     pub client_id: [u8; 3],
+    #[zeroize(skip)]
     pub persistent_keepalive: Option<u16>,
+    #[zeroize(skip)]
     pub aethernoize: Arc<AetherNoizeConfig>,
 }
 
@@ -163,8 +166,12 @@ impl WgTunnel {
         let aethernoize = self.aethernoize.clone();
         let aethernoize_t = self.aethernoize.clone();
         let peer = self.peer;
+        let last_inbound = Arc::new(std::sync::atomic::AtomicU64::new(crate::trust::now_unix()));
+        let last_inbound_r = last_inbound.clone();
+        let last_inbound_t = last_inbound.clone();
+        let post_hs_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let mut recv_task = tokio::spawn(async move {
+        let mut recv_task = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
             let mut tmp = vec![0u8; MAX_PACKET];
             loop {
@@ -178,6 +185,10 @@ impl WgTunnel {
                                 log::debug!("decapsulate error: {e:?}");
                             }
                             TunnResult::WriteToNetwork(pkt) => {
+                                last_inbound_r.store(
+                                    crate::trust::now_unix(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 let pkt_vec = pkt.to_vec();
                                 let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp);
                                 drop(tunn);
@@ -191,6 +202,10 @@ impl WgTunnel {
                             }
                             TunnResult::WriteToTunnelV4(pkt, _)
                             | TunnResult::WriteToTunnelV6(pkt, _) => {
+                                last_inbound_r.store(
+                                    crate::trust::now_unix(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 let pkt_vec = pkt.to_vec();
                                 let (extra, extra_tun) = drain_tunn(&mut tunn, &mut tmp);
                                 drop(tunn);
@@ -210,12 +225,12 @@ impl WgTunnel {
                     }
                 }
             }
-        });
+        }));
 
-        let mut send_task = tokio::spawn(async move {
+        let mut send_task = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
+            let mut out_buf = vec![0u8; MAX_PACKET];
             while let Some(ip_packet) = outbound_rx.recv().await {
                 let mut tunn = tunn_w.lock().await;
-                let mut out_buf = vec![0u8; MAX_PACKET];
 
                 match tunn.encapsulate(&ip_packet, &mut out_buf) {
                     TunnResult::Done => {}
@@ -249,7 +264,9 @@ impl WgTunnel {
                             let _ = inbound_tx_w.send(p).await;
                         }
 
-                        if aethernoize.jc_after_hs > 0 {
+                        if aethernoize.jc_after_hs > 0
+                            && !post_hs_sent.swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
                             let sock_clone = sock_w.clone();
                             let cfg_clone = aethernoize.clone();
                             tokio::spawn(async move {
@@ -268,20 +285,26 @@ impl WgTunnel {
                     TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {}
                 }
             }
-        });
+        }));
 
-        let mut timer_task = tokio::spawn(async move {
+        let mut timer_task = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
             let mut interval = tokio::time::interval(TIMER_TICK);
             // #4: Adaptive keepalive — track idle time and send extra pings
             // when the tunnel goes quiet (mobile NATs drop idle UDP after ~5-30s).
             let mut last_activity = Instant::now();
             let mut extra_keepalive_sent = false;
             let idle_threshold = Duration::from_secs(4);
+            let mut tmp = vec![0u8; MAX_PACKET];
 
             loop {
                 interval.tick().await;
+                let now_unix = crate::trust::now_unix();
+                let last_rx = last_inbound_t.load(std::sync::atomic::Ordering::Relaxed);
+                if now_unix.saturating_sub(last_rx) > 60 {
+                    log::error!("[wg] peer silent for >60s; tearing down dead tunnel");
+                    break;
+                }
                 let mut tunn = tunn_t.lock().await;
-                let mut tmp = vec![0u8; MAX_PACKET];
                 if let TunnResult::WriteToNetwork(pkt) = tunn.update_timers(&mut tmp) {
                     last_activity = Instant::now();
                     extra_keepalive_sent = false;
@@ -319,9 +342,14 @@ impl WgTunnel {
                     // and rebuilds the session, which is the source of connection jank.
                     if last_activity.elapsed() > idle_threshold && !extra_keepalive_sent {
                         extra_keepalive_sent = true;
-                        let mut tunn = tunn_t.lock().await;
-                        if let TunnResult::WriteToNetwork(pkt) = tunn.encapsulate(&[], &mut tmp) {
-                            let pkt_vec = pkt.to_vec();
+                        let pkt_vec = {
+                            let mut tunn = tunn_t.lock().await;
+                            match tunn.encapsulate(&[], &mut tmp) {
+                                TunnResult::WriteToNetwork(pkt) => Some(pkt.to_vec()),
+                                _ => None,
+                            }
+                        };
+                        if let Some(pkt_vec) = pkt_vec {
                             let _ = sock_t.send(&pkt_vec).await;
                             log::debug!(
                                 "[wg] adaptive keepalive: idle {}s, sent empty keepalive",
@@ -331,21 +359,13 @@ impl WgTunnel {
                     }
                 }
             }
-        });
+        }));
 
-        // H4 fix: poll the handles by reference so they are not consumed, then
-        // abort the survivors. Previously whichever task ended first left the
-        // other two running detached forever — the timer task in particular
-        // loops on interval.tick() and kept sending orphaned keepalives (and
-        // pinning the socket + Tunn) after the tunnel was considered dead.
         tokio::select! {
-            _ = &mut recv_task => log::info!("wireguard recv task ended"),
-            _ = &mut send_task => log::info!("wireguard send task ended"),
-            _ = &mut timer_task => log::info!("wireguard timer task ended"),
+            _ = &mut recv_task.0 => log::info!("wireguard recv task ended"),
+            _ = &mut send_task.0 => log::info!("wireguard send task ended"),
+            _ = &mut timer_task.0 => log::info!("wireguard timer task ended"),
         }
-        recv_task.abort();
-        send_task.abort();
-        timer_task.abort();
 
         Ok(())
     }
@@ -398,7 +418,8 @@ async fn verify_dataplane(
     start: Instant,
     deadline: Instant,
 ) -> Result<Duration> {
-    let probe = crate::dns::build_dataplane_probe(local_ipv4, Ipv4Addr::new(8, 8, 8, 8));
+    let probe_target = crate::dns::dataplane_probe_target();
+    let probe = crate::dns::build_dataplane_probe(local_ipv4, probe_target);
     let mut out_buf = vec![0u8; MAX_PACKET];
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let mut tmp_buf = vec![0u8; MAX_PACKET];
@@ -437,7 +458,9 @@ async fn verify_dataplane(
                 let n = r?;
                 clear_reserved_field(&mut recv_buf[..n]);
                 match tunn.decapsulate(None, &recv_buf[..n], &mut tmp_buf) {
-                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                    TunnResult::WriteToTunnelV4(pkt, _)
+                        if crate::dns::is_dns_reply(pkt, probe_target) =>
+                    {
                         successes += 1;
                         log::debug!(
                             "[wg] dataplane round-trip {}/{} confirmed in {:?}",
@@ -449,13 +472,19 @@ async fn verify_dataplane(
                             return Ok(elapsed);
                         }
                         let next_at = Instant::now().max(last_probe_at + DATAPLANE_PROBE_GAP);
+                        if next_at > Instant::now() {
+                            if next_at >= deadline {
+                                return Err(AetherError::Other("dataplane timeout".into()));
+                            }
+                            tokio::time::sleep_until(next_at.into()).await;
+                        }
                         if let Err(e) =
                             send_dataplane_probe(sock, tunn, &probe, &mut out_buf).await
                         {
                             log::warn!("[wg] next dataplane probe could not be sent: {e}");
                         }
-                        last_probe_at = next_at;
-                        resend_at = next_at + Duration::from_millis(700);
+                        last_probe_at = Instant::now();
+                        resend_at = last_probe_at + Duration::from_millis(700);
                     }
                     TunnResult::WriteToNetwork(pkt) => {
                         // Handshake bytes on the verification path: if they do
@@ -580,6 +609,10 @@ pub async fn verify_endpoint_keep_session(
                             // not established, and returning Ok() here used to
                             // report a handshake the peer never received.
                             sock.send(&pkt).await?;
+                        }
+                        if tunn.time_since_last_handshake().is_none() {
+                            log::debug!("[wg] ignoring TunnResult::Done before handshake completion");
+                            continue;
                         }
                         let elapsed = start.elapsed();
                         log::debug!("[wg] handshake done in {:?}", elapsed);

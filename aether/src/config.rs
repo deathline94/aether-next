@@ -178,21 +178,27 @@ pub fn key_source() -> KeySource {
 }
 
 fn key() -> Result<Option<[u8; 32]>> {
-    let Some(v) = crate::runtime_env::var("AETHER_CONFIG_KEY") else {
+    use zeroize::Zeroize;
+    let Some(mut v) = crate::runtime_env::var("AETHER_CONFIG_KEY") else {
         return Ok(None);
     };
-    let v = v.trim().to_string();
-    if v.is_empty() {
+    let trimmed = v.trim().to_string();
+    v.zeroize();
+    if trimmed.is_empty() {
         return Ok(None);
     }
-    let b = base64::engine::general_purpose::STANDARD
-        .decode(&v)
+    let mut b = base64::engine::general_purpose::STANDARD
+        .decode(&trimmed)
         .map_err(|_| AetherError::Config("invalid config key encoding".into()))?;
+    let mut trimmed = trimmed;
+    trimmed.zeroize();
     if b.len() != 32 {
+        b.zeroize();
         return Err(AetherError::Config("config key must be 32 bytes".into()));
     }
     let mut k = [0u8; 32];
     k.copy_from_slice(&b);
+    b.zeroize();
     Ok(Some(k))
 }
 
@@ -214,15 +220,18 @@ fn path_aad(path: &str) -> Vec<u8> {
         out.extend_from_slice(name.as_encoded_bytes());
     }
     if cfg!(windows) {
-        // NTFS names are case-insensitive: `Aether.toml` and `aether.toml` are
-        // the same file, and the bind must not depend on which spelling a
-        // caller happened to pass.
+        // NTFS names are case-insensitive across Unicode: fold UTF-8 paths
+        // with `.to_lowercase()` when valid UTF-8, falling back to ASCII fold.
+        if let Ok(s) = std::str::from_utf8(&out) {
+            return s.to_lowercase().into_bytes();
+        }
         out.make_ascii_lowercase();
     }
     out
 }
 
 fn seal(path: &str, plain: &[u8]) -> Result<Vec<u8>> {
+    use zeroize::Zeroize;
     let Some(mut k) = key()? else {
         return Err(AetherError::Config(
             "no configuration key available: refusing to write identity material in plaintext. \
@@ -234,8 +243,9 @@ fn seal(path: &str, plain: &[u8]) -> Result<Vec<u8>> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let aad = path_aad(path);
-    let ct = seal_with(&cipher, &nonce, &aad, plain)?;
-    k.fill(0);
+    let ct = seal_with(&cipher, &nonce, &aad, plain);
+    k.zeroize();
+    let ct = ct?;
     let mut out = Vec::with_capacity(MAGIC_V2.len() + 1 + NONCE_LEN + ct.len());
     out.extend_from_slice(MAGIC_V2);
     out.push(SCHEMA_VERSION);
@@ -271,9 +281,9 @@ fn open(path: &str, raw: &[u8], k: &[u8; 32]) -> Result<Option<Vec<u8>>> {
                 "truncated config envelope header".into(),
             ));
         };
-        if version > SCHEMA_VERSION {
+        if version == 0 || version > SCHEMA_VERSION {
             return Err(AetherError::Config(format!(
-                "config schema version {version} is newer than this build understands ({SCHEMA_VERSION})"
+                "config schema version {version} is unsupported (expected 1..={SCHEMA_VERSION})"
             )));
         }
         let rest = &body[1..];
@@ -340,12 +350,16 @@ fn restrict_windows_acl(path: &str, fresh: bool) -> Result<()> {
         format!("*{principal}:F"),
     ]);
     for args in steps {
-        let output = std::process::Command::new(&exe)
-            .args(&args)
-            .output()
-            .map_err(|e| {
-                AetherError::Config(format!("failed to run {} on {path}: {e}", exe.display()))
-            })?;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let output = cmd.output().map_err(|e| {
+            AetherError::Config(format!("failed to run {} on {path}: {e}", exe.display()))
+        })?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
             return Err(AetherError::Config(format!(
@@ -617,11 +631,12 @@ fn read_identity(path: &str, allow_plaintext: bool) -> Result<Loaded> {
         None if allow_plaintext => raw,
         None => return Err(plaintext_refused()),
     };
-    let text = String::from_utf8(plain)
+    let mut text = String::from_utf8(plain)
         .map_err(|_| AetherError::Config("invalid config encoding".into()))?;
-    let persisted: PersistedIdentity =
-        toml::from_str(&text).map_err(|e| AetherError::Config(format!("config parse: {e}")))?;
-    let identity = Identity::try_from(persisted)?;
+    let persisted: Result<PersistedIdentity> =
+        toml::from_str(&text).map_err(|e| AetherError::Config(format!("config parse: {e}")));
+    zeroize::Zeroize::zeroize(&mut text);
+    let identity = Identity::try_from(persisted?)?;
     Ok(if legacy_v1 {
         Loaded::LegacySealed(identity)
     } else if sealed {
@@ -643,7 +658,7 @@ fn plaintext_refused() -> AetherError {
 
 pub fn save(path: &str, identity: &Identity) -> Result<()> {
     let persisted = PersistedIdentity::from(identity);
-    let text = toml::to_string_pretty(&persisted)
+    let mut text = toml::to_string_pretty(&persisted)
         .map_err(|e| AetherError::Config(format!("config encode: {e}")))?;
     // The parent must exist *before* sealing: `path_aad` canonicalises it, and on
     // a first write into a new directory canonicalisation fails there and falls
@@ -651,8 +666,9 @@ pub fn save(path: &str, identity: &Identity) -> Result<()> {
     // so every later `load()` authenticated a different one and reported
     // "config authentication failed" on a file this same process had written.
     create_parent(path)?;
-    let data = seal(path, text.as_bytes())?;
-    write_private_file(path, &data)
+    let sealed = seal(path, text.as_bytes());
+    zeroize::Zeroize::zeroize(&mut text);
+    write_private_file(path, &sealed?)
 }
 
 /// Format WireGuard client configuration with AmneziaWG obfuscation parameters.

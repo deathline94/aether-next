@@ -115,6 +115,7 @@ pub enum IdentityCapability {
     MasqueReady,
 }
 
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct MasqueKeyPair {
     pub key_pem: Vec<u8>,
     pub cert_pem: Vec<u8>,
@@ -197,10 +198,249 @@ const API_HOST: &str = "api.cloudflareclient.com";
 /// where the resolver is tampered.
 const API_FALLBACK_EDGES: &[&str] = &["162.159.192.1", "162.159.195.1", "188.114.96.1"];
 
+fn fragmented_http1_enabled() -> bool {
+    crate::fragment::FragmentConfig::from_env().enabled
+}
+
+struct FragmentedHttpReply {
+    status: u16,
+    retry_after: Option<std::time::Duration>,
+    body: String,
+}
+
+fn parse_retry_after_header(value: &str) -> Option<std::time::Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < raw.len() {
+        let Some(rel_end) = raw[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Err(AetherError::Api("truncated chunked HTTP response".into()));
+        };
+        let line = std::str::from_utf8(&raw[pos..pos + rel_end])
+            .map_err(|_| AetherError::Api("non-utf8 chunk size".into()))?;
+        let hex_len = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(hex_len, 16)
+            .map_err(|_| AetherError::Api(format!("invalid chunk length {hex_len:?}")))?;
+        pos += rel_end + 2;
+        if size == 0 {
+            return Ok(out);
+        }
+        let end = pos
+            .checked_add(size)
+            .ok_or_else(|| AetherError::Api("chunk length overflow".into()))?;
+        if end + 2 > raw.len() {
+            return Err(AetherError::Api("truncated chunked HTTP payload".into()));
+        }
+        out.extend_from_slice(&raw[pos..end]);
+        pos = end + 2;
+    }
+    Ok(out)
+}
+
+fn parse_http1_reply(raw: &[u8]) -> Result<FragmentedHttpReply> {
+    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err(AetherError::Api("malformed HTTP response headers".into()));
+    };
+    let head = std::str::from_utf8(&raw[..hdr_end])
+        .map_err(|_| AetherError::Api("non-utf8 HTTP response headers".into()))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| AetherError::Api("empty HTTP status line".into()))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| AetherError::Api(format!("bad HTTP status line: {status_line}")))?;
+
+    let mut retry_after = None;
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        if let Some((name, val)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("retry-after") {
+                retry_after = parse_retry_after_header(val);
+            } else if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && val.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            } else if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = val.trim().parse::<usize>().ok();
+            }
+        }
+    }
+
+    let body_raw = &raw[hdr_end + 4..];
+    let body_bytes = if chunked {
+        decode_chunked_body(body_raw)?
+    } else if let Some(len) = content_length {
+        if body_raw.len() < len {
+            return Err(AetherError::Api("truncated HTTP response body".into()));
+        }
+        body_raw[..len].to_vec()
+    } else {
+        body_raw.to_vec()
+    };
+    let body = String::from_utf8(body_bytes)
+        .map_err(|_| AetherError::Api("non-utf8 HTTP response body".into()))?;
+    Ok(FragmentedHttpReply {
+        status,
+        retry_after,
+        body,
+    })
+}
+
+async fn resolve_api_addrs(edge: Option<&str>) -> Result<Vec<std::net::SocketAddr>> {
+    if let Some(ip) = edge {
+        let addr: std::net::SocketAddr = format!("{ip}:443")
+            .parse()
+            .map_err(|_| AetherError::Api(format!("invalid API fallback edge {ip}")))?;
+        return Ok(vec![addr]);
+    }
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((API_HOST, 443u16))
+        .await
+        .map_err(|e| AetherError::Api(format!("resolve {API_HOST}: {e}")))?
+        .collect();
+    if resolved.is_empty() {
+        return Err(AetherError::Api(format!(
+            "resolve {API_HOST} returned no addresses"
+        )));
+    }
+    Ok(resolved)
+}
+
+fn fragmented_tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+    if let Some(cached) = CFG.get() {
+        return Ok(std::sync::Arc::clone(cached));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|e| AetherError::Api(format!("fragmented API TLS config: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let arc = std::sync::Arc::new(cfg);
+    let _ = CFG.set(std::sync::Arc::clone(&arc));
+    Ok(arc)
+}
+
+async fn send_fragmented_http1(
+    edge: Option<&str>,
+    frag_cfg: crate::fragment::FragmentConfig,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    jwt: Option<&str>,
+    json_body: &[u8],
+) -> Result<FragmentedHttpReply> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let tls_cfg = fragmented_tls_config()?;
+    let server_name = rustls_pki_types::ServerName::try_from(API_HOST.to_string())
+        .map_err(|e| AetherError::Api(format!("fragmented API SNI {API_HOST}: {e}")))?;
+
+    let addrs = resolve_api_addrs(edge).await?;
+    let mut last_err = String::from("no addresses");
+    let mut connected_tcp = None;
+    for addr in addrs {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(tcp)) => {
+                let _ = tcp.set_nodelay(true);
+                connected_tcp = Some(tcp);
+                break;
+            }
+            Ok(Err(e)) => last_err = e.to_string(),
+            Err(_) => last_err = "TCP connect timeout".into(),
+        }
+    }
+    let tcp = connected_tcp
+        .ok_or_else(|| AetherError::Api(format!("fragmented API connect failed: {last_err}")))?;
+
+    let wrapped = crate::fragment::FragmentingStream::new(tcp, frag_cfg);
+    let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+    let mut tls = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        connector.connect(server_name, wrapped),
+    )
+    .await
+    .map_err(|_| AetherError::Api("fragmented API TLS timeout".into()))?
+    .map_err(|e| AetherError::Api(format!("fragmented API TLS: {e}")))?;
+    tls.get_mut().0.stop_fragmenting();
+
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\n\
+         Host: {API_HOST}\r\n\
+         User-Agent: {}\r\n\
+         CF-Client-Version: {}\r\n\
+         Content-Type: application/json; charset=UTF-8\r\n\
+         Accept: application/json\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n",
+        consts::UA_REGISTER,
+        consts::CF_CLIENT_VERSION,
+        json_body.len()
+    );
+    if let Some(tok) = bearer {
+        req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
+    }
+    if let Some(j) = jwt {
+        req.push_str(&format!("CF-Access-Jwt-Assertion: {j}\r\n"));
+    }
+    req.push_str("\r\n");
+
+    tls.write_all(req.as_bytes())
+        .await
+        .map_err(|e| AetherError::Api(format!("fragmented API write headers: {e}")))?;
+    tls.write_all(json_body)
+        .await
+        .map_err(|e| AetherError::Api(format!("fragmented API write body: {e}")))?;
+    tls.flush()
+        .await
+        .map_err(|e| AetherError::Api(format!("fragmented API flush: {e}")))?;
+
+    const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(15), tls.read(&mut chunk))
+            .await
+            .map_err(|_| AetherError::Api("fragmented API read timeout".into()))?
+            .map_err(|e| AetherError::Api(format!("fragmented API read: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        if raw.len() + n > MAX_RESPONSE_BYTES {
+            return Err(AetherError::Api("fragmented API response too large".into()));
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+
+    parse_http1_reply(&raw)
+}
+
 /// Build the API HTTP client. When `edge` is set, DNS for the API host is pinned to
 /// that Cloudflare edge IP (camouflaged, DNS-free path); SNI still follows the URL.
 fn http_client(edge: Option<&str>) -> Result<reqwest::Client> {
     let mut b = reqwest::Client::builder()
+        .no_proxy()
         .user_agent(consts::UA_REGISTER)
         .timeout(std::time::Duration::from_secs(20));
     if let Some(ip) = edge {
@@ -223,67 +463,140 @@ fn retry_after(resp: &reqwest::Response) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
-/// Send an API request resiliently: exponential backoff on transient errors and
-/// 429/5xx (honoring Retry-After), then a camouflaged fallback to direct Cloudflare
-/// edge IPs (no DNS) when `api.cloudflareclient.com` is blocked or poisoned. `build`
-/// reconstructs the request from the supplied client on each attempt.
+/// Send an API request resiliently: supports both standard HTTPS via reqwest
+/// and SNI-split fragmented TLS 1.3 via BoringSSL (`FragmentingStream`).
 async fn send_resilient(
-    build: impl Fn(&reqwest::Client) -> reqwest::RequestBuilder,
-) -> Result<reqwest::Response> {
-    // Attempt targets: normal DNS first, then each camouflaged edge IP.
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    jwt: Option<&str>,
+    json_body: &[u8],
+) -> Result<AccountData> {
     let mut targets: Vec<Option<&str>> = vec![None];
     targets.extend(API_FALLBACK_EDGES.iter().map(|e| Some(*e)));
 
+    let url = format!("{}{path}", consts::API_URL);
+    let frag_env = crate::fragment::FragmentConfig::from_env();
+    let started = std::time::Instant::now();
+    const MAX_TOTAL_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+    const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
     let mut last = String::from("no attempt made");
-    for (ti, edge) in targets.iter().enumerate() {
-        let client = match http_client(*edge) {
-            Ok(c) => c,
-            Err(e) => {
-                last = e.to_string();
-                continue;
+
+    if !fragmented_http1_enabled() {
+        for (ti, edge) in targets.iter().enumerate() {
+            if started.elapsed() >= MAX_TOTAL_RETRY_BUDGET {
+                break;
             }
-        };
-        for attempt in 0u32..3 {
-            match build(&client).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.as_u16() == 429 || status.is_server_error() {
-                        let wait = retry_after(&resp)
-                            .unwrap_or_else(|| std::time::Duration::from_millis(500u64 << attempt));
-                        // The header is server-supplied and this loop runs while the
-                        // provision lock is held: an absurd `Retry-After` wedged
-                        // provisioning with the UI parked on `identity` and every
-                        // other caller waiting on the same lock.
-                        const MAX_RETRY_AFTER: std::time::Duration =
-                            std::time::Duration::from_secs(30);
-                        let wait = if wait > MAX_RETRY_AFTER {
-                            log::warn!(
-                                "[provision] server asked to wait {}s; capping at {}s",
-                                wait.as_secs(),
-                                MAX_RETRY_AFTER.as_secs()
-                            );
-                            MAX_RETRY_AFTER
-                        } else {
-                            wait
-                        };
-                        last = format!("HTTP {status}");
-                        tokio::time::sleep(wait).await;
-                        continue;
-                    }
-                    return Ok(resp);
-                }
+            let client = match http_client(*edge) {
+                Ok(c) => c,
                 Err(e) => {
                     last = e.to_string();
+                    continue;
+                }
+            };
+            for attempt in 0u32..3 {
+                if started.elapsed() >= MAX_TOTAL_RETRY_BUDGET {
+                    break;
+                }
+                crate::session_event::mark_progress();
+                let mut req = match method {
+                    "PATCH" => client.patch(&url),
+                    _ => client.post(&url),
+                }
+                .headers(base_headers())
+                .body(json_body.to_vec());
+                if let Some(tok) = bearer {
+                    req = req.bearer_auth(tok);
+                }
+                if let Some(j) = jwt {
+                    req = req.header("CF-Access-Jwt-Assertion", j);
+                }
+                match req.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.as_u16() == 429 || status.is_server_error() {
+                            let wait = retry_after(&resp)
+                                .unwrap_or_else(|| {
+                                    std::time::Duration::from_millis(500u64 << attempt)
+                                })
+                                .min(MAX_RETRY_AFTER);
+                            last = format!("HTTP {status}");
+                            crate::session_event::mark_progress();
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        let text = resp
+                            .text()
+                            .await
+                            .map_err(|e| AetherError::Api(e.to_string()))?;
+                        return parse_account_body(status.as_u16(), &text);
+                    }
+                    Err(e) => {
+                        last = e.to_string();
+                        crate::session_event::mark_progress();
+                        tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt))
+                            .await;
+                    }
+                }
+            }
+            if ti == 0 {
+                log::warn!(
+                    "[account] api.cloudflareclient.com unreachable via DNS ({last}); trying camouflaged edge fallback"
+                );
+            }
+        }
+        log::warn!(
+            "[account] plain API requests failed ({last}); attempting SNI-fragmented fallback on Cloudflare edges"
+        );
+    }
+
+    let frag_cfg = if frag_env.enabled {
+        frag_env
+    } else {
+        crate::fragment::FragmentConfig::sni_default()
+    };
+    let frag_targets: &[Option<&str>] = if frag_env.enabled {
+        &targets
+    } else {
+        &[
+            Some("162.159.192.1"),
+            Some("162.159.195.1"),
+            Some("188.114.96.1"),
+        ]
+    };
+    for (ti, edge) in frag_targets.iter().enumerate() {
+        if started.elapsed() >= MAX_TOTAL_RETRY_BUDGET {
+            break;
+        }
+        for attempt in 0u32..2 {
+            if started.elapsed() >= MAX_TOTAL_RETRY_BUDGET {
+                break;
+            }
+            crate::session_event::mark_progress();
+            match send_fragmented_http1(*edge, frag_cfg, method, path, bearer, jwt, json_body).await
+            {
+                Ok(reply) if reply.status == 429 || reply.status >= 500 => {
+                    let wait = reply
+                        .retry_after
+                        .unwrap_or_else(|| std::time::Duration::from_millis(500u64 << attempt))
+                        .min(MAX_RETRY_AFTER);
+                    last = format!("HTTP {}", reply.status);
+                    crate::session_event::mark_progress();
+                    tokio::time::sleep(wait).await;
+                }
+                Ok(reply) => return parse_account_body(reply.status, &reply.body),
+                Err(e) => {
+                    last = e.to_string();
+                    crate::session_event::mark_progress();
                     tokio::time::sleep(std::time::Duration::from_millis(400u64 << attempt)).await;
                 }
             }
         }
-        if ti == 0 {
-            log::warn!(
-                "[account] api.cloudflareclient.com unreachable via DNS ({last}); trying camouflaged edge fallback"
-            );
+        if ti == 0 && frag_env.enabled {
+            log::warn!("[account] fragmented DNS API call failed ({last}); trying edge fallback");
         }
     }
+
     Err(AetherError::Api(format!(
         "account API unreachable after retries and edge fallback: {last}"
     )))
@@ -354,16 +667,9 @@ pub async fn register(
         locale: locale.to_string(),
     };
 
-    let url = format!("{}/{}/reg", consts::API_URL, consts::API_VERSION);
-    let resp = send_resilient(|client| {
-        let mut req = client.post(&url).headers(base_headers()).json(&body);
-        if let Some(jwt) = jwt {
-            req = req.header("CF-Access-Jwt-Assertion", jwt);
-        }
-        req
-    })
-    .await?;
-    let account = parse_account(resp).await?;
+    let path = format!("/{}/reg", consts::API_VERSION);
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| AetherError::Api(e.to_string()))?;
+    let account = send_resilient("POST", &path, None, jwt, &body_bytes).await?;
     Ok((account, wg_private))
 }
 
@@ -373,6 +679,15 @@ pub async fn enroll_key(
     spki_der: &[u8],
     name: Option<&str>,
 ) -> Result<AccountData> {
+    if device_id.is_empty()
+        || !device_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(AetherError::Api(format!(
+            "invalid device_id for key enrollment: {device_id:?}"
+        )));
+    }
     let body = DeviceUpdate {
         key: base64::engine::general_purpose::STANDARD.encode(spki_der),
         key_type: consts::KEY_TYPE_MASQUE.to_string(),
@@ -380,37 +695,21 @@ pub async fn enroll_key(
         name: name.map(|s| s.to_string()),
     };
 
-    let url = format!(
-        "{}/{}/reg/{}",
-        consts::API_URL,
-        consts::API_VERSION,
-        device_id
-    );
-    let resp = send_resilient(|client| {
-        client
-            .patch(&url)
-            .headers(base_headers())
-            .bearer_auth(token)
-            .json(&body)
-    })
-    .await?;
-
-    parse_account(resp).await
+    let path = format!("/{}/reg/{}", consts::API_VERSION, device_id);
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| AetherError::Api(e.to_string()))?;
+    send_resilient("PATCH", &path, Some(token), None, &body_bytes).await
 }
 
-async fn parse_account(resp: reqwest::Response) -> Result<AccountData> {
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| AetherError::Api(e.to_string()))?;
-
-    if !status.is_success() {
+fn parse_account_body(status: u16, text: &str) -> Result<AccountData> {
+    if !(200..300).contains(&status) {
+        if matches!(status, 401 | 403) {
+            return Err(AetherError::ApiUnauthorized(format!("HTTP {status}")));
+        }
         return Err(AetherError::Api(format!(
             "upstream account API returned {status}"
         )));
     }
-    let acct = serde_json::from_str::<AccountData>(&text)
+    let acct = serde_json::from_str::<AccountData>(text)
         .map_err(|e| AetherError::Api(format!("invalid account API response: {e}")))?;
     for (i, p) in acct.config.peers.iter().enumerate() {
         if !p.endpoint.host.is_empty() || !p.endpoint.v4.is_empty() || !p.endpoint.v6.is_empty() {
@@ -531,22 +830,33 @@ pub async fn ensure_masque_enrolled(
     .await?;
     let endpoint = masque_endpoint_from(&acct);
     log::info!("[+] MASQUE key enrolled (endpoint={endpoint:?})");
-    Ok((keypair.cert_pem, keypair.key_pem, endpoint))
+    Ok((keypair.cert_pem.clone(), keypair.key_pem.clone(), endpoint))
 }
 
 /// Extract the MASQUE data-plane endpoint (host:443) from a registration/enroll
 /// response's first peer. The API returns `endpoint.v4` like "162.159.198.2:0";
 /// the MASQUE QUIC port is 443, so normalize it.
 fn masque_endpoint_from(acct: &AccountData) -> Option<String> {
-    let ep = acct.config.peers.first()?.endpoint.v4.trim();
-    if ep.is_empty() {
-        return None;
+    let ep = &acct.config.peers.first()?.endpoint;
+    let v4 = ep.v4.trim();
+    if !v4.is_empty() {
+        let host = v4.rsplit_once(':').map(|(h, _)| h).unwrap_or(v4);
+        if !host.is_empty() {
+            return Some(format!("{host}:443"));
+        }
     }
-    let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
-    if host.is_empty() {
-        return None;
+    let v6 = ep.v6.trim();
+    if !v6.is_empty() {
+        let host = if let Some(rest) = v6.strip_prefix('[') {
+            rest.split(']').next().unwrap_or("")
+        } else {
+            v6
+        };
+        if !host.is_empty() {
+            return Some(format!("[{host}]:443"));
+        }
     }
-    Some(format!("{host}:443"))
+    None
 }
 
 impl Identity {
@@ -591,5 +901,39 @@ impl Identity {
 
     pub fn can_run_masque(&self) -> bool {
         matches!(self.capability(), IdentityCapability::MasqueReady)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_content_length_http1_reply() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"id\":\"dev-01\"}ignored";
+        let reply = parse_http1_reply(raw).unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, "{\"id\":\"dev-01\"}");
+    }
+
+    #[test]
+    fn parses_chunked_http1_reply_and_retry_after() {
+        let raw = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
+        let reply = parse_http1_reply(raw).unwrap();
+        assert_eq!(reply.status, 429);
+        assert_eq!(reply.retry_after, Some(std::time::Duration::from_secs(7)));
+        assert_eq!(reply.body, "{\"a\":1}");
+    }
+
+    #[test]
+    fn maps_401_and_403_to_unauthorized_error() {
+        assert!(matches!(
+            parse_account_body(401, "{}"),
+            Err(AetherError::ApiUnauthorized(_))
+        ));
+        assert!(matches!(
+            parse_account_body(403, "{}"),
+            Err(AetherError::ApiUnauthorized(_))
+        ));
     }
 }

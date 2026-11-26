@@ -3,8 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
-import { describeRejectedState } from "@aether/ui";
-import { semverGt } from "../semver";
+import { describeRejectedState, parseSessionStats, type SessionStats } from "@aether/ui";
+import { setupDesktopPreview } from "../previewBridge";
+import { RELEASES_PAGE, releasePageUrl, startUpdateCheck } from "../updateCheck";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
@@ -21,7 +22,7 @@ const SAVE_DEBOUNCE_MS = 400;
  * ceiling so a slow but live route is not aborted.
  */
 const CONNECT_WATCHDOG_MS = 90_000;
-const UPDATE_CHECK_URL = "https://api.github.com/repos/deathline94/aether-next/releases/latest";
+export { RELEASES_PAGE, releasePageUrl };
 
 /** A state the UI asserts for itself, with nothing measured. */
 function uiState(status: RuntimeState["status"], detail: string): RuntimeState {
@@ -60,6 +61,7 @@ export function useRuntime(
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [settingsLoadError, setSettingsLoadError] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeState>(initialRuntime);
+  const [stats, setStats] = useState<SessionStats | null>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [testBusy, setTestBusy] = useState(false);
@@ -96,6 +98,18 @@ export function useRuntime(
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running || !settingsLoaded;
 
+  // A failed hydration leaves defaults on screen that no write may commit. Say
+  // why once when the user tries anyway; the disabled controls cover the mouse.
+  const loadFailureWarnedRef = useRef(false);
+  const refuseOnFailedLoad = useCallback(() => {
+    if (!settingsLoadError || loadFailureWarnedRef.current) return;
+    loadFailureWarnedRef.current = true;
+    appendLog({
+      level: "warn",
+      message: "Settings could not be loaded from disk; defaults are read-only until Retry in Settings succeeds.",
+    });
+  }, [appendLog, settingsLoadError]);
+
   // Initialize: load settings, state, admin status, version + listen for events
   useEffect(() => {
     let disposed = false;
@@ -103,12 +117,36 @@ export function useRuntime(
     const cleanup: Array<() => void> = [];
 
     async function initialize() {
+      const isTauri =
+        typeof window !== "undefined" &&
+        Boolean((window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+
+      if (!isTauri && import.meta.env.MODE !== "test") {
+        const stopPreview = setupDesktopPreview(
+          FALLBACK_VERSION,
+          (merged) => {
+            settingsRef.current = merged;
+            setSettings(merged);
+            setSettingsLoadError(false);
+          },
+          (nextState) => setRuntime(nextState),
+          (nextStats) => setStats(nextStats),
+          (ver) => {
+            setAppVersion(ver);
+            setSettingsLoaded(true);
+          },
+        );
+        cleanup.push(stopPreview);
+        return;
+      }
+
       try {
         const unlistenState = await listen<unknown>("session://state", (event) => {
           receivedRuntimeEvent.current = true;
           const next = parseRuntimeState(event.payload);
           if (next) {
             setRuntime(next);
+            if (next.status !== "connected") setStats(null);
             return;
           }
           // A frame the guard refuses is not a state: keep rendering the last one
@@ -128,6 +166,13 @@ export function useRuntime(
         if (disposed) { unlistenState(); return; }
         cleanup.push(unlistenState);
 
+        const unlistenStats = await listen<unknown>("session://stats", (event) => {
+          const parsedStats = parseSessionStats(event.payload);
+          if (parsedStats) setStats(parsedStats);
+        });
+        if (disposed) { unlistenStats(); return; }
+        cleanup.push(unlistenStats);
+
         const unlistenLog = await listen<{ level: "info" | "warn" | "error"; message: string }>(
           "session://log",
           (event) => appendLog(event.payload),
@@ -138,6 +183,7 @@ export function useRuntime(
         appendLog({ level: "warn", message: errorMessage(error) });
       }
 
+      let hydrated = false;
       try {
         const [loadedSettings, state, isAdmin, info] = await Promise.all([
           invoke<Settings>("get_settings").catch((e) => { appendLog({ level: "warn", message: `Load settings failed: ${errorMessage(e)}` }); return null; }),
@@ -153,6 +199,7 @@ export function useRuntime(
           settingsRef.current = merged;
           setSettings(merged);
           setSettingsLoadError(false);
+          hydrated = true;
           if (corrected.length > 0) {
             appendLog({
               level: "warn",
@@ -167,7 +214,11 @@ export function useRuntime(
         setAdmin(isAdmin);
         setAppVersion(info?.version ? String(info.version) : FALLBACK_VERSION);
       } finally {
-        if (!disposed) {
+        // Only a successful load unlocks the form. `settingsLoaded` gates the
+        // patch, the save and the connect, and after a failure the state holds
+        // defaults rather than the user's profile — the banner's Retry is the
+        // one way back, as on Android.
+        if (!disposed && hydrated) {
           setSettingsLoaded(true);
         }
       }
@@ -237,40 +288,13 @@ export function useRuntime(
   // repo or be generated per run) the result would be an auto-updater that is
   // misconfigured by construction — the one component of this app that could
   // install arbitrary code as the user, without a witness anyone reviewed.
+  const checkedOnceRef = useRef(false);
   useEffect(() => {
     if (!appVersion || appVersion === FALLBACK_VERSION) return;
-    // The app's own content policy states the pre-tunnel window must not reach out
-    // to a third party at all — for a circumvention client the request *is* the
-    // leak, made before there is any path to hide it behind. This used to fire on
-    // mount, on every machine, tunnel or no tunnel. A connected session at least
-    // puts it behind the route the user chose.
-    if (!connected) return;
-    // ...and the answer must not land after the session dropped or the window
-    // unmounted, which is what an uncancelled `fetch` does.
-    const controller = new AbortController();
-    fetch(UPDATE_CHECK_URL, { signal: controller.signal })
-      .then((res) => res.json())
-      .then((data: unknown) => {
-        if (controller.signal.aborted) return;
-        // Shape guard, not trust: this is third-party JSON, and String(undefined)
-        // once produced a "version" that compared nonsense.
-        const payload = data as { tag_name?: unknown; html_url?: unknown } | null;
-        const tag = typeof payload?.tag_name === "string" ? payload.tag_name : null;
-        if (!payload || tag === null || tag.length === 0) return;
-        const latest = tag.replace(/^v/, "");
-        if (semverGt(latest, appVersion)) {
-          setUpdateAvailable({
-            version: tag,
-            url: typeof payload.html_url === "string" && payload.html_url.length > 0
-              ? payload.html_url
-              : "https://github.com/deathline94/aether-next/releases/latest",
-          });
-        }
-      })
-      // Advisory: a failure, a rate limit or an abort means no banner, nothing else.
-      .catch(() => {});
-    return () => controller.abort();
-  }, [appVersion, connected]);
+    if (!connected || settings.routingMode === "proxy-only" || checkedOnceRef.current) return;
+    checkedOnceRef.current = true;
+    return startUpdateCheck(appVersion, setUpdateAvailable);
+  }, [appVersion, connected, settings.routingMode]);
 
   /**
    * Stop the current session without letting a partial teardown block the next
@@ -289,14 +313,22 @@ export function useRuntime(
   }, [appendLog]);
 
   const persistSettings = useCallback((next: Settings) => {
+    // `settingsLoaded` is false exactly when the profile never arrived; the state
+    // then holds defaults, and writing those to disk would erase the real one.
+    if (!settingsLoaded) {
+      refuseOnFailedLoad();
+      return;
+    }
     // Debounced: NumberField commits and toggles can arrive in bursts;
     // don't hit the disk per event.
     pendingSaveRef.current = next;
     if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
     saveDebounceRef.current = setTimeout(async () => {
-      const toSave = pendingSaveRef.current;
-      if (!toSave) return;
       // Skip auto-saving intermediate typing states that violate port invariants
+      saveDebounceRef.current = null;
+      const toSave = pendingSaveRef.current;
+      pendingSaveRef.current = null;
+      if (!toSave) return;
       if (!portsSaveable(toSave)) return;
       const mine = ++saveSeqRef.current;
       try {
@@ -317,7 +349,7 @@ export function useRuntime(
         appendLog({ level: "error", message: err.message });
       }
     }, SAVE_DEBOUNCE_MS);
-  }, [appendLog]);
+  }, [appendLog, settingsLoaded, refuseOnFailedLoad]);
 
   const patchSettings = useCallback((patch: Partial<Settings>) => {
     if (settingsLocked) return;
@@ -341,7 +373,10 @@ export function useRuntime(
     // receives, so a tap before the load lands would push a defaults snapshot at
     // the shell. Disconnecting a live tunnel must stay possible even when the
     // load failed.
-    if (!running && !settingsLoaded) return;
+    if (!running && !settingsLoaded) {
+      refuseOnFailedLoad();
+      return;
+    }
     busyRef.current = true;
     setBusy(true);
     setTestResult(null);
@@ -360,13 +395,21 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect, refuseOnFailedLoad]);
 
   const connectToPeer = useCallback(async (peer: string, protocol: string, transport: string) => {
     if (busyRef.current || busy) return;
     // Same hydration gate as toggleConnection: this connect persists its
     // settings, and doing it from a defaults snapshot loses the saved profile.
-    if (!settingsLoaded) return;
+    if (!settingsLoaded) {
+      refuseOnFailedLoad();
+      return;
+    }
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
+      pendingSaveRef.current = null;
+    }
     busyRef.current = true;
     setBusy(true);
     const previous = settings;
@@ -394,7 +437,7 @@ export function useRuntime(
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect]);
+  }, [busy, running, settings, settingsLoaded, appendLog, safeDisconnect, refuseOnFailedLoad]);
 
   const runTest = useCallback(async () => {
     setTestBusy(true);
@@ -414,6 +457,7 @@ export function useRuntime(
 
   const dismissError = useCallback(async () => {
     try { await invoke("disconnect"); } catch { /* already stopped */ }
+    setStats(null);
     setRuntime(initialRuntime);
   }, []);
 
@@ -429,6 +473,7 @@ export function useRuntime(
         setSettings(merged);
         setSettingsLoadError(false);
         setSettingsLoaded(true);
+        loadFailureWarnedRef.current = false;
         if (corrected.length > 0) {
           appendLog({
             level: "warn",
@@ -444,10 +489,37 @@ export function useRuntime(
     }
   }, [appendLog]);
 
+  const resetSettings = useCallback(async () => {
+    if (running) return;
+    if (saveDebounceRef.current) {
+      clearTimeout(saveDebounceRef.current);
+      saveDebounceRef.current = null;
+      pendingSaveRef.current = null;
+    }
+    try {
+      const reset = await invoke<Settings>("reset_settings");
+      const { settings: merged } = parseSettings(reset);
+      settingsRef.current = merged;
+      setSettings(merged);
+      setSaveError(null);
+      setSettingsLoadError(false);
+      setSettingsLoaded(true);
+      setDirty(false);
+      setSaved(true);
+      if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 1200);
+      appendLog({ level: "info", message: "Settings reset to factory defaults." });
+    } catch (error) {
+      const err = ipcError(error);
+      setSaveError(err);
+      appendLog({ level: "error", message: `Reset settings failed: ${err.message}` });
+    }
+  }, [running, appendLog]);
+
   return {
-    settings, setSettings, runtime, setRuntime, busy, setBusy, testBusy,
+    settings, setSettings, runtime, stats, setRuntime, busy, setBusy, testBusy,
     saved, dirty, saveError, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
-    connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings,
+    connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings, resetSettings,
     patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
   };
 }

@@ -126,9 +126,11 @@ pub async fn run() -> Result<()> {
         // Give the parent shell a moment to read the terminal event before the
         // process disappears, otherwise the GUI sees a bare exit with no reason.
         tokio::time::sleep(Duration::from_millis(80)).await;
+        crate::keyhandoff::forget_key();
         std::process::exit(if retryable { 4 } else { 1 });
     }
 
+    crate::keyhandoff::forget_key();
     // Scan-only sessions finish on their own, but the control-stdin reader parks a
     // tokio::io::stdin() blocking read that blocks runtime shutdown and hangs the
     // process on exit — so the GUI never learns the scan ended and the Scanner tab
@@ -157,12 +159,13 @@ fn parse_cli_flags(args: &[String]) -> Result<Vec<(&'static str, String)>> {
     const KNOWN_BARE: &[&str] = &["--version", "-V", "--diagnostics", "--repair-routes"];
     const VALUE_FLAGS: &[(&str, &str)] = &[
         ("--protocol", "AETHER_PROTOCOL"),
+        ("--scan", "AETHER_SCAN"),
         ("--mim-outer", "AETHER_MIM_OUTER_PEER"),
         ("--mim-inner", "AETHER_MIM_INNER_PEER"),
         ("--mim-peers", "AETHER_MIM_PEERS"),
     ];
     const SUPPORTED: &str =
-        "--protocol <p>, --mim, --mim-outer <a>, --mim-inner <a>, --mim-peers <list>";
+        "--protocol <p>, --scan <m>, --verified, --mim, --mim-outer <a>, --mim-inner <a>, --mim-peers <list>";
 
     let mut out: Vec<(&'static str, String)> = Vec::new();
     let mut protocol_flag: Option<&str> = None;
@@ -171,6 +174,10 @@ fn parse_cli_flags(args: &[String]) -> Result<Vec<(&'static str, String)>> {
         let arg = args[i].as_str();
         i += 1;
         if KNOWN_BARE.contains(&arg) {
+            continue;
+        }
+        if arg == "--verified" {
+            out.push(("AETHER_SCAN", "verified".to_string()));
             continue;
         }
         if arg == "--mim" || arg == "--masque-in-masque" {
@@ -439,7 +446,11 @@ mod cli_flag_tests {
         // This test pins that contract: if the program name ever reaches the
         // parser again (the v1.3.14 regression — every session died at startup
         // with "unknown argument <path>"), the contract breaks loudly here.
-        let program = if cfg!(windows) { r"C:ppsether.exe" } else { "/usr/bin/aether" };
+        let program = if cfg!(windows) {
+            r"C:\apps\aether.exe"
+        } else {
+            "/usr/bin/aether"
+        };
         let err = parse_cli_flags(&args(&[program])).expect_err("a bare path is not a flag");
         assert!(
             !err.to_string().contains(program),

@@ -1,5 +1,6 @@
 package app.aethernext
 
+import android.net.NetworkCapabilities
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -7,13 +8,62 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The VPN service's two JVM-testable decisions: whether the tunnel may be
- * established at all (T202/T208), and whether a background worker still owns it
- * (T227 — the cases this file used to contain asserted on a local `AtomicLong`
- * that the test itself incremented, which no edit to `AetherVpnService` could
- * ever have broken).
+ * The VPN service's JVM-testable decisions: how a network is identified as a
+ * VPN, whether the tunnel may be established at all (T202/T208), and whether a
+ * background worker still owns it (T227 — the cases this file used to contain
+ * asserted on a local `AtomicLong` that the test itself incremented, which no
+ * edit to `AetherVpnService` could ever have broken).
  */
 class AetherVpnServiceTest {
+
+    // ─── the VPN capability test ───────────────────────────────────────────────
+
+    /**
+     * There is no public `NET_CAPABILITY_VPN`; 33 is `NET_CAPABILITY_MMTEL`. The
+     * tunnel is identified by `TRANSPORT_VPN`, and a network the platform marks
+     * `NOT_VPN` is not one — the second read is what keeps a wrong "yes" from
+     * rejecting a real probe network.
+     */
+    @Test
+    fun aVpnNetworkIsIdentifiedByTheVpnTransportNotAnInventedCapability() {
+        val transportsAsked = mutableListOf<Int>()
+        val capabilitiesAsked = mutableListOf<Int>()
+        val isVpn = classifiesAsVpn(
+            hasTransport = {
+                transportsAsked += it
+                it == NetworkCapabilities.TRANSPORT_VPN
+            },
+            hasCapability = {
+                capabilitiesAsked += it
+                it == NetworkCapabilities.NET_CAPABILITY_NOT_VPN
+            },
+        )
+
+        assertFalse("a network the platform marks NOT_VPN is not a tunnel", isVpn)
+        assertEquals(
+            "the transport read must be TRANSPORT_VPN, not the value 33",
+            listOf(NetworkCapabilities.TRANSPORT_VPN),
+            transportsAsked,
+        )
+        assertEquals(
+            listOf(NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+            capabilitiesAsked,
+        )
+    }
+
+    @Test
+    fun onlyAVpnTransportWithoutNotVpnIsTheTunnel() {
+        assertTrue(
+            classifiesAsVpn(
+                hasTransport = { it == NetworkCapabilities.TRANSPORT_VPN },
+                hasCapability = { false },
+            ),
+        )
+        assertFalse(
+            "a non-VPN transport is not the tunnel, even when NOT_VPN is absent",
+            classifiesAsVpn(hasTransport = { false }, hasCapability = { false }),
+        )
+    }
 
     // ─── T202 / T208: loop avoidance is fail-closed ────────────────────────────
 

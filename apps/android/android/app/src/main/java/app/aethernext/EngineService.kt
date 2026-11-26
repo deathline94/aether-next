@@ -29,12 +29,22 @@ class EngineService : Service() {
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        SessionController.getOrNull()?.shutdownHeadless("the app's task was swiped away")
+        // Do not tear down an active tunnel when Recents swipes the UI away: the
+        // foreground notification and Quick Settings tile own tunnel control. Only
+        // if no session was actually started do we stop the keeper service cleanly.
+        val ctrl = SessionController.getOrNull() ?: return
+        if (ctrl.getState().status == "disconnected") {
+            stopSelf()
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        ensureForeground()
+    }
+
+    private fun ensureForeground() {
         val open = PendingIntent.getActivity(
             this,
             0,
@@ -48,44 +58,30 @@ class EngineService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceCompat.startForeground(
-                this,
-                NOTIF_ID,
-                n,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
-        } else {
-            startForeground(NOTIF_ID, n)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIF_ID,
+                    n,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } else {
+                startForeground(NOTIF_ID, n)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("AetherEngineSvc", "startForeground failed: ${e.message}", e)
         }
     }
 
-    /**
-     * Deliberately not `START_STICKY` — and the reason is now a rule, not a comment.
-     *
-     * This service exists only to keep the process of a live session alive; the tunnel
-     * itself is [AetherVpnService] and the engine is its child process, and both die
-     * with this process. Being restarted after such a kill would re-run `onCreate`,
-     * re-post the "Aether is protecting you" notification and have nothing behind it —
-     * a lie in the status bar, which is worse than the honest absence the user can
-     * see. What the death leaves behind is a [SessionLedger] record instead, which the
-     * next launch reports as an unexpected stop rather than hiding it, and
-     * `launchAtLogin` — the explicit resume switch — is what lets the user start again
-     * with one tap.
-     *
-     * The null-intent branch is that decision applied rather than asserted: the policy
-     * is asked, and answers [StartAction.RemainStopped] for the keeper role whatever
-     * the system handed back, because a redelivered keeper has no session to keep.
-     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureForeground()
         val action = ServiceRestartPolicy.decide(
             role = ServiceRole.EngineKeeper,
             redelivered = intent == null || (flags and START_FLAG_REDELIVERY) != 0,
             userAskedToStop = false,
         )
         if (intent == null) {
-            // The start came back with no intent: the session it was keeping is gone,
-            // so the keeper has to go with it rather than sit in the foreground.
             stopSelfResult(startId)
         }
         return ServiceRestartPolicy.startCommandFor(action)

@@ -37,6 +37,8 @@ class EngineEventsTest {
                 EngineEvent.ProxyReady("127.0.0.1:1819", "127.0.0.1:1820"),
             """AETHER_EVENT {"type":"tun_ready"}""" to EngineEvent.TunReady,
             """AETHER_EVENT {"type":"connected","detail":"proxy ready"}""" to EngineEvent.Connected("proxy ready"),
+            """AETHER_EVENT {"type":"stats","up_bps":120,"down_bps":340,"up_bytes":1000,"down_bytes":2000,"uptime_secs":42}""" to
+                EngineEvent.Stats(120, 340, 1000, 2000, 42),
             """AETHER_EVENT {"type":"error","message":"no reachable gateway"}""" to
                 EngineEvent.Failure("no reachable gateway"),
         )

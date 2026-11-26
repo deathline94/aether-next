@@ -24,13 +24,15 @@ export default defineConfig(async () => ({
   // Vite does not read tsconfig paths; without this the bundler cannot see
   // @aether/ui and only the type-check would pass.
   resolve: {
-    alias: { "@aether/ui": uiSrc },
-    // A component that lives in packages/ui still renders JSX, so the runtime
-    // has to be reachable from there too: no root node_modules exists, and the
-    // shared package deliberately has none of its own.
-    react: uiPath("./node_modules/react"),
-    "react/jsx-runtime": uiPath("./node_modules/react/jsx-runtime"),
-    "react/jsx-dev-runtime": uiPath("./node_modules/react/jsx-dev-runtime"),
+    alias: {
+      "@aether/ui": uiSrc,
+      // A component that lives in packages/ui still renders JSX, so the runtime
+      // has to be reachable from there too: no root node_modules exists, and the
+      // shared package deliberately has none of its own.
+      react: uiPath("./node_modules/react"),
+      "react/jsx-runtime": uiPath("./node_modules/react/jsx-runtime"),
+      "react/jsx-dev-runtime": uiPath("./node_modules/react/jsx-dev-runtime"),
+    },
   },
 
   // `packages/ui` installs nothing of its own — there is no root node_modules and

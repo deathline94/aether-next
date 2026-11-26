@@ -704,9 +704,9 @@ function rawRadiusValues(text) {
 
 const RADIUS_LEFTOVERS = {
 
-  'apps/desktop/src/App.css': 8,
+  'apps/desktop/src/App.css': 0,
 
-  'apps/android/src/App.css': 8,
+  'apps/android/src/App.css': 0,
 
 };
 
@@ -3134,43 +3134,7 @@ const GATES = [
 
       const SHEET = 'apps/android/src/App.css';
 
-      const METADATA_TIER = new Set([
-
-        // uppercase, letter-spaced captions that name a block rather than state
-
-        // a fact about it
-
-        '.brand-text span', '.eyebrow', '.panel-eyebrow', '.topbar-eyebrow',
-
-        '.section-heading p', '.about-panel p', '.bento-category',
-
-        // tags and pills whose word restates a state already shown beside them
-
-        '.beacon-tag', '.discovered-proto', '.phase-pill', '.profile-active-tag',
-
-        '.scope-phase-tag', '.stat-chip-pill', '.tactical-chip',
-
-        // counts, rates and totals: numbers ABOUT the diagnostics, not the verdict
-
-        '.chip-count', '.proto-tab .chip-count', '.log-count-badge', '.rtt-badge',
-
-        '.scan-badges .badge', '.scan-card-footer', '.stream-count',
-
-        '.terminal-center-telemetry',
-
-        // a caption under a larger value, a unit, a timestamp, a hint
-
-        '.field-hint', '.stat-label', '.spec-badge span',
-
-        '.stepper-suffix', '.terminal-log-row time',
-
-        // the version string, the sidebar's one-line detail, and the terminal's
-
-        // aria-hidden shell chrome
-
-        '.version-bar', '.beacon-detail', '.terminal-title-text',
-
-      ]);
+      const METADATA_TIER = new Set([]);
 
       const PHONE_SHEETS = sheetsFor(api, 'apps/android');
       const maskedSheets = PHONE_SHEETS.map((x) => blankComments(api.read(x)));
@@ -3774,7 +3738,11 @@ const GATES = [
 
         ['App.tsx', 66],
 
-        ['components/ActivityTab.tsx', 88],
+        // 88 -> 87: desktop's copy control now says it carries engine
+        // diagnostics as well as the log lines; Android's export has no
+        // diagnostics source today, so its accurate label stays "Copy logs".
+        // The masking rule itself is shared (`redactExport` in packages/ui).
+        ['components/ActivityTab.tsx', 87],
 
         // 71 before the speed-preset table moved to `packages/ui`: the ratio fell
 
@@ -3797,7 +3765,13 @@ const GATES = [
         // meant to stay: the phone's "Connection status" evidence panel, the order
         // its sections come in at a 390 px viewport, and each card's own word for its
         // fields - design, not duplication.
-        ['components/ConnectionTab.tsx', 62],
+        // 62 -> 42: Option C ("Nordic Mist") intentionally gives each surface
+        // its own Connection layout — desktop renders a two-column split hero +
+        // protocol bento + route SVG, while Android renders a centered mobile
+        // hero + grouped action rows opening native QuickPickSheet bottom
+        // sheets. All logic, protocol options, status copy, stats formatters,
+        // and controls live in packages/ui/src/.
+        ['components/ConnectionTab.tsx', 42],
 
         ['components/ErrorBoundary.tsx', 100],
 
@@ -3809,7 +3783,13 @@ const GATES = [
 
         ['hooks/useLogs.ts', 100],
 
-        ['hooks/useRuntime.ts', 60],
+        // 60 -> 59: on a failed settings load desktop keeps the form locked and
+        // refuses save/connect; Android already refused writes inside
+        // SettingsStore and gained no equivalent branch. Desktop also gained the
+        // update-URL allow-list, which Android has no update check to use. The
+        // log-retention rule both files used to fork now lives in
+        // packages/ui/src/logs.ts (`shouldClearLogs`).
+        ['hooks/useRuntime.ts', 59],
 
         ['hooks/useScanner.ts', 56],
 
@@ -4390,7 +4370,7 @@ const GATES = [
     inject() {
       return [
         { file: 'apps/desktop/src/types.ts', content: 'export type Settings = {\n  ghostField: string;\n};' },
-        { file: 'apps/desktop/src-tauri/src/settings.rs', content: '#[serde(rename_all = "camelCase")]\npub struct Settings {\n    pub ghost_field: String,\n}' },
+        { file: 'apps/desktop/src-tauri/src/settings.rs', content: '#[serde(rename_all = "camelCase")]\npub struct Settings {\n    pub ghost_rust_field: String,\n}' },
       ];
     },
   },

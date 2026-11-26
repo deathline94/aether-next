@@ -77,6 +77,7 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
     let listen = listener.local_addr()?;
     log::info!("[+] http proxy listening on {listen}");
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(socks::MAX_CLIENTS));
+    let refusal_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     // Same policy as the SOCKS listener: a client that races its own connect must
     // not be allowed to end the tunnel. `session.rs` watches this future's `Err`
     // as "the http proxy exited" and tears the session down on it.
@@ -109,9 +110,12 @@ pub async fn serve_listener(listener: TcpListener, stack: StackHandle) -> Result
                     "http proxy at the {}-session limit; refusing {peer}",
                     socks::MAX_CLIENTS
                 );
-                tokio::spawn(async move {
-                    let _ = refuse_over_capacity(socket).await;
-                });
+                if let Ok(r_permit) = refusal_permits.clone().try_acquire_owned() {
+                    tokio::spawn(async move {
+                        let _r = r_permit;
+                        let _ = refuse_over_capacity(socket).await;
+                    });
+                }
                 continue;
             }
         };
@@ -179,7 +183,16 @@ fn assert_strict_crlf(block: &[u8]) -> Result<()> {
 }
 
 async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
-    let header = read_header(&mut client).await?;
+    let header =
+        match tokio::time::timeout(std::time::Duration::from_secs(12), read_header(&mut client))
+            .await
+        {
+            Ok(header) => header?,
+            // The per-read timeout bounds each read; this bounds the header as a
+            // whole, so a client dribbling one byte every few seconds cannot hold a
+            // session slot for the 4 h MAX_SESSION while the slot is never "idle".
+            Err(_) => return Err(AetherError::Proxy("HTTP header read timeout".into())),
+        };
     let header_end =
         find_header_end(&header).ok_or_else(|| AetherError::Proxy("invalid HTTP header".into()))?;
     assert_strict_crlf(&header[..header_end])?;
@@ -219,8 +232,18 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
 
     let (host, port) = if method.eq_ignore_ascii_case("CONNECT") {
         parse_authority(target, 443)?
-    } else if let Some(authority) = target.strip_prefix("http://") {
-        parse_authority(authority.split('/').next().unwrap_or(""), 80)?
+    } else if target
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
+        let rest = &target[7..];
+        let auth_end = match (rest.find('/'), rest.find('?')) {
+            (Some(s), Some(q)) => s.min(q),
+            (Some(s), None) => s,
+            (None, Some(q)) => q,
+            (None, None) => rest.len(),
+        };
+        parse_authority(&rest[..auth_end], 80)?
     } else {
         // HTTP header names are case-insensitive (RFC 9110); match any spelling
         // of Host instead of only the two common capitalizations.
@@ -280,9 +303,21 @@ async fn handle(mut client: TcpStream, stack: StackHandle) -> Result<()> {
                 return Ok(());
             }
         }
+        // The header block itself is never forwarded on CONNECT — the client
+        // waits for the 200 and then speaks its own protocol — so the proxy's
+        // credentials in it cannot reach the origin.
     } else {
-        match rewrite_absolute_uri(header) {
-            Ok(rewritten) => {
+        // One origin per connection. The proxy connection a browser keeps alive
+        // is keyed by proxy, not by destination, so a second request on this
+        // socket can name a different host: relaying it to the first upstream
+        // sent site B's request and cookies to site A. `Connection: close` makes
+        // the client open a fresh proxy connection per origin instead.
+        match strip_hop_by_hop(&header[..header_end]) {
+            Ok(mut rewritten) => {
+                if header_end < header.len() {
+                    rewritten.extend_from_slice(&header[header_end..]);
+                }
+                crate::counters::bump_by(&crate::counters::BYTES_UP, rewritten.len() as u64);
                 if upstream.send(rewritten).await.is_err() {
                     let _ = client.shutdown().await;
                     return Ok(());
@@ -365,11 +400,19 @@ fn parse_authority(value: &str, default_port: u16) -> Result<(String, u16)> {
         if let Some(end) = value.find(']') {
             let host = &value[1..end];
             let rest = &value[end + 1..];
+            if rest.is_empty() {
+                return Ok((host.to_string(), default_port));
+            }
             if let Some(port) = port_after(rest, default_port)? {
                 return Ok((host.to_string(), port));
             }
-            return Ok((host.to_string(), default_port));
+            return Err(AetherError::Proxy(
+                "invalid bracketed host authority".into(),
+            ));
         }
+        return Err(AetherError::Proxy(
+            "unclosed bracketed host authority".into(),
+        ));
     }
     if let Some((host, port_str)) = value.rsplit_once(':') {
         if !host.contains(':') {
@@ -411,7 +454,13 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
     {
         return Err(AetherError::Proxy("invalid HTTP request line".into()));
     }
-    if target.len() >= 7 && target[..7].eq_ignore_ascii_case("http://") {
+    // `get(..7)`, not `target[..7]`: the byte index 7 can land inside a
+    // multibyte character (e.g. a target of `éééé`), and slicing there panics
+    // the request task.
+    if target
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+    {
         let rest = &target[7..];
         let authority_end = match (rest.find('/'), rest.find('?')) {
             (Some(slash), Some(q)) => Some(slash.min(q)),
@@ -430,24 +479,118 @@ fn rewrite_absolute_uri(mut header: Vec<u8>) -> Result<Vec<u8>> {
     Ok(header)
 }
 
+/// Header names that belong to the client↔proxy hop, not the origin request.
+const PROXY_PRIVATE_HEADERS: [&str; 3] = ["proxy-authorization", "proxy-connection", "connection"];
+
+/// The header block minus credentials and hop-by-hop fields, with the request
+/// line rewritten to origin-form.
+///
+/// Two separate defects lived in forwarding the block verbatim: `Proxy-Authorization`
+/// (the proxy's own credentials) reached every origin, and an absolute-form target
+/// was not rewritten on the CONNECT path's sibling. Both are removed here.
+fn strip_hop_by_hop(header: &[u8]) -> Result<Vec<u8>> {
+    let rewritten = rewrite_absolute_uri(header.to_vec())?;
+    let end = find_header_end(&rewritten)
+        .ok_or_else(|| AetherError::Proxy("invalid HTTP request line".into()))?;
+    let text = std::str::from_utf8(&rewritten[..end])
+        .map_err(|_| AetherError::Proxy("invalid HTTP header".into()))?;
+    let mut lines = text.split_inclusive("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let tokens: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim().eq_ignore_ascii_case("connection").then(|| {
+                value
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<String>>()
+            })
+        })
+        .flatten()
+        .collect();
+    let mut out = Vec::with_capacity(rewritten.len() + 32);
+    out.extend_from_slice(request_line.as_bytes());
+    for line in lines {
+        let name = line
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let drop = name.is_empty()
+            || PROXY_PRIVATE_HEADERS.contains(&name.as_str())
+            || tokens.contains(&name);
+        if !drop {
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+    // One request per proxy connection: the browser keys keep-alive on the
+    // proxy, so a second request here could name a different host.
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    Ok(out)
+}
+
 async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     const RELAY: usize = 256 * 1024;
+    // A relayed flow silent in BOTH directions is closed after 120s.
+    // Sharing one activity timestamp prevents an active one-way upload or
+    // download from being killed by the idle direction's timer.
+    const IDLE_SECS: u64 = 120;
+    const POLL_STEP: std::time::Duration = std::time::Duration::from_secs(15);
+    let started = std::time::Instant::now();
+    let last_active_ms = Arc::new(AtomicU64::new(0));
+    let touch = |stamp: &AtomicU64| {
+        stamp.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    };
+    let is_idle = |stamp: &AtomicU64| -> bool {
+        let now_ms = started.elapsed().as_millis() as u64;
+        now_ms.saturating_sub(stamp.load(Ordering::Relaxed)) >= IDLE_SECS * 1000
+    };
+
     let (sender, mut from_stack) = upstream.into_split();
     let (mut reader, mut writer) = client.into_split();
-    let upload = tokio::spawn(async move {
+    let up_stamp = last_active_ms.clone();
+    let _upload = crate::tunnel::AbortOnDrop(tokio::spawn(async move {
         let mut buf = vec![0u8; RELAY];
         loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => {
+            match tokio::time::timeout(POLL_STEP, reader.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {
                     sender.close().await;
                     break;
                 }
-                Ok(count) if sender.send(buf[..count].to_vec()).await.is_err() => break,
-                Ok(_) => {}
+                Ok(Ok(count)) => {
+                    up_stamp.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    crate::counters::bump_by(&crate::counters::BYTES_UP, count as u64);
+                    if sender.send(buf[..count].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let now_ms = started.elapsed().as_millis() as u64;
+                    if now_ms.saturating_sub(up_stamp.load(Ordering::Relaxed)) >= IDLE_SECS * 1000 {
+                        sender.close().await;
+                        break;
+                    }
+                }
             }
         }
-    });
-    while let Some(first) = from_stack.recv().await {
+    }));
+    loop {
+        let first = match tokio::time::timeout(POLL_STEP, from_stack.recv()).await {
+            Ok(Some(first)) => first,
+            Ok(None) => break,
+            Err(_) => {
+                if is_idle(&last_active_ms) {
+                    break;
+                }
+                continue;
+            }
+        };
+        touch(&last_active_ms);
         let mut batch = first;
         while batch.len() < RELAY {
             match from_stack.try_recv() {
@@ -458,9 +601,9 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
         if writer.write_all(&batch).await.is_err() {
             break;
         }
+        crate::counters::bump_by(&crate::counters::BYTES_DOWN, batch.len() as u64);
     }
     let _ = writer.shutdown().await;
-    upload.abort();
     Ok(())
 }
 
@@ -468,7 +611,7 @@ async fn relay(client: TcpStream, upstream: TcpConn) -> Result<()> {
 mod tests {
     use super::{
         assert_strict_crlf, auth_required_reply, basic_credentials, find_header_end, header_value,
-        over_capacity_reply, proxy_auth_ok, rewrite_absolute_uri,
+        over_capacity_reply, proxy_auth_ok, rewrite_absolute_uri, strip_hop_by_hop,
     };
 
     /// The session-limit refusal has to be a real HTTP response (T163): the old
@@ -592,5 +735,61 @@ mod tests {
         let req5 = b"GET /already/origin?foo=1 HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
         let res5 = rewrite_absolute_uri(req5.clone()).unwrap();
         assert_eq!(res5, req5);
+    }
+
+    #[test]
+    fn forwarded_request_carries_no_proxy_credentials() {
+        // The proxy's own Basic credentials must never reach the origin.
+        let req = b"GET http://example.com/x HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+                    Proxy-Connection: keep-alive\r\n\
+                    Accept: */*\r\n\r\n"
+            .to_vec();
+        let out = strip_hop_by_hop(&req).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.to_ascii_lowercase().contains("proxy-authorization"));
+        assert!(!text.to_ascii_lowercase().contains("proxy-connection"));
+        assert!(text.starts_with("GET /x HTTP/1.1\r\n"), "{text}");
+        assert!(text.contains("Accept: */*\r\n"), "{text}");
+    }
+
+    #[test]
+    fn forwarded_request_is_one_origin_per_connection() {
+        // A browser can reuse a proxy connection for another host, so the block
+        // the origin receives must end the exchange; everything after the header
+        // terminator is dropped rather than forwarded to the first origin.
+        let req = b"GET http://a.example/ HTTP/1.1\r\n\
+                    Host: a.example\r\n\
+                    Connection: keep-alive\r\n\r\n\
+                    GET http://b.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n"
+            .to_vec();
+        let out = strip_hop_by_hop(&req).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.to_ascii_lowercase()
+                .matches("connection: close")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            !text.contains("b.example"),
+            "a second request reached the first origin: {text}"
+        );
+        assert!(text.ends_with("\r\n\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_multibyte_absolute_target_does_not_panic() {
+        // A 1-byte method puts the target at byte 1, so byte 7 is the third byte
+        // of `é` — a byte index that is not a char boundary.
+        let req = "G éééé HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            .as_bytes()
+            .to_vec();
+        let out = strip_hop_by_hop(&req).expect("a multibyte target is awkward, not fatal");
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .starts_with("G éééé HTTP/1.1\r\n"));
     }
 }

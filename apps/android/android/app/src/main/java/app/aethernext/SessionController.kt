@@ -139,6 +139,20 @@ class SessionController(
     private val vpnStarted = AtomicBoolean(false)
     private val vpnEstablished = AtomicBoolean(false)
     private val tearingDown = AtomicBoolean(false)
+
+    /**
+     * Serialises a connect against another connect: two taps used to both pass
+     * the "not running" check, reset the session flags and race for the engine.
+     *
+     * A concurrent [disconnect] deliberately does not take it — that call must
+     * stay non-blocking for a dying activity (see [shutdownHeadless]) — so it
+     * advances [teardownEpoch] instead and [connect] re-reads that after its
+     * slow steps.
+     */
+    private val transitionLock = Any()
+
+    /** Advanced by every [disconnect]; a different value means "a stop overtook you". */
+    private val teardownEpoch = java.util.concurrent.atomic.AtomicLong(0)
     /// Set while a VPN teardown has been asked for but not yet acked by [AetherVpnService].
     private val vpnStopPending = AtomicBoolean(false)
     /// The engine's own `{"type":"connected"}` event — the only statement that can
@@ -193,6 +207,11 @@ class SessionController(
         engineAssertedConnected.set(false)
     }
 
+    private val httpClient = okhttp3.OkHttpClient()
+    private val backgroundExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "aether-session-bg").apply { isDaemon = true }
+    }
+
     private fun handleExit(code: Int?, isScan: Boolean) {
         if (isScan) {
             scanExitEvent(scanTerminalSent.get())?.let { emitScan(it) }
@@ -201,15 +220,14 @@ class SessionController(
             }
             return
         }
-        val wasConnected = connectedOnce.get()
         resetSessionFlags()
-        val isError = code != null && code != 0 && !wasConnected
+        ledger.clearActive()
+        val isError = code != null && code != 0
         val vpnErr = stopVpnService()
         setRuntime(
             if (vpnErr != null) "error" else if (isError) "error" else "disconnected",
-            vpnErr ?: if (isError) "Could not find a working gateway"
-            else if (code == 0 || code == null) "Engine stopped"
-            else "Engine exited ($code)",
+            vpnErr ?: if (isError) "Engine exited unexpectedly ($code)"
+            else "Engine stopped",
             null,
             null,
         )
@@ -309,6 +327,7 @@ class SessionController(
         val vpnErr = stopVpnService()
 
         resetSessionFlags()
+        ledger.clearActive()
 
         val stopped = runner.stopAndWait(3000)
         val stillRunning = runner.isRunning()
@@ -326,7 +345,9 @@ class SessionController(
         return finalReason
     }
 
-    fun connect(s: Settings): String? {
+    fun connect(s: Settings): String? = synchronized(transitionLock) {
+        if (tearingDown.get()) return STOPPING_MESSAGE
+        val epoch = teardownEpoch.get()
         if (runner.isRunning()) {
             if (runner.getState() == SupervisorState.SCANNING) {
                 if (!runner.stopAndWait(3000)) {
@@ -342,25 +363,20 @@ class SessionController(
             }
         }
         validate(s)
-        // The permission check runs *before* anything is persisted. Answering
-        // `VPN_PERMISSION_REQUIRED` after the save used to leave a device with a
-        // stored `routingMode=tun` and no session behind it, so the next launch
-        // started in a mode it had never been granted and the consent sheet came
-        // back on every connect.
         if (s.routingMode == "tun") {
             val prep = VpnService.prepare(context)
             if (prep != null) {
                 return "VPN_PERMISSION_REQUIRED"
             }
         }
+        if (aStopOvertook(epoch)) return STOPPING_MESSAGE
         store.save(s)
         settings = s
+        // Capture stale VPN state BEFORE resetting session flags.
+        val hadStaleVpn = vpnStarted.get() || VpnTunnel.up
         resetSessionFlags()
         malformedEvents.set(0)
-        // A tunnel left over from a previous attempt carries the *old* SOCKS port,
-        // and AetherVpnService will not re-establish while a tun exists: make the
-        // stale one go away and say so instead of quietly ignoring the new setting.
-        if (vpnStarted.get() || VpnTunnel.up) {
+        if (hadStaleVpn) {
             val stale = stopVpnService()
             if (stale != null) {
                 setRuntime("error", stale, null, null)
@@ -368,6 +384,9 @@ class SessionController(
             }
         }
 
+        // Last check before the launch: an engine started from here would outlive
+        // the "Ready" a concurrent stop has already published.
+        if (aStopOvertook(epoch)) return STOPPING_MESSAGE
         setRuntime("connecting", "Scanning reachable routes", null, null)
         val err = runner.start(s)
         if (err != null) {
@@ -382,10 +401,59 @@ class SessionController(
             Log.e(TAG, "startForegroundService failed: ${e.message}", e)
             return rollbackStartup("Service start failed: ${e.message}")
         }
-        
+
+        // The engine and its keeper are up, so only now can a Stop that raced the
+        // launch be guaranteed to find them. One that landed earlier must win.
+        if (aStopOvertook(epoch)) return abandonOvertakenStart()
+
         setRuntime("connecting", "Scanning reachable routes", runner.pid(), null)
+        // A stop that landed between the check above and this publish must not be
+        // left under a "connecting" badge: anything later will find the engine.
+        if (aStopOvertook(epoch)) return abandonOvertakenStart()
         // VPN (hev) starts once local SOCKS is listening — see maybeStartVpn().
-        return null
+        null
+    }
+
+    /** Whether a [disconnect] began after [epoch] was captured. */
+    private fun aStopOvertook(epoch: Long): Boolean =
+        tearingDown.get() || teardownEpoch.get() != epoch
+
+    /**
+     * Undo a start that a [disconnect] overtook, and answer the caller with the
+     * reason it did not connect.
+     *
+     * The engine is stopped here even when the stop that overtook us is still in
+     * flight: its own `stopAndWait` may have run before this process existed, and
+     * a device left with an engine nobody asked for is the bug this closes. The
+     * end state is republished from what this cleanup verified, because the stop's
+     * own verdict can have landed before the engine it never saw.
+     */
+    private fun abandonOvertakenStart(): String {
+        Log.w(TAG, "connect aborted: a stop landed while the engine was starting")
+        val engineStopped = runner.stopAndWait(3000)
+        try {
+            context.stopService(Intent(context, EngineService::class.java))
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to stop EngineService during connect abort: ${e.message}")
+        }
+        val vpnErr = stopVpnService()
+        resetSessionFlags()
+        // An engine that asserted `connected` in the abort window must not leave
+        // the next launch reporting an end nobody asked for.
+        ledger.clearActive()
+        val problems = mutableListOf<String>()
+        if (vpnErr != null) problems += vpnErr
+        if (!engineStopped || runner.isRunning()) {
+            problems += "engine process pid=${runner.pid()} is still running"
+        }
+        if (problems.isNotEmpty()) {
+            val detail = "Could not fully stop Aether: ${problems.joinToString("; ")}"
+            Log.e(TAG, detail)
+            setRuntime("error", detail, null, runtime.endpoint)
+            return detail
+        }
+        setRuntime("disconnected", "Ready", null, null)
+        return STOPPING_MESSAGE
     }
 
     /**
@@ -398,9 +466,19 @@ class SessionController(
         timeoutMs: Int,
         noize: String,
         runId: String = "",
-    ): String? {
-        // Recorded before anything can emit: the first `scan_start` must carry the id
-        // the UI is filtering on.
+    ): String? = synchronized(transitionLock) {
+        if (tearingDown.get()) {
+            val err = "Aether is stopping; try scanning in a moment"
+            scanTerminalSent.set(true)
+            emitScan(JSONObject().put("type", "scan_failed").put("message", err))
+            return err
+        }
+        if (!runner.isScanMode() && (runner.isRunning() || VpnTunnel.up)) {
+            val err = "Disconnect the active tunnel before starting a scan"
+            scanTerminalSent.set(true)
+            emitScan(JSONObject().put("type", "scan_failed").put("message", err))
+            return err
+        }
         scanRunId = runId
         if (runner.isRunning()) {
             if (!runner.stopAndWait(3000)) {
@@ -426,25 +504,27 @@ class SessionController(
             emitScan(JSONObject().put("type", "scan_failed").put("message", err))
             return err
         }
-        return null
+        null
     }
 
     fun stopScan() {
         runner.stop()
     }
 
-    /**
-     * Tear the session down.
-     *
-     * @return `null` when everything that was up is now down, otherwise the
-     *   actionable reason the caller must show. The old version returned Unit and
-     *   then reported `disconnected`/"Ready" no matter what the VPN stop did
-     *   (T206), so a still-running tunnel was announced as gone.
-     */
     fun disconnect(): String? {
-        if (!tearingDown.compareAndSet(false, true)) return null
-        // Fail-closed ordering (T216): a stale engine must not be left holding the
-        // SOCKS port the next connect() will ask the tunnel for.
+        if (!tearingDown.compareAndSet(false, true)) {
+            val deadline = System.currentTimeMillis() + 4000L
+            while (tearingDown.get() && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(50)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+            return if (tearingDown.get()) "Teardown still in progress" else null
+        }
+        teardownEpoch.incrementAndGet()
         val engineStopped = runner.stopAndWait(3000)
         val engineStillUp = !engineStopped || runner.isRunning()
         try {
@@ -454,29 +534,31 @@ class SessionController(
         }
         val vpnErr = stopVpnService()
         resetSessionFlags()
-        // Whatever the teardown found, this session was asked to stop, so the next
-        // process has nothing to report. Leaving the ledger set would turn a
-        // routine disconnect into an "unexpectedly ended" alarm on next launch.
         ledger.clearActive()
 
         val problems = mutableListOf<String>()
         if (vpnErr != null) problems += vpnErr
         if (engineStillUp) problems += "engine process pid=${runner.pid()} is still running"
-        tearingDown.set(false)
 
-        if (problems.isNotEmpty()) {
-            val detail = "Could not fully stop Aether: ${problems.joinToString("; ")}"
+        val detail = if (problems.isEmpty()) {
+            null
+        } else {
+            "Could not fully stop Aether: ${problems.joinToString("; ")}"
+        }
+        if (detail != null) {
             Log.e(TAG, detail)
             setRuntime("error", detail, null, runtime.endpoint)
-            return detail
+        } else {
+            setRuntime("disconnected", "Ready", null, null)
         }
-        setRuntime("disconnected", "Ready", null, null)
-        return null
+        tearingDown.set(false)
+        return detail
     }
 
     fun testConnection(s: Settings): JSONObject {
+        validate(s)
         val proxy = "http://127.0.0.1:${s.httpPort}"
-        val client = okhttp3.OkHttpClient.Builder()
+        val client = httpClient.newBuilder()
             .proxy(
                 java.net.Proxy(
                     java.net.Proxy.Type.HTTP,
@@ -575,6 +657,7 @@ class SessionController(
             }
 
             is EngineEvent.ProxyReady -> {
+                if (tearingDown.get()) return
                 socksSeen.set(true)
                 maybeStartVpn()
             }
@@ -582,14 +665,30 @@ class SessionController(
             is EngineEvent.TunnelReady,
             is EngineEvent.TunReady,
             -> {
+                if (tearingDown.get()) return
                 tunnelSeen.set(true)
                 maybeStartVpn()
             }
 
             is EngineEvent.Connected -> {
+                if (tearingDown.get()) return
                 tunnelSeen.set(true)
                 engineAssertedConnected.set(true)
                 maybeStartVpn()
+            }
+
+            is EngineEvent.Stats -> {
+                if (!tearingDown.get()) {
+                    emit(
+                        "session://stats",
+                        JSONObject()
+                            .put("upBps", ev.upBps)
+                            .put("downBps", ev.downBps)
+                            .put("upBytes", ev.upBytes)
+                            .put("downBytes", ev.downBytes)
+                            .put("uptimeSecs", ev.uptimeSecs),
+                    )
+                }
             }
 
             is EngineEvent.Failure -> {
@@ -668,38 +767,40 @@ class SessionController(
      *   the session went on to report "disconnected"/"Ready" (T206).
      */
     internal fun stopVpnService(): String? {
+        if (!VpnTunnel.up && AetherVpnService.current == null && !vpnStarted.get()) {
+            return null
+        }
         var refused: Throwable? = null
         val stop = Intent(context, AetherVpnService::class.java).apply {
             action = AetherVpnService.ACTION_STOP
         }
+        var stopDelivered = false
         try {
-            // The cooperative stop is what actually closes the fd; `stopService`
-            // alone can be answered by the system after the process is long gone.
             context.startService(stop)
             vpnStopPending.set(true)
+            stopDelivered = true
         } catch (e: Exception) {
             refused = e
             Log.e(TAG, "VPN stop request failed: ${e.message}", e)
             if (e is IllegalStateException) {
-                // API 26+ answers `startService` from a backgrounded app with
-                // IllegalStateException. The stop must still reach a service that may
-                // be carrying the device, so escalate — [AetherVpnService] answers an
-                // ACTION_STOP by taking itself into the foreground first, which is what
-                // makes `startForegroundService` legal on this path. The refusal is
-                // still reported: an escalation is a request, not a confirmation.
                 try {
                     context.startForegroundService(stop)
+                    vpnStopPending.set(true)
+                    refused = null
+                    stopDelivered = true
                 } catch (e2: Exception) {
                     refused = e2
                     Log.e(TAG, "escalated VPN stop request also failed: ${e2.message}", e2)
                 }
             }
         }
-        try {
-            context.stopService(Intent(context, AetherVpnService::class.java))
-        } catch (e: Exception) {
-            refused = refused ?: e
-            Log.e(TAG, "VPN stopService failed: ${e.message}", e)
+        if (!stopDelivered) {
+            try {
+                context.stopService(Intent(context, AetherVpnService::class.java))
+            } catch (e: Exception) {
+                refused = refused ?: e
+                Log.e(TAG, "VPN stopService failed: ${e.message}", e)
+            }
         }
         if (refused == null) return null
         vpnStopPending.set(false)
@@ -748,7 +849,7 @@ class SessionController(
     }
 
     fun onVpnFailed(message: String) {
-        rollbackStartup("VPN failed: $message")
+        backgroundExecutor.execute { rollbackStartup("VPN failed: $message") }
     }
 
     /**
@@ -762,18 +863,11 @@ class SessionController(
     }
 
     private fun parseEndpoint(line: String): String? {
-        for (marker in listOf(
-            "selected MASQUE gateway ",
-            "selected WireGuard endpoint ",
-            "using cloudflare edge ",
-            "using forced peer ",
-            "best gateway ",
-            "best wg endpoint ",
-        )) {
+        for (marker in ENDPOINT_MARKERS) {
             val i = line.indexOf(marker)
             if (i >= 0) {
                 val rest = line.substring(i + marker.length)
-                val token = rest.split(Regex("\\s+")).firstOrNull()
+                val token = rest.split(WHITESPACE_RE).firstOrNull()
                     ?.trim('(', ')', ',')
                     ?: continue
                 if (token.isNotEmpty()) return token
@@ -793,33 +887,51 @@ class SessionController(
         setRuntime("connected", detail, runner.pid(), runtime.endpoint)
     }
 
-    /** Publish a whole new snapshot; the old one is never touched again. */
+    /** Publish a whole new snapshot; emit outside `stateLock` to avoid lock inversion. */
     private fun setRuntime(
         status: String,
         detail: String,
         pid: Int?,
         endpoint: String?,
-    ) = synchronized(stateLock) {
-        val previous = runtime
-        val next = RuntimeState(
-            status = status,
-            detail = detail,
-            pid = pid,
-            endpoint = when {
-                status == "disconnected" -> null
-                endpoint != null -> endpoint
-                status == "error" -> previous.endpoint
-                else -> previous.endpoint
-            },
-        )
-        runtime = next
+    ) {
+        val next = synchronized(stateLock) {
+            val previous = runtime
+            val resolved = RuntimeState(
+                status = status,
+                detail = detail,
+                pid = pid,
+                endpoint = when {
+                    status == "disconnected" -> null
+                    endpoint != null -> endpoint
+                    status == "connecting" -> null
+                    status == "error" -> previous.endpoint
+                    else -> previous.endpoint
+                },
+            )
+            runtime = resolved
+            resolved
+        }
+        if (status != "connected") {
+            emit(
+                "session://stats",
+                JSONObject()
+                    .put("upBps", 0L)
+                    .put("downBps", 0L)
+                    .put("upBytes", 0L)
+                    .put("downBytes", 0L)
+                    .put("uptimeSecs", 0L),
+            )
+        }
         emit("session://state", next.toJson())
     }
 
     /** Endpoint label only — it never changes [status]. */
-    private fun setEndpoint(endpoint: String) = synchronized(stateLock) {
-        val next = runtime.copy(endpoint = endpoint)
-        runtime = next
+    private fun setEndpoint(endpoint: String) {
+        val next = synchronized(stateLock) {
+            val updated = runtime.copy(endpoint = endpoint)
+            runtime = updated
+            updated
+        }
         emit("session://state", next.toJson())
     }
 
@@ -880,10 +992,13 @@ class SessionController(
     /** A warning that must not be classified out of existence by its wording. */
     fun emitWarn(message: String) = emitAt("warn", message)
 
-    internal fun logLevelOf(message: String): String = when {
-        message.lowercase().contains("error") || message.lowercase().contains("failed") -> "error"
-        message.lowercase().contains("warn") || message.lowercase().contains("[-]") -> "warn"
-        else -> "info"
+    internal fun logLevelOf(message: String): String {
+        val lower = message.lowercase()
+        return when {
+            lower.contains("error") || lower.contains("failed") -> "error"
+            lower.contains("warn") || lower.contains("[-]") -> "warn"
+            else -> "info"
+        }
     }
 
     /**
@@ -954,6 +1069,19 @@ class SessionController(
 
     companion object {
         private const val TAG = "SessionController"
+        private val WHITESPACE_RE = Regex("\\s+")
+        private val PEER_SOCKET_RE = Regex("^(\\[[0-9a-fA-F:]+]|\\d{1,3}(?:\\.\\d{1,3}){3}):(\\d{1,5})$")
+        private val ENDPOINT_MARKERS = listOf(
+            "selected MASQUE gateway ",
+            "selected WireGuard endpoint ",
+            "using cloudflare edge ",
+            "using forced peer ",
+            "best gateway ",
+            "best wg endpoint ",
+        )
+
+        /** What a connect that raced a stop answers: the stop wins. */
+        private const val STOPPING_MESSAGE = "Aether is stopping; try again in a moment"
 
         /**
          * MASQUE-family protocols nest the user's traffic inside an encrypted
@@ -992,7 +1120,7 @@ class SessionController(
             if (s.transport.lowercase() !in validTransports) {
                 throw SettingRejected("transport", "Invalid transport '${s.transport}'. Allowed: $validTransports")
             }
-            val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "thorough", "ironclad")
+            val validScanModes = setOf("balanced", "fast", "deep", "turbo", "stealth", "verified", "thorough", "ironclad")
             if (s.scanMode.lowercase() !in validScanModes) {
                 throw SettingRejected("scanMode", "Invalid scanMode '${s.scanMode}'. Allowed: $validScanModes")
             }
@@ -1040,6 +1168,18 @@ class SessionController(
             }
             if (s.noizeJmax < s.noizeJmin) {
                 throw SettingRejected("noizeJmax", "noizeJmax (${s.noizeJmax}) must be >= noizeJmin (${s.noizeJmin})")
+            }
+            if (s.noizeIntervalMs !in 0..5000) {
+                throw SettingRejected("noizeIntervalMs", "noizeIntervalMs must be 0-5000 (got ${s.noizeIntervalMs})")
+            }
+            val peer = s.peer.trim()
+            if (peer.isNotEmpty()) {
+                val m = PEER_SOCKET_RE.matchEntire(peer)
+                    ?: throw SettingRejected("peer", "Custom endpoint must be ip:port or [ipv6]:port")
+                val port = m.groupValues[2].toIntOrNull() ?: 0
+                if (port !in 1..65535) {
+                    throw SettingRejected("peer", "Custom endpoint port must be 1-65535")
+                }
             }
         }
 

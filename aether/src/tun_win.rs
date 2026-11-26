@@ -119,11 +119,13 @@ fn find_wintun_dll() -> Result<PathBuf> {
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<String> {
+    use std::os::windows::process::CommandExt;
     // Never by name: this process runs elevated, and the default search order
     // includes the current directory.
     let exe = crate::win_exec::system_exe(program)?;
     let out = Command::new(&exe)
         .args(args)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| AetherError::HostState(format!("{} failed: {e}", exe.display())))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -929,15 +931,15 @@ fn set_interface_mtu_and_metric(if_index: u32, mtu: u32, metric: u32) -> Result<
         write_interface_row(if_index, mtu, None)?;
         row = interface_row_v4(if_index)?;
     }
-    if row.NlMtu < mtu {
+    if row.NlMtu > mtu || row.NlMtu < 576 {
         return Err(AetherError::HostState(format!(
-            "IF {if_index} reports NlMtu={} after SetIpInterfaceEntry asked for {mtu}; the \
-             tunnel would blackhole everything but the smallest requests",
+            "IF {if_index} reports NlMtu={} after SetIpInterfaceEntry asked for {mtu}; an \
+             oversized or below-floor adapter MTU would blackhole tunnel traffic",
             row.NlMtu
         )));
-    } else if row.NlMtu != mtu {
+    } else if row.NlMtu < mtu {
         log::info!(
-            "[tun] IF {if_index} has NlMtu={} (asked for {mtu}); adapter MTU headroom is acceptable",
+            "[tun] IF {if_index} has NlMtu={} (asked for {mtu}); adapter MTU headroom is conservative",
             row.NlMtu
         );
     }
@@ -2159,7 +2161,21 @@ fn recover_legacy_state_file() -> bool {
     let mut removed = false;
     let mut keep_for_later = false;
     if let Some(journal) = journal {
-        let holder = combine(process_liveness(journal.creator_pid), &journal);
+        let birth = std::fs::metadata(&legacy)
+            .and_then(|m| m.created().or_else(|_| m.modified()))
+            .ok()
+            .and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+            })
+            .unwrap_or(0);
+        let probed = route_repair::combine_start_time(
+            birth,
+            route_repair::process_start_unix(journal.creator_pid),
+            process_liveness(journal.creator_pid),
+        );
+        let holder = combine(probed, &journal);
         match route_repair::decide_replay(
             &journal,
             holder,
@@ -2437,6 +2453,7 @@ pub async fn spawn(
                     continue;
                 }
                 n += 1;
+                crate::counters::bump_by(&crate::counters::BYTES_UP, data.len() as u64);
                 if n == 1 || n.is_multiple_of(5000) {
                     log::info!("[tun] rx from kernel packets={n} last_len={}", data.len());
                 }
@@ -2496,6 +2513,10 @@ pub async fn spawn(
                                 {
                                     packet.bytes_mut()[..pkt.len()].copy_from_slice(&pkt);
                                     session.send_packet(packet);
+                                    crate::counters::bump_by(
+                                        &crate::counters::BYTES_DOWN,
+                                        pkt.len() as u64,
+                                    );
                                     ok += 1;
                                 }
                             } else if pkt[0] >> 4 == 6 {
@@ -2517,6 +2538,10 @@ pub async fn spawn(
                                     {
                                         packet.bytes_mut()[..ip_len].copy_from_slice(&pkt[14..]);
                                         session.send_packet(packet);
+                                        crate::counters::bump_by(
+                                            &crate::counters::BYTES_DOWN,
+                                            ip_len as u64,
+                                        );
                                         ok += 1;
                                     }
                                 }

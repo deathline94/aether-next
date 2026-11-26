@@ -108,6 +108,45 @@ describe("android useRuntime hook", () => {
     expect(result.current.settingsLoadError).toBe(true);
   });
 
+  it("keeps the carrier unchanged until the connect it chose actually lands", async () => {
+    let rejectConnect: (e: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "get_settings") return { protocol: "masque", transport: "h2", peer: "" };
+      if (cmd === "connect") {
+        return new Promise((_, reject) => {
+          rejectConnect = reject;
+        });
+      }
+      if (cmd === "app_info") return { version: "1.2.9" };
+      return null;
+    });
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+
+    let attempt: Promise<void> = Promise.resolve();
+    await act(async () => {
+      attempt = result.current.connectToPeer("9.9.9.9:443", "wireguard", "h3");
+    });
+
+    // Nothing has been reached yet, so no address may be presented as carrying
+    // traffic — the endpoint used to be published the moment the dial started.
+    expect(result.current.runtime.status).toBe("connecting");
+    expect(result.current.runtime.endpoint).toBeNull();
+
+    await act(async () => {
+      rejectConnect(new Error("engine refused the endpoint"));
+      await attempt;
+    });
+
+    // The optimistic commit is rolled back: a direct connect that never came up
+    // must not leave the user's carrier protocol rewritten and saved.
+    expect(result.current.settings.protocol).toBe("masque");
+    expect(result.current.settings.transport).toBe("h2");
+    expect(result.current.settings.peer).toBe("");
+    expect(result.current.runtime.status).toBe("error");
+  });
+
   it("keeps the reason a save was rejected instead of only logging it", async () => {
     vi.mocked(invoke).mockImplementation(async (cmd: string) => {
       if (cmd === "get_settings") {

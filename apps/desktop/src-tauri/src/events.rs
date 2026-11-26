@@ -7,9 +7,19 @@
 use crate::settings::{RoutingMode, Settings};
 use crate::state::{emit_log, emit_state, AppState};
 use crate::supervision::{cleanup_routing, mark_connected};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StatsEvent {
+    pub(crate) up_bps: u64,
+    pub(crate) down_bps: u64,
+    pub(crate) up_bytes: u64,
+    pub(crate) down_bytes: u64,
+    pub(crate) uptime_secs: u64,
+}
 
 /// Mirror of the engine's `session_event::SessionEvent`
 /// (`aether/src/session_event.rs`), deserialised rather than probed field by
@@ -47,6 +57,13 @@ pub(crate) enum EngineEvent {
     TunReady,
     Connected {
         detail: String,
+    },
+    Stats {
+        up_bps: u64,
+        down_bps: u64,
+        up_bytes: u64,
+        down_bytes: u64,
+        uptime_secs: u64,
     },
     Error {
         message: String,
@@ -142,20 +159,47 @@ pub(crate) fn handle_engine_line(
                     socks_seen.store(true, Ordering::SeqCst);
                     tunnel_seen.store(true, Ordering::SeqCst);
                 }
+                EngineEvent::Stats {
+                    up_bps,
+                    down_bps,
+                    up_bytes,
+                    down_bytes,
+                    uptime_secs,
+                } => {
+                    let _ = app.emit(
+                        "session://stats",
+                        StatsEvent {
+                            up_bps,
+                            down_bps,
+                            up_bytes,
+                            down_bytes,
+                            uptime_secs,
+                        },
+                    );
+                }
                 EngineEvent::Error { message } => {
                     let msg = message;
                     emit_log(app, format!("engine error: {msg}"));
                     let state = app.state::<AppState>();
                     let endpoint = state.runtime.lock().endpoint.clone();
 
-                    // 1) Paint the banner.
-                    emit_state(app, &state, "error", &msg, None, endpoint);
-
-                    // 2) Tear the session down so the next Connect is allowed WITHOUT
-                    //    dismissing the banner. watch_child's `already_error` guard keeps
-                    //    the error banner visible when the child finally exits.
+                    // Reset readiness flags and stamps so falling out of this match cannot
+                    // ever call `mark_connected` on a dead session (or leave stale stats).
+                    socks_seen.store(false, Ordering::SeqCst);
+                    tunnel_seen.store(false, Ordering::SeqCst);
+                    tun_seen.store(false, Ordering::SeqCst);
                     state.generation.fetch_add(1, Ordering::SeqCst);
                     state.connecting.store(false, Ordering::SeqCst);
+                    *state.connect_since.lock() = None;
+                    *state.session_origin.lock() = None;
+                    *state.last_beat.lock() = None;
+
+                    // 1) Paint the banner (also clears handshake_rtt_ms & emits zero stats).
+                    emit_state(app, &state, "error", &msg, None, endpoint);
+
+                    // 2) Tear the session down off the `operation` lock where possible: ask
+                    //    the child cleanly first with a brief grace wait so TUN routes tear
+                    //    down before falling back to kill().
                     let child = state.child.lock().take();
                     if let Some(mut child) = child {
                         if let Some(mut stdin) = child.stdin.take() {
@@ -163,10 +207,28 @@ pub(crate) fn handle_engine_line(
                             let _ = stdin.write_all(b"shutdown\n");
                             let _ = stdin.flush();
                         }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(_)) => break,
+                                Ok(None) if std::time::Instant::now() < deadline => {
+                                    std::thread::sleep(std::time::Duration::from_millis(25));
+                                }
+                                _ => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    cleanup_routing(app, &state);
+                    let problems = cleanup_routing(app, &state);
+                    for problem in problems {
+                        crate::startup::note(&format!("[aether] {problem}"));
+                        emit_log(app, format!("cleanup warning: {problem}"));
+                    }
+                    return;
                 }
                 EngineEvent::IdentityReady { .. } => {}
                 // Scan traffic belongs to the scan child's own stream, which

@@ -47,12 +47,19 @@ internal fun escapeHtml(raw: String?): String {
 internal fun isTrustedUiUrl(url: String?, host: String, entryPrefix: String): Boolean {
     if (url.isNullOrBlank()) return false
     if (url.startsWith("about:") || url.startsWith("data:") || url.startsWith("blob:")) return false
-    val lowered = url.lowercase()
-    if (!lowered.startsWith("https://")) return false
-    val withoutScheme = lowered.substring("https://".length)
-    val pathStart = withoutScheme.indexOf('/')
-    val urlHost = if (pathStart < 0) withoutScheme else withoutScheme.substring(0, pathStart)
-    if (urlHost != host.lowercase()) return false
-    val path = if (pathStart < 0) "/" else withoutScheme.substring(pathStart)
-    return path.startsWith(entryPrefix)
+    val uri = try {
+        java.net.URI(url).normalize()
+    } catch (_: Exception) {
+        return false
+    }
+    if (!uri.scheme.equals("https", ignoreCase = true)) return false
+    val urlHost = uri.host ?: return false
+    if (!urlHost.equals(host, ignoreCase = true)) return false
+    if (uri.port != -1) return false
+    val rawPath = uri.rawPath ?: return false
+    // Reject dot segments even if percent-encoded or trailing.
+    if (rawPath.split('/').any { it == ".." || it == "." || it.contains("%2e", ignoreCase = true) }) {
+        return false
+    }
+    return rawPath.startsWith(entryPrefix)
 }

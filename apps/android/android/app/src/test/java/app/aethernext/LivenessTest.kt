@@ -90,17 +90,14 @@ class LivenessTest {
     }
 
     @Test
-    fun aSpentBudgetIsDeathAndIsDecidedBeforeTheCounters() {
-        // The ordering is the bug class: a spent budget that still reports "alive"
-        // because traffic moved keeps the badge green over a tunnel that already
-        // failed three supervised restarts.
+    fun aSpentBudgetStaysAliveWhileHealthyAndGivesUpOnlyOnNextFailure() {
         assertEquals(
-            "traffic must not outrank a spent budget",
-            LivenessDecision.Exhausted,
+            "a working third restart carrying traffic must not be torn down",
+            LivenessDecision.Alive,
             decideLiveness(stats(), stats(txP = 5, rxP = 5), elapsedMs = step, attempt = MAX_ATTEMPTS),
         )
         assertEquals(
-            "neither may a stall",
+            "once dead again with no retries left, report Exhausted",
             LivenessDecision.Exhausted,
             decideLiveness(
                 stats(), stats(), elapsedMs = step, attempt = MAX_ATTEMPTS,

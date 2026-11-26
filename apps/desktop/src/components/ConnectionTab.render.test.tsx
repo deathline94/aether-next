@@ -12,17 +12,20 @@
  * one surface only.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ConnectionTab, PLATFORM, START_HINT } from "./ConnectionTab";
 import { defaults, initialRuntime } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import {
-  connectedCopy,
-  heroCopy,
-  portStateCopy,
+  nordicHeroHeadline,
+  nordicRoutingSummary,
   powerControlLabel,
-  powerHint,
 } from "@aether/ui/statusCopy";
+import { RELEASES_PAGE } from "../hooks/useRuntime";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+
+import { invoke } from "@tauri-apps/api/core";
 
 afterEach(() => cleanup());
 
@@ -66,49 +69,50 @@ describe("the desktop renders the shared claim table", () => {
   for (const mode of MODES) {
     it(`says the table's piece about a connected ${mode} session`, () => {
       const { container } = renderTab(mode);
-      const copy = connectedCopy(mode, PLATFORM);
-      const listeners = portStateCopy(true, mode, PLATFORM);
-
-      expect(text(container.querySelector(".switch-status-pill"))).toBe(copy.badge);
-      // The live region carries the body verbatim: what a screen reader is told is
-      // the sentence a sighted user reads, not a paraphrase of it.
-      expect(text(container.querySelector('.connection-copy p[aria-live="polite"]'))).toContain(copy.body);
-      const tags = Array.from(container.querySelectorAll(".daemon-tag strong")).map(text);
-      expect(tags).toContain(listeners.http);
-      expect(tags).toContain(listeners.socks);
+      expect(text(container.querySelector(".hero-title"))).toBe(
+        nordicHeroHeadline("connected", mode, PLATFORM.canSetSystemProxy),
+      );
+      const liveBody = text(container.querySelector('.hero-subtitle[aria-live="polite"]'));
+      if (mode === "proxy-only") {
+        expect(liveBody).toContain("127.0.0.1");
+        expect(nordicHeroHeadline("connected", mode, PLATFORM.canSetSystemProxy)).toBe("Connected");
+      } else {
+        expect(liveBody).toContain("Cloudflare Edge");
+        expect(nordicHeroHeadline("connected", mode, PLATFORM.canSetSystemProxy)).toBe("Protected");
+      }
+      expect(container.textContent ?? "").toContain(nordicRoutingSummary(mode, "desktop"));
+      const proxyCodes = Array.from(
+        container.querySelectorAll('section[aria-label="Local Proxies"] code'),
+      ).map(text);
+      expect(proxyCodes).toContain(`127.0.0.1:${defaults.socksPort}`);
+      expect(proxyCodes).toContain(`127.0.0.1:${defaults.httpPort}`);
       cleanup();
     });
   }
 
-  it("names the state the same way whatever the mode, and only the badge carries the mode", () => {
+  it("names the state the same way whatever the mode", () => {
     for (const status of ["disconnected", "connecting", "error"] as const) {
       for (const mode of MODES) {
         cleanup();
         const { container } = renderTab(mode, { status }, false, status === "connecting");
-        const hero = heroCopy(status);
-        expect(text(container.querySelector(".eyebrow span"))).toBe(hero.eyebrow);
-        expect(text(container.querySelector(".connection-copy h2"))).toBe(hero.title);
-        expect(text(container.querySelector(".switch-status-pill"))).toBe(hero.badge);
+        expect(text(container.querySelector(".hero-title"))).toBe(
+          nordicHeroHeadline(status, mode, PLATFORM.canSetSystemProxy),
+        );
       }
     }
   });
 
   it("calls the control what it does, in this surface's verb", () => {
     const stopped = renderTab("system-proxy", { status: "disconnected" }, false, false);
-    expect(text(stopped.container.querySelector(".switch-action-hint"))).toBe(powerHint(false, PLATFORM));
-    expect(
-      stopped.container.querySelector(".master-toggle-btn")?.getAttribute("aria-label"),
-    ).toBe(powerControlLabel(false));
+    const stoppedBtn = stopped.container.querySelector(".primary-cta");
+    expect(stoppedBtn?.getAttribute("aria-label")).toBe(powerControlLabel(false));
+    expect(text(stoppedBtn)).toBe("Connect");
     cleanup();
 
     const up = renderTab("tun");
-    expect(text(up.container.querySelector(".switch-action-hint"))).toBe(powerHint(true, PLATFORM));
-    expect(up.container.querySelector(".master-toggle-btn")?.getAttribute("aria-label")).toBe(
-      powerControlLabel(true),
-    );
-    // The accessible name and the visible hint agree about which verb this surface
-    // uses, which is the part no line-comparison gate can see.
-    expect(powerHint(true, PLATFORM)).toContain(PLATFORM.actionVerb.toUpperCase());
+    const upBtn = up.container.querySelector(".primary-cta");
+    expect(upBtn?.getAttribute("aria-label")).toBe(powerControlLabel(true));
+    expect(text(upBtn)).toBe("Disconnect");
     expect(START_HINT.startsWith(PLATFORM.actionVerb)).toBe(true);
   });
 
@@ -122,5 +126,47 @@ describe("the desktop renders the shared claim table", () => {
       }
       expect(said).not.toMatch(/unbreakable|anonymous|100\s*%|traffic secure|route open/i);
     }
+  });
+});
+
+describe("the update banner's opener", () => {
+  function renderBanner(url: string) {
+    return render(
+      <ConnectionTab
+        settings={defaults}
+        runtime={{ ...initialRuntime, status: "connected", detail: "Session is up." }}
+        busy={false}
+        testBusy={false}
+        connected
+        running
+        settingsLocked
+        settingsLoaded
+        admin
+        testResult={null}
+        appVersion="1.3.0"
+        updateAvailable={{ version: "v9.9.9", url }}
+        dismissUpdate={vi.fn()}
+        toggleConnection={vi.fn()}
+        patchSettings={vi.fn()}
+        runTest={vi.fn()}
+        dismissError={vi.fn()}
+        appendLog={vi.fn()}
+      />,
+    );
+  }
+
+  it("opens this repository's release page", () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const url = "https://github.com/deathline94/aether-next/releases/tag/v9.9.9";
+    renderBanner(url);
+    fireEvent.click(screen.getByRole("button", { name: "View release" }));
+    expect(invoke).toHaveBeenCalledWith("plugin:opener|open_url", { url });
+  });
+
+  it("refuses a URL taken from network data", () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    renderBanner("javascript:alert(1)");
+    fireEvent.click(screen.getByRole("button", { name: "View release" }));
+    expect(invoke).toHaveBeenCalledWith("plugin:opener|open_url", { url: RELEASES_PAGE });
   });
 });

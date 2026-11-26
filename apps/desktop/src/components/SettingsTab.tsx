@@ -5,64 +5,46 @@ import {
   HardDrive,
   Lock,
   Radio,
+  RotateCcw,
   Shield,
   SlidersHorizontal,
   Wifi,
   X,
 } from "lucide-react";
 import { memo, useEffect, useState } from "react";
-import type { NoizeProfile, Settings } from "../types";
+import { noiseIsInert } from "@aether/ui";
 import {
   IP_FAMILY_OPTIONS,
   NOIZE_OPTIONS,
   NOIZE_PROFILES,
+  oneOf,
   ROUTING_MODE_OPTIONS,
   SCAN_MODE_OPTIONS,
-  TUNNEL_PROTOCOL_OPTIONS,
   TRANSPORT_OPTIONS,
-  oneOf,
+  TUNNEL_PROTOCOL_OPTIONS,
 } from "@aether/ui/enums";
-import { noiseIsInert } from "@aether/ui";
+import type { NoizeProfile } from "@aether/ui/enums";
 import type { IpcError } from "../ipcError";
+import type { Settings } from "../types";
 import { NumberField, Segmented, Toggle } from "./ui";
 
-/** This platform's wording for the shared routing-mode values; the value list
-    itself is `ROUTING_MODE_OPTIONS`, so a new mode still surfaces here. */
 const ROUTING_LABELS: Record<string, string> = {
-  "system-proxy": "System Proxy (Standard Windows Proxy)",
-  "proxy-only": "Proxy Only (Local Listeners Only)",
-  tun: "TUN Virtual Device (Elevated System-Wide)",
+  "system-proxy": "System Proxy (automatic)",
+  tun: "Full Device TUN (admin)",
+  "proxy-only": "Proxy Only (ports only)",
 };
 
-/**
- * A free-text path commits on blur or Enter, not on every keystroke.
- *
- * The form auto-saves 400 ms after the last change, so per-character patching
- * wrote "C:", then "C:\Use", then the real path to disk: an aborted edit
- * left a nonsense engine path saved, and the next connect failed over a
- * half-typed string nobody meant to keep. Null means nothing changed, so a blur
- * on an untouched field does not write at all.
- */
-export function commitPath(draft: string, current: string): string | null {
-  const next = draft.trim();
-  return next === current.trim() ? null : next;
+export function commitPath(draft: string, saved: string): string | null {
+  const trimmed = draft.trim();
+  return trimmed === saved ? null : trimmed;
 }
 
-/**
- * Which of the two noise controls the transport can carry.
- *
- * UDP junk frames have nowhere to go on an HTTP/2 TCP stream, so the profile
- * select is disabled there — but only for MASQUE. WireGuard and Gool ride UDP
- * whatever `transport` says, so their select stayed live and accepted `custom`
- * while the parameter matrix rendered only for `transport !== "h2"`: the profile
- * went to disk with four numbers nobody could see or edit. Both halves now read
- * the same predicate, so a profile is only pickable where its parameters are
- * showable.
- */
-export function noiseFieldState(settings: Settings): { blocked: boolean; showMatrix: boolean } {
+export function noiseUiState(settings: Pick<Settings, "protocol" | "transport" | "noize">) {
   const blocked = noiseIsInert(settings.protocol, settings.transport);
   return { blocked, showMatrix: !blocked && settings.noize === "custom" };
 }
+
+export const noiseFieldState = noiseUiState;
 
 interface SettingsTabProps {
   settings: Settings;
@@ -70,15 +52,9 @@ interface SettingsTabProps {
   settingsLoaded: boolean;
   settingsLoadError?: boolean;
   retrySettings?: () => void | Promise<void>;
-  /** The shell has just accepted a write; the dock flashes "Synchronized". */
+  resetSettings?: () => void | Promise<void>;
   saved: boolean;
-  /**
-   * An edit of ours has not been accepted yet — queued, in flight, or refused.
-   * Without it the dock had no idle state: `!saved` was the only test, so it pulsed
-   * "Auto-Saving / Synchronizing changes…" from first paint.
-   */
-  dirty: boolean;
-  /** The last save the shell refused, if one is still outstanding. */
+  dirty?: boolean;
   saveError?: IpcError | null;
   patchSettings: (patch: Partial<Settings>) => void;
 }
@@ -89,92 +65,68 @@ function SettingsTabImpl({
   settingsLoaded,
   settingsLoadError,
   retrySettings,
+  resetSettings,
   saved,
-  dirty,
+  dirty = false,
   saveError,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
-  const noise = noiseFieldState(settings);
-  // `field` is the machine-readable half of the rejection: the shell says which
-  // setting it refused, so the input itself can be marked, not just the log.
   const rejected = (field: string) => saveError?.field === field;
+  const noise = noiseUiState(settings);
   const [pathDraft, setPathDraft] = useState(settings.enginePath);
-  // Keep the draft honest when something else moves the value (hydration, a
-  // retry, a profile preset); leave it alone while the user is editing it.
-  useEffect(() => {
-    setPathDraft((draft) =>
-      commitPath(draft, settings.enginePath) === null ? settings.enginePath : draft,
-    );
-  }, [settings.enginePath]);
+  const [peerDraft, setPeerDraft] = useState(settings.peer);
+  useEffect(() => { setPathDraft(settings.enginePath); }, [settings.enginePath]);
+  useEffect(() => { setPeerDraft(settings.peer); }, [settings.peer]);
 
   return (
     <div className="settings-view">
       {settingsLoadError && (
         <div className="error-banner" role="alert">
           <div className="error-banner-content">
-            <AlertTriangle size={18} aria-hidden="true" />
+            <AlertTriangle size={16} aria-hidden="true" />
             <div>
-              <strong>SETTINGS HYDRATION FAILED</strong>
-              <span>Could not load configuration from disk. Defaults are active.</span>
+              <strong>Settings Hydration Failed</strong>
+              <span>Could not read settings from disk; defaults shown read-only until Retry succeeds.</span>
             </div>
           </div>
           {retrySettings && (
-            <button
-              type="button"
-              onClick={() => void retrySettings()}
-              className="banner-action"
-            >
+            <button type="button" onClick={() => void retrySettings()} className="banner-action">
               Retry
             </button>
           )}
         </div>
       )}
-      {/* A rejected save used to be only a log line, so the status text below
-          stayed on "Synchronizing changes…" over a value that would never be
-          accepted. The shell's own sentence is the message; `field` marks the
-          input it is about. */}
-      {saveError && (
-        <div className="error-banner" role="alert">
-          <div className="error-banner-content">
-            <AlertTriangle size={18} aria-hidden="true" />
-            <span>AUTO-SAVE REJECTED — {saveError.message}</span>
-          </div>
-        </div>
-      )}
+
       {settingsLocked && (
         <div className="tactical-lock-banner" role="status">
-          <div className="lock-banner-icon">
-            <Lock size={16} aria-hidden="true" />
-          </div>
-          <div className="lock-banner-text">
-            <strong>TUNNEL OPERATIONAL — CONFIGURATION LOCKED</strong>
-            <span>
-              {settingsLoaded
-                ? "Active egress route is protected. Disconnect the tunnel to modify network protocols or port bindings."
-                : "Synchronizing engine daemon parameters…"}
-            </span>
+          <div className="error-banner-content">
+            <Lock size={15} aria-hidden="true" />
+            <div>
+              <strong>Configuration Locked</strong>
+              <span>
+                {settingsLoaded
+                  ? "Disconnect the active tunnel to modify protocols or port bindings."
+                  : "Loading saved profile…"}
+              </span>
+            </div>
           </div>
         </div>
       )}
 
-      {/* ─── Panel 1: Transport & Carrier Engine ─────────────────────────── */}
-      <section className="settings-section">
+      <section className="nordic-card">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">CARRIER PROTOCOL & ANTI-DPI</p>
-            <h3>Transport Engine</h3>
+            <p className="panel-eyebrow">TRANSPORT &amp; ANTI-DPI</p>
+            <h2 className="nordic-card-title">Protocol Engine</h2>
           </div>
-          <Wifi size={20} className="panel-head-icon" aria-hidden="true" />
+          <Wifi size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>Carrier Protocol</strong>
-              <span className="tactical-chip">EGRESS LAYER</span>
-            </div>
-            <span>Underlying network protocol used to bridge outbound traffic</span>
+            <strong>Carrier Protocol</strong>
+            <span>Network protocol used for Cloudflare egress</span>
           </div>
           <Segmented
             label="Carrier protocol"
@@ -188,11 +140,8 @@ function SettingsTabImpl({
         {(settings.protocol === "masque" || settings.protocol === "mim") && (
           <div className="setting-row">
             <div>
-              <div className="setting-label-row">
-                <strong>MASQUE Transport Framing</strong>
-                <span className="tactical-chip cyan">HTTP/3 / H2</span>
-              </div>
-              <span>HTTP/2 provides reliable fallback on restricted networks that block UDP/QUIC</span>
+              <strong>MASQUE Framing</strong>
+              <span>HTTP/2 provides TCP fallback where UDP/QUIC is throttled</span>
             </div>
             <Segmented
               label="MASQUE transport"
@@ -207,11 +156,8 @@ function SettingsTabImpl({
         {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && (
           <div className="setting-row">
             <div>
-              <div className="setting-label-row">
-                <strong>QUIC Initial Fragmentation</strong>
-                <span className="tactical-chip emerald">ANTI-DPI</span>
-              </div>
-              <span>Split the TLS ClientHello across fragmented datagrams to bypass SNI inspect filters</span>
+              <strong>QUIC Initial Fragmentation</strong>
+              <span>Split ClientHello across two datagrams to bypass SNI inspection</span>
             </div>
             <Toggle
               label="QUIC Initial fragmentation"
@@ -222,38 +168,34 @@ function SettingsTabImpl({
           </div>
         )}
 
-        {(settings.protocol === "masque" || settings.protocol === "mim") && settings.transport === "h3" && settings.quicInitialFrag && (
-          <div className="setting-row">
-            <div>
-              <div className="setting-label-row">
+        {(settings.protocol === "masque" || settings.protocol === "mim") &&
+          settings.transport === "h3" &&
+          settings.quicInitialFrag && (
+            <div className="setting-row">
+              <div>
                 <strong>Initial Fragment Length</strong>
-                <span className="tactical-chip">16–512 BYTES</span>
+                <span>Bytes carried in the first ClientHello datagram (16–512)</span>
               </div>
-              <span>Exact size of the ClientHello packet dispatched in the first datagram</span>
+              <NumberField
+                label="QUIC Initial first fragment size"
+                min={16}
+                max={512}
+                step={16}
+                suffix="B"
+                disabled={settingsLocked}
+                value={settings.quicInitialFragSize}
+                onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })}
+              />
             </div>
-            <NumberField
-            label="QUIC Initial first fragment size"
-            min={16}
-            max={512}
-            step={16}
-            suffix="B"
-            disabled={settingsLocked}
-            value={settings.quicInitialFragSize}
-            onCommit={(quicInitialFragSize) => patchSettings({ quicInitialFragSize })}
-          />
-          </div>
-        )}
+          )}
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>Handshake Obfuscation</strong>
-              {settings.noize !== "off" && !noise.blocked && <span className="tactical-chip amber">ACTIVE JUNK</span>}
-            </div>
+            <strong>Handshake Obfuscation</strong>
             <span>
               {noise.blocked
-                ? "UDP junk frames are not applicable for HTTP/2 TCP streams"
-                : "Inject randomized pre-handshake padding to prevent active protocol fingerprinting"}
+                ? "UDP junk frames do not apply to HTTP/2 TCP streams"
+                : "Pre-handshake padding to prevent active DPI fingerprinting"}
             </span>
           </div>
           <select
@@ -275,13 +217,11 @@ function SettingsTabImpl({
           <div className="custom-noise-matrix">
             <div className="matrix-title">
               <SlidersHorizontal size={14} aria-hidden="true" />
-              <span>CUSTOM NOISE PARAMETERS</span>
+              <span>Custom Noise Parameters</span>
             </div>
             <div className="matrix-grid">
               <div className="matrix-cell">
-                <label htmlFor="field-junk-packet-count">
-                  <span>Junk Packet Count</span>
-                </label>
+                <label htmlFor="field-junk-packet-count">Junk Packet Count</label>
                 <NumberField
                   id="field-junk-packet-count"
                   label="Junk packet count"
@@ -294,11 +234,8 @@ function SettingsTabImpl({
                   onCommit={(noizeJc) => patchSettings({ noizeJc })}
                 />
               </div>
-
               <div className="matrix-cell">
-                <label htmlFor="field-min-payload-size-bytes">
-                  <span>Min Payload Size</span>
-                </label>
+                <label htmlFor="field-min-payload-size-bytes">Min Payload Size</label>
                 <NumberField
                   id="field-min-payload-size-bytes"
                   label="Min payload size (bytes)"
@@ -316,11 +253,8 @@ function SettingsTabImpl({
                   }
                 />
               </div>
-
               <div className="matrix-cell">
-                <label htmlFor="field-max-payload-size-bytes">
-                  <span>Max Payload Size</span>
-                </label>
+                <label htmlFor="field-max-payload-size-bytes">Max Payload Size</label>
                 <NumberField
                   id="field-max-payload-size-bytes"
                   label="Max payload size (bytes)"
@@ -338,11 +272,8 @@ function SettingsTabImpl({
                   }
                 />
               </div>
-
               <div className="matrix-cell">
-                <label htmlFor="field-burst-interval-ms">
-                  <span>Burst Interval</span>
-                </label>
+                <label htmlFor="field-burst-interval-ms">Burst Interval</label>
                 <NumberField
                   id="field-burst-interval-ms"
                   label="Burst interval (ms)"
@@ -360,31 +291,24 @@ function SettingsTabImpl({
         )}
       </section>
 
-      {/* ─── Panel 2: Discovery & Topology ───────────────────────────────── */}
-      <section className="settings-section">
+      <section className="nordic-card">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">AUTO-DISCOVERY & LATENCY SEARCH</p>
-            <h3>Topology Scanner</h3>
+            <p className="panel-eyebrow">ENDPOINT DISCOVERY</p>
+            <h2 className="nordic-card-title">Scanner &amp; Pinned Peer</h2>
           </div>
-          <Radio size={20} className="panel-head-icon" aria-hidden="true" />
+          <Radio size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>Probe Velocity Profile</strong>
-              <span className="tactical-chip cyan">{settings.scanMode.toUpperCase()}</span>
-            </div>
-            <span>Dictates worker concurrency and RTT probe thoroughness during edge search</span>
+            <strong>Probe Velocity Profile</strong>
+            <span>Concurrency and probe depth during edge selection</span>
           </div>
           <select
             disabled={settingsLocked}
             aria-label="Scan mode"
             className="tactical-select"
-            // Every mode the shell accepts, from the shared list: `ironclad` was a
-            // legal wire value with no option, so a config that carried it showed a
-            // blank selection and the next patch silently changed it.
             value={SCAN_MODE_OPTIONS.some((o) => o.value === settings.scanMode) ? settings.scanMode : "balanced"}
             onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}
           >
@@ -398,11 +322,8 @@ function SettingsTabImpl({
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>IP Pool Family</strong>
-              <span className="tactical-chip">NETWORK TARGET</span>
-            </div>
-            <span>IP address versions scanned and benchmarked for edge ingress</span>
+            <strong>IP Pool Family</strong>
+            <span>Address families probed when discovering endpoints</span>
           </div>
           <Segmented
             label="IP version"
@@ -412,32 +333,52 @@ function SettingsTabImpl({
             onChange={(ipVersion) => patchSettings({ ipVersion })}
           />
         </div>
+
+        <div className="setting-row">
+          <div>
+            <strong>Pinned Endpoint</strong>
+            <span>Optional fixed IP:port override (leave blank for automatic selection)</span>
+          </div>
+          <div className="tactical-input-wrapper">
+            <input
+              disabled={settingsLocked}
+              aria-label="Pinned endpoint"
+              placeholder="Auto-select best edge"
+              className="tactical-text-input font-mono"
+              value={peerDraft}
+              onChange={(e) => setPeerDraft(e.target.value)}
+              onBlur={() => {
+                const next = commitPath(peerDraft, settings.peer);
+                if (next !== null) patchSettings({ peer: next });
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter") return;
+                const next = commitPath(peerDraft, settings.peer);
+                if (next !== null) patchSettings({ peer: next });
+              }}
+            />
+          </div>
+        </div>
       </section>
 
-      {/* ─── Panel 3: Windows Integration & Routing Policy ───────────────── */}
-      <section className="settings-section">
+      <section className="nordic-card">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">PLATFORM & OS INTEGRATION</p>
-            <h3>Routing & Startup</h3>
+            <p className="panel-eyebrow">WINDOWS INTEGRATION</p>
+            <h2 className="nordic-card-title">Routing &amp; Startup</h2>
           </div>
-          <Shield size={20} className="panel-head-icon" aria-hidden="true" />
+          <Shield size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>Routing Pipeline</strong>
-              <span className={`tactical-chip ${settings.routingMode === "tun" ? "coral" : "emerald"}`}>
-                {settings.routingMode === "tun" ? "ADMIN TUN" : "USER-SPACE"}
-              </span>
-            </div>
+            <strong>Routing Mode</strong>
             <span>
               {settings.routingMode === "system-proxy"
-                ? "Directs Windows system proxy settings so all browser and standard applications route transparently"
+                ? "Configures Windows system proxy for browsers and standard apps"
                 : settings.routingMode === "tun"
-                ? "Installs a virtual Wintun network adapter for universal, system-wide packet routing (requires admin)"
-                : "Keeps ports listening locally without altering global Windows network proxy settings"}
+                  ? "Routes all device packets through WinTUN (requires Administrator)"
+                  : "Opens local proxy listeners without touching Windows system proxy"}
             </span>
           </div>
           <select
@@ -447,8 +388,6 @@ function SettingsTabImpl({
             value={settings.routingMode}
             onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
           >
-            {/* Values come from the shared list so a new routing mode surfaces
-                automatically; the wording is this platform's own. */}
             {ROUTING_MODE_OPTIONS.map((option) => (
               <option key={option.value} value={option.value}>
                 {ROUTING_LABELS[option.value] ?? option.label}
@@ -460,7 +399,7 @@ function SettingsTabImpl({
         <div className="setting-row">
           <div>
             <strong>Launch at Login</strong>
-            <span>Automatically initialize Aether daemon when Windows boots</span>
+            <span>Start Aether Next automatically when signing into Windows</span>
           </div>
           <Toggle
             label="Launch at login"
@@ -473,7 +412,7 @@ function SettingsTabImpl({
         <div className="setting-row">
           <div>
             <strong>Start Minimized to Tray</strong>
-            <span>Launch silently into the Windows system tray without popping the window</span>
+            <span>Open directly to the system tray on startup</span>
           </div>
           <Toggle
             label="Start minimized"
@@ -484,23 +423,20 @@ function SettingsTabImpl({
         </div>
       </section>
 
-      {/* ─── Panel 4: Local Ports & Daemon Binary ────────────────────────── */}
-      <section className="settings-section">
+      <section className="nordic-card">
         <div className="section-heading">
           <div>
-            <p className="panel-eyebrow">LOCAL LISTENERS & BINARY HOOKS</p>
-            <h3>Proxy Endpoints</h3>
+            <p className="panel-eyebrow">LOCAL PORTS &amp; ENGINE</p>
+            <h2 className="nordic-card-title">Proxy Bindings</h2>
           </div>
-          <HardDrive size={20} className="panel-head-icon" aria-hidden="true" />
+          <HardDrive size={18} className="panel-head-icon" aria-hidden="true" />
         </div>
 
-        <div className="setting-row">
+        <div className="setting-row input-row">
           <div className="port-field-block">
             <label htmlFor="field-http-proxy-port">
-              <div className="field-meta">
-                <strong>HTTP Proxy Port</strong>
-                <span className="field-hint">1024–65535</span>
-              </div>
+              <strong>HTTP Proxy Port</strong>
+              <span className="field-hint">1024–65535</span>
             </label>
             <NumberField
               id="field-http-proxy-port"
@@ -514,13 +450,10 @@ function SettingsTabImpl({
               onCommit={(httpPort) => patchSettings({ httpPort })}
             />
           </div>
-
           <div className="port-field-block">
             <label htmlFor="field-socks5-proxy-port">
-              <div className="field-meta">
-                <strong>SOCKS5 Proxy Port</strong>
-                <span className="field-hint">1024–65535</span>
-              </div>
+              <strong>SOCKS5 Proxy Port</strong>
+              <span className="field-hint">1024–65535</span>
             </label>
             <NumberField
               id="field-socks5-proxy-port"
@@ -539,23 +472,17 @@ function SettingsTabImpl({
         {portsCollide && (
           <div className="port-collision-alert" role="alert">
             <AlertTriangle size={16} aria-hidden="true" />
-            <div>
-              <strong>Port Collision Detected</strong>
-              <p>HTTP and SOCKS5 listeners cannot bind to the identical port ({settings.httpPort}). Modify one port to re-enable saving.</p>
-            </div>
+            <span>HTTP and SOCKS5 ports cannot share port {settings.httpPort}.</span>
           </div>
         )}
 
         <div className="setting-row">
           <div>
-            <div className="setting-label-row">
-              <strong>Engine Binary Path</strong>
-              <span className="tactical-chip">OVERRIDE</span>
-            </div>
-            <span>Custom executable path to aether.exe (leave blank for bundled auto-detection)</span>
+            <strong>Engine Binary Path</strong>
+            <span>Optional path to aether.exe (blank uses the bundled verified binary)</span>
           </div>
           <div className="tactical-input-wrapper">
-            <FolderGit2 size={16} className="input-affix-icon" aria-hidden="true" />
+            <FolderGit2 size={15} className="input-affix-icon" aria-hidden="true" />
             <input
               disabled={settingsLocked}
               aria-label="Engine path"
@@ -577,64 +504,66 @@ function SettingsTabImpl({
         </div>
       </section>
 
-      {/* ─── Save Dock ───────────────────────────────────────────────────── */}
+      {saveError && (
+        <div className="error-banner" role="alert">
+          <div className="error-banner-content">
+            <X size={16} aria-hidden="true" />
+            <span>AUTO-SAVE REJECTED — {saveError.message}</span>
+          </div>
+        </div>
+      )}
+
       <div className="tactical-save-dock">
         <div className="save-bar-status" role="status" aria-live="polite">
-          <span className="save-status-indicator-dot" />
           <span className="save-status-text">
             {!settingsLoaded
               ? "Reading configuration profile from disk…"
               : settingsLocked
-              ? "Interface locked — disconnect tunnel to commit changes"
-              : portsCollide
-              ? "Save blocked — resolve HTTP/SOCKS port collision"
-              : saveError
-              ? "Last save was rejected — see the message above"
-              : saved
-              ? "All parameters synchronized with runtime daemon"
-              : dirty
-              ? "Synchronizing changes…"
-              : "No changes pending — the form matches the profile on disk"}
+                ? "Interface locked — disconnect tunnel to commit changes"
+                : portsCollide
+                  ? "Save blocked — resolve HTTP/SOCKS port collision"
+                  : saveError
+                    ? "Last save was rejected — see the message above"
+                    : saved
+                      ? "All parameters synchronized with runtime daemon"
+                      : dirty
+                        ? "Synchronizing changes…"
+                        : "No changes pending — the form matches the profile on disk"}
           </span>
         </div>
 
-        {/* Four states, and the pulse only on the one that is pulsing: this branch
-            used to be `!saved`, so "Auto-Saving" spun from first paint until the
-            first 1.2 s "Synchronized" flash — a save indicator that lied about a
-            write in progress. */}
-        <div className={`save-indicator ${portsCollide || saveError ? "blocked" : dirty ? "" : "idle"}`}>
-          {portsCollide ? (
-            <>
-              <X size={15} aria-hidden="true" />
-              <span>Collision Conflict</span>
-            </>
-          ) : saveError ? (
-            <>
-              <X size={15} aria-hidden="true" />
-              <span>Save Rejected</span>
-            </>
-          ) : saved ? (
-            <>
-              <Check size={15} aria-hidden="true" />
-              <span>Synchronized</span>
-            </>
-          ) : dirty ? (
-            <>
-              <div className="save-sync-pulse" aria-hidden="true" />
-              <span>Auto-Saving</span>
-            </>
-          ) : (
-            <>
-              <span className="save-idle-dot" aria-hidden="true" />
-              <span>Idle</span>
-            </>
+        <div className="save-dock-actions">
+          {resetSettings && (
+            <button
+              type="button"
+              className="banner-action"
+              disabled={settingsLocked}
+              onClick={() => void resetSettings()}
+            >
+              <RotateCcw size={13} aria-hidden="true" />
+              <span>Reset defaults</span>
+            </button>
           )}
+          <div className={`save-indicator ${portsCollide || saveError ? "blocked" : dirty ? "" : "idle"}`}>
+            {portsCollide ? (
+              <span>Collision Conflict</span>
+            ) : saveError ? (
+              <span>Save Rejected</span>
+            ) : saved ? (
+              <>
+                <Check size={14} aria-hidden="true" />
+                <span>Synchronized</span>
+              </>
+            ) : dirty ? (
+              <span>Auto-Saving</span>
+            ) : (
+              <span>Idle</span>
+            )}
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-// Memoized at the boundary: the log and scan buffers live in App, so every
-// appended line re-rendered all four tabs even when nothing they read changed.
 export const SettingsTab = memo(SettingsTabImpl);

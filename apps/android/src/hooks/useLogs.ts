@@ -6,6 +6,8 @@ import {
   appendToStore,
   emptyStore,
   hitKeyOf,
+  redactExport,
+  shouldClearLogs,
   visibleWindow,
 } from "@aether/ui/logs";
 import type { Classified, Store } from "@aether/ui/logs";
@@ -18,7 +20,7 @@ import type { Classified, Store } from "@aether/ui/logs";
  * same answers and did not. The re-exports below keep this hook the surface
  * callers and tests read from.
  */
-export { hitKeyOf, RENDER_CAP };
+export { hitKeyOf, redactExport, shouldClearLogs, RENDER_CAP };
 export type { Classified, Store };
 
 export function useLogs() {

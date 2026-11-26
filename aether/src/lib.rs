@@ -14,6 +14,7 @@ pub mod diagnostics;
 pub mod dns;
 pub mod engine_config;
 pub mod error;
+pub mod fragment;
 pub mod h3_probe;
 pub mod host_lock;
 pub mod http_proxy;

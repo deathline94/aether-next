@@ -108,17 +108,17 @@ pub fn allowed_binary_roots(exe_dir: Option<&Path>) -> Vec<PathBuf> {
             roots.push(candidate.canonicalize().unwrap_or(candidate));
         }
     }
-    // `cargo run` / `cargo test` from the repository: the engine sits in the
-    // workspace's release target directory, which is no relation to where the
-    // shell binary happens to be.
-    let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../aether/target/release")
-        .join(if cfg!(windows) {
-            "aether.exe"
-        } else {
-            "aether"
-        });
-    roots.push(repo_build.canonicalize().unwrap_or(repo_build));
+    #[cfg(debug_assertions)]
+    {
+        let repo_build = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../aether/target/release")
+            .join(if cfg!(windows) {
+                "aether.exe"
+            } else {
+                "aether"
+            });
+        roots.push(repo_build.canonicalize().unwrap_or(repo_build));
+    }
     roots
 }
 
@@ -691,22 +691,30 @@ pub fn verify_authenticode_signature(
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub fn verify_authenticode_signature(
-    _path: &Path,
-    _expected_cn: &str,
-    _expected_cert_sha256: Option<&str>,
-) -> Result<(), BinaryTrustError> {
-    Ok(())
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn verify_elevated_binary(
     path: &Path,
     label: &str,
     policy: &TrustedBinaryPolicy,
 ) -> Result<fs::File, BinaryTrustError> {
-    // Which witness the running binary holds has to be recoverable from the logs
-    // alone, otherwise a refusal is indistinguishable from an old build.
+    verify_elevated_binary_with_path(path, label, policy).map(|(file, _)| file)
+}
+
+#[cfg(not(test))]
+pub fn verify_elevated_binary(
+    path: &Path,
+    label: &str,
+    policy: &TrustedBinaryPolicy,
+) -> Result<fs::File, BinaryTrustError> {
+    verify_elevated_binary_with_path(path, label, policy).map(|(file, _)| file)
+}
+
+pub(crate) fn verify_elevated_binary_with_path(
+    path: &Path,
+    label: &str,
+    policy: &TrustedBinaryPolicy,
+) -> Result<(fs::File, PathBuf), BinaryTrustError> {
     static ANCHOR_LOGGED: std::sync::Once = std::sync::Once::new();
     let (_, anchor_sha, table, has_placeholder) = engine_trust_anchor();
     ANCHOR_LOGGED.call_once(|| {
@@ -719,10 +727,6 @@ pub fn verify_elevated_binary(
     let path_buf = path.to_path_buf();
     validate_trusted_binary(&path_buf, label)
         .map_err(|e| BinaryTrustError::Validation(e.message))?;
-    // Hash and authenticate the *final* path. The two checks used to open whatever
-    // name the caller passed while the root test resolved it separately, so the
-    // bytes witnessed here and the file later launched were not guaranteed to be
-    // the same object.
     let verified_path = path.canonicalize().map_err(|e| {
         BinaryTrustError::Validation(format!(
             "{}: cannot resolve a final path for verification ({e})",
@@ -732,17 +736,10 @@ pub fn verify_elevated_binary(
 
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or(label);
 
-    // One open, one read. The digest compared against the anchor below and the
-    // signer read out of the PE's certificate table are both taken from these
-    // bytes, through this handle, and nothing in this module opens the path a
-    // second time to ask a third-party tool who signed it.
     let (source, bytes) =
         open_for_verification(&verified_path).map_err(BinaryTrustError::Validation)?;
     #[cfg(windows)]
     if !bytes.starts_with(b"MZ") {
-        // `validate_trusted_binary` checked the magic through an *earlier* open of the
-        // same name. These are the bytes the verdict is about, so the check is made of
-        // them rather than inherited from that open.
         return Err(BinaryTrustError::Validation(format!(
             "{} is not a Windows PE binary",
             verified_path.display()
@@ -760,10 +757,6 @@ pub fn verify_elevated_binary(
                 continue;
             }
             if expected_hash == PLACEHOLDER_SHA256 {
-                // Nothing has been witnessed for this artifact yet, so this is a
-                // pipeline gap rather than tampering. A debug build asserts
-                // nothing about release provenance and may proceed; a release
-                // build refuses, because "no comparison possible" is not a pass.
                 if policy.enforce_hash_match {
                     return Err(BinaryTrustError::AnchorNotPublished {
                         filename: filename.to_string(),
@@ -785,12 +778,12 @@ pub fn verify_elevated_binary(
         });
     }
 
-    // Aether's own engine is distributed without Authenticode. Its exact bytes
-    // must match the separately reviewed witness above. Keep the vendor-signed
-    // WinTUN path below unchanged.
     if label.eq_ignore_ascii_case("aether.exe") {
-        if !policy.enforce_hash_match || is_witnessed_unsigned_engine(&anchor_entries(), filename) {
-            return Ok(source);
+        if !policy.enforce_hash_match
+            || is_witnessed_unsigned_engine(&anchor_entries(), label)
+            || is_witnessed_unsigned_engine(&anchor_entries(), filename)
+        {
+            return Ok((source, verified_path));
         }
         if policy.enforce_hash_match {
             return Err(BinaryTrustError::Validation(
@@ -799,10 +792,6 @@ pub fn verify_elevated_binary(
         }
     }
 
-    // Who signed it, from the reviewed witness rather than from a string compiled
-    // into the shell: `pinned_signer` reads the anchor this binary carries, and
-    // `expected_publisher_cn` is what a development build falls back to when the
-    // witness names nobody (a release cannot reach that fallback, refused below).
     let signer = pinned_signer(filename).or_else(|| pinned_signer(label));
     require_pinned_identity(signer.as_ref(), policy.enforce_hash_match, filename)?;
 
@@ -812,9 +801,6 @@ pub fn verify_elevated_binary(
             .as_ref()
             .map(|s| s.common_name.clone())
             .unwrap_or_else(|| policy.expected_publisher_cn.to_string());
-        // The build.rs table is the same witness read a different way; prefer it
-        // when the entry carries no `cert_sha256` at all, so an anchor written
-        // before the pin existed is no weaker than it was.
         let pinned = signer
             .as_ref()
             .and_then(|s| s.cert_sha256.clone())
@@ -830,11 +816,10 @@ pub fn verify_elevated_binary(
         match auth_res {
             Ok(()) => {}
             Err(e) => {
-                // Exactly one outcome exists in a release binary: refuse.
                 #[cfg(debug_assertions)]
                 if policy.allow_unsigned_for_dev {
                     eprintln!("[warn] debug build only, Authenticode check skipped: {e}");
-                    return Ok(source);
+                    return Ok((source, verified_path));
                 }
                 #[cfg(not(debug_assertions))]
                 let _ = &e;
@@ -842,18 +827,9 @@ pub fn verify_elevated_binary(
             }
         }
     }
-    Ok(source)
+    Ok((source, verified_path))
 }
 
-/// Verify the engine binary this process is about to spawn, in **every** mode.
-///
-/// The call used to live inside `if settings.routing_mode == RoutingMode::Tun`, so the
-/// unelevated proxy/socks paths started a binary whose signature and digest
-/// nobody had looked at: `engine_path` only proves "a PE under an allowed root",
-/// which a dropped-in file satisfies. Wrapping it in one named function keeps a
-/// mode from being able to opt out again by accident, and gives the invariant
-/// gate a single token to count against the spawn sites. The caller must keep
-/// the returned file handle alive until `Command::spawn` completes.
 pub(crate) fn verify_engine_or_refuse(path: &Path) -> Result<fs::File, CommandError> {
     verify_elevated_binary(path, "aether.exe", &TrustedBinaryPolicy::for_engine())
         .map_err(CommandError::from)

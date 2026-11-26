@@ -53,7 +53,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (!state.error) {
       // Keep the tracked keys current even while healthy, or the first crash after
       // a tab switch would see a stale list and clear itself immediately.
-      return state.resetKeys === props.resetKeys ? null : { resetKeys: props.resetKeys };
+      return resetKeysChanged(state.resetKeys, props.resetKeys)
+        ? { resetKeys: props.resetKeys }
+        : null;
     }
     return resetKeysChanged(state.resetKeys, props.resetKeys)
       ? { error: null, resetKeys: props.resetKeys }

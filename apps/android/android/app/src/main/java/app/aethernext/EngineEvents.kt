@@ -35,6 +35,14 @@ internal sealed class EngineEvent {
     /** The engine's own "the data path works" statement. */
     data class Connected(val detail: String) : EngineEvent()
 
+    data class Stats(
+        val upBps: Long,
+        val downBps: Long,
+        val upBytes: Long,
+        val downBytes: Long,
+        val uptimeSecs: Long,
+    ) : EngineEvent()
+
     data class Failure(val message: String) : EngineEvent()
 
     /** `scan_start` / `scan_progress` / `scan_hit` / `scan_done`, forwarded verbatim. */
@@ -57,7 +65,7 @@ internal sealed class EngineEvent {
         const val PREFIX = "AETHER_EVENT "
 
         /** Types that carry no lifecycle meaning; kept out of the warning path. */
-        private val STAGE_TYPES = setOf("h3_stage")
+        private val STAGE_TYPES = setOf("h3_stage", "heartbeat")
 
         /**
          * @return the parsed event, or `null` when [line] holds no event at all
@@ -92,6 +100,13 @@ internal sealed class EngineEvent {
                 "tunnel_ready" -> TunnelReady(transport = json.optString("transport"))
                 "tun_ready" -> TunReady
                 "connected" -> Connected(detail = json.optString("detail"))
+                "stats" -> Stats(
+                    upBps = json.optLong("up_bps", 0L),
+                    downBps = json.optLong("down_bps", 0L),
+                    upBytes = json.optLong("up_bytes", 0L),
+                    downBytes = json.optLong("down_bytes", 0L),
+                    uptimeSecs = json.optLong("uptime_secs", 0L),
+                )
                 "error" -> Failure(json.optString("message", "Connection failed"))
                 "scan_start", "scan_progress", "scan_hit", "scan_done" -> Scan(type, json)
                 else -> if (type in STAGE_TYPES) Stage(type, json) else Unrecognised(type)

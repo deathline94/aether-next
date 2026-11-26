@@ -12,7 +12,11 @@ fn the_binary_starts_and_reports_its_version() {
         .arg("--version")
         .output()
         .expect("spawn the engine binary");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("aether"), "version line missing: {stdout}");
 }

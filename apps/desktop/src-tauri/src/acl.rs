@@ -16,17 +16,17 @@ use std::process::Command;
 /// `%SystemRoot%` fails closed instead of falling back to the bare name.
 #[cfg(windows)]
 pub(crate) fn system32(program: &str) -> Result<PathBuf, CommandError> {
-    let root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("WINDIR"))
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or_else(|| {
-            CommandError::new(
-                "internal",
-                format!("cannot locate %SystemRoot%\\System32\\{program}"),
-            )
-        })?;
-    Ok(root.join("System32").join(program))
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 || (len as usize) >= buf.len() {
+        return Err(CommandError::new(
+            "internal",
+            format!("cannot locate System32\\{program} via GetSystemDirectoryW"),
+        ));
+    }
+    let sys_dir = String::from_utf16_lossy(&buf[..len as usize]);
+    Ok(PathBuf::from(sys_dir).join(program))
 }
 
 /// SDDL string (`S-1-5-21-...`) for the user SID of *this* process token.
@@ -54,7 +54,9 @@ fn current_user_sid_string() -> Result<String, CommandError> {
             CloseHandle(token);
             return Err(CommandError::new("internal", "cannot read token user SID"));
         }
-        let mut buf = vec![0u8; needed as usize];
+        // 8-byte aligned backing allocation so `TOKEN_USER` and `SID` pointers are aligned.
+        let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; words];
         let ok = GetTokenInformation(
             token,
             TokenUser,
@@ -71,7 +73,7 @@ fn current_user_sid_string() -> Result<String, CommandError> {
         if sid.is_null() || IsValidSid(sid) == 0 || GetLengthSid(sid) == 0 {
             return Err(CommandError::new("internal", "malformed token user SID"));
         }
-        let sid_ref = &*(sid as *const SID);
+        let sid_ref = std::ptr::read_unaligned(sid as *const SID);
         let count_ptr = GetSidSubAuthorityCount(sid);
         if sid_ref.Revision != 1 || count_ptr.is_null() {
             return Err(CommandError::new("internal", "malformed token user SID"));
@@ -95,16 +97,6 @@ fn current_user_sid_string() -> Result<String, CommandError> {
 
 #[cfg(windows)]
 pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
-    // Fail closed. The previous `if let Ok(user)` skipped the whole ACL whenever
-    // the principal was unavailable, so the file that gates every other secret
-    // kept whatever the directory handed out.
-    //
-    // The principal comes from the token's user SID, never from `%USERNAME%`: on
-    // the documented elevated path ("Run as administrator" with a different
-    // admin credential) the env var names the *elevator's* account, so one
-    // elevated run re-granted the secrets to the admin and locked the ordinary
-    // user out of settings.json / config_key.dpapi / aether.toml - and made the
-    // DPAPI master key undecryptable for the account that owns it.
     let sid = current_user_sid_string()?;
     let icacls = system32("icacls.exe")?;
     {
@@ -112,17 +104,15 @@ pub fn restrict_directory_acl(path: &Path) -> Result<(), CommandError> {
         let scope = if is_dir { "(OI)(CI)" } else { "" };
         let user_perm = format!("*{sid}:{scope}F");
         let sys_perm = format!("SYSTEM:{scope}F");
+        use std::os::windows::process::CommandExt;
         let output = Command::new(&icacls)
             .arg(path.as_os_str())
-            // Grant only. `/inheritance:r` revoked every inherited ACE, which is
-            // how an elevated run could delete the owning user's inherited
-            // access; `/grant:r` replaces just the explicit ACE for each named
-            // principal and leaves inheritance (and the owner's grant coming
-            // through it) untouched.
+            .arg("/inheritance:r")
             .arg("/grant:r")
             .arg(&user_perm)
             .arg("/grant:r")
             .arg(sys_perm)
+            .creation_flags(0x0800_0000)
             .output()
             .map_err(|e| {
                 format!(

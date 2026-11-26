@@ -230,7 +230,18 @@ fn pkcs7_from_certificate_table(table: &[u8]) -> Result<Option<&[u8]>, String> {
              (0x{WIN_CERT_TYPE_PKCS_SIGNED_DATA:04x})"
         ));
     }
-    Ok(Some(&table[WIN_CERTIFICATE_HEADER..length]))
+    // Strip trailing 8-byte alignment zero-padding inside WIN_CERTIFICATE.bCertificate
+    // if present, since DER parsers reject unparsed trailing pad bytes.
+    let mut cert_bytes = &table[WIN_CERTIFICATE_HEADER..length];
+    if cert_bytes.last() == Some(&0) && cert_bytes.len() > 2 {
+        // Only trim up to 7 alignment bytes once a valid DER TLV ends earlier.
+        if let Some((_, tail)) = read_der(cert_bytes) {
+            if !tail.is_empty() && tail.len() < 8 && tail.iter().all(|b| *b == 0) {
+                cert_bytes = &cert_bytes[..cert_bytes.len() - tail.len()];
+            }
+        }
+    }
+    Ok(Some(cert_bytes))
 }
 
 /* --------------------------------------------------------------- the DER reader */
@@ -302,6 +313,10 @@ fn read_der(input: &[u8]) -> Option<(Der<'_>, &[u8])> {
         for byte in raw {
             acc = (acc << 8) | usize::from(*byte);
         }
+        // DER requires minimal-length encoding: values < 128 must use short form.
+        if acc < 128 {
+            return None;
+        }
         (acc, 2 + count)
     };
     let body_end = body_start.checked_add(length)?;
@@ -332,7 +347,12 @@ fn der_children(value: &[u8]) -> Option<Vec<Der<'_>>> {
 fn oid_dotted(value: &[u8]) -> Option<String> {
     let (first, rest) = value.split_first()?;
     let first = u64::from(*first);
-    let mut arcs = vec![first / 40, first % 40];
+    // Arc 2 covers values >= 80 (`80 + second_arc`), not mod 40 division.
+    let mut arcs = if first >= 80 {
+        vec![2, first - 80]
+    } else {
+        vec![first / 40, first % 40]
+    };
     let mut current: u64 = 0;
     for byte in rest {
         current = (current << 7) | u64::from(byte & 0x7f);
@@ -390,8 +410,10 @@ fn dn_value_text(element: &Der<'_>) -> String {
     let decoded = if element.tag == TAG_BMP_STRING {
         let units: Vec<u16> = element
             .value
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[hi, lo]| u16::from_be_bytes([hi, lo]))
             .collect();
         String::from_utf16_lossy(&units)
     } else {

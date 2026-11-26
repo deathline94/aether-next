@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
-import { useRuntime } from "./useRuntime";
+import { RELEASES_PAGE, releasePageUrl, useRuntime } from "./useRuntime";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -90,22 +90,53 @@ afterEach(() => {
 });
 
 describe("desktop useRuntime hydration", () => {
-  it("completes hydration in finally block even when get_settings rejects", async () => {
+  it("keeps the form locked when get_settings rejects, instead of unlocking the defaults", async () => {
     stubInvoke(null);
 
     const { result } = renderHook(() => useRuntime(appendLog));
 
     await waitFor(() => {
-      expect(result.current.settingsLoaded).toBe(true);
+      expect(result.current.settingsLoadError).toBe(true);
     });
 
-    expect(result.current.settingsLoadError).toBe(true);
+    // The defaults in state are a render fallback, not the user's profile: only a
+    // successful load may unlock a form that auto-saves whatever it holds.
+    expect(result.current.settingsLoaded).toBe(false);
+    expect(result.current.settingsLocked).toBe(true);
     expect(result.current.settings.protocol).toBe("masque");
     // The fallback has to be usable by every reader, not merely shaped enough to
     // satisfy a `protocol` assertion.
     expect(result.current.settings.ipVersion).toBe("v4");
     expect(result.current.settings.noize).toBe("off");
     expect(result.current.settings.scanMode).toBe("balanced");
+  });
+
+  it("never writes defaults over settings.json after a failed load", async () => {
+    stubInvoke(null);
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoadError).toBe(true));
+    vi.mocked(invoke).mockClear();
+
+    // A preset tap and a Connect are the first two things a user does; before
+    // the fix both wrote the defaults in state to disk as the real profile.
+    act(() => {
+      result.current.patchSettings({ protocol: "wireguard", noize: "light", peer: "104.16.0.1:443" });
+    });
+    await act(async () => {
+      await result.current.toggleConnection();
+    });
+    // Past the 400 ms save debounce: nothing was queued, so nothing may arrive.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 600));
+    });
+
+    const commands = vi.mocked(invoke).mock.calls.map(([c]) => c);
+    expect(commands).not.toContain("save_settings");
+    expect(commands).not.toContain("connect");
+    // The refused patch leaves the read-only defaults on screen.
+    expect(result.current.settings.protocol).toBe("masque");
+    expect(result.current.settings.peer).toBe("");
   });
 
   it("applies loaded settings when get_settings succeeds", async () => {
@@ -181,9 +212,8 @@ describe("desktop useRuntime hydration", () => {
     const { result } = renderHook(() => useRuntime(appendLog));
 
     await waitFor(() => {
-      expect(result.current.settingsLoaded).toBe(true);
+      expect(result.current.settingsLoadError).toBe(true);
     });
-    expect(result.current.settingsLoadError).toBe(true);
 
     failFirst = false;
     await act(async () => {
@@ -191,6 +221,8 @@ describe("desktop useRuntime hydration", () => {
     });
 
     expect(result.current.settingsLoadError).toBe(false);
+    // Retry is the one path that unlocks the form.
+    expect(result.current.settingsLoaded).toBe(true);
     expect(result.current.settings.protocol).toBe("gool");
     expect(result.current.settings.ipVersion).toBe("v4");
   });
@@ -204,15 +236,15 @@ describe("desktop useRuntime hydration", () => {
     const { result } = renderHook(() => useRuntime(appendLog));
 
     await waitFor(() => {
-      expect(result.current.settingsLoaded).toBe(true);
+      expect(result.current.settingsLoadError).toBe(true);
     });
-    expect(result.current.settingsLoadError).toBe(true);
 
     await act(async () => {
       await result.current.retrySettings();
     });
 
     expect(result.current.settingsLoadError).toBe(true);
+    expect(result.current.settingsLoaded).toBe(false);
   });
 });
 
@@ -422,6 +454,42 @@ describe("desktop useRuntime save state", () => {
 });
 
 describe("desktop useRuntime update check", () => {
+  it("only opens this repository's https release pages", () => {
+    const allowed = "https://github.com/deathline94/aether-next/releases/tag/v1.4.0";
+    expect(releasePageUrl(allowed)).toBe(allowed);
+    for (const hostile of [
+      "javascript:alert(1)",
+      "http://github.com/deathline94/aether-next/releases/tag/v1.4.0",
+      "https://evil.example/deathline94/aether-next/releases",
+      "https://github.com.evil.example/deathline94/aether-next/releases/tag/v1",
+      "https://github.com/other/repo/releases/tag/v1",
+      "not a url",
+      "",
+      null,
+    ]) {
+      expect(releasePageUrl(hostile)).toBe(RELEASES_PAGE);
+    }
+  });
+
+  it("does not copy a release URL the API hands it", async () => {
+    // The banner's URL comes from api.github.com's JSON; it used to reach
+    // plugin:opener, and window.open, unchecked.
+    const fetchMock = vi.fn().mockResolvedValue({
+      json: async () => ({ tag_name: "v9.9.9", html_url: "javascript:alert(1)" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const emit = captureState();
+    stubInvoke(shellSettings());
+
+    const { result } = renderHook(() => useRuntime(appendLog));
+    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
+
+    await waitFor(() => expect(result.current.updateAvailable).not.toBeNull());
+    expect(result.current.updateAvailable?.version).toBe("v9.9.9");
+    expect(result.current.updateAvailable?.url).toBe(RELEASES_PAGE);
+  });
+
   it("does not contact the release host before a tunnel exists", async () => {
     const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
     vi.stubGlobal("fetch", fetchMock);

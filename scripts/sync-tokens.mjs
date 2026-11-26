@@ -66,7 +66,8 @@ for (const rel of SHEETS) {
   // compared with line endings normalized: the file-wide CRLF detection used to
   // flip the whole fence to CRLF when one stray CRLF appeared, and the check
   // then flip-flopped between runs instead of settling.
-  const want = fence(body, '\n');
+  const eol = css.includes('\r\n') ? '\r\n' : '\n';
+  const want = fence(body, eol);
   const normalized = (s) => s.replace(/\r\n/g, '\n');
   const next = css.replace(fenceRe, () => want);
   if (normalized(next) !== normalized(css)) {

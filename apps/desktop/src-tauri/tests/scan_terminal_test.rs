@@ -76,6 +76,34 @@ fn a_broken_output_stream_is_blamed_on_the_shell() {
     assert!(empty.contains("no working endpoint"), "got {empty}");
 }
 
+/// The scan child used to be spawned outside any job object, so a GUI crash left
+/// it probing (and writing the endpoint cache) with nothing left able to stop it.
+/// Pinned at the source because observing the real behaviour needs a crashed GUI.
+#[cfg(windows)]
+#[test]
+fn the_scan_spawn_path_puts_the_child_in_a_kill_on_close_job() {
+    let src = include_str!("../src/scan.rs");
+    let (before_spawn, after_spawn) = src
+        .split_once("command.spawn()")
+        .expect("the scan still spawns a child");
+    let before_handoff = after_spawn
+        .split_once("handoff_preamble")
+        .expect("the key still travels after the spawn")
+        .0;
+    assert!(
+        before_spawn.contains("Job::create"),
+        "the scan child is launched outside the kill-on-close job the tunnel uses"
+    );
+    assert!(
+        before_handoff.contains("job.assign_child(&child)"),
+        "the spawned scan child is never placed in the job"
+    );
+    assert!(
+        before_handoff.contains("SCAN_JOB"),
+        "nothing keeps the job handle open for the life of the scan"
+    );
+}
+
 /// The activity log's level, decided without a running engine.
 ///
 /// The prose fallback asked whether the lowercased line *contained* "error", so a

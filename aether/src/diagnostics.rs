@@ -22,7 +22,14 @@ use crate::runtime_env;
 /// knob cannot leak by being forgotten in a per-key list.
 fn is_secret_key(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    k.contains("KEY") || k.contains("SECRET") || k.contains("TOKEN") || k.contains("PASS")
+    k.contains("KEY")
+        || k.contains("SECRET")
+        || k.contains("TOKEN")
+        || k.contains("PASS")
+        || k.contains("AUTH")
+        || k.contains("CRED")
+        || k.contains("CERT")
+        || k.contains("PRIVATE")
 }
 
 /// Redact a secret value while keeping its shape reportable.

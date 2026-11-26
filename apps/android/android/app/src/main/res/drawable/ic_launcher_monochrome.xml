@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Single-colour silhouette of the desktop badge for Android themed icons. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
@@ -8,22 +7,29 @@
     android:tint="#FFFFFF">
     <group
         android:translateX="27.6"
-        android:translateY="27.38"
+        android:translateY="27.6"
         android:scaleX="2.2"
         android:scaleY="2.2">
         <path
             android:fillColor="#00000000"
             android:strokeColor="#FFFFFF"
-            android:strokeWidth="3.3"
+            android:strokeWidth="2.6"
             android:strokeLineCap="round"
             android:strokeLineJoin="round"
-            android:pathData="M4.8,19 L10.7,4 L12,2.8 L13.3,4 L19.2,19 M8,16.4 H16" />
+            android:pathData="M3.5,18.5 C6.2,7.5 13.5,3.5 20.5,7.5" />
         <path
             android:fillColor="#00000000"
             android:strokeColor="#FFFFFF"
-            android:strokeWidth="3.3"
+            android:strokeWidth="2.4"
             android:strokeLineCap="round"
             android:strokeLineJoin="round"
-            android:pathData="M3.2,13 C5,20 9.2,19 12.5,15 C16.8,9.5 20.4,9.8 21.8,14" />
+            android:pathData="M5.5,19.5 C8.2,11.2 14.2,8.2 20,11.5" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="2.2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M8.5,20 C10.6,15 14.5,13.2 18.5,15.2" />
     </group>
 </vector>

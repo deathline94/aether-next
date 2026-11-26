@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark canvas behind the circular desktop badge on adaptive launchers. -->
-    <color name="ic_launcher_background">#07090B</color>
+    <color name="ic_launcher_background">#EBF1F5</color>
 </resources>

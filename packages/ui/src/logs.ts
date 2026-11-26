@@ -108,10 +108,14 @@ export const isErrorLine = (l: LogLine) => l.level === "error" || l.level === "w
 const PROBE_NOISE_MARKERS = ["probe src", "probe timeout", "candidate rejected"] as const;
 
 /** milestones: exclude noisy progress and probe error lines so transitions stand out. */
-export const isMilestoneLine = (l: LogLine) =>
-  !l.message.includes("scanning...") &&
-  !l.message.includes("probe candidate failed") &&
-  !PROBE_NOISE_MARKERS.some((marker) => l.message.includes(marker));
+export const isMilestoneLine = (l: LogLine) => {
+  const m = l.message.toLowerCase();
+  return (
+    !m.includes("scanning...") &&
+    !m.includes("probe candidate failed") &&
+    !PROBE_NOISE_MARKERS.some((marker) => m.includes(marker))
+  );
+};
 
 /**
  * Which severity a row is drawn as. The engine sends three levels; the fourth,
@@ -234,4 +238,51 @@ export function appendToStore<L extends LogLine>(store: Store<L>, entry: L): Sto
 export function visibleWindow<L>(filtered: L[]): { visible: L[]; hasMore: boolean } {
   if (filtered.length <= RENDER_CAP) return { visible: filtered, hasMore: false };
   return { visible: filtered.slice(filtered.length - RENDER_CAP), hasMore: true };
+}
+
+/** Full or compressed IPv6, bounded so a clock or a word never matches. */
+const IPV6 =
+  /(?<![0-9a-z:])(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,7}:|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}|::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,5})?)(?![0-9a-z:])/gi;
+
+/**
+ * Mask what identifies the user's network before an export leaves the window.
+ *
+ * The export is pasted into bug reports and it carries the probe's real edge
+ * address, the peers a scan found and the engine's own environment; nothing else
+ * in the app redacts those. Addresses keep a documentation-range shape
+ * (`192.0.2.0`, `2001:db8::`) so a support reader can still tell which kind of
+ * value a field held. Ports, schemes and paths stay put.
+ */
+export function redactExport(text: string): string {
+  return text
+    .replace(/\b([A-Za-z]:\\Users\\)([^\\\s]+)(\\[^\s]*)/gi, "$1<user>$3")
+    .replace(/\/(Users|home)\/([^/\s]+)/gi, "/$1/<user>")
+    .replace(/\b(https?:\/\/)[^\s/?#]+/gi, (match, scheme: string) => {
+      const port = /:\d{1,5}$/.exec(match);
+      return `${scheme}host${port ? port[0] : ""}`;
+    })
+    .replace(/(?<![\dvV.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])(:\d{1,5})?/g, (match, a, b, c, d, port?: string) => {
+      if ([Number(a), Number(b), Number(c), Number(d)].some((o) => o > 255)) return match;
+      return `192.0.2.0${port ?? ""}`;
+    })
+    .replace(IPV6, "2001:db8::")
+    .replace(/\b(?:[a-z0-9-]+\.)+([a-z]{2,}):(\d{1,5})\b/gi, (match, tld: string, port: string) => {
+      if (/^(rs|ts|tsx|js|jsx|kt|java|py|go|toml|json|md|css|html)$/i.test(tld)) return match;
+      return `host:${port}`;
+    });
+}
+
+/**
+ * Whether a status transition is a fresh session start whose log should reset.
+ *
+ * The shell reuses "connecting" for supervised recovery, so clearing on every
+ * entry into it destroyed the record of the failure being recovered from. Only a
+ * start out of a clean disconnect, or a clean disconnect itself, resets the buffer.
+ * Shared because the two frontends forked this rule and drifted: one treated
+ * "error" as idle and wiped the evidence on retry.
+ */
+export function shouldClearLogs(prev: string, next: string): boolean {
+  if (prev === next) return false;
+  if (next === "connecting") return prev === "disconnected";
+  return next === "disconnected";
 }

@@ -1,10 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Dark canvas behind the circular desktop badge on adaptive launchers. -->
-    <color name="ic_launcher_background">#0B0F11</color>
+    <!-- Nordic Mist glacial adaptive launcher plate. -->
+    <color name="ic_launcher_background">#EBF1F5</color>
 
-    <!-- The one app canvas: window background, status bar, navigation bar and the
-         WebView's own background all read this, so the chrome cannot end up three
-         shades apart as the system theme changes. -->
-    <color name="app_canvas">#0D1113</color>
+    <!-- Nordic Mist canvas: shared across window background, system bars, and WebView. -->
+    <color name="app_canvas">#F4F7FA</color>
 </resources>

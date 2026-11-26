@@ -45,10 +45,16 @@ export function useScanner(
     [requestedConcurrency, protocol],
   );
   const [timeoutMs, setTimeoutMs] = useState(6000);
+  const effectiveTimeout = useMemo(
+    () => effectiveScanTimeout(protocol, timeoutMs),
+    [protocol, timeoutMs],
+  );
   const [noize, setNoize] = useState("off");
+  const effectiveNoize = protocol === "masque-h2" ? "off" : noize;
   const [endpoints, setEndpoints] = useState<DiscoveredEndpoint[]>([]);
   const [scanState, setScanState] = useState<ScanState>(initialScanState);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const unlistenRef = useRef<(() => void) | null>(null);
   // The run this window started. Events from any other run are dropped rather
   // than merged, so a late terminal event from a cancelled scan cannot end the
@@ -69,6 +75,14 @@ export function useScanner(
   const rejectedEvents = useRef(new Set<string>());
   // Single source of truth — buttons and progress UI must never disagree.
   const active = scanState.active;
+  const displayedScanState = useMemo<ScanState>(() => {
+    const scoped = endpoints.filter((e) => isEndpointForProtocol(e.protocol, protocol));
+    const fastest = scoped[0];
+    return {
+      ...scanState,
+      bestRtt: fastest ? (fastest.rtt || `${fastest.rttMs}ms`) : scanState.bestRtt,
+    };
+  }, [scanState, endpoints, protocol]);
 
   useEffect(() => {
     let disposed = false;
@@ -155,7 +169,11 @@ export function useScanner(
             active: false,
             phase: scanVerdict(endpointsRef.current.length, ev.addr, prev.working),
           }));
-          if (ev.addr) appendLog({ level: "info", message: `Scan complete — best: ${ev.addr} (${ev.rtt})` });
+          if (ev.addr) {
+            appendLog({ level: "info", message: `Scan complete — best: ${ev.addr}${ev.rtt ? ` (${ev.rtt})` : ""}` });
+          } else {
+            appendLog({ level: "info", message: "Scan complete — 0 working endpoints found." });
+          }
           break;
         case "scan_failed":
           setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.failed }));
@@ -181,7 +199,15 @@ export function useScanner(
   }, [appendLog]);
 
   const startScan = useCallback(async () => {
-    if (busy || active) return;
+    if (busyRef.current || busy || active) return;
+    busyRef.current = true;
+    // Mint the run id before anything is cleared or awaited. This used to happen
+    // after `await invoke("disconnect")`, so the outgoing run's terminal event —
+    // still stamped with the id the guard was matching — landed on the state just
+    // reset for the new run and wrote `active: false` and `phase: "Verified"` onto
+    // a scan that had not begun yet.
+    const runId = crypto.randomUUID();
+    runIdRef.current = runId;
     clearLogs?.();
     setBusy(true);
     // Preserve results from other protocols; only reset rows belonging to the active protocol.
@@ -199,26 +225,29 @@ export function useScanner(
     // Same clamp the shell applies (`ScanLimits.clampTimeout`), so what the field
     // shows and what the engine runs are one number.
     const effectiveTimeout = effectiveScanTimeout(protocol, timeoutMs);
+    const scanNoize = protocol === "masque-h2" ? "off" : noize;
     appendLog({
       level: "info",
-      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${workers}, timeout=${effectiveTimeout}ms)`,
+      message: `Starting standalone scan: ${protocol.toUpperCase()} (concurrency=${workers}, timeout=${effectiveTimeout}ms, noise=${scanNoize})`,
     });
     try {
       if (running) {
         await invoke("disconnect");
       }
-      const runId = crypto.randomUUID();
-      runIdRef.current = runId;
-      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency: workers, timeoutMs: effectiveTimeout, noize });
+      await invoke("scan", { runId, protocol, ipVersion: ipScan, concurrency: workers, timeoutMs: effectiveTimeout, noize: scanNoize });
     } catch (error) {
       appendLog({ level: "error", message: `Scan error: ${errorMessage(error)}` });
       setScanState((prev) => ({ ...prev, active: false, phase: SCAN_PHASES.error }));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }, [busy, active, protocol, ipScan, effectiveConcurrency, timeoutMs, noize, running, appendLog, clearLogs]);
 
   const stopScan = useCallback(async () => {
+    // Retire the run id with the run: without this, a stopped scan's stragglers
+    // still match and are merged into whichever scan starts next.
+    runIdRef.current = "";
     // Ask the engine first; report "Stopped" regardless so the UI never sticks.
     try {
       await invoke("stop_scan");
@@ -236,9 +265,9 @@ export function useScanner(
     // The lanes this protocol runs, which is the number the field shows; the setter
     // still takes what the user asks for, so a wider transport can carry it.
     concurrency: effectiveConcurrency, setConcurrency: setRequestedConcurrency,
-    timeoutMs, setTimeoutMs,
-    noize, setNoize,
-    endpoints, active, scanState, busy,
+    timeoutMs: effectiveTimeout, setTimeoutMs,
+    noize: effectiveNoize, setNoize,
+    endpoints, active, scanState: displayedScanState, busy,
     startScan, stopScan,
   };
 }

@@ -58,19 +58,15 @@ const positionOf = (container: HTMLElement, selector: string) =>
   sectionOrder(container).findIndex((classes) => classes.includes(selector));
 
 describe("android connection tab section order (item 20)", () => {
-  it("puts presets directly under the connect control", () => {
+  it("puts the hero stage above the grouped configuration card", () => {
     const { container } = renderTab();
     expect(sectionOrder(container)).toEqual([
-      "connection-stage disconnected",
-      "profiles-panel",
-      "test-panel connection-evidence",
-      "proxy-panel",
-      "telemetry-bento",
-      "about-panel",
+      "mobile-hero-stage disconnected",
+      "grouped-card",
     ]);
   });
 
-  it("keeps the banners that explain a failed or offline attempt above the evidence", () => {
+  it("keeps the banners that explain a failed or offline attempt above the grouped rows", () => {
     const { container } = renderTab({
       online: false,
       settings: { peer: "104.16.23.19:443" },
@@ -78,62 +74,41 @@ describe("android connection tab section order (item 20)", () => {
     });
     expect(sectionOrder(container)).toEqual([
       "offline-banner",
-      "connection-stage error",
       "error-banner",
       "pinned-peer-bar",
-      "profiles-panel",
-      "test-panel connection-evidence",
-      "proxy-panel",
-      "telemetry-bento",
-      "about-panel",
+      "mobile-hero-stage error",
+      "grouped-card",
     ]);
   });
 
-  it("reaches presets immediately after the control at 320 and 390 px", () => {
-    // The two widths the layout changes at are both above 320 px, so the order a
-    // phone sees is this order; the assertion is made at both anyway because the
-    // scroll depth claim is about phones, not about the desktop grid.
+  it("keeps the hero action ahead of configuration at 320 and 390 px", () => {
     for (const width of [320, 390]) {
       cleanup();
       Object.defineProperty(window, "innerWidth", { value: width, configurable: true });
       const { container } = renderTab({ connected: true, running: true });
-      const evidence = positionOf(container, "connection-evidence");
-      expect(evidence, `${width}px: no status panel rendered`).toBeGreaterThan(-1);
-      for (const lower of ["telemetry-bento", "about-panel"]) {
-        expect(positionOf(container, lower), `${width}px: ${lower} sits above the evidence`).toBeGreaterThan(evidence);
-      }
-      expect(positionOf(container, "profiles-panel")).toBe(positionOf(container, "connection-stage") + 1);
-      expect(evidence).toBe(positionOf(container, "profiles-panel") + 1);
+      const hero = positionOf(container, "mobile-hero-stage");
+      const group = positionOf(container, "grouped-card");
+      expect(hero, `${width}px: no hero stage rendered`).toBeGreaterThan(-1);
+      expect(group).toBe(hero + 1);
     }
   });
 
-  it("shows connection state, coverage, the endpoint and the test action in that panel", () => {
+  it("shows connection state, endpoint, configuration rows and test action", () => {
     const { container, props } = renderTab({
       connected: true,
       running: true,
       settings: { routingMode: "proxy-only" },
       runtime: { status: "connected", endpoint: "104.16.23.19:443" },
     });
-    const panel = container.querySelector(".connection-evidence");
-    expect(panel).not.toBeNull();
-    const text = panel?.textContent ?? "";
+    const text = container.textContent ?? "";
     expect(text).toContain("Connected");
-    expect(text).toContain("Apps you set up");
+    expect(text).toContain("Local proxy");
     expect(text).toContain("104.16.23.19:443");
-    expect(text).toMatch(/Test connection/);
+    expect(text).toMatch(/Test route/);
 
-    // The rows come before the action they describe the result of.
-    const rows = Array.from(panel?.querySelectorAll(".endpoint-row") ?? []);
-    expect(rows.map((r) => r.querySelector("strong")?.textContent)).toEqual([
-      "Connection",
-      "What it covers",
-      "Server reached",
-    ]);
-    const testRow = panel?.querySelector(".test-row button");
-    if (!testRow) throw new Error("the status panel has no test action");
-    expect(rows.every((r) => r.compareDocumentPosition(testRow) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
-
-    fireEvent.click(testRow);
+    const testBtn = container.querySelector(".text-action-btn");
+    if (!testBtn) throw new Error("the hero stage has no test action");
+    fireEvent.click(testBtn);
     expect(props.runTest).toHaveBeenCalledTimes(1);
   });
 });
@@ -148,19 +123,19 @@ describe("android connection tab controls", () => {
     fireEvent.click(connectButtons[0] as Element);
     expect(props.toggleConnection).toHaveBeenCalledTimes(1);
 
-    const testButtons = Array.from(container.querySelectorAll(".test-row button"));
+    const testButtons = Array.from(container.querySelectorAll(".text-action-btn"));
     expect(testButtons).toHaveLength(1);
   });
 
   it("names the control for what it does, on both sides", () => {
     const disconnected = renderTab();
-    expect(disconnected.container.querySelector(".master-toggle-btn")?.getAttribute("aria-label")).toBe("Connect Aether");
-    expect(disconnected.container.querySelector(".switch-action-hint")?.textContent).toBe("TAP TO CONNECT");
+    expect(disconnected.container.querySelector(".mobile-hero-cta")?.getAttribute("aria-label")).toBe("Connect Aether");
+    expect(disconnected.container.querySelector(".mobile-hero-cta")?.textContent).toBe("Connect");
     cleanup();
 
     const running = renderTab({ connected: true, running: true });
-    expect(running.container.querySelector(".master-toggle-btn")?.getAttribute("aria-label")).toBe("Disconnect Aether");
-    expect(running.container.querySelector(".switch-action-hint")?.textContent).toBe("TAP TO DISCONNECT");
+    expect(running.container.querySelector(".mobile-hero-cta")?.getAttribute("aria-label")).toBe("Disconnect Aether");
+    expect(running.container.querySelector(".mobile-hero-cta")?.textContent).toBe("Disconnect");
   });
 });
 
@@ -241,38 +216,30 @@ describe("android connection tab copy (item 21)", () => {
     ]) {
       expect(text, `the tab still labels something ${jargon}`).not.toContain(jargon);
     }
-    // The replacements say what the line is for.
-    expect(text).toContain("Protocol & encryption");
-    expect(text).toContain("SPLITS THE FIRST PACKET");
-    expect(text).toContain("Connection status");
-    expect(text).toContain("Test connection");
-    expect(text).toContain("Change how it connects");
+    // The replacements say what each grouped row controls.
+    expect(text).toContain("Protocol");
+    expect(text).toContain("Routing");
+    expect(text).toContain("Obfuscation");
+    expect(text).toContain("Local SOCKS5");
+    expect(text).toContain("Test route");
   });
 
-  it("keeps routing mode out of the disconnected headline and the cover story out of the cipher", () => {
+  it("keeps routing mode out of the disconnected headline", () => {
     const proxy = renderTab({ settings: { routingMode: "proxy-only" } });
-    expect(proxy.container.querySelector(".switch-status-pill")?.textContent).toBe("NOT CONNECTED");
+    expect(proxy.container.querySelector(".mobile-hero-title")?.textContent).toBe("Standby");
     expect(proxy.container.textContent).not.toMatch(/VPN NOT ACTIVE/);
     cleanup();
 
-    // MASQUE negotiates its suite with the peer; nothing here observes which.
-    const masque = renderTab({ settings: { protocol: "masque", transport: "h3" } });
-    expect(masque.container.textContent).toContain("Chosen with the server");
-    expect(masque.container.textContent).not.toContain("ChaCha20-Poly1305");
-    cleanup();
-
-    const gool = renderTab({ settings: { protocol: "gool", transport: "h3" } });
-    expect(gool.container.textContent).toContain("ChaCha20-Poly1305");
+    const tun = renderTab({ settings: { routingMode: "tun" } });
+    expect(tun.container.querySelector(".mobile-hero-title")?.textContent).toBe("Standby");
   });
 
   it("tells a first run what the button does and where the answer will appear", () => {
     const { container } = renderTab();
-    const copy = container.querySelector(".connection-copy p")?.textContent ?? "";
-    expect(copy).toBe(START_HINT);
+    const copy = container.querySelector(".mobile-hero-subtitle")?.textContent ?? "";
+    expect(copy).toContain(START_HINT);
     expect(copy).toMatch(/Tap the power button to connect/i);
     expect(copy).toMatch(/connection status shows what that covers/i);
-    // The sentence that used to sit here was operator prose about a "tunnel",
-    // "edge telemetry" and "device sockets" — none of it an instruction.
     for (const jargon of ["Initialize the tunnel", "negotiate", "device sockets", "edge telemetry"]) {
       expect(copy.toLowerCase()).not.toContain(jargon.toLowerCase());
     }
@@ -280,7 +247,7 @@ describe("android connection tab copy (item 21)", () => {
 
   it("does not claim a measurement it never took", () => {
     const untested = renderTab({ connected: true, running: true, runtime: { status: "connected" as const } });
-    expect(untested.container.textContent).toContain("not measured");
+    expect(untested.container.textContent).not.toMatch(/\b\d+\s*ms\b/);
     cleanup();
 
     const tested = renderTab({
@@ -290,7 +257,6 @@ describe("android connection tab copy (item 21)", () => {
       testResult: { detail: "OK 181.49.124.240 (h3) 47 ms", latencyMs: 47 },
     });
     expect(tested.container.textContent).toContain("47 ms");
-    expect(tested.container.textContent).not.toContain("not measured");
   });
 });
 

@@ -30,6 +30,13 @@ pub enum SessionEvent {
     Connected {
         detail: String,
     },
+    Stats {
+        up_bps: u64,
+        down_bps: u64,
+        up_bytes: u64,
+        down_bytes: u64,
+        uptime_secs: u64,
+    },
     Error {
         message: String,
     },

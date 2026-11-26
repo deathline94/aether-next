@@ -133,6 +133,7 @@ wire_enum! {
         Balanced = "balanced" | "auto",
         Thorough = "thorough" | "deep",
         Stealth = "stealth" | "quiet",
+        Verified = "verified" | "proven",
         Ironclad = "ironclad" | "verify",
     }
     default Balanced
@@ -346,12 +347,36 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 pub(crate) fn save_settings_file(app: &AppHandle, settings: &Settings) -> Result<(), CommandError> {
-    let path = settings_path(app)?;
+    save_settings_at(&settings_path(app)?, settings)
+}
+
+/// `save_settings_file`'s body, by path so the refusal below is testable without
+/// an app.
+///
+/// A file that exists but does not decode is the user's only copy of their
+/// configuration; overwriting it turns a parse error into data loss. This is the
+/// guard the "refusing to overwrite it" message in [`decode_settings_text`] only
+/// ever promised: the tray's Connect fell back to the built-in defaults on a
+/// corrupt file and wrote them straight back. `NotFound` is a first run and is
+/// still allowed to create the file.
+pub fn save_settings_at(path: &Path, settings: &Settings) -> Result<(), CommandError> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            decode_settings_text(&text)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CommandError::new(
+                "settings_unreadable",
+                format!("cannot read {}: {e}", path.display()),
+            ))
+        }
+    }
     let parent = path.parent().ok_or("invalid config path")?;
     fs::create_dir_all(parent).map_err(CommandError::from)?;
     restrict_directory_acl(parent)?;
     let json = serde_json::to_vec_pretty(settings).map_err(CommandError::from)?;
-    write_atomic(&path, &json).map_err(CommandError::from)
+    write_atomic(path, &json).map_err(CommandError::from)
 }
 
 /// The obfuscation profile names the engine is willing to run. Shared by
@@ -410,19 +435,6 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             "HTTP and SOCKS5 ports must differ",
         ));
     }
-    // `protocol`, `transport`, `scanMode`, `ipVersion` and `routingMode` are not
-    // checked here any more: they are `wire_enum!` types, so a value outside the
-    // vocabulary cannot be built in the first place. That removes the drift this
-    // list was papering over — `ipVersion` allowed `auto/4/6/v4/v6/ipv4/ipv6/dual`
-    // but not `"both"`, which is the exact string the Scanner's Dual-Stack row and
-    // the Settings select both send. A valid choice was refused on save and
-    // hard-broke the Connect button while the same label worked everywhere else,
-    // and `"thorogh"` sat in the list as a legal scan mode.
-    //
-    // The first argument is the `Settings` key in the name the frontend uses,
-    // because that is what the form needs in order to mark the right input: a
-    // rejected value otherwise has nowhere to go but the log, and the save
-    // spinner never stops.
     let allow = |field: &'static str, val: &str, opts: &[&str]| -> Result<(), CommandError> {
         if opts.iter().any(|o| o.eq_ignore_ascii_case(val.trim())) {
             Ok(())
@@ -434,6 +446,17 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         }
     };
     allow("noize", &settings.noize, NOIZE_VOCABULARY)?;
+    if !settings.peer.trim().is_empty()
+        && settings.peer.trim().parse::<std::net::SocketAddr>().is_err()
+    {
+        return Err(CommandError::validation(
+            "peer",
+            format!(
+                "custom endpoint must be ip:port or [ipv6]:port (got {})",
+                settings.peer.trim()
+            ),
+        ));
+    }
     if settings.noize.eq_ignore_ascii_case("custom") {
         if settings.noize_jmax < settings.noize_jmin {
             return Err(CommandError::validation(
@@ -441,8 +464,6 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
                 "custom obfuscation: max size must be >= min size",
             ));
         }
-        // One message for three different inputs is a message nobody can act on,
-        // so each bound reports the field it broke.
         if settings.noize_jc > 64 {
             return Err(CommandError::validation(
                 "noizeJc",
@@ -471,14 +492,9 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
             ));
         }
     }
-    // `routingMode` is a `wire_enum!` type now, so the three values are the only
-    // ones that can reach here.
-    // A custom engine path is checked for existence here rather than at connect,
-    // where the allow-list would refuse it and the user would be left with a
-    // "binary is not trusted" error for a path they typed themselves. It used to
-    // be validated nowhere: the settings form persists on a 400 ms debounce, so a
-    // half-typed path reached the disk as the configured engine.
-    if !settings.engine_path.trim().is_empty() && !Path::new(settings.engine_path.trim()).is_file()
+    if settings.routing_mode != RoutingMode::Tun
+        && !settings.engine_path.trim().is_empty()
+        && !Path::new(settings.engine_path.trim()).is_file()
     {
         return Err(CommandError::validation(
             "enginePath",
@@ -489,6 +505,60 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
         ));
     }
     Ok(())
+}
+
+/// Strict enum check at the IPC boundary so misspelled or unsupported strings
+/// sent from the frontend aren't silently coerced before saving.
+pub(crate) fn parse_ipc_settings(raw: serde_json::Value) -> Result<Settings, CommandError> {
+    type FieldCheck = (&'static str, fn(&str) -> Option<()>);
+    if let Some(obj) = raw.as_object() {
+        let checks: &[FieldCheck] = &[
+            ("protocol", |s| Protocol::parse(s).map(|_| ())),
+            ("transport", |s| TransportKind::parse(s).map(|_| ())),
+            ("scanMode", |s| ScanMode::parse(s).map(|_| ())),
+            ("ipVersion", |s| IpVersion::parse(s).map(|_| ())),
+            ("routingMode", |s| RoutingMode::parse(s).map(|_| ())),
+        ];
+        for &(key, checker) in checks {
+            if let Some(val) = obj.get(key).and_then(|v| v.as_str()) {
+                if checker(val).is_none() {
+                    return Err(CommandError {
+                        code: "validation",
+                        message: format!("{key} has unsupported value: {val:?}"),
+                        field: Some(key),
+                    });
+                }
+            }
+        }
+    }
+    serde_json::from_value::<Settings>(raw).map_err(|e| CommandError {
+        code: "validation",
+        message: format!("invalid settings payload: {e}"),
+        field: Some("settings"),
+    })
+}
+
+/// Quarantine an unreadable settings.json to `settings.corrupt-<ts>.json` and
+/// write fresh defaults cleanly.
+pub(crate) fn reset_corrupt_settings_blocking(app: AppHandle) -> Result<Settings, CommandError> {
+    let path = settings_path(&app)?;
+    if path.exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantine = path.with_file_name(format!("settings.corrupt-{stamp}.json"));
+        let _ = fs::rename(&path, quarantine);
+    }
+    let defaults = Settings::default();
+    let parent = path.parent().ok_or("invalid config path")?;
+    fs::create_dir_all(parent).map_err(CommandError::from)?;
+    restrict_directory_acl(parent)?;
+    let json = serde_json::to_vec_pretty(&defaults).map_err(CommandError::from)?;
+    write_atomic(&path, &json).map_err(CommandError::from)?;
+    #[cfg(windows)]
+    autostart::set(defaults.launch_at_login)?;
+    Ok(defaults)
 }
 
 /// `save_settings`'s body: it runs `icacls` on the config directory and writes the

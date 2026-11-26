@@ -117,7 +117,7 @@ describe("android console copy (item 21)", () => {
   });
 
   it("counts lines, not a buffer", () => {
-    const { container } = renderTab({ logFilter: "errors" });
+    const { container } = renderTab({ visibleLogs: LOGS.slice(2, 3), logFilter: "errors" });
     const count = container.querySelector(".stream-count")?.textContent ?? "";
     expect(count).toBe("1 of 3 lines shown");
     expect(count).not.toMatch(/buffer/i);
@@ -136,6 +136,7 @@ describe("android console copy (item 21)", () => {
     const buttons = Array.from(container.querySelectorAll(".tactile-terminal-btn"));
     const labels = buttons.map((b) => b.textContent);
     expect(labels).toContain("Copy logs");
+    expect(container.querySelector(".tactile-terminal-btn")?.getAttribute("title")).toContain("addresses masked");
     expect(labels).toContain("Clear logs");
     expect(labels.join(" ")).not.toMatch(/Buffer|Flush/i);
   });
@@ -149,7 +150,7 @@ describe("android console copy (item 21)", () => {
     const empty = container.querySelector(".empty-logs");
     const text = empty?.textContent ?? "";
     expect(text).toContain("No log lines yet");
-    expect(text).toMatch(/appear here while Aether runs/i);
+    expect(text).toMatch(/appear here while Aether Next runs/i);
     expect(text).not.toMatch(/daemon|upon execution|carrier/i);
   });
 
@@ -183,7 +184,7 @@ describe("android console copy (item 21)", () => {
         bestRtt: "48 ms",
       } as ScanState,
     });
-    const text = container.querySelector(".tactical-scan-card")?.textContent ?? "";
+    const text = container.querySelector('section[aria-label="Active scan progress"]')?.textContent ?? "";
     expect(text).toContain("Scanning for servers");
     expect(text).toContain("Checked 40 of 100 addresses");
     expect(text).toContain("7 answered");

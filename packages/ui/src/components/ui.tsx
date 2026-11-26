@@ -87,39 +87,92 @@ function CheckIcon() {
   );
 }
 
+export function AetherMark({ size = 24, className = "" }: { size?: number; className?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      className={className}
+      aria-hidden="true"
+    >
+      <path
+        d="M3.5 18.5 C6.2 7.5 13.5 3.5 20.5 7.5"
+        stroke="var(--emerald)"
+        strokeWidth="2.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M5.5 19.5 C8.2 11.2 14.2 8.2 20 11.5"
+        stroke="var(--fg)"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8.5 20 C10.6 15 14.5 13.2 18.5 15.2"
+        stroke="var(--emerald)"
+        strokeWidth="2.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 /**
  * Copy button that confirms in place — feedback where the user is looking. One
  * implementation for both frontends: the two copies were verbatim twins whose
  * only future difference would have been a fix applied to one of them.
  */
-export function CopyButton({ value, label, onCopyFailed }: {
+export function CopyButton({ value, label, text, onCopyFailed }: {
   value: string;
   label: string;
+  /** Optional visible text label (e.g. "Copy"). Defaults to icon-only. */
+  text?: string;
   /** Called when the copy fails; the caller owns how the failure surfaces. */
   onCopyFailed?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, []);
 
   return (
     <button
       type="button"
-      className="tactile-copy-btn"
+      className={`tactile-copy-btn ${text ? "with-label" : ""} ${copied ? "copied" : ""}`.trim()}
       aria-label={copied ? "Copied" : label}
       title={copied ? "Copied" : label}
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(value);
+          if (!mountedRef.current) return;
           setCopied(true);
           if (timer.current) clearTimeout(timer.current);
-          timer.current = setTimeout(() => setCopied(false), 1500);
+          timer.current = setTimeout(() => {
+            if (mountedRef.current) setCopied(false);
+          }, 1500);
         } catch {
-          onCopyFailed?.();
+          if (mountedRef.current) onCopyFailed?.();
         }
       }}
     >
-      {copied ? <CheckIcon /> : <CopyIcon />}
+      {text ? (
+        <span>{copied ? "Copied" : text}</span>
+      ) : copied ? (
+        <CheckIcon />
+      ) : (
+        <CopyIcon />
+      )}
     </button>
   );
 }

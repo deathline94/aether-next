@@ -176,6 +176,28 @@ describe("an edit, and the write that follows it", () => {
   });
 });
 
+describe("leaving inside the debounce window", () => {
+  it("writes the pending edit instead of letting the timer die with the view", async () => {
+    const { result, unmount } = renderHook(() => useRuntime(appendLog));
+    await hydrated(result);
+
+    act(() => {
+      result.current.patchSettings({ noize: "light" });
+    });
+    // Still inside the debounce: nothing has been sent yet.
+    expect(saveCalls()).toBe(0);
+    expect(result.current.saved).toBe("dirty");
+
+    unmount();
+
+    // The window is gone, so the edit had one chance left: the teardown flush.
+    // Clearing the timer alone (the defect) lost the last change made before exit.
+    expect(saveCalls()).toBe(1);
+    const call = mocks.invoke.mock.calls.find(([cmd]) => cmd === "save_settings");
+    expect((call?.[1] as { settings: { noize: string } }).settings.noize).toBe("light");
+  });
+});
+
 describe("a save the shell refuses", () => {
   it("leaves the edit pending and says which value it refused", async () => {
     mocks.state.save = () =>

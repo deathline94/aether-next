@@ -444,6 +444,27 @@ pub fn combine_liveness(created_unix: u64, this_boot_unix: u64, probe: Liveness)
     probe
 }
 
+/// Fold "when was the record written" with "when did the named process start".
+///
+/// A pid only means a process within one boot: same-boot the number can already
+/// belong to an unrelated program, and `OpenProcess` + exit-code answers "alive"
+/// for it, so its journal was never replayed and its routes stayed black-holed.
+/// A process that started *after* its journal was written cannot be the writer.
+/// A missing start time keeps the probe's answer — guessing "dead" would delete
+/// routes a live tunnel is using.
+pub fn combine_start_time(
+    record_written_unix: u64,
+    holder_started_unix: Option<u64>,
+    probe: Liveness,
+) -> Liveness {
+    match holder_started_unix {
+        Some(started) if record_written_unix != 0 && started > record_written_unix => {
+            Liveness::Dead
+        }
+        _ => probe,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering: the only place a journal becomes command text.
 //
@@ -776,8 +797,13 @@ pub fn current_owner() -> JournalOwner {
 /// Seconds-since-boot folded into the wall clock. Every journal written in the
 /// same boot shares it, and a reboot cannot reproduce the previous value, so a
 /// recycled pid cannot claim an earlier boot's journal.
+///
+/// Cached for the process lifetime: `now - uptime` re-derived at two call sites
+/// a tick apart differs by one second, and a handle that clears the journal path
+/// for `boot_id + 1` leaves the real journal behind for the next start to replay.
 pub fn boot_id() -> u64 {
-    crate::trust::now_unix().saturating_sub(uptime_secs())
+    static BOOT_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOOT_ID.get_or_init(|| crate::trust::now_unix().saturating_sub(uptime_secs()))
 }
 
 #[cfg(windows)]
@@ -877,6 +903,76 @@ pub struct StaleJournal {
     pub holder: Liveness,
 }
 
+/// When the named process started, in Unix seconds.
+///
+/// `None` when it cannot be read, which [`combine_start_time`] treats as "keep
+/// the probe's answer". The creation time is the kernel's own record of the
+/// process, so a recycled pid cannot fake it.
+#[cfg(windows)]
+pub fn process_start_unix(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = (
+        FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+        FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+        FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+        FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+    );
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    // 100 ns ticks since 1601-01-01; Unix epoch starts 11644473600 s later.
+    let ticks = ((u64::from(creation.dwHighDateTime)) << 32) | u64::from(creation.dwLowDateTime);
+    Some((ticks / 10_000_000).saturating_sub(11_644_473_600))
+}
+
+#[cfg(not(windows))]
+pub fn process_start_unix(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// When the file was created, in Unix seconds, falling back to its modification
+/// time. `0` when neither can be read.
+fn file_birth_unix(path: &PathBuf) -> u64 {
+    use std::time::UNIX_EPOCH;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let created = secs(meta.created());
+    if created != 0 {
+        created
+    } else {
+        secs(meta.modified())
+    }
+}
+
 /// Read every journal and answer, for each, whether its holder is running.
 ///
 /// `probe` is injected: the process query is the part that cannot run in CI, and
@@ -895,6 +991,13 @@ pub fn scan_journals(this_boot_unix: u64, probe: impl Fn(u32) -> Liveness) -> Ve
             }
         };
         let probed = probe(journal.creator_pid);
+        // A pid says nothing outside its own process: same-boot reuse answers
+        // "alive" for an unrelated program. The journal's birth time settles it.
+        let probed = combine_start_time(
+            file_birth_unix(&path),
+            process_start_unix(journal.creator_pid),
+            probed,
+        );
         let holder = combine_liveness(journal.created_unix, this_boot_unix, probed);
         found.push(StaleJournal {
             path,
@@ -1062,16 +1165,51 @@ pub fn write_journal(path: &std::path::Path, j: &RouteJournal) -> Result<()> {
         path,
         &format!(".{}.{}.tmp", std::process::id(), rand::random::<u32>()),
     );
-    std::fs::write(&tmp, body)
-        .map_err(|e| AetherError::HostState(format!("write journal: {e}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| AetherError::HostState(format!("rename journal into place: {e}")))?;
+    // Flushed before the rename: the journal is the only record of what this
+    // process changed on the host, and a power loss that publishes an empty file
+    // reads as "nothing to repair" while the NetMGMT routes survive the reboot.
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| AetherError::HostState(format!("create journal: {e}")))?;
+        file.write_all(&body)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| AetherError::HostState(format!("write journal: {e}")))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        AetherError::HostState(format!("rename journal into place: {e}"))
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same-boot pid reuse: the probe sees a live process, but that process
+    /// started after the journal was written, so it cannot be the writer. A
+    /// missing start time must keep the probe's answer.
+    #[test]
+    fn a_process_that_started_after_its_journal_is_not_its_holder() {
+        assert_eq!(
+            combine_start_time(1_000, Some(2_000), Liveness::Alive),
+            Liveness::Dead
+        );
+        assert_eq!(
+            combine_start_time(1_000, Some(900), Liveness::Alive),
+            Liveness::Alive
+        );
+        assert_eq!(
+            combine_start_time(1_000, None, Liveness::Alive),
+            Liveness::Alive
+        );
+        assert_eq!(
+            combine_start_time(0, Some(2_000), Liveness::Alive),
+            Liveness::Alive,
+            "an unknown write time cannot prove reuse"
+        );
+    }
 
     fn journal() -> RouteJournal {
         RouteJournal {

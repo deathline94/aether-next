@@ -174,129 +174,121 @@ pub mod windows_proxy {
     }
 
     const DEFAULT_CONNECTION_SETTINGS: &str = "DefaultConnectionSettings";
-    /// `ProxySettingsFlag`: bit 0 use a proxy server, bit 1 auto-detect, bit 2 use
-    /// a script. Any of the three takes the connection out of "direct" and puts it
-    /// ahead of the per-user values.
-    const FLAG_USE_PROXY: u32 = 0x1;
-    const FLAG_AUTO_DETECT: u32 = 0x2;
+    const SAVED_LEGACY_SETTINGS: &str = "SavedLegacySettings";
+    /// Real WinINet `INTERNET_PER_CONN_OPTION` flag bits in `Connections` blobs:
+    /// `0x1` = PROXY_TYPE_DIRECT (not a conflict), `0x2` = PROXY_TYPE_PROXY,
+    /// `0x4` = PROXY_TYPE_AUTO_PROXY_URL (PAC), `0x8` = PROXY_TYPE_AUTO_DETECT (WPAD).
+    const FLAG_USE_PROXY: u32 = 0x2;
     const FLAG_USE_SCRIPT: u32 = 0x4;
-    /// The string area begins at 1000; the header holds 4-byte version, 4 reserved,
-    /// 4-byte flags, then u16 offsets for ProxyServer / ProxyBypass / ProxyPAC.
-    const STRING_AREA: usize = 1000;
-    const SERVER_AT: usize = 12;
-    const PAC_AT: usize = 16;
+    const FLAG_AUTO_DETECT: u32 = 0x8;
+    const MIN_VERSION: u32 = 0x3C;
+    const MAX_VERSION: u32 = 0x50;
 
-    /// Decode the proxy-relevant head of a `DefaultConnectionSettings` blob.
-    ///
-    /// `Ok(None)` means the connection is direct, so it cannot outrank anything.
-    /// `Err` means the blob is not one this decoder can read, and the caller must
-    /// report that rather than treat it as clean: a conflict it cannot see is a
-    /// conflict it will deny.
+    fn read_len_prefixed_str(blob: &[u8], pos: &mut usize) -> Result<String, String> {
+        let len = blob
+            .get(*pos..*pos + 4)
+            .ok_or_else(|| "truncated WinINet string length header".to_string())?;
+        let n = u32::from_le_bytes(len.try_into().expect("4 bytes")) as usize;
+        *pos += 4;
+        let bytes = blob
+            .get(*pos..*pos + n)
+            .ok_or_else(|| format!("truncated WinINet string body (need {n} bytes)"))?;
+        *pos += n;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Decode a real Windows `HKCU\...\Connections` `REG_BINARY` value:
+    /// `[u32 version (0x3C..=0x50), u32 counter, u32 flags, len+server, len+bypass, len+pac, ...]`.
     pub fn decode_connection_proxy(
         blob: &[u8],
         connection: &str,
     ) -> Result<Option<PerConnectionProxy>, String> {
-        if blob.len() < 18 {
+        if blob.len() < 24 {
             return Err(format!(
-                "{connection}: {DEFAULT_CONNECTION_SETTINGS} is {} bytes, too short to hold a proxy header",
+                "{connection}: connection settings is {} bytes, too short to hold a proxy header",
                 blob.len()
             ));
         }
-        let head = |at: usize, width: usize| -> usize {
-            if width == 4 {
-                u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes")) as usize
-            } else {
-                u16::from_le_bytes(blob[at..at + 2].try_into().expect("2 bytes")) as usize
-            }
-        };
-        let version = head(0, 4);
-        // 5 (XP SP3) through 8 (Windows 10/11) share this header. Anything else is
-        // a layout this decoder would be guessing at.
-        if !(5..=8).contains(&version) {
+        let version = u32::from_le_bytes(blob[0..4].try_into().expect("4 bytes"));
+        if !(MIN_VERSION..=MAX_VERSION).contains(&version) {
             return Err(format!(
-                "{connection}: {DEFAULT_CONNECTION_SETTINGS} version {version} is not one this decoder knows"
+                "{connection}: connection settings version 0x{version:x} is not one this decoder knows"
             ));
         }
-        let flags = head(8, 4) as u32;
+        let flags = u32::from_le_bytes(blob[8..12].try_into().expect("4 bytes"));
         let use_proxy = flags & FLAG_USE_PROXY != 0;
         let use_script = flags & FLAG_USE_SCRIPT != 0;
         let auto_detect = flags & FLAG_AUTO_DETECT != 0;
         if !use_proxy && !use_script && !auto_detect {
             return Ok(None);
         }
-        // A script wins over a server in WinINet's own order of precedence, and
-        // deleting our per-user proxy has no effect on either.
-        let (slot, what) = if use_script {
-            (PAC_AT, "PAC script")
-        } else if use_proxy {
-            (SERVER_AT, "proxy server")
-        } else {
-            // Auto-detect alone resolves through WPAD rather than a server the
-            // caller can name. It is still a connection deciding its own route
-            // while Aether claims to own it, so it is reported, not reasoned away.
+        let mut pos = 12usize;
+        let server = read_len_prefixed_str(blob, &mut pos)
+            .map_err(|e| format!("{connection}: server field: {e}"))?;
+        let _bypass = read_len_prefixed_str(blob, &mut pos)
+            .map_err(|e| format!("{connection}: bypass field: {e}"))?;
+        let pac = read_len_prefixed_str(blob, &mut pos)
+            .map_err(|e| format!("{connection}: PAC field: {e}"))?;
+
+        if use_script {
+            if pac.trim().is_empty() {
+                return Err(format!(
+                    "{connection}: flags claim a PAC script but the string is empty"
+                ));
+            }
             return Ok(Some(PerConnectionProxy {
                 connection: connection.to_string(),
-                effective: "auto-detect (WPAD)".to_string(),
+                effective: pac,
+                via_script: true,
+            }));
+        }
+        if use_proxy {
+            if server.trim().is_empty() {
+                return Err(format!(
+                    "{connection}: flags claim a proxy server but the string is empty"
+                ));
+            }
+            return Ok(Some(PerConnectionProxy {
+                connection: connection.to_string(),
+                effective: server,
                 via_script: false,
             }));
-        };
-        let offset = head(slot, 2);
-        if offset < STRING_AREA || offset >= blob.len() {
-            return Err(format!(
-                "{connection}: flags claim a {what} but its offset {offset} lies outside the blob's string area"
-            ));
-        }
-        let end = blob[offset..]
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or_else(|| format!("{connection}: the {what} string is not terminated"))?;
-        let value = String::from_utf8_lossy(&blob[offset..offset + end]).into_owned();
-        if value.trim().is_empty() {
-            return Err(format!(
-                "{connection}: flags claim a {what} but the string is empty — the connection's route cannot be told"
-            ));
         }
         Ok(Some(PerConnectionProxy {
             connection: connection.to_string(),
-            effective: value,
-            via_script: use_script,
+            effective: "auto-detect (WPAD)".to_string(),
+            via_script: false,
         }))
     }
 
-    /// Which of this user's connections would ignore the proxy Aether just wrote.
-    ///
-    /// `HKCU\...\Internet Settings\Connections` is per-user, so this needs no
-    /// elevation; it reads only.
+    /// Which of this user's dial-up/VPN connections under
+    /// `HKCU\...\Internet Settings\Connections` would ignore the per-user proxy.
     pub fn per_connection_conflicts() -> Result<Vec<PerConnectionProxy>, String> {
         let root = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
             "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections",
             winreg::enums::KEY_READ,
         ) {
             Ok(root) => root,
-            // No Connections key is a real state: nothing is configured
-            // per-connection, so nothing can outrank the per-user values.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("open the Connections key: {e}")),
         };
         let mut out = Vec::new();
-        for name in root.enum_keys().flatten() {
-            // `get_raw_value`, not `get_value::<Vec<u8>>`: winreg has no
-            // `FromRegValue` for bytes because a byte vector could be any of
-            // REG_BINARY or REG_MULTI_SZ, and guessing which is exactly what this
-            // read must not do.
-            let value = match root
-                .open_subkey(&name)
-                .and_then(|k| k.get_raw_value(DEFAULT_CONNECTION_SETTINGS))
-            {
-                Ok(value) => value,
-                // A connection folder without the value has no per-connection proxy
-                // to conflict with; a folder we cannot open is a different matter.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("{name}: read {DEFAULT_CONNECTION_SETTINGS}: {e}")),
+        for entry in root.enum_values() {
+            let (name, value) = match entry {
+                Ok(v) => v,
+                Err(e) => return Err(format!("enumerate Connections values: {e}")),
             };
+            // DefaultConnectionSettings & SavedLegacySettings are the default LAN
+            // connection mirror updated by InternetSetOptionW; only named RAS/VPN
+            // entries override per-user settings independently.
+            if name.eq_ignore_ascii_case(DEFAULT_CONNECTION_SETTINGS)
+                || name.eq_ignore_ascii_case(SAVED_LEGACY_SETTINGS)
+            {
+                continue;
+            }
             if value.vtype != winreg::enums::RegType::REG_BINARY {
                 return Err(format!(
-                    "{name}: {DEFAULT_CONNECTION_SETTINGS} is {:?}, not REG_BINARY",
+                    "{name}: connection value is {:?}, not REG_BINARY",
                     value.vtype
                 ));
             }
@@ -374,32 +366,30 @@ pub mod windows_proxy {
     mod per_connection_tests {
         use super::*;
 
-        /// A `DefaultConnectionSettings` blob laid out the way a real one is: a
-        /// 1000-byte header, then the NUL-terminated ANSI strings the offsets in
-        /// that header point at.
+        /// A real Windows `HKCU\...\Connections` `REG_BINARY` value:
+        /// `[u32 LE version, u32 LE counter, u32 LE flags, len+server, len+bypass, len+pac]`.
         fn blob(version: u32, flags: u32, server: Option<&str>, pac: Option<&str>) -> Vec<u8> {
-            let mut head = vec![0u8; STRING_AREA];
-            head[0..4].copy_from_slice(&version.to_le_bytes());
-            head[8..12].copy_from_slice(&flags.to_le_bytes());
-            let mut at = STRING_AREA;
-            for (slot, value) in [(SERVER_AT, server), (PAC_AT, pac)] {
-                let Some(value) = value else { continue };
-                head[slot..slot + 2].copy_from_slice(&(at as u16).to_le_bytes());
-                head.extend_from_slice(value.as_bytes());
-                head.push(0);
-                at += value.len() + 1;
+            let mut out = Vec::with_capacity(64);
+            out.extend_from_slice(&version.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes()); // counter
+            out.extend_from_slice(&flags.to_le_bytes());
+            for val in [server, Some(""), pac] {
+                let s = val.unwrap_or("");
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
             }
-            head
+            out.extend_from_slice(&[0u8; 16]);
+            out
         }
 
         #[test]
         fn a_connection_with_its_own_proxy_outranks_ours() {
-            let b = blob(8, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            let b = blob(0x46, 0x1 | FLAG_USE_PROXY, Some("198.51.100.9:3128"), None);
             let found = decode_connection_proxy(&b, "Ethernet").unwrap();
             assert_eq!(
                 Some(PerConnectionProxy {
                     connection: "Ethernet".into(),
-                    effective: "10.0.0.9:3128".into(),
+                    effective: "198.51.100.9:3128".into(),
                     via_script: false,
                 }),
                 found
@@ -409,7 +399,7 @@ pub mod windows_proxy {
         #[test]
         fn a_connection_script_outranks_ours_too_and_is_named_as_one() {
             let b = blob(
-                7,
+                0x46,
                 FLAG_USE_SCRIPT,
                 Some("ignored:80"),
                 Some("http://corp/pac.js"),
@@ -421,42 +411,36 @@ pub mod windows_proxy {
 
         #[test]
         fn a_direct_connection_is_not_a_conflict() {
-            let b = blob(8, 0, Some("stale:1"), None);
+            // Flag 0x1 is PROXY_TYPE_DIRECT in WinINet — not a proxy conflict.
+            let b = blob(0x46, 0x1, Some("stale:1"), None);
             assert_eq!(None, decode_connection_proxy(&b, "WiFi").unwrap());
         }
 
         #[test]
         fn a_layout_this_decoder_does_not_know_is_a_problem_not_an_all_clear() {
-            // Failing closed here is the point: "cannot tell" must not become
-            // "nothing conflicts", which is what a default-on decode gave back.
-            let b = blob(9, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            let b = blob(0x99, FLAG_USE_PROXY, Some("198.51.100.9:3128"), None);
             assert!(decode_connection_proxy(&b, "WiFi").is_err());
             assert!(decode_connection_proxy(&b[..12], "WiFi").is_err());
         }
 
         #[test]
         fn flags_that_claim_a_value_the_blob_does_not_carry_are_a_problem() {
-            let mut b = blob(8, FLAG_USE_PROXY, None, None);
-            // offset 12 left zeroed: inside the header, not the string area.
+            let mut b = blob(0x46, FLAG_USE_PROXY, None, None);
             assert!(decode_connection_proxy(&b, "WiFi").is_err());
-            b = blob(8, FLAG_USE_PROXY, Some("   "), None);
+            b = blob(0x46, FLAG_USE_PROXY, Some("   "), None);
             assert!(decode_connection_proxy(&b, "WiFi").is_err());
         }
 
-        /// A connection carrying its own enable bit, server **and** PAC URL — the
-        /// shape a dial-up/VPN profile has after `SetProxyReg` copies the per-user
-        /// values into it — alongside a second connection with only a server. Both
-        /// outrank everything `enable` writes, so both have to stop it.
         #[test]
         fn a_connection_with_its_own_server_and_pac_refuses_the_takeover_up_front() {
             let both = blob(
-                8,
+                0x46,
                 FLAG_USE_PROXY | FLAG_USE_SCRIPT,
-                Some("10.0.0.9:3128"),
+                Some("198.51.100.9:3128"),
                 Some("http://corp/conn.pac"),
             );
-            let server = blob(7, FLAG_USE_PROXY, Some("proxy.isp:8080"), None);
-            let direct = blob(8, 0, Some("stale:1"), None);
+            let server = blob(0x46, FLAG_USE_PROXY, Some("proxy.isp:8080"), None);
+            let direct = blob(0x46, 0x1, Some("stale:1"), None);
 
             let mut conflicts = Vec::new();
             for (name, b) in [("VPN", &both), ("Ethernet", &server), ("WiFi", &direct)] {
@@ -479,7 +463,7 @@ pub mod windows_proxy {
                 );
             }
             assert!(
-                !refusal.contains("10.0.0.9:3128"),
+                !refusal.contains("198.51.100.9:3128"),
                 "the server a script outranks is not the route, so naming it would \
                  misdescribe the conflict"
             );
@@ -491,21 +475,17 @@ pub mod windows_proxy {
 
         #[test]
         fn a_machine_with_no_per_connection_proxy_is_not_blocked() {
-            // Refusing here too would be a new way for an unrelated registry quirk
-            // to stop a session, which is why the empty list is its own case.
             assert!(preflight_per_connection(Ok(Vec::new())).is_none());
         }
 
         #[test]
         fn a_blob_nobody_can_read_refuses_rather_than_passing_the_connection() {
-            let b = blob(9, FLAG_USE_PROXY, Some("10.0.0.9:3128"), None);
+            let b = blob(0x99, FLAG_USE_PROXY, Some("198.51.100.9:3128"), None);
             let unreadable = decode_connection_proxy(&b, "VPN").unwrap_err();
             assert!(preflight_per_connection(Err(unreadable)).is_some());
-            // …and the refusal says why, because "cannot tell" has to be legible
-            // to the user whose connect button just did nothing.
-            let why = preflight_per_connection(Err("offset 12 lies outside the blob".into()))
+            let why = preflight_per_connection(Err("truncated WinINet header".into()))
                 .expect("an unreadable blob refuses");
-            assert!(why.contains("offset 12 lies outside the blob"), "{why}");
+            assert!(why.contains("truncated WinINet header"), "{why}");
         }
 
         /// What makes "restore does not cover per-connections" a complete answer
@@ -581,6 +561,30 @@ pub mod windows_proxy {
         Ok(())
     }
 
+    /// What `enable` leaves behind: the values found before the session and the
+    /// values it wrote. The recovery reader needs both: without `applied` it
+    /// cannot tell "still Aether's dead proxy" from "the user changed it".
+    ///
+    /// A recovery file from an older build is a bare [`ProxySnapshot`]; the decoder
+    /// below still reads it, with `applied` absent.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RecoveryJournal {
+        pub snapshot: ProxySnapshot,
+        #[serde(default)]
+        pub applied: Option<ProxySnapshot>,
+    }
+
+    fn decode_recovery(data: &[u8]) -> Result<RecoveryJournal, CommandError> {
+        if let Ok(journal) = serde_json::from_slice::<RecoveryJournal>(data) {
+            return Ok(journal);
+        }
+        let snapshot: ProxySnapshot = serde_json::from_slice(data).map_err(CommandError::from)?;
+        Ok(RecoveryJournal {
+            snapshot,
+            applied: None,
+        })
+    }
+
     pub fn enable(
         port: u16,
         endpoint: Option<&str>,
@@ -596,25 +600,33 @@ pub mod windows_proxy {
         }
         let key = key().map_err(|e| (e.to_string(), None))?;
         let snapshot = read_snapshot(&key).map_err(|e| (e.message, None))?;
+        let applied = applied_expectation(port, endpoint);
         // Registry mirror first: from this moment on, a deleted recovery file is
         // an inconvenience rather than an unrecoverable loss.
-        write_mirror(&snapshot);
+        write_mirror(&snapshot, &applied);
         if let Some(path) = recovery_path {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| (format!("proxy recovery directory: {e}"), None))?;
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    clear_mirror();
+                    return Err((format!("proxy recovery directory: {e}"), None));
+                }
             }
-            let json = serde_json::to_vec_pretty(&snapshot)
-                .map_err(|e| (format!("proxy recovery encode: {e}"), None))?;
-            // Exclusively-created temp + fsync before the rename: this file is the
-            // only record of what the proxy was before Aether touched it, and a
-            // fixed `proxy-recovery.json.tmp` name let a second writer (or a
-            // reconnect while the first session was still bringing the proxy up)
-            // interleave into it.
-            crate::write_atomic(path, &json)
-                .map_err(|e| (format!("proxy recovery write/commit: {e}"), None))?;
+            let journal = RecoveryJournal {
+                snapshot: snapshot.clone(),
+                applied: Some(applied.clone()),
+            };
+            let json = match serde_json::to_vec_pretty(&journal) {
+                Ok(j) => j,
+                Err(e) => {
+                    clear_mirror();
+                    return Err((format!("proxy recovery encode: {e}"), None));
+                }
+            };
+            if let Err(e) = crate::write_atomic(path, &json) {
+                clear_mirror();
+                return Err((format!("proxy recovery write/commit: {e}"), None));
+            }
         }
-        let applied = applied_expectation(port, endpoint);
         let result = (|| -> Result<(), CommandError> {
             let server = applied.server.clone().unwrap_or_default();
             let bypass = applied.bypass.clone().unwrap_or_default();
@@ -622,8 +634,6 @@ pub mod windows_proxy {
                 .map_err(CommandError::from)?;
             key.set_value("ProxyOverride", &bypass)
                 .map_err(CommandError::from)?;
-            // Take the PAC out of the way while our proxy is active, but only
-            // because it has been snapshotted: `restore` puts it back.
             match key.delete_value("AutoConfigURL") {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -631,6 +641,8 @@ pub mod windows_proxy {
             }
             key.set_value("ProxyEnable", &1u32)
                 .map_err(CommandError::from)?;
+            let actual = read_snapshot(&key)?;
+            verify_readback_values(&applied, &actual)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -649,6 +661,10 @@ pub mod windows_proxy {
             };
         }
         refresh();
+        // The proxy is up, so a crash from here on leaves the machine pointed at a
+        // port that only this (now dead) process was serving. The journal covers
+        // the next start of Aether; RunOnce covers a logon when nobody starts it.
+        register_repair_at_logon();
         // The caller keeps the *applied* values so it can tell, later, whether
         // something else changed the proxy underneath it.
         Ok((snapshot, applied))
@@ -742,9 +758,59 @@ pub mod windows_proxy {
         // Only now: the mirror is what a later start restores *from*, and clearing
         // it before the values are back would lose the only remaining record.
         clear_mirror();
+        // The proxy is no longer Aether's, so a logon repair would find nothing.
+        clear_repair_at_logon();
 
         refresh();
         Ok(())
+    }
+
+    /// Whether putting `snapshot` back may proceed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RestoreDecision {
+        Restore,
+        LeaveAlone,
+    }
+
+    /// Compare-and-swap: the pre-session values may only go back while the
+    /// registry still holds what Aether wrote.
+    ///
+    /// `applied` is what this session (or the journal it left) wrote; `None` is a
+    /// journal from a build that did not record it. Then the only state in which
+    /// restoring `snapshot` is provably harmless is the one where the registry
+    /// already equals it — restoring is a no-op, so it can neither clobber a
+    /// change nor lose one.
+    pub fn decide_restore(
+        current: &ProxySnapshot,
+        applied: Option<&ProxySnapshot>,
+        snapshot: &ProxySnapshot,
+    ) -> RestoreDecision {
+        match applied {
+            Some(applied) if current != applied => RestoreDecision::LeaveAlone,
+            Some(_) => RestoreDecision::Restore,
+            None if current == snapshot => RestoreDecision::Restore,
+            None => RestoreDecision::LeaveAlone,
+        }
+    }
+
+    /// Restore `snapshot`, but only if the live registry is still what Aether
+    /// applied. Returns whether the snapshot was written.
+    ///
+    /// On a mismatch the journal is closed anyway: it describes a proxy that is
+    /// no longer in place, so keeping it would only make every later start try the
+    /// same clobber again. The values found instead are the user's now.
+    pub fn restore_if_ours(
+        applied: Option<&ProxySnapshot>,
+        snapshot: ProxySnapshot,
+    ) -> Result<bool, CommandError> {
+        let current = read_current()?;
+        if decide_restore(&current, applied, &snapshot) == RestoreDecision::LeaveAlone {
+            clear_mirror();
+            clear_repair_at_logon();
+            return Ok(false);
+        }
+        restore(snapshot)?;
+        Ok(true)
     }
 
     pub fn read_optional_reg_value(
@@ -772,12 +838,17 @@ pub mod windows_proxy {
         pub creator_pid: u32,
         pub written_unix: u64,
         pub snapshot: ProxySnapshot,
+        /// What the writer put in the registry. A restore may only put `snapshot`
+        /// back while the live values still equal this; `None` in a mirror from an
+        /// older build, where the restore falls back to comparing with `snapshot`.
+        #[serde(default)]
+        pub applied: Option<ProxySnapshot>,
     }
 
     const JOURNAL_SUBKEY: &str = "Software\\AetherNext";
     const JOURNAL_VALUE: &str = "ProxyJournal";
 
-    fn write_mirror(snapshot: &ProxySnapshot) {
+    fn write_mirror(snapshot: &ProxySnapshot, applied: &ProxySnapshot) {
         let mirror = JournalMirror {
             creator_pid: std::process::id(),
             written_unix: std::time::SystemTime::now()
@@ -785,6 +856,7 @@ pub mod windows_proxy {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             snapshot: snapshot.clone(),
+            applied: Some(applied.clone()),
         };
         let json = match serde_json::to_string(&mirror) {
             Ok(j) => j,
@@ -824,8 +896,66 @@ pub mod windows_proxy {
     }
 
     fn clear_mirror() {
-        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(JOURNAL_SUBKEY) {
-            let _ = key.delete_value(JOURNAL_VALUE);
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(JOURNAL_SUBKEY, winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE)
+        {
+            match key.delete_value(JOURNAL_VALUE) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("[proxy] cannot clear registry journal mirror: {e}"),
+            }
+        }
+    }
+
+    const RUNONCE_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+    const REPAIR_VALUE: &str = "AetherProxyRepair";
+
+    /// The command Windows runs at the next logon to repair a proxy this process
+    /// could not put back. Quoted: a normal install lives under `C:\Program
+    /// Files\...`, and an unquoted path with spaces names a different program.
+    pub fn repair_command(exe: &Path) -> String {
+        format!("\"{}\" --repair-proxy --minimized", exe.display())
+    }
+
+    /// Ask Windows to run one repair pass at the next logon.
+    ///
+    /// The recovery journal only helps when Aether is started again, which is
+    /// exactly what a user whose browser is broken may never do; the RunOnce entry
+    /// is the repair that needs no second launch. Best effort: a locked-down
+    /// RunOnce key must not fail a connect whose proxy is already up.
+    fn register_repair_at_logon() {
+        let command = match std::env::current_exe() {
+            Ok(exe) => repair_command(&exe),
+            Err(error) => {
+                crate::startup::note(&format!(
+                    "could not resolve this executable for the at-logon proxy repair: {error}"
+                ));
+                return;
+            }
+        };
+        let written = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUNONCE_KEY, winreg::enums::KEY_SET_VALUE)
+            .and_then(|key| key.set_value(REPAIR_VALUE, &command));
+        if let Err(error) = written {
+            crate::startup::note(&format!(
+                "could not register the at-logon proxy repair ({error}); the recovery journal \
+                 still covers the next start of Aether"
+            ));
+        }
+    }
+
+    fn clear_repair_at_logon() {
+        let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUNONCE_KEY, winreg::enums::KEY_SET_VALUE)
+        else {
+            return;
+        };
+        match key.delete_value(REPAIR_VALUE) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => crate::startup::note(&format!(
+                "could not remove the at-logon proxy repair: {error}"
+            )),
         }
     }
 
@@ -890,38 +1020,81 @@ pub mod windows_proxy {
     }
 
     /// Startup orphan sweep: restore from the mirror when the file was lost.
-    pub fn sweep_orphan() -> Option<ProxySnapshot> {
-        let mirror = read_mirror()?;
+    ///
+    /// `Ok(Some(true))` restored, `Ok(Some(false))` closed the journal without
+    /// writing because the registry no longer held Aether's values, `Ok(None)`
+    /// nothing to sweep. An `Err` keeps the mirror for the next start.
+    pub fn sweep_orphan() -> Result<Option<bool>, CommandError> {
+        let Some(mirror) = read_mirror() else {
+            return Ok(None);
+        };
         match decide_sweep(Some(&mirror), false, holder_alive(mirror.creator_pid)) {
             Sweep::RestoreFromMirror => {
                 eprintln!(
                 "[proxy] recovery file missing but HKCU\\{JOURNAL_SUBKEY} still records a change \
-                 by dead pid {}; restoring the proxy from the mirror",
+                 by dead pid {}; checking the live values before restoring from the mirror",
                 mirror.creator_pid
             );
-                Some(mirror.snapshot)
+                restore_if_ours(mirror.applied.as_ref(), mirror.snapshot).map(Some)
             }
-            Sweep::Nothing => None,
+            Sweep::Nothing => Ok(None),
         }
+    }
+
+    /// The outcome of consuming a recovery file.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecoverOutcome {
+        Nothing,
+        Restored,
+        /// The file was consumed but the snapshot was not written: the registry
+        /// no longer held the values the journal's session applied.
+        LeftAlone,
     }
 
     /// Consume a recovery file: restore, and only then unlink. A restore that
     /// reports failure leaves the file in place, so the next start tries again.
-    pub fn recover_internal<F: Fn(ProxySnapshot) -> Result<(), CommandError>>(
+    pub fn recover_internal<F: Fn(RecoveryJournal) -> Result<bool, CommandError>>(
         path: &Path,
         restorer: F,
-    ) -> Result<bool, CommandError> {
+    ) -> Result<RecoverOutcome, CommandError> {
         if !path.exists() {
-            return Ok(false);
+            return Ok(RecoverOutcome::Nothing);
         }
         let data = std::fs::read(path).map_err(CommandError::from)?;
-        let snapshot: ProxySnapshot = serde_json::from_slice(&data).map_err(CommandError::from)?;
-        restorer(snapshot)?;
+        let journal = decode_recovery(&data)?;
+        let restored = restorer(journal)?;
         std::fs::remove_file(path).map_err(CommandError::from)?;
-        Ok(true)
+        Ok(if restored {
+            RecoverOutcome::Restored
+        } else {
+            RecoverOutcome::LeftAlone
+        })
     }
 
-    pub fn recover(path: &Path) -> Result<bool, CommandError> {
-        recover_internal(path, restore)
+    pub fn recover(path: &Path) -> Result<RecoverOutcome, CommandError> {
+        if !path.exists() {
+            // The common first start: nothing to read.
+            return Ok(RecoverOutcome::Nothing);
+        }
+        recover_internal(path, |journal| {
+            restore_if_ours(journal.applied.as_ref(), journal.snapshot)
+        })
+    }
+
+    /// The holder a `--repair-proxy` run must not disturb, if any.
+    ///
+    /// That flag is the one entry point that runs beside a live tray instance, so
+    /// it may consume the journal — and restore the proxy — only while the
+    /// process that wrote it is gone. Pure so the rule is testable; the liveness
+    /// probe is the same one `decide_sweep` trusts.
+    pub fn repair_refusal(mirror: Option<&JournalMirror>, holder_alive: bool) -> Option<u32> {
+        let mirror = mirror?;
+        holder_alive.then_some(mirror.creator_pid)
+    }
+
+    /// The pid of a live Aether recorded by the registry journal, if any.
+    pub fn live_holder_pid() -> Option<u32> {
+        let mirror = read_mirror()?;
+        repair_refusal(Some(&mirror), holder_alive(mirror.creator_pid))
     }
 }

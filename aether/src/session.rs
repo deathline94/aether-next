@@ -36,6 +36,31 @@ use crate::wireguard;
 /// measured over.
 const SUPERVISE_TICK: Duration = Duration::from_secs(2);
 
+fn spawn_stats_task() -> AbortOnDrop<()> {
+    crate::counters::reset_traffic();
+    AbortOnDrop(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.tick().await;
+        let start = tokio::time::Instant::now();
+        let mut prev_up = 0u64;
+        let mut prev_down = 0u64;
+        loop {
+            tick.tick().await;
+            let up = crate::counters::get(&crate::counters::BYTES_UP);
+            let down = crate::counters::get(&crate::counters::BYTES_DOWN);
+            session_event::emit(SessionEvent::Stats {
+                up_bps: up.saturating_sub(prev_up),
+                down_bps: down.saturating_sub(prev_down),
+                up_bytes: up,
+                down_bytes: down,
+                uptime_secs: start.elapsed().as_secs(),
+            });
+            prev_up = up;
+            prev_down = down;
+        }
+    }))
+}
+
 /// What warp-in-warp costs the inner packet: ~60 B of WireGuard encapsulation
 /// on the outer leg plus ~60 B on the inner one.
 const INNER_ENCAP_OVERHEAD: usize = 120;
@@ -269,7 +294,11 @@ mod mim_endpoint_tests {
         SocketAddr::from((Ipv4Addr::new(a, b, c, d), port))
     }
 
-    fn assert_eq_endpoints(got: MimEndpoints, outer: Option<SocketAddr>, inner: Option<SocketAddr>) {
+    fn assert_eq_endpoints(
+        got: MimEndpoints,
+        outer: Option<SocketAddr>,
+        inner: Option<SocketAddr>,
+    ) {
         assert_eq!(got.outer, outer, "outer endpoint");
         assert_eq!(got.inner, inner, "inner endpoint");
     }
@@ -279,7 +308,11 @@ mod mim_endpoint_tests {
         let env = CleanEnv::new();
 
         // Nothing set: fully automatic, no error.
-        assert_eq_endpoints(mim_endpoints_from_env().expect("unset env parses"), None, None);
+        assert_eq_endpoints(
+            mim_endpoints_from_env().expect("unset env parses"),
+            None,
+            None,
+        );
 
         // A scan keyword means "no pinned endpoints", not a parse failure.
         for keyword in ["auto", "scan", "none", "off", "0"] {
@@ -293,7 +326,10 @@ mod mim_endpoint_tests {
 
         // A comma list pins outer then inner; whitespace and empty items are
         // tolerated.
-        env.set("AETHER_MIM_PEERS", " 162.159.198.1:443 , , 162.159.198.2:8443 ");
+        env.set(
+            "AETHER_MIM_PEERS",
+            " 162.159.198.1:443 , , 162.159.198.2:8443 ",
+        );
         assert_eq_endpoints(
             mim_endpoints_from_env().expect("peer list parses"),
             Some(v4(162, 159, 198, 1, 443)),
@@ -328,7 +364,10 @@ mod mim_endpoint_tests {
         // Identical pinned hops are a config error: an inner hop onto the outer
         // edge's own socket pinches the tunnel it is supposed to nest through.
         env.set("AETHER_MIM_INNER_PEER", "162.159.198.3:4443");
-        assert!(mim_endpoints_from_env().is_err(), "outer == inner must refuse");
+        assert!(
+            mim_endpoints_from_env().is_err(),
+            "outer == inner must refuse"
+        );
     }
 }
 
@@ -384,9 +423,16 @@ mod mim_hop_tests {
         use super::parse_endpoint_list;
         let parsed =
             parse_endpoint_list(" 162.159.198.1:443 , , 162.159.198.2:8443 ").expect("parses");
-        assert_eq!(parsed, vec![v4(162, 159, 198, 1, 443), v4(162, 159, 198, 2, 8443)]);
-        assert!(parse_endpoint_list("").expect("empty list is empty").is_empty());
-        assert!(parse_endpoint_list("   ,  ").expect("blank list is empty").is_empty());
+        assert_eq!(
+            parsed,
+            vec![v4(162, 159, 198, 1, 443), v4(162, 159, 198, 2, 8443)]
+        );
+        assert!(parse_endpoint_list("")
+            .expect("empty list is empty")
+            .is_empty());
+        assert!(parse_endpoint_list("   ,  ")
+            .expect("blank list is empty")
+            .is_empty());
         assert!(parse_endpoint_list("not-an-endpoint").is_err());
         assert!(parse_endpoint_list("162.159.198.1:443, junk").is_err());
     }
@@ -402,9 +448,15 @@ mod mim_hop_tests {
             derive_sibling_path("relative/config.json", "secondary"),
             "relative/config-secondary.json"
         );
-        assert_eq!(derive_sibling_path("config.json", "masque"), "config-masque.json");
+        assert_eq!(
+            derive_sibling_path("config.json", "masque"),
+            "config-masque.json"
+        );
         // No extension: the suffix attaches to the bare name.
-        assert_eq!(derive_sibling_path("config", "secondary"), "config-secondary");
+        assert_eq!(
+            derive_sibling_path("config", "secondary"),
+            "config-secondary"
+        );
         assert_eq!(
             derive_sibling_path("/var/lib/aether/config", "masque"),
             "/var/lib/aether/config-masque"
@@ -631,9 +683,19 @@ pub async fn run_session(cfg: EngineConfig) -> Result<()> {
             // ranking learns from actual connections, not just scan reachability.
             let active_transport = crate::cache::active_masque_transport();
             let mutation = if result.is_ok() {
-                crate::cache::record_success_for_transport(&base_config, peer, true, active_transport)
+                crate::cache::record_success_for_transport(
+                    &base_config,
+                    peer,
+                    true,
+                    active_transport,
+                )
             } else {
-                crate::cache::record_failure_for_transport(&base_config, peer, true, active_transport)
+                crate::cache::record_failure_for_transport(
+                    &base_config,
+                    peer,
+                    true,
+                    active_transport,
+                )
             };
             if mutation.was_skipped() {
                 log::warn!(
@@ -914,16 +976,41 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
             return Ok(identity);
         }
         log::info!("[+] masque identity missing credentials; enrolling masque key");
-        let (cert_pem, key_pem, masque_endpoint) =
-            account::ensure_masque_enrolled(&identity).await?;
-        // Assigned in place rather than rebuilt with `..identity`: an `Identity`
-        // zeroizes on drop, so it cannot be partially moved out of.
-        let mut identity = identity;
-        identity.cert_pem = cert_pem;
-        identity.key_pem = key_pem;
-        identity.masque_endpoint = masque_endpoint;
-        config::save(config_path, &identity)?;
-        return Ok(identity);
+        match account::ensure_masque_enrolled(&identity).await {
+            Ok((cert_pem, key_pem, masque_endpoint)) => {
+                // Assigned in place rather than rebuilt with `..identity`: an `Identity`
+                // zeroizes on drop, so it cannot be partially moved out of.
+                let mut identity = identity;
+                identity.cert_pem = cert_pem;
+                identity.key_pem = key_pem;
+                identity.masque_endpoint = masque_endpoint;
+                config::save(config_path, &identity)?;
+                return Ok(identity);
+            }
+            // The stored device no longer exists server-side (revoked, expired,
+            // account deleted). A fresh registration is attempted exactly once —
+            // retrying the same rejected token is an infinite loop, not a
+            // recovery — and it replaces the file in place: only the account is
+            // gone, and a rename-aside would risk the local key for no benefit.
+            Err(AetherError::ApiUnauthorized(why)) => {
+                log::warn!(
+                    "[account] the stored masque identity was rejected ({why}); re-registering this device"
+                );
+                let identity =
+                    account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None)
+                        .await?;
+                let (cert_pem, key_pem, masque_endpoint) =
+                    account::ensure_masque_enrolled(&identity).await?;
+                let mut identity = identity;
+                identity.cert_pem = cert_pem;
+                identity.key_pem = key_pem;
+                identity.masque_endpoint = masque_endpoint;
+                config::save(config_path, &identity)?;
+                log::info!("[+] re-provisioned masque identity after a rejected token");
+                return Ok(identity);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     log::info!("[+] no masque identity found; provisioning dedicated masque account");
@@ -1041,7 +1128,8 @@ async fn select_peer(
             if quick_reconnect_enabled() && !scan_only() {
                 let cache_path = lastconn::cache_path(base_config);
                 if let Some(cached) = lastconn::load_for(&cache_path, active_transport) {
-                    if let Ok(peer_addr) = cached.peer.parse::<SocketAddr>() {
+                    let ring = lastconn::usable_peers(&cached);
+                    for peer_addr in ring {
                         // Enforce is_valid_masque_h3_endpoint before quick verification when running H3.
                         // If ineligible, bypass quick verification without adding failure strikes.
                         let is_eligible = match active_transport {
@@ -1051,72 +1139,76 @@ async fn select_peer(
                             crate::cache::TransportKind::H2 => true,
                             _ => false,
                         };
-                        if is_eligible {
-                            log::info!("[*] verifying cached gateway {peer_addr} before reuse");
-                            // Verify over the transport the tunnel will actually use.
-                            let verified = if is_h2 {
-                                let h2cfg = masque_h2::H2TunnelConfig {
-                                    peer: masque_h2::h2_peer(peer_addr),
-                                    sni: probe.sni.clone(),
-                                    authority: probe.authority.clone(),
-                                    cert_pem: identity.cert_pem.clone(),
-                                    key_pem: identity.key_pem.clone(),
-                                    probe_src: Some(local_ipv4),
-                                };
-                                masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
-                            } else {
-                                quick_verify_masque(
-                                    identity,
-                                    peer_addr,
-                                    &probe.sni,
-                                    ech_config.as_deref(),
-                                )
-                                .await
-                            };
-                            if let Ok(rtt) = verified {
-                                log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
-                                if crate::cache::record_success_for_transport(
-                                    base_config,
-                                    peer_addr,
-                                    true,
-                                    active_transport,
-                                )
-                                .was_skipped()
-                                {
-                                    log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
-                                }
-                                session_event::emit(SessionEvent::EndpointSelected {
-                                    addr: peer_addr.to_string(),
-                                    protocol: protocol.event_tag().into(),
-                                    rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
-                                });
-                                return Ok(Selection {
-                                    peer: peer_addr,
-                                    rtt: Some(rtt),
-                                });
-                            } else {
-                                log::warn!(
-                                    "[-] cached gateway {peer_addr} no longer works; scanning fresh"
-                                );
-                                // Evict the dead peer from the trust cache so we stop
-                                // trying it first on every reconnect after a network change.
-                                if crate::cache::record_failure_for_transport(
-                                    base_config,
-                                    peer_addr,
-                                    true,
-                                    active_transport,
-                                )
-                                .was_skipped()
-                                {
-                                    log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
-                                }
-                            }
-                        } else {
+                        if !is_eligible {
                             log::info!(
-                                "[*] cached gateway {peer_addr} is ineligible for {active_transport:?}; bypassing quick reconnect without strikes"
+                                "[*] cached gateway {peer_addr} is ineligible for {active_transport:?}; skipping without strikes"
                             );
+                            continue;
+                        }
+                        log::info!("[*] verifying cached gateway {peer_addr} before reuse");
+                        let verified = if is_h2 {
+                            let h2cfg = masque_h2::H2TunnelConfig {
+                                peer: masque_h2::h2_peer(peer_addr),
+                                sni: probe.sni.clone(),
+                                authority: probe.authority.clone(),
+                                cert_pem: identity.cert_pem.clone(),
+                                key_pem: identity.key_pem.clone(),
+                                probe_src: Some(local_ipv4),
+                            };
+                            masque_h2::verify_h2(&h2cfg, std::time::Duration::from_secs(6)).await
+                        } else {
+                            quick_verify_masque(
+                                identity,
+                                peer_addr,
+                                &probe.sni,
+                                ech_config.as_deref(),
+                            )
+                            .await
+                        };
+                        if let Ok(rtt) = verified {
+                            log::info!("[+] cached gateway {peer_addr} still works; skipping scan");
+                            if crate::cache::record_success_for_transport(
+                                base_config,
+                                peer_addr,
+                                true,
+                                active_transport,
+                            )
+                            .was_skipped()
+                            {
+                                log::warn!("[cache] quick-reconnect success for {peer_addr} was not recorded");
+                            }
+                            lastconn::save(
+                                &cache_path,
+                                &peer_addr.to_string(),
+                                "",
+                                active_transport,
+                            );
+                            session_event::emit(SessionEvent::EndpointSelected {
+                                addr: peer_addr.to_string(),
+                                protocol: protocol.event_tag().into(),
+                                rtt_ms: Some(rtt.as_secs_f64() * 1000.0),
+                            });
+                            return Ok(Selection {
+                                peer: peer_addr,
+                                rtt: Some(rtt),
+                            });
+                        } else {
+                            log::warn!(
+                                "[-] cached gateway {peer_addr} no longer answers; trying next remembered gateway"
+                            );
+                            if crate::cache::record_failure_for_transport(
+                                base_config,
+                                peer_addr,
+                                true,
+                                active_transport,
+                            )
+                            .was_skipped()
+                            {
+                                log::warn!("[cache] quick-reconnect failure for {peer_addr} was not recorded");
+                            }
                         }
                     }
+                    log::warn!("[-] no remembered gateway answered; scanning fresh");
                 }
             }
 
@@ -1129,7 +1221,12 @@ async fn select_peer(
             );
             let peer = SocketAddr::new(best.ip, best.port);
             // Cache the working gateway so the next session can quick-reconnect.
-            lastconn::save(&lastconn::cache_path(base_config), &peer.to_string(), "", active_transport);
+            lastconn::save(
+                &lastconn::cache_path(base_config),
+                &peer.to_string(),
+                "",
+                active_transport,
+            );
             session_event::emit(SessionEvent::EndpointSelected {
                 addr: format!("{}:{}", best.ip, best.port),
                 protocol: protocol.event_tag().into(),
@@ -1161,7 +1258,11 @@ async fn select_peer(
                 sessions: wg_sessions,
             };
 
-            let best = prober::hunt_best_wg_endpoint(&probe, mode).await?;
+            let profile_name = runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| {
+                obfuscation::default_profile(obfuscation::Transport::WireGuard).to_string()
+            });
+            let best =
+                select_or_reuse_wg_endpoint(base_config, &probe, mode, &profile_name).await?;
             log::info!(
                 "[+] selected WireGuard endpoint {}:{} (rtt {:?})",
                 best.ip,
@@ -1174,6 +1275,57 @@ async fn select_peer(
             })
         }
     }
+}
+
+async fn select_or_reuse_wg_endpoint(
+    base_config: &str,
+    probe: &prober::WgProbe,
+    mode: prober::ScanMode,
+    profile_name: &str,
+) -> Result<prober::ProbeResult> {
+    let cache_path = lastconn::cache_path(base_config);
+    if quick_reconnect_enabled() && !scan_only() {
+        if let Some(cached) = lastconn::load_wg(&cache_path) {
+            for peer_addr in lastconn::usable_peers(&cached) {
+                log::info!("[*] verifying cached WireGuard endpoint {peer_addr} before reuse");
+                match wireguard::verify_endpoint_keep_session(
+                    peer_addr,
+                    *probe.private_key,
+                    *probe.peer_public_key,
+                    probe.client_id,
+                    probe.local_ipv4,
+                    &probe.aethernoize,
+                    Duration::from_secs(5),
+                )
+                .await
+                {
+                    Ok((rtt, established)) => {
+                        log::info!(
+                            "[+] cached WireGuard endpoint {peer_addr} still works (rtt {rtt:?}); skipping scan"
+                        );
+                        probe.sessions.insert_capped(peer_addr, established);
+                        lastconn::save_wg(&cache_path, &peer_addr.to_string(), profile_name);
+                        return Ok(prober::ProbeResult {
+                            ip: peer_addr.ip(),
+                            port: peer_addr.port(),
+                            rtt,
+                        });
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[-] cached WireGuard endpoint {peer_addr} no longer answers ({e}); trying next remembered endpoint"
+                        );
+                    }
+                }
+            }
+            log::warn!("[-] no remembered WireGuard endpoint answered; scanning fresh");
+        }
+    }
+
+    let best = prober::hunt_best_wg_endpoint(probe, mode).await?;
+    let peer = SocketAddr::new(best.ip, best.port);
+    lastconn::save_wg(&cache_path, &peer.to_string(), profile_name);
+    Ok(best)
 }
 
 /// Smart reconnect gating. Defaults ON (column requested); turn off via
@@ -1301,17 +1453,14 @@ async fn run_masque_tunnel(
     listen: SocketAddr,
     http_listen: SocketAddr,
 ) -> Result<()> {
-    let mtu_val = mtu::resolve_mtu("masque", !identity.ipv6.trim().is_empty()).await;
-    // H3 CONNECT-IP carries inner IP packets as QUIC DATAGRAMs, whose size is bounded
-    // by the QUIC path MTU minus framing. A higher netstack MTU silently drops full-size
-    // TCP packets (tunnel_ready yet curl times out). Cap the H3 data-plane MTU so inner
-    // packets always fit the datagram; H2 (capsules over the stream) is unaffected.
-    // Threaded explicitly into the netstack/TUN spawn below instead of a global
-    // AETHER_MTU set() that a concurrent scan/tunnel in the same process could clobber.
+    let ipv6_configured = !identity.ipv6.trim().is_empty();
+    let mtu_val = mtu::resolve_mtu("masque", ipv6_configured).await;
+    // H3 CONNECT-IP carries inner IP packets inside one QUIC DATAGRAM, bounded by
+    // MAX_DATAGRAM_SIZE - 50. H2 carries capsules over a byte stream and keeps mtu_val.
     let stack_mtu = if masque_h2::enabled() {
         mtu_val
     } else {
-        let capped = mtu_val.min(1280);
+        let capped = mtu::cap_for_h3(mtu_val, ipv6_configured);
         if capped != mtu_val {
             log::info!(
                 "[+] H3 data-plane MTU capped to {capped} (was {mtu_val}) to fit QUIC DATAGRAM"
@@ -1488,6 +1637,7 @@ async fn run_masque_tunnel(
     // its life — has to say "I am still here and my transport task has not exited"
     // or a healthy tunnel would look stalled.
     let mut tunnel_handle = tunnel_handle;
+    let _stats_task = spawn_stats_task();
     let mut supervise = tokio::time::interval(SUPERVISE_TICK);
     let tunnel_result: Result<()> = loop {
         tokio::select! {
@@ -1555,9 +1705,10 @@ async fn run_wireguard(
     let peer_public = identity.peer_public_key_bytes()?;
     let ipv4 = identity.tunnel_ipv4()?;
 
-    let primary_profile =
-        runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| "balanced".to_string());
-    let profile = obfuscation::aethernoize_from_name(&primary_profile);
+    let primary_profile = runtime_env::var("AETHER_NOIZE").unwrap_or_else(|| {
+        obfuscation::default_profile(obfuscation::Transport::WireGuard).to_string()
+    });
+    let profile = aethernoize_config();
 
     let wg_sessions = prober::WgSessionCache::new();
 
@@ -1590,7 +1741,7 @@ async fn run_wireguard(
             sessions: wg_sessions.clone(),
         };
 
-        let best = prober::hunt_best_wg_endpoint(&probe, mode).await?;
+        let best = select_or_reuse_wg_endpoint(base_config, &probe, mode, &primary_profile).await?;
         log::info!(
             "[+] selected WireGuard endpoint {}:{} (rtt {:?})",
             best.ip,
@@ -1698,6 +1849,7 @@ async fn run_wireguard_tunnel(
     // behind a live WireGuard session, and its socket was never confirmed released
     // before the next connect rebound the same port — the "Address already in use"
     // reconnect failure. The interval arm is the progress the heartbeat needs.
+    let _stats_task = spawn_stats_task();
     let tunnel_result = {
         let mut tunnel_fut = std::pin::pin!(wg_tunnel.run(tints.outbound_rx));
         let mut supervise = tokio::time::interval(SUPERVISE_TICK);
@@ -1894,6 +2046,7 @@ async fn run_warp_in_warp(
     // the proxies accepting connections that nothing would ever answer, and the
     // HTTP task was aborted without being awaited so its port could still be held
     // when the next connect rebound it.
+    let _stats_task = spawn_stats_task();
     let mut http_task = Some(http_task);
     let result = {
         let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
@@ -1997,7 +2150,12 @@ async fn spawn_tcp_forwarder(
         }
     });
 
-    Ok((local, TcpForwarderGuard { listener_task: AbortOnDrop(task) }))
+    Ok((
+        local,
+        TcpForwarderGuard {
+            listener_task: AbortOnDrop(task),
+        },
+    ))
 }
 
 // The inner payload is deliberately never read: the variant exists to pick
@@ -2056,14 +2214,21 @@ async fn establish_masque(
             // The inner hop dials a local forwarder we already resolved to its
             // final form; remapping the port is only for the outer leg's
             // QUIC→H2 port derivation.
-            peer: if is_inner { peer } else { masque_h2::h2_peer(peer) },
+            peer: if is_inner {
+                peer
+            } else {
+                masque_h2::h2_peer(peer)
+            },
             sni: consts::CONNECT_SNI.to_string(),
             authority: crate::quic::resolve_h3_authority(),
             cert_pem: identity.cert_pem.clone(),
             key_pem: identity.key_pem.clone(),
             probe_src,
         };
-        log::info!("[+] [{label}] MASQUE transport: HTTP/2 (TCP) to {}", h2cfg.peer);
+        log::info!(
+            "[+] [{label}] MASQUE transport: HTTP/2 (TCP) to {}",
+            h2cfg.peer
+        );
         tokio::spawn(async move { masque_h2::run(h2cfg, internals, Some(addr_tx), ready_tx).await })
     } else {
         let cfg = quic::TunnelConfig {
@@ -2078,7 +2243,11 @@ async fn establish_masque(
             // The outer leg may run the operator's obfuscation profile; the inner
             // hop is already inside the obfuscated outer tunnel, so obfuscating
             // again would be waste, not defense.
-            noize: if is_inner { noize::NoizeConfig::off() } else { noize_config() },
+            noize: if is_inner {
+                noize::NoizeConfig::off()
+            } else {
+                noize_config()
+            },
         };
         log::info!("[+] [{label}] MASQUE transport: HTTP/3 (QUIC) to {peer}");
         tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
@@ -2278,11 +2447,17 @@ async fn run_masque_in_masque(
     mim: MimEndpoints,
 ) -> Result<()> {
     let h2 = masque_h2::enabled();
-    let outer_mtu = mtu::resolve_mtu("masque", !primary.ipv6.trim().is_empty()).await;
-    let stack_mtu = if h2 { outer_mtu } else { outer_mtu.min(1280) };
+    let ipv6_configured = !primary.ipv6.trim().is_empty();
+    let outer_mtu = mtu::resolve_mtu("masque", ipv6_configured).await;
+    let stack_mtu = if h2 {
+        outer_mtu
+    } else {
+        mtu::cap_for_h3(outer_mtu, ipv6_configured)
+    };
 
     log::info!("[*] establishing outer MASQUE tunnel to {peer}...");
-    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, "outer").await?;
+    let outer =
+        establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, "outer").await?;
     wait_stack_alive(&outer.stack, "outer MASQUE").await?;
 
     // A pinned inner that lands on the outer edge's own address used to be
@@ -2328,7 +2503,9 @@ async fn run_masque_in_masque(
             (f, ForwarderGuard::Udp(g))
         };
 
-        log::info!("[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}");
+        log::info!(
+            "[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}"
+        );
         match establish_masque(&secondary, forwarder, None, h2, inner_mtu, true, "inner").await {
             Ok(hop) => {
                 // The data-plane check is the unbounded part of an attempt; racing
@@ -2386,6 +2563,8 @@ async fn run_masque_in_masque(
         detail: format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)"),
     });
 
+    let _stats_task = spawn_stats_task();
+    let _inner_addr_task = inner.addr_task;
     let mut http_task = Some(http_task);
     let mut inner_task = inner.tunnel_task;
     let inner_stack = inner.stack;

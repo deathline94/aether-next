@@ -40,6 +40,15 @@ pub enum AetherError {
     #[error("api: {0}")]
     Api(String),
 
+    /// The account API rejected the stored device token outright (401/403).
+    ///
+    /// Distinct from [`Self::Api`] because retrying is exactly wrong here: the
+    /// token is what the server refuses, so every retry is another rejection.
+    /// The recovery is to forget the identity and register a new device, which
+    /// `load_or_provision_masque` does once before surfacing this.
+    #[error("api: the stored account was rejected ({0}); re-provisioning is required")]
+    ApiUnauthorized(String),
+
     /// The identity/config file could not be read, parsed, sealed or opened. The
     /// user can fix this in Settings; no retry can.
     #[error("config: {0}")]
@@ -83,6 +92,7 @@ impl AetherError {
             Self::NoIpv6Route => "no_ipv6_route",
             Self::Capsule(_) => "capsule",
             Self::Api(_) => "api",
+            Self::ApiUnauthorized(_) => "api_unauthorized",
             Self::Config(_) => "config",
             Self::Proxy(_) => "proxy",
             Self::HostState(_) => "host_state",
@@ -109,6 +119,8 @@ impl AetherError {
             ),
             Self::Quic(_) | Self::H3(_) | Self::Capsule(_) => true,
             Self::Api(_) => true,
+            // Nothing changes between attempts until the identity is replaced.
+            Self::ApiUnauthorized(_) => false,
             Self::Proxy(_) => true,
             Self::Config(_) | Self::HostState(_) => false,
             Self::NoCleanEndpoint => true,

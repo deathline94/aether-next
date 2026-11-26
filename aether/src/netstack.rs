@@ -971,10 +971,21 @@ pub fn forbidden_destination(ip: IpAddr) -> Option<&'static str> {
                 return forbidden_v4(inner, blocked_lan);
             }
             let f = v6.segments();
+            if f[0] == 0x0064 && f[1] == 0xff9b && f[2] == 0 && f[3] == 0 && f[4] == 0 && f[5] == 0
+            {
+                // NAT64 well-known prefix 64:ff9b::/96 -> extract embedded IPv4.
+                let b = v6.octets();
+                return forbidden_v4(Ipv4Addr::new(b[12], b[13], b[14], b[15]), blocked_lan);
+            }
+            if f[0] == 0x0064 && f[1] == 0xff9b && f[2] == 0x0001 {
+                return Some("nat64 local-use (64:ff9b:1::/48)");
+            }
             if f[0] & 0xfe00 == 0xfc00 {
                 Some("unique local (fc00::/7)")
             } else if f[0] & 0xffc0 == 0xfe80 {
                 Some("link-local (fe80::/10)")
+            } else if f[0] & 0xffc0 == 0xfec0 {
+                Some("deprecated site-local (fec0::/10)")
             } else if f[0] == 0x2001 && f[1] == 0 {
                 // Teredo is a v4-relayed tunnel: every route through it ends at
                 // an IPv4 literal embedded in the address, which is exactly what
@@ -1002,6 +1013,10 @@ fn forbidden_v4(v4: Ipv4Addr, blocked_lan: bool) -> Option<&'static str> {
         Some("link-local (instance metadata)")
     } else if o[0] == 100 && o[1] >= 64 && o[1] <= 127 {
         Some("carrier-grade NAT (100.64.0.0/10)")
+    } else if o[0] >= 240 {
+        Some("reserved/broadcast (240.0.0.0/4)")
+    } else if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        Some("ietf protocol assignments (192.0.0.0/24)")
     } else if v4.is_multicast() {
         Some("multicast")
     } else if blocked_lan

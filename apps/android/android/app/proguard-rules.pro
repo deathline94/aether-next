@@ -16,6 +16,7 @@
 
 # Same hazard for the WebView bridge: `AetherAndroid.invoke` is called from JavaScript
 # by name.
+-keepattributes JavascriptInterface
 -keepclassmembers,includedescriptorclasses class * {
     @android.webkit.JavascriptInterface <methods>;
 }
@@ -23,6 +24,7 @@
 # The foreground-service and VPN entry points Android instantiates reflectively.
 -keep class app.aethernext.AetherVpnService
 -keep class app.aethernext.EngineService
+-keep class app.aethernext.AetherTileService
 -keep class app.aethernext.MainActivity
 -keep class app.aethernext.AetherApp
 -keep class app.aethernext.BootReceiver
@@ -37,12 +39,6 @@
     public static int v(...);
     public static int d(...);
     public static int i(...);
-}
-
-# `System.out` is the same leak through a different door.
--assumenosideeffects class java.io.PrintStream {
-    public *** println(...);
-    public *** print(...);
 }
 
 # Drop the debug-only WebView plumbing from release entirely (BuildConfig.DEBUG is a

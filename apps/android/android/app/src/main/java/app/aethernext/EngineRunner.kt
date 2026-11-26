@@ -71,7 +71,13 @@ open class EngineRunner(
             val m = p.javaClass.getMethod("pid")
             (m.invoke(p) as? Number)?.toInt()
         } catch (_: Exception) {
-            null
+            try {
+                // UNIXProcess on Android API 26-33 holds an int `pid` field.
+                val f = p.javaClass.getDeclaredField("pid").apply { isAccessible = true }
+                (f.get(p) as? Number)?.toInt()
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 
@@ -158,38 +164,28 @@ open class EngineRunner(
      *   configuration key", so a KeyStore that needs re-provisioning looked exactly
      *   like a broken download (T2xx).
      */
-    private fun handoffConfigKey(proc: Process): String? = try {
-        val key = configKey()
+    private fun handoffConfigKey(proc: Process, preloadedKey: String? = null): String? = try {
+        val key = preloadedKey ?: configKey()
         val stream = proc.outputStream
         stream.write("key ".toByteArray(Charsets.US_ASCII))
         stream.write(key.toByteArray(Charsets.US_ASCII))
-        stream.write(byteArrayOf(0x0A)) // line terminator for the control channel
+        stream.write(byteArrayOf(0x0A))
         stream.flush()
         null
     } catch (e: Exception) {
         Log.e(TAG, "config key handoff failed: ${e.message}", e)
-        // The cause chain, verbatim: `ConfigKeyStore.loadOrCreate` throws the real
-        // reason (keystore unavailable, a KeyStoreException, a failed retry loop) and
-        // it used to die in a log line no user ever sees.
         "${e.javaClass.simpleName}: ${e.message ?: e.toString()}"
     }
 
-    /**
-     * A daemon reader thread for one child's stdout.
-     *
-     * Raw non-daemon `Thread().start()` per child meant a wedged pipe held the JVM
-     * open after the service was torn down, and nothing bounded how many such threads
-     * a flapping engine could leave behind.
-     */
+    private fun readBoundedLine(reader: BufferedReader): String? {
+        val line = reader.readLine() ?: return null
+        return if (line.length > MAX_LINE_CHARS) line.substring(0, MAX_LINE_CHARS) else line
+    }
+
     private fun startIoThread(name: String, body: () -> Unit) {
         Thread(body, name).apply { isDaemon = true }.start()
     }
 
-    /**
-     * Release the child's pipes. The control stream is deliberately left open while
-     * the child runs — it is how `shutdown`/`cancel` reach it — so the only moment it
-     * is safe to close it is once the process is gone.
-     */
     internal fun closeChildStreams(proc: Process?) {
         proc ?: return
         listOf(proc.outputStream, proc.errorStream, proc.inputStream).forEach { stream ->
@@ -206,6 +202,11 @@ open class EngineRunner(
         }
         val binary = resolveEngine()
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
+        val preloadedKey = try {
+            configKey()
+        } catch (e: Exception) {
+            return "Could not unlock configuration key — ${e.javaClass.simpleName}: ${e.message ?: e.toString()}"
+        }
         scanMode.set(false)
         running.set(true)
         supervisorState.set(SupervisorState.CONNECTING)
@@ -224,7 +225,7 @@ open class EngineRunner(
             }
 
             processRef.set(proc)
-            val handoffFailure = handoffConfigKey(proc)
+            val handoffFailure = handoffConfigKey(proc, preloadedKey)
             if (handoffFailure != null) {
                 proc.destroy()
                 proc.destroyForcibly()
@@ -238,7 +239,7 @@ open class EngineRunner(
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                         var line: String?
-                        while (reader.readLine().also { line = it } != null) {
+                        while (readBoundedLine(reader).also { line = it } != null) {
                             onLine(line!!)
                         }
                     }
@@ -247,23 +248,26 @@ open class EngineRunner(
                 } finally {
                     val code = try {
                         proc.waitFor()
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        null
                     } catch (_: Exception) {
                         null
                     }
-                    // The child is gone: its control pipe can be closed now, and not a
-                    // moment earlier — it is how `shutdown` reaches a living engine.
-                    closeChildStreams(proc)
-                    // EOF on stdout is not process death. A child that closes or
-                    // redirects stdout used to flip the runner to IDLE while the
-                    // engine was still up, and the supervisor then launched a
-                    // *second* engine: two tunnels, two route tables, one device.
-                    if (proc.isAlive) {
+                    if (!proc.isAlive) {
+                        closeChildStreams(proc)
+                        val won = generation.compareAndSet(currentGeneration, currentGeneration + 1)
+                        // Always clear STOPPING/running once this owned process actually died
+                        // so a forced exit that overtook stopAndWait never wedges the runner.
+                        if (processRef.compareAndSet(proc, null)) {
+                            running.set(false)
+                            supervisorState.set(SupervisorState.IDLE)
+                        }
+                        if (won) {
+                            onExit(code, false)
+                        }
+                    } else {
                         Log.w(TAG, "engine stdout closed while process still alive; not marking it stopped")
-                    } else if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
-                        running.set(false)
-                        supervisorState.set(SupervisorState.IDLE)
-                        processRef.compareAndSet(proc, null)
-                        onExit(code, false)
                     }
                 }
             }
@@ -358,6 +362,11 @@ open class EngineRunner(
         }
         val binary = resolveEngine()
             ?: return "Engine binary not found in the APK (libaether.so / assets)."
+        val preloadedKey = try {
+            configKey()
+        } catch (e: Exception) {
+            return "Could not unlock configuration key — ${e.javaClass.simpleName}: ${e.message ?: e.toString()}"
+        }
         scanMode.set(true)
         running.set(true)
         supervisorState.set(SupervisorState.SCANNING)
@@ -368,7 +377,7 @@ open class EngineRunner(
 
             val proc = launcher.launch(command, env)
             processRef.set(proc)
-            val handoffFailure = handoffConfigKey(proc)
+            val handoffFailure = handoffConfigKey(proc, preloadedKey)
             if (handoffFailure != null) {
                 proc.destroy()
                 proc.destroyForcibly()
@@ -382,26 +391,33 @@ open class EngineRunner(
                 try {
                     BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                         var line: String?
-                        while (reader.readLine().also { line = it } != null) {
+                        while (readBoundedLine(reader).also { line = it } != null) {
                             onLine(line!!)
                         }
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "scan reader ended: ${e.message}")
                 } finally {
-                    val code = try { proc.waitFor() } catch (_: Exception) { null }
-                    closeChildStreams(proc)
-                    // EOF on stdout is not process death. A child that closes or
-                    // redirects stdout used to flip the runner to IDLE while the
-                    // engine was still up, and the supervisor then launched a
-                    // *second* engine: two tunnels, two route tables, one device.
-                    if (proc.isAlive) {
+                    val code = try {
+                        proc.waitFor()
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        null
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (!proc.isAlive) {
+                        closeChildStreams(proc)
+                        val won = generation.compareAndSet(currentGeneration, currentGeneration + 1)
+                        if (processRef.compareAndSet(proc, null)) {
+                            running.set(false)
+                            supervisorState.set(SupervisorState.IDLE)
+                        }
+                        if (won) {
+                            onExit(code, true)
+                        }
+                    } else {
                         Log.w(TAG, "engine stdout closed while process still alive; not marking it stopped")
-                    } else if (generation.compareAndSet(currentGeneration, currentGeneration + 1)) {
-                        running.set(false)
-                        supervisorState.set(SupervisorState.IDLE)
-                        processRef.compareAndSet(proc, null)
-                        onExit(code, true)
                     }
                 }
             }
@@ -496,6 +512,7 @@ open class EngineRunner(
 
     companion object {
         private const val TAG = "EngineRunner"
+        private const val MAX_LINE_CHARS = 65_536
 
         /** The engine's protocol token. `wg` and `wireguard` are the same choice. */
         /**

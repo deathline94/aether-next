@@ -218,12 +218,23 @@ pub struct CapsuleParser {
     buf: Vec<u8>,
 }
 
+const MAX_CAPSULE_BUF: usize = 8 * 1024 * 1024;
+
 impl CapsuleParser {
     pub fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
     pub fn push(&mut self, data: &[u8]) {
+        if self.buf.len().saturating_add(data.len()) > MAX_CAPSULE_BUF {
+            log::warn!(
+                "[capsule] parser buffer exceeded {MAX_CAPSULE_BUF} bytes; dropping buffered data"
+            );
+            self.buf.clear();
+            if data.len() > MAX_CAPSULE_BUF {
+                return;
+            }
+        }
         self.buf.extend_from_slice(data);
     }
 
@@ -234,15 +245,19 @@ impl CapsuleParser {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
-        let len = match b.get_varint() {
-            Ok(v) => v as usize,
+        let raw_len = match b.get_varint() {
+            Ok(v) => v,
             Err(_) => return Ok(None),
         };
-        // Cap absurd lengths so a corrupt stream cannot stall forever.
-        if len > 4 * 1024 * 1024 {
+        // Check against u64 BEFORE casting to usize so 32-bit targets (e.g.
+        // Android armv7) cannot truncate `(1<<32)+10` past the 4 MiB ceiling.
+        if raw_len > 4 * 1024 * 1024 {
             self.buf.clear();
-            return Err(AetherError::Capsule(format!("capsule too large: {len}")));
+            return Err(AetherError::Capsule(format!(
+                "capsule too large: {raw_len}"
+            )));
         }
+        let len = raw_len as usize;
         if b.cap() < len {
             return Ok(None);
         }
@@ -298,6 +313,12 @@ fn parse_address_assign(value: &[u8]) -> Result<Vec<AssignedAddress>> {
         };
         let address = b.get_bytes(addr_len).map_err(oct)?.to_vec();
         let prefix_len = b.get_u8().map_err(oct)?;
+        let max_prefix = if ip_version == 4 { 32 } else { 128 };
+        if prefix_len > max_prefix {
+            return Err(AetherError::Capsule(format!(
+                "bad prefix_len {prefix_len} for ip_version {ip_version}"
+            )));
+        }
 
         out.push(AssignedAddress {
             ip_version,

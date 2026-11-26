@@ -168,6 +168,41 @@ fn an_empty_or_truncated_file_is_corruption_but_an_absent_one_is_not() {
     assert!(aether_desktop_lib::decode_settings_text("{}").is_ok());
 }
 
+/// The tray's Connect used to fall back to `Settings::default()` on a corrupt
+/// file and then save them through the blocking connect path, so the defaults
+/// replaced the user's only copy. The save must refuse a file that exists and does
+/// not decode; an absent file is a first run and is still created.
+#[test]
+fn a_corrupt_settings_file_is_not_replaced_by_a_save() {
+    let dir = scratch_dir("no-clobber");
+    let path = dir.join("settings.json");
+    let corrupt = br#"{"protocol":"masque","httpPort":"18a20"}"#;
+    std::fs::write(&path, corrupt).expect("seed corrupt settings");
+
+    let err = aether_desktop_lib::save_settings_at(&path, &Settings::default())
+        .expect_err("a damaged file must not be overwritten");
+    assert_eq!(
+        serde_json::to_value(&err).expect("errors carry their code over IPC")["code"],
+        "settings_corrupt",
+        "the refusal has to say why: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("the file is still there"),
+        corrupt,
+        "the bytes the user could still repair must be untouched"
+    );
+
+    // No file at all is a first run, not corruption.
+    let first_run = dir.join("new-profile").join("settings.json");
+    aether_desktop_lib::save_settings_at(&first_run, &Settings::default())
+        .expect("a first run must be allowed to create the file");
+    let written: Settings =
+        serde_json::from_str(&std::fs::read_to_string(&first_run).unwrap()).unwrap();
+    assert_eq!(written.http_port, Settings::default().http_port);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn scratch_dir(tag: &str) -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let nanos = std::time::SystemTime::now()

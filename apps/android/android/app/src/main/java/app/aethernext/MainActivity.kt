@@ -62,9 +62,16 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var loadedUrl: String? = null
 
+    @Volatile
+    private var pageFinished = false
+
+    private val preLoadEvents = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, JSONObject>>()
+    private lateinit var bridge: AetherBridge
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingConnectAfterVpn = savedInstanceState?.getBoolean(KEY_PENDING_VPN_CONNECT, false) ?: false
         // The uncaught-exception forwarder is installed once, from AetherApp.
         // Chaining it here re-wrapped the default handler on every activity
         // create, so a destroyed activity's closure stayed in the chain forever.
@@ -154,14 +161,14 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClientCompat() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                return request.url.scheme != "https" || request.url.host != APP_HOST
+                return !isTrustedUiUrl(request.url.toString(), APP_HOST, UI_PATH_PREFIX)
             }
 
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest,
             ): android.webkit.WebResourceResponse? {
-                if (request.url.scheme == "https" && request.url.host == APP_HOST) {
+                if (isTrustedUiUrl(request.url.toString(), APP_HOST, UI_PATH_PREFIX)) {
                     return assetLoader.shouldInterceptRequest(request.url)
                 }
                 Log.w(TAG, "blocked untrusted WebView resource: ${request.url}")
@@ -171,15 +178,37 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                // Runs on the UI thread before any script in that document, so the
-                // bridge gate can never see a URL later than the page executing.
                 loadedUrl = url
+                pageFinished = false
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 Log.i(TAG, "page finished: $url")
+                pageFinished = true
                 emitToJs("session://state", session.getState().toJson())
+                while (true) {
+                    val queued = preLoadEvents.poll() ?: break
+                    emitToJs(queued.first, queued.second)
+                }
                 surfaceBootHandoff()
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView,
+                detail: android.webkit.RenderProcessGoneDetail,
+            ): Boolean {
+                Log.e(TAG, "WebView render process gone (didCrash=${detail.didCrash()}); reloading UI")
+                if (isDestroyed || isFinishing) return true
+                pageFinished = false
+                loadedUrl = null
+                runOnUiThread {
+                    if (!isDestroyed && !isFinishing && ::webView.isInitialized) {
+                        val entry = "https://$APP_HOST$UI_PATH_PREFIX" + "index.html"
+                        loadedUrl = entry
+                        webView.loadUrl(entry)
+                    }
+                }
+                return true
             }
 
             override fun onReceivedError(
@@ -200,25 +229,11 @@ class MainActivity : AppCompatActivity() {
                     Log.w(TAG, "resource error: $desc url=${request.url}")
                 }
             }
-
-            @Deprecated("Deprecated in Java")
-            override fun onReceivedError(
-                view: WebView?,
-                errorCode: Int,
-                description: String?,
-                failingUrl: String?,
-            ) {
-                Log.e(TAG, "legacy error $errorCode $description $failingUrl")
-            }
         }
 
-        // Maps to assets/www/index.html → relative ./assets/*.js load correctly.
         val entry = "https://$APP_HOST$UI_PATH_PREFIX" + "index.html"
-        // Only expose bridge after client is locked to appassets host.
-        webView.addJavascriptInterface(
-            AetherBridge(this, session) { isBridgeOriginTrusted() },
-            "AetherAndroid",
-        )
+        bridge = AetherBridge(this, session)
+        webView.addJavascriptInterface(bridge, "AetherAndroid")
         Log.i(TAG, "loading $entry")
         loadedUrl = entry
         webView.loadUrl(entry)
@@ -242,18 +257,15 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
         val perm = android.Manifest.permission.POST_NOTIFICATIONS
         if (checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            val prefs = getSharedPreferences("aether_ui_prefs", MODE_PRIVATE)
+            if (prefs.getBoolean("notif_asked_once", false) && !shouldShowRequestPermissionRationale(perm)) {
+                return
+            }
+            prefs.edit().putBoolean("notif_asked_once", true).apply()
             requestPermissions(arrayOf(perm), REQ_NOTIFICATIONS)
         }
     }
 
-    /**
-     * The answer to [maybeRequestNotificationPermission].
-     *
-     * There was none, which mattered because a foreground service whose notification is
-     * suppressed is still a foreground service: the tunnel runs, the system counts it
-     * against the user's battery, and nothing on screen says so. A denial is therefore
-     * reported into the UI, where the user can act on it.
-     */
     @Deprecated("Deprecated in Java")
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -273,25 +285,17 @@ class MainActivity : AppCompatActivity() {
         if (::session.isInitialized) session.emitWarn(message)
     }
 
-    /**
-     * The "UI failed to load" page.
-     *
-     * Two hardening rules live here (T219): the bridge is detached *before* this
-     * document can run — the error page used to inherit a live `AetherAndroid`
-     * object, which is the actual exploit path — and both interpolated values are
-     * HTML-escaped, because `error.description` and the failing URL come from
-     * whatever made the navigation fail, not from us.
-     */
     private fun showLoadError(description: String, url: String) {
         loadedUrl = null
+        pageFinished = false
         webView.removeJavascriptInterface("AetherAndroid")
         val html = """
             <!DOCTYPE html><html><head>
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width,initial-scale=1"/>
             <style>
-              body{font-family:sans-serif;background:#0d1113;color:#e8edf0;padding:24px;line-height:1.45}
-              code{color:#66e3a4;word-break:break-all}
+              body{font-family:sans-serif;background:#F4F7FA;color:#0D1B2A;padding:24px;line-height:1.45}
+              code{color:#0F6E6E;word-break:break-all}
               h1{font-size:18px;margin:0 0 12px}
             </style></head><body>
             <h1>UI failed to load</h1>
@@ -354,8 +358,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(KEY_PENDING_VPN_CONNECT, pendingConnectAfterVpn)
+    }
+
     private fun attachUiSink() {
-        session.attachUi(this) { event, payload -> runOnUiThread { emitToJs(event, payload) } }
+        session.attachUi(this) { event, payload ->
+            if (!pageFinished) {
+                if (preLoadEvents.size < 256) preLoadEvents.add(event to payload)
+                return@attachUi
+            }
+            runOnUiThread { emitToJs(event, payload) }
+        }
     }
 
     override fun onResume() {
@@ -414,7 +429,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun emitToJs(event: String, payload: JSONObject) {
-        if (!::webView.isInitialized) return
+        if (isDestroyed || isFinishing || !::webView.isInitialized) return
         val ev = JSONObject.quote(event)
         val pl = JSONObject.quote(payload.toString())
         val js = "window.__aetherEmit && window.__aetherEmit($ev, $pl);"
@@ -422,17 +437,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        // Detach *this* activity's sink and, if it was the last one, stop the tunnel —
-        // off the main thread, because a full teardown waits on the engine child and on
-        // hev. The previous code called `setEmitter { _, _ -> }` on a process singleton:
-        // it silenced every listener, so the engine and a full-device VPN kept running
-        // with nothing attached to see or stop them (T2xx).
         if (::session.isInitialized) {
             val lastUi = session.detachUi(this)
-            if (lastUi && !isChangingConfigurations) {
-                val executor = teardownExecutor
+            // Keep an already-running VPN tunnel alive across Back/Recents; only
+            // stop if a session died before connecting or user asked to exit.
+            if (lastUi && !isChangingConfigurations && session.getState().status == "disconnected") {
                 val controller = session
-                executor.execute {
+                teardownExecutor.execute {
                     try {
                         controller.shutdownHeadless()
                     } catch (e: Exception) {
@@ -441,16 +452,23 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        if (::bridge.isInitialized) {
+            bridge.shutdown()
+        }
+        connectExecutor.shutdownNow()
+        teardownExecutor.shutdown()
         if (::webView.isInitialized) {
             webView.removeJavascriptInterface("AetherAndroid")
             webView.destroy()
         }
         loadedUrl = null
+        pageFinished = false
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "AetherMain"
+        private const val KEY_PENDING_VPN_CONNECT = "pending_connect_after_vpn"
         private const val REQ_VPN = 1001
         private const val REQ_NOTIFICATIONS = 1002
         private const val APP_HOST = "appassets.androidplatform.net"
