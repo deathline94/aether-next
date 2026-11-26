@@ -86,4 +86,15 @@ class BridgeEnvelopeTest {
             SessionController.validateSettings(Settings().apply { routingMode = "bridge" })
         }
     }
+
+    @Test
+    fun parseThemeArgAcceptsLightOrDarkAndRejectsOthers() {
+        assertTrue(AetherBridge.parseThemeArg("dark"))
+        assertTrue(AetherBridge.parseThemeArg("DARK"))
+        assertFalse(AetherBridge.parseThemeArg("light"))
+        val rejected = assertThrows(SettingRejected::class.java) {
+            AetherBridge.parseThemeArg("sepia")
+        }
+        assertEquals("theme", rejected.field)
+    }
 }

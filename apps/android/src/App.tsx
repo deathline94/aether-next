@@ -1,11 +1,12 @@
 import { Activity, AlertTriangle, KeyRound, Search, Settings as SettingsIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useOnline, useTheme } from "@aether/ui";
 import { shouldClearLogs } from "@aether/ui/logs";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
 import "@aether/ui/shared.css";
 import "./App.css";
+import { invoke } from "./bridge";
 import { ActivityTab } from "./components/ActivityTab";
 import { ConnectionTab } from "./components/ConnectionTab";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -62,6 +63,10 @@ function App() {
   const [view, setView] = useState<View>("home");
   const online = useOnline();
   const { isDark, toggleTheme } = useTheme();
+
+  useEffect(() => {
+    void invoke("set_theme", { theme: isDark ? "dark" : "light" }).catch(() => {});
+  }, [isDark]);
 
   const {
     logs,
@@ -177,6 +182,20 @@ function App() {
     return false;
   }, [logs, appendLog]);
 
+  const handleRetrySettings = useCallback(() => void retrySettings(), [retrySettings]);
+  const handleResetSettings = useCallback(() => void resetSettings(), [resetSettings]);
+  const corruptProp = useMemo(
+    () =>
+      settingsCorrupt
+        ? {
+            notice: settingsCorruptionNotice ?? "",
+            busy: resetSettingsBusy,
+            onReset: handleResetSettings,
+          }
+        : undefined,
+    [settingsCorrupt, settingsCorruptionNotice, resetSettingsBusy, handleResetSettings],
+  );
+
   return (
     <div className="android-shell">
       <main className="mobile-workspace">
@@ -282,7 +301,7 @@ function App() {
           <ErrorBoundary
             label="Settings tab"
             resetKeys={tabResetKeys("settings", runtime, settings, logFilter)}
-            onRetry={() => void retrySettings()}
+            onRetry={handleRetrySettings}
           >
             <SettingsTab
               settings={settings}
@@ -303,15 +322,7 @@ function App() {
               onCheckUpdates={checkForUpdates}
               onInstallUpdate={installUpdate}
               patchSettings={patchSettings}
-              corrupt={
-                settingsCorrupt
-                  ? {
-                      notice: settingsCorruptionNotice ?? "",
-                      busy: resetSettingsBusy,
-                      onReset: () => void resetSettings(),
-                    }
-                  : undefined
-              }
+              corrupt={corruptProp}
             />
           </ErrorBoundary>
         )}

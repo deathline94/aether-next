@@ -387,6 +387,8 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
         engine: "deathline94/aether-next",
         platform: platformLabel().toLowerCase(),
       } as T;
+    case "set_theme":
+      return undefined as T;
     default:
       throw new Error(`unknown command ${cmd}`);
   }

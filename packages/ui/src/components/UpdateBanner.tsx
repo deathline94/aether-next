@@ -106,7 +106,7 @@ export function InlineUpdateBanner({
           >
             <div
               className="update-progress-fill"
-              style={{ width: `${updateProgress?.percent ?? 0}%` }}
+              style={{ transform: `scaleX(${(updateProgress?.percent ?? 0) / 100})` }}
             />
           </div>
         )}

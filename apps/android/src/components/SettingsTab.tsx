@@ -20,7 +20,6 @@ import {
 import {
   IP_FAMILY_OPTIONS,
   NOIZE_OPTIONS,
-  ROUTING_MODE_OPTIONS,
   SCAN_MODE_OPTIONS,
   TRANSPORT_OPTIONS,
   TUNNEL_PROTOCOL_OPTIONS,
@@ -30,12 +29,8 @@ import { saveDockCopy, saveStateOf } from "../saveState";
 import type { SaveState } from "../saveState";
 import { normalizeNoize } from "../settingsPayload";
 import type { Settings } from "../types";
+import { androidRoutingOptions, SelectSheet } from "./SelectSheet";
 import { NumberField, Segmented, Toggle } from "./ui";
-
-const ROUTING_LABELS: Record<string, string> = {
-  tun: "Full VPN (Android VpnService)",
-  "proxy-only": "Proxy Only (Local Listeners)",
-};
 
 interface SettingsTabProps {
   settings: Settings;
@@ -69,7 +64,7 @@ function SettingsTabImpl({
   saveError,
   corrupt,
   admin,
-  appVersion = "1.3.20",
+  appVersion = "1.3.21",
   isDark = false,
   onToggleTheme,
   updateInfo = null,
@@ -233,19 +228,14 @@ function SettingsTabImpl({
                 : "Pre-handshake padding to prevent active DPI fingerprinting"}
             </span>
           </div>
-          <select
+          <SelectSheet
+            label="Obfuscation noise profile"
+            title="Handshake Obfuscation"
             disabled={settingsLocked || noiseBlocked}
-            aria-label="Obfuscation noise profile"
-            className="tactical-select"
             value={normalizeNoize(settings.noize) ?? settings.noize}
-            onChange={(e) => patchSettings({ noize: e.target.value })}
-          >
-            {NOIZE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+            options={NOIZE_OPTIONS}
+            onChange={(noize) => patchSettings({ noize })}
+          />
         </div>
 
         {settings.noize === "custom" && !noiseBlocked && (
@@ -340,19 +330,14 @@ function SettingsTabImpl({
             <strong>Scan Thoroughness</strong>
             <span>Concurrency and probe depth during edge selection</span>
           </div>
-          <select
+          <SelectSheet
+            label="Scan mode"
+            title="Scan Thoroughness"
             disabled={settingsLocked}
-            aria-label="Scan mode"
-            className="tactical-select"
             value={settings.scanMode}
-            onChange={(e) => patchSettings({ scanMode: e.target.value as Settings["scanMode"] })}
-          >
-            {SCAN_MODE_OPTIONS.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+            options={SCAN_MODE_OPTIONS}
+            onChange={(mode) => patchSettings({ scanMode: mode as Settings["scanMode"] })}
+          />
         </div>
 
         <div className="setting-row">
@@ -425,28 +410,14 @@ function SettingsTabImpl({
                 : "Opens local SOCKS5/HTTP listeners without device VPN routing"}
             </span>
           </div>
-          <select
+          <SelectSheet
+            label="Routing mode"
+            title="Routing Mode"
             disabled={settingsLocked}
-            aria-label="Routing mode"
-            className="tactical-select"
             value={settings.routingMode}
-            onChange={(e) => patchSettings({ routingMode: e.target.value as Settings["routingMode"] })}
-          >
-            {ROUTING_MODE_OPTIONS.map((option) => {
-              if (option.value === "system-proxy") {
-                return settings.routingMode === "system-proxy" ? (
-                  <option key={option.value} value={option.value} disabled>
-                    System Proxy — stored, not available on Android
-                  </option>
-                ) : null;
-              }
-              return (
-                <option key={option.value} value={option.value}>
-                  {ROUTING_LABELS[option.value] ?? option.label}
-                </option>
-              );
-            })}
-          </select>
+            options={androidRoutingOptions(settings.routingMode)}
+            onChange={(mode) => patchSettings({ routingMode: mode as Settings["routingMode"] })}
+          />
         </div>
 
         <div className="setting-row">

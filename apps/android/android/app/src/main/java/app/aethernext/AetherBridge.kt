@@ -90,6 +90,7 @@ class AetherBridge(
         "download_and_install_update" -> handleDownloadAndInstallUpdate(args)
         "app_info" -> handleAppInfo()
         "get_result" -> handleGetResult(args)
+        "set_theme" -> handleSetTheme(args)
         else -> throw BridgeError("unknown_command", "unknown command $cmd")
     }
 
@@ -208,6 +209,12 @@ class AetherBridge(
         return session.downloadAndInstallUpdate(assetUrl, assetName, sha256, port, useProxy)
     }
 
+    internal fun handleSetTheme(args: JSONObject): Any {
+        val isDark = parseThemeArg(args.optString("theme", "light"))
+        activityRef.get()?.applyNativeTheme(isDark)
+        return JSONObject.NULL
+    }
+
     internal fun handleAppInfo(): Any =
         JSONObject()
             .put("name", "Aether Next")
@@ -218,6 +225,12 @@ class AetherBridge(
 
     companion object {
         private const val TAG = "AetherBridge"
+
+        internal fun parseThemeArg(raw: String): Boolean = when {
+            raw.equals("dark", ignoreCase = true) -> true
+            raw.equals("light", ignoreCase = true) -> false
+            else -> throw SettingRejected("theme", "Unsupported theme '$raw'; expected 'light' or 'dark'.")
+        }
 
         /** How often the web layer may ask for a settled result. */
         const val POLL_INTERVAL_MS = 120L

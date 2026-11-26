@@ -130,7 +130,7 @@ function ActivityTabImpl({
             aria-valuemax={scanState.total}
             aria-valuenow={scanState.scanned}
           >
-            <div className="scan-progress-bar-fill" style={{ width: `${pct}%` }} />
+            <div className="scan-progress-bar-fill" style={{ transform: `scaleX(${pct / 100})` }} />
           </div>
           <div className="scan-card-footer">
             <small className="tabular-nums">{scan.progressLabel}</small>

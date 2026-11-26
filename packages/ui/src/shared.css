@@ -407,6 +407,7 @@ body,
   color: var(--fg);
   background: var(--bg-sidebar);
   -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
 }
 
 button,
@@ -793,9 +794,12 @@ select:disabled {
 }
 
 .update-progress-fill {
+  width: 100%;
   height: 100%;
   background: var(--emerald);
-  transition: width var(--duration-fast) ease;
+  transform-origin: left center;
+  transition: transform var(--duration-fast) var(--ease-fluid);
+  will-change: transform;
 }
 
 .banner-actions,
@@ -999,6 +1003,8 @@ select:disabled {
 
 .status-dot.connecting {
   background: var(--yellow);
+  will-change: opacity;
+  transform: translateZ(0);
   animation: pulse-dot 1.4s ease-in-out infinite;
 }
 

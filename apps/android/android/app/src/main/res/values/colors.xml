@@ -5,4 +5,7 @@
 
     <!-- Nordic Mist canvas: shared across window background, system bars, and WebView. -->
     <color name="app_canvas">#F4F7FA</color>
+    <color name="app_canvas_dark">#0B1117</color>
+    <color name="app_nav_light">#FFFFFF</color>
+    <color name="app_nav_dark">#151E28</color>
 </resources>

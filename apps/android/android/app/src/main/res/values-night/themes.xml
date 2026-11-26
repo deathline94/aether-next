@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Nordic Slate dark appearance matching WebView dark tokens. -->
+    <style name="Theme.Aether" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#38C5B6</item>
+        <item name="colorPrimaryVariant">#0B1117</item>
+        <item name="colorOnPrimary">#07111A</item>
+        <item name="android:statusBarColor">@color/app_canvas_dark</item>
+        <item name="android:navigationBarColor">@color/app_nav_dark</item>
+        <item name="android:windowBackground">@color/app_canvas_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+</resources>

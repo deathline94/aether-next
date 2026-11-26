@@ -2,6 +2,7 @@ import { Network, Radio, Search, SlidersHorizontal, X, Zap } from "lucide-react"
 import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { DiscoveredEndpoint, ScanState } from "../types";
+import { SelectSheet } from "./SelectSheet";
 import { CopyButton, NumberField, Segmented } from "./ui";
 import {
   isEndpointForProtocol,
@@ -12,7 +13,7 @@ import {
   scanConcurrencyCeiling,
   scanTimeoutFloor,
 } from "@aether/ui";
-import { IP_FAMILY_OPTIONS, NOIZE_PROFILES, oneOf, SCAN_PROTOCOL_OPTIONS } from "@aether/ui/enums";
+import { IP_FAMILY_OPTIONS, NOIZE_OPTIONS, NOIZE_PROFILES, oneOf, SCAN_PROTOCOL_OPTIONS } from "@aether/ui/enums";
 import type { ScanProtocolFilter } from "@aether/ui/enums";
 
 type ProtoFilter = ScanProtocolFilter;
@@ -153,7 +154,7 @@ function ScannerTabImpl({
               aria-valuemax={scanState.total}
               aria-valuenow={scanState.scanned}
             >
-              <div className="scan-progress-bar-fill" style={{ width: `${progressPct}%` }} />
+              <div className="scan-progress-bar-fill" style={{ transform: `scaleX(${progressPct / 100})` }} />
             </div>
             <div className="scan-inline-stats">
               <span className="tactical-chip">{scanState.concurrency} Workers</span>
@@ -288,20 +289,14 @@ function ScannerTabImpl({
                 : "Pre-handshake anti-DPI profile during probes"}
             </span>
           </div>
-          <select
-            aria-label="Obfuscation noise profile for probes"
-            className="tactical-select"
+          <SelectSheet
+            label="Obfuscation noise profile for probes"
+            title="Probe Obfuscation"
             value={noize}
             disabled={active || protocol === "masque-h2"}
-            onChange={(e) => setNoize(oneOf(e.target.value, NOIZE_PROFILES, noize))}
-          >
-            <option value="off">Off — no noise</option>
-            <option value="light">Light — low noise</option>
-            <option value="medium">Medium — default</option>
-            <option value="high">High — stronger</option>
-            <option value="max">Max — highest noise</option>
-            <option value="custom">Custom — manual values</option>
-          </select>
+            options={NOIZE_OPTIONS}
+            onChange={(value) => setNoize(oneOf(value, NOIZE_PROFILES, noize))}
+          />
         </div>
       </section>
 

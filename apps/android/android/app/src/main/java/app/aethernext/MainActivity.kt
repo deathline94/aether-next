@@ -7,16 +7,19 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
-import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebResourceErrorCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewClientCompat
@@ -26,7 +29,14 @@ import java.io.ByteArrayInputStream
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private lateinit var contentRoot: LinearLayout
+    private lateinit var statusBarInset: View
+    private lateinit var bottomBarInset: View
     private lateinit var session: SessionController
+
+    @Volatile
+    private var darkTheme = false
+    private var imeVisible = false
 
     /**
      * Set when a connect is waiting on the VPN consent sheet.
@@ -71,6 +81,8 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        darkTheme = getSharedPreferences("aether_ui_prefs", MODE_PRIVATE)
+            .getString("ui_theme", "light") == "dark"
         pendingConnectAfterVpn = savedInstanceState?.getBoolean(KEY_PENDING_VPN_CONNECT, false) ?: false
         // The uncaught-exception forwarder is installed once, from AetherApp.
         // Chaining it here re-wrapped the default handler on every activity
@@ -79,43 +91,68 @@ class MainActivity : AppCompatActivity() {
         // Helpful when diagnosing UI blanks on emulators / LDPlayer.
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
-        // Target SDK 36 draws behind system bars. Keep the WebView viewport inside
-        // the status/navigation bars so its sticky header and bottom tabs cannot
-        // overlap the system UI. Zero the handled insets before they reach WebView:
-        // newer WebView versions also expose them as CSS safe-area values.
+        // Target SDK 36 draws behind system bars. Paint dedicated inset views matching
+        // our theme chrome (status bar = canvas, bottom nav bar = panel) so dark mode
+        // updates system bars seamlessly instead of leaving bright white stripes.
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
+        val initialCanvas = getColor(if (darkTheme) R.color.app_canvas_dark else R.color.app_canvas)
+        val initialNav = getColor(if (darkTheme) R.color.app_nav_dark else R.color.app_nav_light)
+
+        statusBarInset = View(this).apply { setBackgroundColor(initialCanvas) }
+        bottomBarInset = View(this).apply { setBackgroundColor(initialNav) }
         webView = WebView(this).apply {
-            // The theme's canvas, not a second copy of the hex: this is the colour
-            // visible before the WebView's own stylesheet paints, and a literal
-            // here is how the chrome drifted three shades apart.
-            setBackgroundColor(getColor(R.color.app_canvas))
+            setBackgroundColor(initialCanvas)
+            overScrollMode = View.OVER_SCROLL_NEVER
+            isVerticalScrollBarEnabled = false
+            isHorizontalScrollBarEnabled = false
         }
-        val content = FrameLayout(this).apply {
-            setBackgroundColor(getColor(R.color.app_canvas))
-            addView(webView, FrameLayout.LayoutParams(-1, -1))
+        contentRoot = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(initialCanvas)
+            addView(statusBarInset, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0))
+            addView(webView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(bottomBarInset, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0))
         }
-        ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(contentRoot) { view, insets ->
             val types = WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             val bars = insets.getInsets(types)
-            // The keyboard is consumed into the same padding: with decor-fits off,
+            // The keyboard is consumed into the same bottom spacer: with decor-fits off,
             // adjustResize no longer resizes the window, so nothing else shrank the
             // WebView and the Settings tab's port fields and sticky save dock sat
             // behind the soft keyboard. Max with the nav bar so an open IME replaces
             // the navigation inset rather than stacking on top of it.
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            imeVisible = ime.bottom > bars.bottom
             val bottom = maxOf(bars.bottom, ime.bottom)
-            view.setPadding(bars.left, bars.top, bars.right, bottom)
+            view.setPadding(bars.left, 0, bars.right, 0)
+            if (statusBarInset.layoutParams.height != bars.top) {
+                statusBarInset.layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    bars.top,
+                )
+            }
+            if (bottomBarInset.layoutParams.height != bottom) {
+                bottomBarInset.layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    bottom,
+                )
+            }
+            val canvasColor = getColor(if (darkTheme) R.color.app_canvas_dark else R.color.app_canvas)
+            val navColor = getColor(if (darkTheme) R.color.app_nav_dark else R.color.app_nav_light)
+            statusBarInset.setBackgroundColor(canvasColor)
+            bottomBarInset.setBackgroundColor(if (imeVisible) canvasColor else navColor)
             // Zero the consumed types before they reach WebView: newer WebView
             // versions also expose them as CSS safe-area values, and both the bar
-            // and the keyboard inset have already been turned into padding here.
+            // and the keyboard inset have already been turned into spacers here.
             WindowInsetsCompat.Builder(insets)
                 .setInsets(types, Insets.NONE)
                 .setInsets(WindowInsetsCompat.Type.ime(), Insets.NONE)
                 .build()
         }
-        setContentView(content)
-        ViewCompat.requestApplyInsets(content)
+        setContentView(contentRoot)
+        applyNativeTheme(darkTheme)
+        ViewCompat.requestApplyInsets(contentRoot)
 
         // The sink belongs to *this* WebView, so it is registered per owner: the
         // session is a process singleton, and handing its one emitter to whichever
@@ -285,17 +322,59 @@ class MainActivity : AppCompatActivity() {
         if (::session.isInitialized) session.emitWarn(message)
     }
 
+    fun applyNativeTheme(dark: Boolean) {
+        darkTheme = dark
+        getSharedPreferences("aether_ui_prefs", MODE_PRIVATE)
+            .edit()
+            .putString("ui_theme", if (dark) "dark" else "light")
+            .apply()
+        runOnUiThread {
+            if (isDestroyed || isFinishing) return@runOnUiThread
+            val canvasColor = getColor(if (dark) R.color.app_canvas_dark else R.color.app_canvas)
+            val navColor = getColor(if (dark) R.color.app_nav_dark else R.color.app_nav_light)
+            window.decorView.setBackgroundColor(canvasColor)
+            if (::contentRoot.isInitialized) contentRoot.setBackgroundColor(canvasColor)
+            if (::statusBarInset.isInitialized) statusBarInset.setBackgroundColor(canvasColor)
+            if (::bottomBarInset.isInitialized) {
+                bottomBarInset.setBackgroundColor(if (imeVisible) canvasColor else navColor)
+            }
+            if (::webView.isInitialized) webView.setBackgroundColor(canvasColor)
+            @Suppress("DEPRECATION")
+            window.statusBarColor = canvasColor
+            @Suppress("DEPRECATION")
+            window.navigationBarColor = navColor
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+            val targetMode = if (dark) {
+                AppCompatDelegate.MODE_NIGHT_YES
+            } else {
+                AppCompatDelegate.MODE_NIGHT_NO
+            }
+            if (delegate.localNightMode != targetMode) {
+                delegate.localNightMode = targetMode
+            }
+        }
+    }
+
     private fun showLoadError(description: String, url: String) {
         loadedUrl = null
         pageFinished = false
         webView.removeJavascriptInterface("AetherAndroid")
+        val bg = if (darkTheme) "#0B1117" else "#F4F7FA"
+        val fg = if (darkTheme) "#E6EEF6" else "#0D1B2A"
+        val accent = if (darkTheme) "#38C5B6" else "#0F6E6E"
         val html = """
             <!DOCTYPE html><html><head>
             <meta charset="utf-8"/>
             <meta name="viewport" content="width=device-width,initial-scale=1"/>
             <style>
-              body{font-family:sans-serif;background:#F4F7FA;color:#0D1B2A;padding:24px;line-height:1.45}
-              code{color:#0F6E6E;word-break:break-all}
+              body{font-family:sans-serif;background:$bg;color:$fg;padding:24px;line-height:1.45}
+              code{color:$accent;word-break:break-all}
               h1{font-size:18px;margin:0 0 12px}
             </style></head><body>
             <h1>UI failed to load</h1>

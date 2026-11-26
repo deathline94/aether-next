@@ -393,7 +393,7 @@ option:disabled { color: var(--muted); }
 .android-shell {
   display: flex;
   flex-direction: column;
-  height: 100dvh;
+  height: 100%;
   background: var(--bg-app);
   overflow-x: hidden;
   padding-left: env(safe-area-inset-left, 0px);
@@ -404,6 +404,7 @@ option:disabled { color: var(--muted); }
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
+  overscroll-behavior-y: contain;
   padding: calc(12px + env(safe-area-inset-top, 0px)) 16px 24px;
   display: flex;
   flex-direction: column;
@@ -435,6 +436,8 @@ option:disabled { color: var(--muted); }
   height: 220px;
   pointer-events: none;
   opacity: 0.75;
+  contain: layout paint;
+  transform: translateZ(0);
 }
 
 .mobile-hero-contour svg {
@@ -570,7 +573,7 @@ option:disabled { color: var(--muted); }
   background: var(--panel);
   text-align: left;
   font-size: 14.5px;
-  transition: background-color var(--duration-fast) ease, transform 100ms ease;
+  transition: background-color var(--duration-fast) ease, opacity 100ms ease;
 }
 
 .grouped-row-btn:disabled {
@@ -590,7 +593,7 @@ option:disabled { color: var(--muted); }
   background: var(--panel);
   text-align: left;
   font-size: 14.5px;
-  transition: background-color var(--duration-fast) ease, transform 100ms ease;
+  transition: background-color var(--duration-fast) ease, opacity 100ms ease;
 }
 
 .grouped-row-btn:first-child,
@@ -606,7 +609,7 @@ option:disabled { color: var(--muted); }
 
 .grouped-row-btn:active:not(:disabled) {
   background: var(--panel-hover);
-  transform: scale(0.995);
+  opacity: 0.92;
 }
 
 .grouped-row-label {
@@ -651,12 +654,14 @@ option:disabled { color: var(--muted); }
   background: var(--scrim-bg);
   display: flex;
   align-items: flex-end;
+  animation: sheet-fade-in 160ms var(--ease-fluid);
 }
 
 .bottom-sheet {
   width: 100%;
-  max-height: 80dvh;
+  max-height: 80%;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
   background: var(--panel);
   border-top-left-radius: var(--radius-hero);
   border-top-right-radius: var(--radius-hero);
@@ -664,6 +669,45 @@ option:disabled { color: var(--muted); }
   display: flex;
   flex-direction: column;
   gap: 12px;
+  will-change: transform;
+  animation: sheet-slide-up 200ms var(--ease-spring);
+}
+
+@keyframes sheet-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes sheet-slide-up {
+  from {
+    transform: translateY(24px);
+    opacity: 0.96;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.select-sheet-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  max-width: 100%;
+  text-align: left;
+  transition: background-color var(--duration-fast) ease, border-color var(--duration-fast) ease, transform 100ms ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .select-sheet-trigger:hover:not(:disabled) {
+    background: var(--panel-hover);
+  }
+}
+
+.select-sheet-trigger:active:not(:disabled) {
+  background: var(--panel-hover);
+  transform: scale(0.98);
 }
 
 .sheet-handle {
@@ -754,6 +798,8 @@ option:disabled { color: var(--muted); }
   border-top: 1px solid var(--edge);
   padding: 6px 8px calc(8px + env(safe-area-inset-bottom, 0px));
   flex-shrink: 0;
+  contain: layout style;
+  transform: translateZ(0);
 }
 
 .bottom-nav-tab {
@@ -986,9 +1032,12 @@ option:disabled { color: var(--muted); }
 }
 
 .scan-progress-bar-fill {
+  width: 100%;
   height: 100%;
   background: var(--emerald);
-  transition: width 180ms ease;
+  transform-origin: left center;
+  transition: transform 180ms var(--ease-fluid);
+  will-change: transform;
 }
 
 .scan-inline-stats {
@@ -1004,6 +1053,7 @@ option:disabled { color: var(--muted); }
 }
 
 .spin-icon {
+  will-change: transform;
   animation: spin 2s linear infinite;
 }
 
@@ -1053,6 +1103,7 @@ option:disabled { color: var(--muted); }
 .discovered-list {
   height: 300px;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
 }
 
 .discovered-row {
@@ -1251,6 +1302,7 @@ option:disabled { color: var(--muted); }
   border: 1px solid var(--edge);
   background: var(--screen-bg);
   overflow-y: auto;
+  overscroll-behavior-y: contain;
   font-size: 12px;
 }
 
