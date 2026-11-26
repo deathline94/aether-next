@@ -1882,8 +1882,14 @@ async fn run_wireguard_tunnel(
 
 // ─── WARP-in-WARP (gool) tunnel runner ─────────────────────────────────────
 
+#[cfg(windows)]
 fn tun_mode_enabled() -> bool {
     crate::tun_win::enabled()
+}
+
+#[cfg(not(windows))]
+fn tun_mode_enabled() -> bool {
+    false
 }
 
 async fn spawn_stack_and_optional_tun(
@@ -2797,7 +2803,7 @@ mod tests {
     fn tun_mode_enabled_reads_aether_tun_flag() {
         let prev = runtime_env::var("AETHER_TUN");
         runtime_env::set("AETHER_TUN", "1");
-        assert!(tun_mode_enabled());
+        assert_eq!(tun_mode_enabled(), cfg!(windows));
         runtime_env::set("AETHER_TUN", "0");
         assert!(!tun_mode_enabled());
         match prev {
