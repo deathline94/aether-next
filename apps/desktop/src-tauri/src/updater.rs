@@ -719,9 +719,13 @@ try {
     $hasExe = @(Get-ChildItem -LiteralPath $srcRoot -Filter '*.exe' -File).Count -gt 0
     if (-not $hasExe) { throw 'Portable update archive contains no executable.' }
 
+    $srcRoot = (Get-Item -LiteralPath $srcRoot).FullName
     $srcPrefix = $srcRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     $files = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File)
     foreach ($file in $files) {
+        if (-not $file.FullName.StartsWith($srcPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ("Unexpected extracted path '$($file.FullName)' outside '$srcPrefix'.")
+        }
         $rel = $file.FullName.Substring($srcPrefix.Length)
         $destPath = Join-Path $TargetDir $rel
         $destDir = [System.IO.Path]::GetDirectoryName($destPath)
@@ -1050,9 +1054,11 @@ mod tests {
         let status = cmd.status().unwrap();
         assert!(status.success(), "helper exited with {status}");
 
+        let log = fs::read_to_string(updates_dir.join("portable-update.log")).unwrap_or_default();
         assert_eq!(
             fs::read(target_dir.join("AetherNext-Desktop.exe")).unwrap(),
-            b"v2-desktop"
+            b"v2-desktop",
+            "portable-update.log:\n{log}"
         );
         assert_eq!(
             fs::read(target_dir.join("wintun.dll")).unwrap(),
@@ -1067,9 +1073,17 @@ mod tests {
             b"v2-engine-wintun"
         );
         assert!(!target_dir.join("engine").join("engine").exists());
+        let mut top_entries: Vec<String> = fs::read_dir(&target_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top_entries.sort();
+        assert_eq!(
+            top_entries,
+            vec!["AetherNext-Desktop.exe", "engine", "wintun.dll"]
+        );
         assert!(!zip_path.exists());
 
-        let log = fs::read_to_string(updates_dir.join("portable-update.log")).unwrap();
         assert!(
             log.contains("Portable update applied"),
             "unexpected portable-update.log:\n{log}"
