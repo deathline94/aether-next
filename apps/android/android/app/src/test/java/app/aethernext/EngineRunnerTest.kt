@@ -138,12 +138,12 @@ class EngineRunnerTest {
 
         repeat(threads) {
             Thread {
-                val err = try {
-                    runner.start(Settings())
+                try {
+                    val err = runner.start(Settings())
+                    if (err == null) accepted.incrementAndGet() else rejected.incrementAndGet()
                 } finally {
                     done.countDown()
                 }
-                if (err == null) accepted.incrementAndGet() else rejected.incrementAndGet()
             }.start()
         }
         assertTrue("the contenders deadlocked", done.await(10, TimeUnit.SECONDS))

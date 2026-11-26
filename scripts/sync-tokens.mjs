@@ -35,7 +35,7 @@ const SHEETS = [
 ];
 const CHECK = process.argv.includes('--check');
 
-const src = readFileSync(TOKENS, 'utf8');
+const src = readFileSync(TOKENS, 'utf8').replace(/\r\n/g, '\n');
 const shared = src.match(/\/\*==SHARED-BEGIN==\*\/([\s\S]*?)\/\*==SHARED-END==\*\//);
 if (!shared) {
   console.error('sync-tokens: tokens.css has no SHARED-BEGIN/END span');
@@ -46,7 +46,7 @@ const fence = (content, eol) => {
   const text = `/*==AETHER-TOKENS-START==*/\n/* GENERATED from packages/ui/tokens.css by scripts/sync-tokens.mjs — do not edit this block. */\n${content}\n/*==AETHER-TOKENS-END==*/`;
   // Match the host sheet's line endings so the check is idempotent even after a
   // Windows editor (git autocrlf / the Edit tool) rewrites the file as CRLF.
-  return eol === '\r\n' ? text.replace(/\n/g, '\r\n') : text;
+  return eol === '\r\n' ? text.replace(/\r?\n/g, '\r\n') : text;
 };
 
 let drifted = 0;
