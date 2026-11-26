@@ -79,6 +79,12 @@ fn inner_mtu_for(tunnel_mtu: usize) -> usize {
     tunnel_mtu.saturating_sub(INNER_ENCAP_OVERHEAD)
 }
 
+/// Inner MTU adjusted for an IPv6 outer packet (20 bytes larger header than IPv4).
+fn inner_mtu_for_peer(tunnel_mtu: usize, inner_peer: SocketAddr) -> usize {
+    let overhead = if inner_peer.is_ipv6() { 20 } else { 0 };
+    inner_mtu_for(tunnel_mtu).saturating_sub(overhead)
+}
+
 /// MTU for a WireGuard-leg stack (plain WARP and the gool outer leg).
 ///
 /// `mtu::resolve_mtu`'s `protocol` argument only steers the *first* probe: the
@@ -1977,6 +1983,204 @@ async fn establish_wg(
     Ok((stack, tun, AbortOnDrop(handle)))
 }
 
+async fn establish_wg_from_session(
+    identity: &account::Identity,
+    established: wireguard::EstablishedSession,
+    mtu: usize,
+    label: &'static str,
+    tun_route_peer: Option<SocketAddr>,
+) -> Result<(
+    Option<netstack::StackHandle>,
+    Option<routing_plane::TunGuard>,
+    AbortOnDrop<()>,
+)> {
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(crate::tunnel::NET_QUEUE);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(crate::tunnel::NET_QUEUE);
+    let profile = std::sync::Arc::new(aethernoize::from_profile("off"));
+    let wg_tunnel = wireguard::WgTunnel::from_established(established, profile, inbound_tx);
+
+    let (stack, tun) = if let Some(route_peer) = tun_route_peer {
+        spawn_stack_and_optional_tun(
+            &identity.ipv4,
+            &identity.ipv6,
+            route_peer,
+            mtu,
+            inbound_rx,
+            outbound_tx,
+        )
+        .await?
+    } else {
+        (
+            Some(netstack::spawn(
+                &identity.ipv4,
+                &identity.ipv6,
+                mtu,
+                inbound_rx,
+                outbound_tx,
+            )?),
+            None,
+        )
+    };
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = wg_tunnel.run(outbound_rx).await {
+            log::error!("[{label}] wireguard tunnel exited: {e}");
+        }
+    });
+
+    Ok((stack, tun, AbortOnDrop(handle)))
+}
+
+// ─── NAT64 inner-hop synthesis (foreign exit escape with direct fallback) ───
+
+const NAT64_INNER_TIMEOUT: Duration = Duration::from_secs(7);
+const WG_NAT64_PRIMARY_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(162, 159, 193, 1);
+const WG_NAT64_ALT_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(162, 159, 192, 1);
+const WG_NAT64_PORT: u16 = 2408;
+const MASQUE_NAT64_PRIMARY_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(162, 159, 198, 1);
+const MASQUE_NAT64_ALT_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(162, 159, 198, 2);
+
+const DEFAULT_NAT64_PRESETS: &[(&str, &str)] = &[
+    ("DE level66", "2001:67c:2960:6464::"),
+    ("FI TREX", "2001:67c:2b0:db32:0:1::"),
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Nat64Relay {
+    label: String,
+    prefix: std::net::Ipv6Addr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InnerCandidate {
+    addr: SocketAddr,
+    via: Option<String>,
+}
+
+fn synthesize_nat64(prefix: std::net::Ipv6Addr, v4: std::net::Ipv4Addr, port: u16) -> SocketAddr {
+    let mut octets = prefix.octets();
+    octets[12..16].copy_from_slice(&v4.octets());
+    SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::from(octets)), port)
+}
+
+fn parse_nat64_prefix(raw: &str) -> Option<std::net::Ipv6Addr> {
+    let trimmed = raw.trim();
+    let addr_str = match trimmed.split_once('/') {
+        Some((addr, "96")) => addr.trim(),
+        Some(_) => return None,
+        None => trimmed,
+    };
+    let prefix: std::net::Ipv6Addr = addr_str.parse().ok()?;
+    if prefix.octets()[12..16] != [0, 0, 0, 0] {
+        return None;
+    }
+    Some(prefix)
+}
+
+fn default_nat64_relays() -> Vec<Nat64Relay> {
+    DEFAULT_NAT64_PRESETS
+        .iter()
+        .filter_map(|(label, raw)| {
+            parse_nat64_prefix(raw).map(|prefix| Nat64Relay {
+                label: (*label).to_string(),
+                prefix,
+            })
+        })
+        .collect()
+}
+
+fn nat64_relays_from_raw(raw: Option<&str>) -> Vec<Nat64Relay> {
+    let Some(val) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default_nat64_relays();
+    };
+    match val.to_ascii_lowercase().as_str() {
+        "auto" | "1" | "true" | "on" => default_nat64_relays(),
+        "off" | "0" | "false" | "none" => Vec::new(),
+        _ => val
+            .split(',')
+            .filter_map(|entry| {
+                let s = entry.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                match parse_nat64_prefix(s) {
+                    Some(prefix) => Some(Nat64Relay {
+                        label: format!("custom {prefix}"),
+                        prefix,
+                    }),
+                    None => {
+                        log::warn!("[-] ignoring invalid AETHER_INNER_NAT64 /96 prefix {s:?}");
+                        None
+                    }
+                }
+            })
+            .collect(),
+    }
+}
+
+fn nat64_relays_from_env() -> Vec<Nat64Relay> {
+    nat64_relays_from_raw(crate::runtime_env::var("AETHER_INNER_NAT64").as_deref())
+}
+
+fn gool_inner_candidates(
+    outer: SocketAddr,
+    ipv6_configured: bool,
+    relays: &[Nat64Relay],
+) -> Vec<InnerCandidate> {
+    let mut out = Vec::new();
+    if ipv6_configured && !relays.is_empty() {
+        let target_v4 = if outer.ip() == IpAddr::V4(WG_NAT64_PRIMARY_V4) {
+            WG_NAT64_ALT_V4
+        } else {
+            WG_NAT64_PRIMARY_V4
+        };
+        for relay in relays {
+            out.push(InnerCandidate {
+                addr: synthesize_nat64(relay.prefix, target_v4, WG_NAT64_PORT),
+                via: Some(format!("NAT64 {}", relay.label)),
+            });
+        }
+    }
+    out.push(InnerCandidate {
+        addr: outer,
+        via: None,
+    });
+    out
+}
+
+fn mim_inner_candidates(
+    outer: SocketAddr,
+    pinned_inner: Option<SocketAddr>,
+    h2: bool,
+    ipv6_configured: bool,
+    relays: &[Nat64Relay],
+) -> Vec<InnerCandidate> {
+    if let Some(inner) = pinned_inner {
+        return vec![InnerCandidate {
+            addr: inner,
+            via: None,
+        }];
+    }
+    let mut out = Vec::new();
+    if ipv6_configured && !relays.is_empty() {
+        let target_v4 = if outer.ip() == IpAddr::V4(MASQUE_NAT64_PRIMARY_V4) {
+            MASQUE_NAT64_ALT_V4
+        } else {
+            MASQUE_NAT64_PRIMARY_V4
+        };
+        for relay in relays {
+            out.push(InnerCandidate {
+                addr: synthesize_nat64(relay.prefix, target_v4, MASQUE_INNER_PORT),
+                via: Some(format!("NAT64 {}", relay.label)),
+            });
+        }
+    }
+    for addr in inner_masque_candidates(outer, MIM_INNER_TRIES, h2) {
+        out.push(InnerCandidate { addr, via: None });
+    }
+    out
+}
+
 struct UdpForwarderGuard {
     // Fields exist purely for their Drop side effects (abort on teardown).
     #[allow(dead_code)]
@@ -2037,7 +2241,8 @@ async fn run_warp_in_warp(
     listen: SocketAddr,
     http_listen: SocketAddr,
 ) -> Result<()> {
-    let outer_mtu = wireguard_mtu(!primary.ipv6.trim().is_empty()).await;
+    let ipv6_configured = !primary.ipv6.trim().is_empty();
+    let outer_mtu = wireguard_mtu(ipv6_configured).await;
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let (outer_stack_opt, _outer_tun, mut outer_task) =
         establish_wg(&primary, peer, outer_mtu, true, 5, "outer", None).await?;
@@ -2049,26 +2254,152 @@ async fn run_warp_in_warp(
     // path that was still handshaking.
     wait_stack_alive(&outer_stack, "outer WARP").await?;
 
-    let (forwarder, _forwarder_guard) = spawn_udp_forwarder(&outer_stack, peer).await?;
-    log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
-
-    log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
-    let inner_mtu = inner_mtu_for(outer_mtu);
+    let relays = nat64_relays_from_env();
+    let candidates = gool_inner_candidates(peer, ipv6_configured, &relays);
     let inner_tun_route = tun_mode_enabled().then_some(peer);
-    let (inner_stack, _inner_tun, mut inner_task) = establish_wg(
-        &secondary,
-        forwarder,
-        inner_mtu,
-        false,
-        20,
-        "inner",
-        inner_tun_route,
-    )
-    .await?;
-    if let Some(ref stack) = inner_stack {
-        // Same gate for the inner leg before proxies accept traffic.
-        wait_stack_alive(stack, "inner WARP").await?;
+    let inner_priv = secondary.private_key_bytes()?;
+    let inner_pub = secondary.peer_public_key_bytes()?;
+    let inner_v4 = secondary.tunnel_ipv4()?;
+    let no_obf = aethernoize::from_profile("off");
+
+    struct GoolInnerHop {
+        via: Option<String>,
+        stack: Option<netstack::StackHandle>,
+        #[allow(dead_code)]
+        tun: Option<routing_plane::TunGuard>,
+        task: AbortOnDrop<()>,
+        #[allow(dead_code)]
+        forwarder: UdpForwarderGuard,
     }
+
+    let mut chosen: Option<GoolInnerHop> = None;
+
+    for candidate in candidates {
+        if outer_task.0.is_finished() {
+            return Err(AetherError::Other(
+                "outer WARP tunnel exited while seeking an inner edge".into(),
+            ));
+        }
+        let inner_mtu = inner_mtu_for_peer(outer_mtu, candidate.addr);
+        let (forwarder, forwarder_guard) =
+            spawn_udp_forwarder(&outer_stack, candidate.addr).await?;
+
+        if let Some(ref via) = candidate.via {
+            log::info!(
+                "[*] trying inner WARP leg via {via} ({}) through outer warp via {forwarder}...",
+                candidate.addr
+            );
+            let probe = tokio::select! {
+                res = wireguard::verify_endpoint_keep_session(
+                    forwarder,
+                    inner_priv,
+                    inner_pub,
+                    secondary.client_id,
+                    inner_v4,
+                    &no_obf,
+                    NAT64_INNER_TIMEOUT,
+                ) => Some(res),
+                _ = outer_task.done() => None,
+            };
+            match probe {
+                None => {
+                    return Err(AetherError::Other(
+                        "outer WARP tunnel exited while seeking an inner edge".into(),
+                    ));
+                }
+                Some(Err(e)) => {
+                    log::warn!(
+                        "[-] inner WARP via {via} ({}) failed: {e}; falling back to next candidate",
+                        candidate.addr
+                    );
+                    continue;
+                }
+                Some(Ok((rtt, established))) => {
+                    let (inner_stack, inner_tun, inner_task) = establish_wg_from_session(
+                        &secondary,
+                        established,
+                        inner_mtu,
+                        "inner",
+                        inner_tun_route,
+                    )
+                    .await?;
+                    if let Some(ref stack) = inner_stack {
+                        let alive = tokio::select! {
+                            r = wait_stack_alive(stack, "inner WARP") => Some(r),
+                            _ = outer_task.done() => None,
+                        };
+                        match alive {
+                            None => {
+                                return Err(AetherError::Other(
+                                    "outer WARP tunnel exited while seeking an inner edge".into(),
+                                ));
+                            }
+                            Some(Err(e)) => {
+                                log::warn!(
+                                    "[-] inner WARP data plane via {via} ({}) failed: {e}; falling back",
+                                    candidate.addr
+                                );
+                                continue;
+                            }
+                            Some(Ok(())) => {}
+                        }
+                    }
+                    log::info!(
+                        "[+] inner WARP tunnel established via {via} ({}, rtt {rtt:?})",
+                        candidate.addr
+                    );
+                    chosen = Some(GoolInnerHop {
+                        via: candidate.via,
+                        stack: inner_stack,
+                        tun: inner_tun,
+                        task: inner_task,
+                        forwarder: forwarder_guard,
+                    });
+                    break;
+                }
+            }
+        } else {
+            log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
+            log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
+            let (inner_stack, inner_tun, inner_task) = establish_wg(
+                &secondary,
+                forwarder,
+                inner_mtu,
+                false,
+                20,
+                "inner",
+                inner_tun_route,
+            )
+            .await?;
+            if let Some(ref stack) = inner_stack {
+                // Same gate for the inner leg before proxies accept traffic.
+                tokio::select! {
+                    r = wait_stack_alive(stack, "inner WARP") => r?,
+                    _ = outer_task.done() => {
+                        return Err(AetherError::Other(
+                            "outer WARP tunnel exited while seeking an inner edge".into(),
+                        ));
+                    }
+                }
+            }
+            chosen = Some(GoolInnerHop {
+                via: None,
+                stack: inner_stack,
+                tun: inner_tun,
+                task: inner_task,
+                forwarder: forwarder_guard,
+            });
+            break;
+        }
+    }
+
+    let GoolInnerHop {
+        via: chosen_via,
+        stack: inner_stack,
+        tun: _inner_tun,
+        task: mut inner_task,
+        forwarder: _forwarder_guard,
+    } = chosen.ok_or_else(|| AetherError::Other("no inner WARP endpoint answered".into()))?;
 
     let (mut socks_task, mut http_task) = if let Some(stack) = inner_stack {
         let socks_listener = socks::bind(listen).await?;
@@ -2092,10 +2423,16 @@ async fn run_warp_in_warp(
     });
     session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
-        detail: if socks_task.is_some() {
-            "warp-in-warp ready".into()
-        } else {
-            "warp-in-warp full-device tunnel ready".into()
+        detail: {
+            let base = if socks_task.is_some() {
+                "warp-in-warp ready"
+            } else {
+                "warp-in-warp full-device tunnel ready"
+            };
+            match chosen_via {
+                Some(via) => format!("{base} (via {via})"),
+                None => base.into(),
+            }
         },
     });
 
@@ -2234,6 +2571,7 @@ struct MasqueHop {
     addr_task: AbortOnDrop<()>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn establish_masque(
     identity: &account::Identity,
     peer: SocketAddr,
@@ -2242,6 +2580,7 @@ async fn establish_masque(
     mtu: usize,
     is_inner: bool,
     tun_route_peer: Option<SocketAddr>,
+    startup_timeout: Duration,
 ) -> Result<MasqueHop> {
     let label = if is_inner { "inner" } else { "outer" };
     let (chans, internals) = quic::channels();
@@ -2328,12 +2667,6 @@ async fn establish_masque(
         };
         log::info!("[+] [{label}] MASQUE transport: HTTP/3 (QUIC) to {peer}");
         tokio::spawn(async move { quic::run(cfg, internals, Some(addr_tx), ready_tx).await })
-    };
-
-    let startup_timeout = if is_inner {
-        std::time::Duration::from_secs(12)
-    } else {
-        std::time::Duration::from_secs(20)
     };
 
     match tokio::time::timeout(startup_timeout, ready_rx).await {
@@ -2554,7 +2887,17 @@ async fn run_masque_in_masque(
     };
 
     log::info!("[*] establishing outer MASQUE tunnel to {peer}...");
-    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, None).await?;
+    let outer = establish_masque(
+        &primary,
+        peer,
+        ech.clone(),
+        h2,
+        stack_mtu,
+        false,
+        None,
+        Duration::from_secs(20),
+    )
+    .await?;
     let outer_stack = outer.stack.ok_or_else(|| {
         AetherError::Other("outer MASQUE leg requires user-space netstack".into())
     })?;
@@ -2571,10 +2914,8 @@ async fn run_masque_in_masque(
             )));
         }
     }
-    let candidates = match mim.inner {
-        Some(inner) => vec![inner],
-        None => inner_masque_candidates(peer, MIM_INNER_TRIES, h2),
-    };
+    let relays = nat64_relays_from_env();
+    let candidates = mim_inner_candidates(peer, mim.inner, h2, ipv6_configured, &relays);
 
     let _outer_tun = outer.tun;
     let mut outer_task = outer.tunnel_task;
@@ -2582,9 +2923,12 @@ async fn run_masque_in_masque(
     let outer_route_peer = if h2 { masque_h2::h2_peer(peer) } else { peer };
     let inner_tun_route = tun_mode_enabled().then_some(outer_route_peer);
 
-    let mut chosen: Option<(SocketAddr, MasqueHop, ForwarderGuard)> = None;
+    let mut chosen: Option<(SocketAddr, Option<String>, MasqueHop, ForwarderGuard)> = None;
+    let mut last_mtu_err: Option<AetherError> = None;
+    let mut attempted_any = false;
 
-    for inner_peer in candidates.into_iter().filter(|c| c.ip() != peer.ip()) {
+    for candidate in candidates.into_iter().filter(|c| c.addr.ip() != peer.ip()) {
+        let inner_peer = candidate.addr;
         // The outer tunnel is not supervised until the select loop below, so a
         // mid-hopping outer death used to burn the whole candidate list in doomed
         // attempts before anything noticed. The cheap poll bounds it to one
@@ -2594,7 +2938,15 @@ async fn run_masque_in_masque(
                 "outer MASQUE tunnel exited while seeking an inner edge".into(),
             ));
         }
-        let inner_mtu = mim_inner_mtu(stack_mtu, inner_peer, h2)?;
+        let inner_mtu = match mim_inner_mtu(stack_mtu, inner_peer, h2) {
+            Ok(mtu) => mtu,
+            Err(e) => {
+                log::warn!("[-] skipping inner MASQUE edge {inner_peer}: {e}");
+                last_mtu_err = Some(e);
+                continue;
+            }
+        };
+        attempted_any = true;
         let (forwarder, forwarder_guard) = if h2 {
             let (f, g) = spawn_tcp_forwarder(&outer_stack, inner_peer).await?;
             (f, ForwarderGuard::Tcp(g))
@@ -2603,9 +2955,19 @@ async fn run_masque_in_masque(
             (f, ForwarderGuard::Udp(g))
         };
 
-        log::info!(
-            "[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}"
-        );
+        let timeout = if candidate.via.is_some() {
+            NAT64_INNER_TIMEOUT
+        } else {
+            Duration::from_secs(12)
+        };
+        match &candidate.via {
+            Some(via) => log::info!(
+                "[*] trying inner MASQUE edge {inner_peer} via {via} through outer tunnel via {forwarder}"
+            ),
+            None => log::info!(
+                "[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}"
+            ),
+        }
         match establish_masque(
             &secondary,
             forwarder,
@@ -2614,6 +2976,7 @@ async fn run_masque_in_masque(
             inner_mtu,
             true,
             inner_tun_route,
+            timeout,
         )
         .await
         {
@@ -2633,8 +2996,15 @@ async fn run_masque_in_masque(
                 };
                 match alive {
                     Some(Ok(())) => {
-                        log::info!("[+] inner MASQUE tunnel established through {inner_peer}");
-                        chosen = Some((inner_peer, hop, forwarder_guard));
+                        match &candidate.via {
+                            Some(via) => log::info!(
+                                "[+] inner MASQUE tunnel established through {inner_peer} via {via}"
+                            ),
+                            None => log::info!(
+                                "[+] inner MASQUE tunnel established through {inner_peer}"
+                            ),
+                        }
+                        chosen = Some((inner_peer, candidate.via, hop, forwarder_guard));
                         break;
                     }
                     Some(Err(e)) => {
@@ -2653,7 +3023,12 @@ async fn run_masque_in_masque(
         }
     }
 
-    let Some((inner_peer, inner, _forwarder_guard)) = chosen else {
+    let Some((inner_peer, chosen_via, inner, _forwarder_guard)) = chosen else {
+        if !attempted_any {
+            if let Some(e) = last_mtu_err {
+                return Err(e);
+            }
+        }
         return Err(AetherError::Other(
             "no inner masque edge answered through the outer tunnel".into(),
         ));
@@ -2683,12 +3058,18 @@ async fn run_masque_in_masque(
     });
     session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
-        detail: if socks_task.is_some() {
-            format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)")
-        } else {
-            format!(
-                "masque-in-masque full-device tunnel ready: {peer} (outer) and {inner_peer} (inner)"
-            )
+        detail: {
+            let base = if socks_task.is_some() {
+                format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)")
+            } else {
+                format!(
+                    "masque-in-masque full-device tunnel ready: {peer} (outer) and {inner_peer} (inner)"
+                )
+            };
+            match chosen_via {
+                Some(via) => format!("{base} via {via}"),
+                None => base,
+            }
         },
     });
 
@@ -2810,5 +3191,124 @@ mod tests {
             Some(v) => runtime_env::set("AETHER_TUN", &v),
             None => runtime_env::remove("AETHER_TUN"),
         }
+    }
+
+    #[test]
+    fn nat64_synthesizes_rfc6052_96_addresses() {
+        let de: std::net::Ipv6Addr = "2001:67c:2960:6464::".parse().unwrap();
+        let fi: std::net::Ipv6Addr = "2001:67c:2b0:db32:0:1::".parse().unwrap();
+        assert_eq!(
+            synthesize_nat64(de, std::net::Ipv4Addr::new(162, 159, 193, 1), 2408),
+            "[2001:67c:2960:6464::a29f:c101]:2408".parse().unwrap()
+        );
+        assert_eq!(
+            synthesize_nat64(fi, std::net::Ipv4Addr::new(162, 159, 198, 1), 443),
+            "[2001:67c:2b0:db32:0:1:a29f:c601]:443".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn nat64_prefix_parser_accepts_96_and_rejects_bad_prefixes() {
+        assert_eq!(
+            parse_nat64_prefix("2001:67c:2960:6464::"),
+            Some("2001:67c:2960:6464::".parse().unwrap())
+        );
+        assert_eq!(
+            parse_nat64_prefix(" 2001:67c:2b0:db32:0:1::/96 "),
+            Some("2001:67c:2b0:db32:0:1::".parse().unwrap())
+        );
+        assert_eq!(parse_nat64_prefix("2001:67c:2960:6464::/64"), None);
+        assert_eq!(parse_nat64_prefix("2001:67c:2960:6464::1/96"), None);
+        assert_eq!(parse_nat64_prefix("not-an-ipv6"), None);
+    }
+
+    #[test]
+    fn nat64_env_parser_supports_auto_off_and_custom() {
+        assert_eq!(nat64_relays_from_raw(None).len(), 2);
+        assert_eq!(nat64_relays_from_raw(Some("auto")).len(), 2);
+        assert!(nat64_relays_from_raw(Some("off")).is_empty());
+        assert!(nat64_relays_from_raw(Some("0")).is_empty());
+        assert!(nat64_relays_from_raw(Some("FALSE")).is_empty());
+        let custom = nat64_relays_from_raw(Some("2001:67c:2960:6464::/96, bad"));
+        assert_eq!(custom.len(), 1);
+        assert_eq!(
+            custom[0].prefix,
+            "2001:67c:2960:6464::"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
+        assert!(nat64_relays_from_raw(Some("garbage")).is_empty());
+    }
+
+    #[test]
+    fn gool_inner_candidates_puts_nat64_before_direct_fallback() {
+        let relays = default_nat64_relays();
+        let outer: SocketAddr = "162.159.193.1:2408".parse().unwrap();
+        let cands = gool_inner_candidates(outer, true, &relays);
+        assert_eq!(cands.len(), 3);
+        assert!(cands[0].via.is_some() && cands[0].addr.is_ipv6());
+        assert!(cands[1].via.is_some() && cands[1].addr.is_ipv6());
+        // Must pick alternate Cloudflare WireGuard IPv4 rather than outer's IP.
+        assert_eq!(
+            cands[0].addr,
+            "[2001:67c:2960:6464::a29f:c001]:2408".parse().unwrap()
+        );
+        assert_eq!(
+            cands[2],
+            InnerCandidate {
+                addr: outer,
+                via: None
+            }
+        );
+
+        assert_eq!(
+            gool_inner_candidates(outer, false, &relays),
+            vec![InnerCandidate {
+                addr: outer,
+                via: None
+            }]
+        );
+        assert_eq!(
+            gool_inner_candidates(outer, true, &[]),
+            vec![InnerCandidate {
+                addr: outer,
+                via: None
+            }]
+        );
+    }
+
+    #[test]
+    fn mim_inner_candidates_puts_nat64_first_and_respects_pin() {
+        let relays = default_nat64_relays();
+        let outer: SocketAddr = "162.159.198.1:443".parse().unwrap();
+        let auto = mim_inner_candidates(outer, None, false, true, &relays);
+        assert!(auto.len() > 2);
+        assert!(auto[0].via.is_some() && auto[0].addr.is_ipv6());
+        assert!(auto[1].via.is_some() && auto[1].addr.is_ipv6());
+        assert_eq!(
+            auto[0].addr,
+            "[2001:67c:2960:6464::a29f:c602]:443".parse().unwrap()
+        );
+        assert!(auto[2..].iter().all(|c| c.via.is_none() && c.addr != outer));
+
+        let pinned: SocketAddr = "162.159.198.2:443".parse().unwrap();
+        assert_eq!(
+            mim_inner_candidates(outer, Some(pinned), false, true, &relays),
+            vec![InnerCandidate {
+                addr: pinned,
+                via: None
+            }]
+        );
+
+        let no_v6 = mim_inner_candidates(outer, None, false, false, &relays);
+        assert!(no_v6.iter().all(|c| c.via.is_none()));
+    }
+
+    #[test]
+    fn inner_mtu_for_peer_accounts_for_ipv6_header() {
+        let v4: SocketAddr = "162.159.193.1:2408".parse().unwrap();
+        let v6: SocketAddr = "[2001:67c:2960:6464::a29f:c101]:2408".parse().unwrap();
+        assert_eq!(inner_mtu_for_peer(1280, v4), 1160);
+        assert_eq!(inner_mtu_for_peer(1280, v6), 1140);
     }
 }
