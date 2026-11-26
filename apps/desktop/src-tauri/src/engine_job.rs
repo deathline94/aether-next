@@ -21,7 +21,11 @@ impl Job {
     pub fn create() -> Result<Self, CommandError> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
-            return Err(format!("CreateJobObjectW failed: {}", std::io::Error::last_os_error()).into());
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
         }
         let mut info = unsafe { std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -45,7 +49,11 @@ impl Job {
         let ok =
             unsafe { AssignProcessToJobObject(self.0 as HANDLE, child.as_raw_handle() as HANDLE) };
         if ok == 0 {
-            Err(format!("AssignProcessToJobObject failed: {}", std::io::Error::last_os_error()).into())
+            Err(format!(
+                "AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            )
+            .into())
         } else {
             Ok(())
         }

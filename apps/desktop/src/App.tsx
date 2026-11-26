@@ -1,8 +1,7 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Radio, ScrollText, Search, Settings as SettingsIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useOnline } from "@aether/ui";
-import { AetherMark } from "@aether/ui/components/ui";
+import { useOnline, useTheme } from "@aether/ui";
+import { AetherMark, ThemeToggleButton } from "@aether/ui/components/ui";
 import { shouldClearLogs } from "@aether/ui/logs";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
@@ -13,6 +12,7 @@ import { ConnectionTab } from "./components/ConnectionTab";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { ScannerTab } from "./components/ScannerTab";
 import { SettingsTab } from "./components/SettingsTab";
+import { useDesktopWindow } from "./hooks/useDesktopWindow";
 import { redactExport, useLogs } from "./hooks/useLogs";
 import { useRuntime } from "./hooks/useRuntime";
 import { useScanner } from "./hooks/useScanner";
@@ -68,13 +68,11 @@ const navigation: { id: View; label: string; icon: typeof Radio }[] = [
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
-const isTauriEnv = () =>
-  typeof window !== "undefined" &&
-  Boolean((window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
-
 export function App() {
   const [view, setView] = useState<View>("home");
   const online = useOnline();
+  const { isDark, toggleTheme } = useTheme();
+  const { maximized, minimize: winMinimize, toggleMaximize: winMaximize, close: winClose } = useDesktopWindow();
   const {
     logs,
     logFilter,
@@ -201,32 +199,34 @@ export function App() {
     }
   }, [logs, appVersion, runtime, settings, appendLog]);
 
-  const winMinimize = () => {
-    if (!isTauriEnv()) return;
-    void getCurrentWindow().minimize().catch(() => {});
-  };
-  const winMaximize = () => {
-    if (!isTauriEnv()) return;
-    void getCurrentWindow().toggleMaximize().catch(() => {});
-  };
-  const winClose = () => {
-    if (!isTauriEnv()) return;
-    void getCurrentWindow().close().catch(() => {});
-  };
-
   return (
     <div className="desktop-frame">
       <header className="titlebar-strip" data-tauri-drag-region>
         <div className="titlebar-drag" data-tauri-drag-region />
         <div className="window-controls">
           <button type="button" className="window-ctrl-btn" onClick={winMinimize} aria-label="Minimize window">
-            <span aria-hidden="true">—</span>
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <path d="M1 5h8" stroke="currentColor" strokeWidth="1" />
+            </svg>
           </button>
-          <button type="button" className="window-ctrl-btn" onClick={winMaximize} aria-label="Maximize window">
-            <span aria-hidden="true">□</span>
+          <button
+            type="button"
+            className="window-ctrl-btn"
+            onClick={winMaximize}
+            aria-label={maximized ? "Restore window" : "Maximize window"}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              {maximized ? (
+                <path d="M3 3V1.5h5.5V7H7M1.5 3H7v5.5H1.5z" fill="none" stroke="currentColor" strokeWidth="1" />
+              ) : (
+                <rect x="1.5" y="1.5" width="7" height="7" fill="none" stroke="currentColor" strokeWidth="1" />
+              )}
+            </svg>
           </button>
           <button type="button" className="window-ctrl-btn close" onClick={winClose} aria-label="Close window">
-            <span aria-hidden="true">×</span>
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+            </svg>
           </button>
         </div>
       </header>
@@ -265,6 +265,7 @@ export function App() {
 
           <div className="sidebar-footer">
             <span className="version-tag tabular-nums">v{appVersion}</span>
+            <ThemeToggleButton isDark={isDark} onToggle={toggleTheme} />
           </div>
         </aside>
 
@@ -364,6 +365,8 @@ export function App() {
                 dirty={dirty}
                 saveError={saveError}
                 appVersion={appVersion}
+                isDark={isDark}
+                onToggleTheme={toggleTheme}
                 updateInfo={updateInfo}
                 updateProgress={updateProgress}
                 updateChecking={updateChecking}

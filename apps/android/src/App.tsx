@@ -1,6 +1,6 @@
 import { Activity, AlertTriangle, KeyRound, Search, Settings as SettingsIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useOnline } from "@aether/ui";
+import { useOnline, useTheme } from "@aether/ui";
 import { shouldClearLogs } from "@aether/ui/logs";
 import "@fontsource-variable/geist";
 import "@fontsource-variable/geist-mono";
@@ -61,6 +61,7 @@ const navigation: { id: View; label: string; icon: typeof KeyRound }[] = [
 function App() {
   const [view, setView] = useState<View>("home");
   const online = useOnline();
+  const { isDark, toggleTheme } = useTheme();
 
   const {
     logs,
@@ -217,6 +218,8 @@ function App() {
               online={online}
               testResult={testResult}
               appVersion={appVersion}
+              isDark={isDark}
+              onToggleTheme={toggleTheme}
               updateInfo={updateInfo}
               updateProgress={updateProgress}
               installUpdate={installUpdate}
@@ -291,6 +294,8 @@ function App() {
               saveError={saveError}
               admin={admin}
               appVersion={appVersion}
+              isDark={isDark}
+              onToggleTheme={toggleTheme}
               updateInfo={updateInfo}
               updateProgress={updateProgress}
               updateChecking={updateChecking}

@@ -447,7 +447,11 @@ pub fn validate_settings(settings: &Settings) -> Result<(), CommandError> {
     };
     allow("noize", &settings.noize, NOIZE_VOCABULARY)?;
     if !settings.peer.trim().is_empty()
-        && settings.peer.trim().parse::<std::net::SocketAddr>().is_err()
+        && settings
+            .peer
+            .trim()
+            .parse::<std::net::SocketAddr>()
+            .is_err()
     {
         return Err(CommandError::validation(
             "peer",

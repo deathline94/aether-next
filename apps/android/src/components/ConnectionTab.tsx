@@ -9,7 +9,7 @@ import {
   type UpdateInfo,
   type UpdateProgress,
 } from "@aether/ui";
-import { AetherMark, CopyButton } from "./ui";
+import { AetherMark, CopyButton, ThemeToggleButton } from "./ui";
 import {
   connectionTestCopy,
   coverageClaim,
@@ -85,6 +85,8 @@ interface ConnectionTabProps {
   online?: boolean;
   testResult: TestOutcome | null;
   appVersion?: string;
+  isDark?: boolean;
+  onToggleTheme?: () => void;
   updateInfo?: UpdateInfo | null;
   updateProgress?: UpdateProgress | null;
   installUpdate?: () => void | Promise<void>;
@@ -108,6 +110,8 @@ function ConnectionTabImpl({
   settingsLoaded,
   online = true,
   testResult,
+  isDark = false,
+  onToggleTheme,
   updateInfo = null,
   updateProgress = null,
   installUpdate,
@@ -217,9 +221,12 @@ function ConnectionTabImpl({
             <AetherMark size={26} />
             <strong className="mobile-brand-name">Aether Next</strong>
           </div>
-          <div className="status-rtt-pill" title={runtime.detail}>
-            <span className={`status-dot ${runtime.status}`} aria-hidden="true" />
-            <span className="tabular-nums">{badgeText}</span>
+          <div className="mobile-top-actions">
+            {onToggleTheme && <ThemeToggleButton isDark={isDark} onToggle={onToggleTheme} />}
+            <div className="status-rtt-pill" title={runtime.detail}>
+              <span className={`status-dot ${runtime.status}`} aria-hidden="true" />
+              <span className="tabular-nums">{badgeText}</span>
+            </div>
           </div>
         </header>
 

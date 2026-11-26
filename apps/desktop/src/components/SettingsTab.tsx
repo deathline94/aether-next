@@ -62,6 +62,8 @@ interface SettingsTabProps {
   dirty?: boolean;
   saveError?: IpcError | null;
   appVersion?: string;
+  isDark?: boolean;
+  onToggleTheme?: () => void;
   updateInfo?: UpdateInfo | null;
   updateProgress?: UpdateProgress | null;
   updateChecking?: boolean;
@@ -81,7 +83,9 @@ function SettingsTabImpl({
   saved,
   dirty = false,
   saveError,
-  appVersion = "1.3.16",
+  appVersion = "1.3.17",
+  isDark = false,
+  onToggleTheme,
   updateInfo = null,
   updateProgress = null,
   updateChecking = false,
@@ -387,6 +391,18 @@ function SettingsTabImpl({
             <h2 className="nordic-card-title">Routing &amp; Startup</h2>
           </div>
           <Shield size={18} className="panel-head-icon" aria-hidden="true" />
+        </div>
+
+        <div className="setting-row">
+          <div>
+            <strong>Dark Mode</strong>
+            <span>Switch between Nordic Mist light and dark slate surfaces</span>
+          </div>
+          <Toggle
+            label="Dark mode"
+            checked={isDark}
+            onChange={() => onToggleTheme?.()}
+          />
         </div>
 
         <div className="setting-row">

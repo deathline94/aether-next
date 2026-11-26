@@ -1882,6 +1882,10 @@ async fn run_wireguard_tunnel(
 
 // ─── WARP-in-WARP (gool) tunnel runner ─────────────────────────────────────
 
+fn tun_mode_enabled() -> bool {
+    crate::tun_win::enabled()
+}
+
 async fn spawn_stack_and_optional_tun(
     ipv4: &str,
     ipv6: &str,
@@ -1903,7 +1907,12 @@ async fn establish_wg(
     obfuscate: bool,
     keepalive: u16,
     label: &'static str,
-) -> Result<(netstack::StackHandle, AbortOnDrop<()>)> {
+    tun_route_peer: Option<SocketAddr>,
+) -> Result<(
+    Option<netstack::StackHandle>,
+    Option<routing_plane::TunGuard>,
+    AbortOnDrop<()>,
+)> {
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
 
@@ -1927,7 +1936,28 @@ async fn establish_wg(
 
     let wg_tunnel = wireguard::WgTunnel::new(cfg, inbound_tx).await?;
 
-    let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
+    let (stack, tun) = if let Some(route_peer) = tun_route_peer {
+        spawn_stack_and_optional_tun(
+            &identity.ipv4,
+            &identity.ipv6,
+            route_peer,
+            mtu,
+            inbound_rx,
+            outbound_tx,
+        )
+        .await?
+    } else {
+        (
+            Some(netstack::spawn(
+                &identity.ipv4,
+                &identity.ipv6,
+                mtu,
+                inbound_rx,
+                outbound_tx,
+            )?),
+            None,
+        )
+    };
 
     // M12 fix: the tunnel task used to be spawned detached, so a failed inner
     // establishment leaked the OUTER tunnel — still handshaking/pinging the edge
@@ -1938,7 +1968,7 @@ async fn establish_wg(
         }
     });
 
-    Ok((stack, AbortOnDrop(handle)))
+    Ok((stack, tun, AbortOnDrop(handle)))
 }
 
 struct UdpForwarderGuard {
@@ -2003,8 +2033,10 @@ async fn run_warp_in_warp(
 ) -> Result<()> {
     let outer_mtu = wireguard_mtu(!primary.ipv6.trim().is_empty()).await;
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
-    let (outer_stack, mut outer_task) =
-        establish_wg(&primary, peer, outer_mtu, true, 5, "outer").await?;
+    let (outer_stack_opt, _outer_tun, mut outer_task) =
+        establish_wg(&primary, peer, outer_mtu, true, 5, "outer", None).await?;
+    let outer_stack = outer_stack_opt
+        .ok_or_else(|| AetherError::Other("outer WARP leg requires user-space netstack".into()))?;
 
     // M12 fix: active data-plane gate instead of a fixed 1.5s hope-the-handshake-
     // finished sleep. Slow links used to start the inner tunnel against an outer
@@ -2016,44 +2048,60 @@ async fn run_warp_in_warp(
 
     log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
     let inner_mtu = inner_mtu_for(outer_mtu);
-    let (inner_stack, mut inner_task) =
-        establish_wg(&secondary, forwarder, inner_mtu, false, 20, "inner").await?;
-    // Same gate for the inner leg before proxies accept traffic.
-    wait_stack_alive(&inner_stack, "inner WARP").await?;
+    let inner_tun_route = tun_mode_enabled().then_some(peer);
+    let (inner_stack, _inner_tun, mut inner_task) = establish_wg(
+        &secondary,
+        forwarder,
+        inner_mtu,
+        false,
+        20,
+        "inner",
+        inner_tun_route,
+    )
+    .await?;
+    if let Some(ref stack) = inner_stack {
+        // Same gate for the inner leg before proxies accept traffic.
+        wait_stack_alive(stack, "inner WARP").await?;
+    }
 
-    let socks_listener = socks::bind(listen).await?;
-    let http_listener = http_proxy::bind(http_listen).await?;
-    log::info!("[+] socks5 server listening on {listen}");
-    let http_task = tokio::spawn(http_proxy::serve_listener(
-        http_listener,
-        inner_stack.clone(),
-    ));
-    session_event::emit(SessionEvent::ProxyReady {
-        socks: listen.to_string(),
-        http: http_listen.to_string(),
-    });
+    let (mut socks_task, mut http_task) = if let Some(stack) = inner_stack {
+        let socks_listener = socks::bind(listen).await?;
+        let http_listener = http_proxy::bind(http_listen).await?;
+        let socks_stack = stack.clone();
+        let socks_task = tokio::spawn(async move {
+            log::info!("[+] socks5 server listening on {listen}");
+            socks::serve_listener(socks_listener, socks_stack).await
+        });
+        let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, stack));
+        session_event::emit(SessionEvent::ProxyReady {
+            socks: listen.to_string(),
+            http: http_listen.to_string(),
+        });
+        (Some(socks_task), Some(http_task))
+    } else {
+        (None, None)
+    };
     session_event::emit(SessionEvent::TunnelReady {
         transport: "gool".into(),
     });
     session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
-        detail: "warp-in-warp ready".into(),
+        detail: if socks_task.is_some() {
+            "warp-in-warp ready".into()
+        } else {
+            "warp-in-warp full-device tunnel ready".into()
+        },
     });
 
-    // Both WARP legs are supervised alongside the two proxy listeners, like the
-    // MASQUE path. Previously only the SOCKS listener was awaited: an outer or
-    // inner tunnel that died logged its error from inside its own task and left
-    // the proxies accepting connections that nothing would ever answer, and the
-    // HTTP task was aborted without being awaited so its port could still be held
-    // when the next connect rebound it.
+    // Both WARP legs are supervised alongside the optional proxy listeners,
+    // matching `run_wireguard_tunnel`: full-device TUN mode runs with no local
+    // proxy tasks while forwarding OS packets through the inner leg.
     let _stats_task = spawn_stats_task();
-    let mut http_task = Some(http_task);
     let result = {
-        let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
         let mut supervise = tokio::time::interval(SUPERVISE_TICK);
         loop {
             tokio::select! {
-                r = &mut socks_fut => break r,
+                _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
                 _ = outer_task.done() => break Err(AetherError::Other("outer WARP tunnel exited".into())),
                 _ = inner_task.done() => break Err(AetherError::Other("inner WARP tunnel exited".into())),
                 _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
@@ -2061,6 +2109,10 @@ async fn run_warp_in_warp(
             }
         }
     };
+    if let Some(task) = socks_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(task) = http_task.take() {
         task.abort();
         let _ = task.await;
@@ -2168,7 +2220,9 @@ enum ForwarderGuard {
 }
 
 struct MasqueHop {
-    stack: netstack::StackHandle,
+    stack: Option<netstack::StackHandle>,
+    #[allow(dead_code)]
+    tun: Option<routing_plane::TunGuard>,
     tunnel_task: AbortOnDrop<Result<()>>,
     #[allow(dead_code)]
     addr_task: AbortOnDrop<()>,
@@ -2181,8 +2235,9 @@ async fn establish_masque(
     h2: bool,
     mtu: usize,
     is_inner: bool,
-    label: &'static str,
+    tun_route_peer: Option<SocketAddr>,
 ) -> Result<MasqueHop> {
+    let label = if is_inner { "inner" } else { "outer" };
     let (chans, internals) = quic::channels();
     let local_ipv4 = identity.tunnel_ipv4()?;
     let quic::Channels {
@@ -2190,21 +2245,37 @@ async fn establish_masque(
         inbound_rx,
     } = chans;
 
-    let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
+    let (stack, deferred_tun_channels) = if let Some(route_peer) = tun_route_peer {
+        (None, Some((route_peer, inbound_rx, outbound_tx)))
+    } else {
+        (
+            Some(netstack::spawn(
+                &identity.ipv4,
+                &identity.ipv6,
+                mtu,
+                inbound_rx,
+                outbound_tx,
+            )?),
+            None,
+        )
+    };
 
     let (addr_tx, mut addr_rx) = tokio::sync::mpsc::channel::<quic::AssignedAddr>(64);
-    let bridge_stack = stack.clone();
-    let addr_task = tokio::spawn(async move {
-        while let Some(a) = addr_rx.recv().await {
-            let res = match a.ip {
-                IpAddr::V4(v4) => bridge_stack.set_addrs(Some((v4, a.prefix)), None).await,
-                IpAddr::V6(v6) => bridge_stack.set_addrs(None, Some((v6, a.prefix))).await,
-            };
-            if let Err(e) = res {
-                log::warn!("[-] failed to sync edge address into netstack: {e}");
+    let addr_task = if let Some(bridge_stack) = stack.clone() {
+        tokio::spawn(async move {
+            while let Some(a) = addr_rx.recv().await {
+                let res = match a.ip {
+                    IpAddr::V4(v4) => bridge_stack.set_addrs(Some((v4, a.prefix)), None).await,
+                    IpAddr::V6(v6) => bridge_stack.set_addrs(None, Some((v6, a.prefix))).await,
+                };
+                if let Err(e) = res {
+                    log::warn!("[-] failed to sync edge address into netstack: {e}");
+                }
             }
-        }
-    });
+        })
+    } else {
+        tokio::spawn(async move { while addr_rx.recv().await.is_some() {} })
+    };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
     let probe_src = Some(local_ipv4);
@@ -2260,11 +2331,32 @@ async fn establish_masque(
     };
 
     match tokio::time::timeout(startup_timeout, ready_rx).await {
-        Ok(Ok(())) => Ok(MasqueHop {
-            stack,
-            tunnel_task: AbortOnDrop(tunnel_handle),
-            addr_task: AbortOnDrop(addr_task),
-        }),
+        Ok(Ok(())) => {
+            let tunnel_task = AbortOnDrop(tunnel_handle);
+            let addr_task = AbortOnDrop(addr_task);
+            let (stack, tun) =
+                if let Some((route_peer, inbound_rx, outbound_tx)) = deferred_tun_channels {
+                    // Attach WinTUN only after the inner CONNECT-IP session confirms
+                    // readiness so failed candidate probes never touch system routes.
+                    spawn_stack_and_optional_tun(
+                        &identity.ipv4,
+                        &identity.ipv6,
+                        route_peer,
+                        mtu,
+                        inbound_rx,
+                        outbound_tx,
+                    )
+                    .await?
+                } else {
+                    (stack, None)
+                };
+            Ok(MasqueHop {
+                stack,
+                tun,
+                tunnel_task,
+                addr_task,
+            })
+        }
         Ok(Err(_)) => {
             let joined = tunnel_handle.await;
             let msg = match joined {
@@ -2456,9 +2548,11 @@ async fn run_masque_in_masque(
     };
 
     log::info!("[*] establishing outer MASQUE tunnel to {peer}...");
-    let outer =
-        establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, "outer").await?;
-    wait_stack_alive(&outer.stack, "outer MASQUE").await?;
+    let outer = establish_masque(&primary, peer, ech.clone(), h2, stack_mtu, false, None).await?;
+    let outer_stack = outer.stack.ok_or_else(|| {
+        AetherError::Other("outer MASQUE leg requires user-space netstack".into())
+    })?;
+    wait_stack_alive(&outer_stack, "outer MASQUE").await?;
 
     // A pinned inner that lands on the outer edge's own address used to be
     // silently filtered out of the candidate loop below and reported as
@@ -2476,11 +2570,11 @@ async fn run_masque_in_masque(
         None => inner_masque_candidates(peer, MIM_INNER_TRIES, h2),
     };
 
-    let MasqueHop {
-        stack: outer_stack,
-        tunnel_task: mut outer_task,
-        addr_task: _outer_addr_task,
-    } = outer;
+    let _outer_tun = outer.tun;
+    let mut outer_task = outer.tunnel_task;
+    let _outer_addr_task = outer.addr_task;
+    let outer_route_peer = if h2 { masque_h2::h2_peer(peer) } else { peer };
+    let inner_tun_route = tun_mode_enabled().then_some(outer_route_peer);
 
     let mut chosen: Option<(SocketAddr, MasqueHop, ForwarderGuard)> = None;
 
@@ -2506,14 +2600,30 @@ async fn run_masque_in_masque(
         log::info!(
             "[*] trying inner MASQUE edge {inner_peer} through outer tunnel via {forwarder}"
         );
-        match establish_masque(&secondary, forwarder, None, h2, inner_mtu, true, "inner").await {
+        match establish_masque(
+            &secondary,
+            forwarder,
+            None,
+            h2,
+            inner_mtu,
+            true,
+            inner_tun_route,
+        )
+        .await
+        {
             Ok(hop) => {
-                // The data-plane check is the unbounded part of an attempt; racing
-                // it against the outer tunnel keeps a dead outer from stretching
-                // the search past this candidate.
-                let alive = tokio::select! {
-                    r = wait_stack_alive(&hop.stack, "inner MASQUE") => Some(r),
-                    _ = outer_task.done() => None,
+                // In proxy mode run the active netstack echo check; in WinTUN
+                // mode `establish_masque` already verified `ready_rx` and
+                // attached WinTUN, so only guard against outer collapse.
+                let alive = if let Some(ref inner_stack) = hop.stack {
+                    tokio::select! {
+                        r = wait_stack_alive(inner_stack, "inner MASQUE") => Some(r),
+                        _ = outer_task.done() => None,
+                    }
+                } else if outer_task.0.is_finished() {
+                    None
+                } else {
+                    Some(Ok(()))
                 };
                 match alive {
                     Some(Ok(())) => {
@@ -2543,38 +2653,48 @@ async fn run_masque_in_masque(
         ));
     };
 
-    let socks_listener = socks::bind(listen).await?;
-    let http_listener = http_proxy::bind(http_listen).await?;
-    log::info!("[+] socks5 server listening on {listen}");
-    let http_task = tokio::spawn(http_proxy::serve_listener(
-        http_listener,
-        inner.stack.clone(),
-    ));
+    let _inner_tun = inner.tun;
+    let (mut socks_task, mut http_task) = if let Some(inner_stack) = inner.stack {
+        let socks_listener = socks::bind(listen).await?;
+        let http_listener = http_proxy::bind(http_listen).await?;
+        let socks_stack = inner_stack.clone();
+        let socks_task = tokio::spawn(async move {
+            log::info!("[+] socks5 server listening on {listen}");
+            socks::serve_listener(socks_listener, socks_stack).await
+        });
+        let http_task = tokio::spawn(http_proxy::serve_listener(http_listener, inner_stack));
+        session_event::emit(SessionEvent::ProxyReady {
+            socks: listen.to_string(),
+            http: http_listen.to_string(),
+        });
+        (Some(socks_task), Some(http_task))
+    } else {
+        (None, None)
+    };
 
-    session_event::emit(SessionEvent::ProxyReady {
-        socks: listen.to_string(),
-        http: http_listen.to_string(),
-    });
     session_event::emit(SessionEvent::TunnelReady {
         transport: "mim".into(),
     });
     session_event::set_phase(session_event::Phase::Tunnel);
     session_event::emit(SessionEvent::Connected {
-        detail: format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)"),
+        detail: if socks_task.is_some() {
+            format!("masque-in-masque ready: {peer} (outer) and {inner_peer} (inner)")
+        } else {
+            format!(
+                "masque-in-masque full-device tunnel ready: {peer} (outer) and {inner_peer} (inner)"
+            )
+        },
     });
 
     let _stats_task = spawn_stats_task();
     let _inner_addr_task = inner.addr_task;
-    let mut http_task = Some(http_task);
     let mut inner_task = inner.tunnel_task;
-    let inner_stack = inner.stack;
 
     let result = {
-        let mut socks_fut = std::pin::pin!(socks::serve_listener(socks_listener, inner_stack));
         let mut supervise = tokio::time::interval(SUPERVISE_TICK);
         loop {
             tokio::select! {
-                r = &mut socks_fut => break r,
+                _ = await_opt(&mut socks_task) => break Err(AetherError::Other("socks5 server exited".into())),
                 _ = outer_task.done() => break Err(AetherError::Other("outer MASQUE tunnel exited".into())),
                 _ = inner_task.done() => break Err(AetherError::Other("inner MASQUE tunnel exited".into())),
                 _ = await_opt(&mut http_task) => break Err(AetherError::Other("http proxy exited".into())),
@@ -2583,6 +2703,10 @@ async fn run_masque_in_masque(
         }
     };
 
+    if let Some(task) = socks_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(task) = http_task.take() {
         task.abort();
         let _ = task.await;
@@ -2662,5 +2786,23 @@ async fn select_ip_version() -> prober::IpScan {
         Some("2") => prober::IpScan::V6,
         Some("3") => prober::IpScan::Both,
         _ => prober::IpScan::V4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tun_mode_enabled_reads_aether_tun_flag() {
+        let prev = runtime_env::var("AETHER_TUN");
+        runtime_env::set("AETHER_TUN", "1");
+        assert!(tun_mode_enabled());
+        runtime_env::set("AETHER_TUN", "0");
+        assert!(!tun_mode_enabled());
+        match prev {
+            Some(v) => runtime_env::set("AETHER_TUN", &v),
+            None => runtime_env::remove("AETHER_TUN"),
+        }
     }
 }

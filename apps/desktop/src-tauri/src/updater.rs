@@ -165,9 +165,7 @@ pub fn parse_sha256sums(body: &str, asset_name: &str) -> Option<String> {
         let mut parts = trimmed.split_whitespace();
         let digest = parts.next()?;
         let name = parts.next()?.trim_start_matches('*');
-        if name == asset_name
-            && digest.len() == 64
-            && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        if name == asset_name && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Some(digest.to_ascii_lowercase());
         }
@@ -176,9 +174,9 @@ pub fn parse_sha256sums(body: &str, asset_name: &str) -> Option<String> {
 }
 
 fn url_host(url: &str) -> Result<String, CommandError> {
-    let rest = url.strip_prefix("https://").ok_or_else(|| {
-        CommandError::new("invalid_url", "Update download URL must use HTTPS.")
-    })?;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| CommandError::new("invalid_url", "Update download URL must use HTTPS."))?;
     let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
     if host_port.is_empty() || host_port.contains('@') {
         return Err(CommandError::new("invalid_url", "Malformed download URL."));
@@ -196,7 +194,10 @@ fn url_host(url: &str) -> Result<String, CommandError> {
 
 pub fn validate_download_url(url: &str) -> Result<(), CommandError> {
     let host = url_host(url)?;
-    if !ALLOWED_DOWNLOAD_HOSTS.iter().any(|allowed| *allowed == host) {
+    if !ALLOWED_DOWNLOAD_HOSTS
+        .iter()
+        .any(|allowed| *allowed == host)
+    {
         return Err(CommandError::new(
             "untrusted_host",
             format!("Refusing update download from untrusted host '{host}'."),
@@ -230,9 +231,7 @@ pub fn validate_asset_name(name: &str) -> Result<(), CommandError> {
 
 fn sanitize_release_page(candidate: Option<&str>) -> String {
     match candidate {
-        Some(url)
-            if url.starts_with("https://github.com/deathline94/aether-next/releases") =>
-        {
+        Some(url) if url.starts_with("https://github.com/deathline94/aether-next/releases") => {
             url.to_string()
         }
         _ => RELEASES_PAGE.to_string(),
@@ -272,7 +271,9 @@ pub(crate) fn check_update_blocking(
         .set("User-Agent", &user_agent())
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| CommandError::new("update_check_failed", format!("Update check failed: {e}")))?;
+        .map_err(|e| {
+            CommandError::new("update_check_failed", format!("Update check failed: {e}"))
+        })?;
 
     let body = resp.into_string().map_err(|e| {
         CommandError::new(
@@ -315,8 +316,7 @@ pub(crate) fn check_update_blocking(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
-    let (asset_name, asset_url, asset_size) =
-        select_windows_asset(assets).unwrap_or_default();
+    let (asset_name, asset_url, asset_size) = select_windows_asset(assets).unwrap_or_default();
     let available = semver_gt(&latest_version, current) && !asset_url.is_empty();
 
     let sha256 = if available {
@@ -432,7 +432,13 @@ pub(crate) fn download_and_install_blocking(
             .is_some_and(|want| sha256_file_hex(&dest).is_ok_and(|got| got == *want));
 
     if !cached_ok {
-        emit_progress(&app, "downloading", 0, 0, "Connecting to GitHub Releases...");
+        emit_progress(
+            &app,
+            "downloading",
+            0,
+            0,
+            "Connecting to GitHub Releases...",
+        );
         let client = build_http_client(http_port, use_local_proxy, 60)?;
         let resp = client
             .get(&asset_url)
@@ -440,7 +446,10 @@ pub(crate) fn download_and_install_blocking(
             .call()
             .map_err(|e| {
                 emit_progress(&app, "error", 0, 0, &format!("Download failed: {e}"));
-                CommandError::new("update_download_failed", format!("Update download failed: {e}"))
+                CommandError::new(
+                    "update_download_failed",
+                    format!("Update download failed: {e}"),
+                )
             })?;
 
         // Re-check final host after GitHub's 302 redirect to CDN.
@@ -502,7 +511,13 @@ pub(crate) fn download_and_install_blocking(
         }
         drop(file);
 
-        emit_progress(&app, "verifying", downloaded, total, "Verifying SHA-256 digest...");
+        emit_progress(
+            &app,
+            "verifying",
+            downloaded,
+            total,
+            "Verifying SHA-256 digest...",
+        );
         let digest = hasher.finalize();
         let mut got_hex = String::with_capacity(64);
         for b in digest {

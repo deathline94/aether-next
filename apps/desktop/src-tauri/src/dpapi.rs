@@ -239,8 +239,9 @@ pub fn decrypt_with(data: &[u8], svc: KeyService) -> Result<Vec<u8>, CommandErro
     match svc {
         #[cfg(windows)]
         KeyService::Dpapi => {
-            let cb_data = u32::try_from(data.len())
-                .map_err(|_| CommandError::new("internal", "DPAPI ciphertext exceeds u32 length"))?;
+            let cb_data = u32::try_from(data.len()).map_err(|_| {
+                CommandError::new("internal", "DPAPI ciphertext exceeds u32 length")
+            })?;
             let in_blob = CRYPT_INTEGER_BLOB {
                 cbData: cb_data,
                 pbData: data.as_ptr() as *mut u8,
@@ -304,7 +305,11 @@ const DPAPI_MAGIC: &[u8] = b"DP01";
 fn unwrap_dpapi_config_key(key_file: &Path, raw: &[u8]) -> Result<Zeroizing<String>, CommandError> {
     use base64::Engine;
     if !raw.starts_with(DPAPI_MAGIC) {
-        return Err(format!("invalid DPAPI key envelope header in {}", key_file.display()).into());
+        return Err(format!(
+            "invalid DPAPI key envelope header in {}",
+            key_file.display()
+        )
+        .into());
     }
     let decrypted = Zeroizing::new(decrypt(&raw[DPAPI_MAGIC.len()..])?);
     if decrypted.len() != 32 {
@@ -324,7 +329,9 @@ fn unwrap_dpapi_config_key(key_file: &Path, raw: &[u8]) -> Result<Zeroizing<Stri
 
 /// Derives or retrieves the 32-byte DPAPI-protected configuration master key.
 /// Returns the base64-encoded string representation for `AETHER_CONFIG_KEY`.
-pub fn get_or_create_dpapi_config_key(app_data_dir: &Path) -> Result<Zeroizing<String>, CommandError> {
+pub fn get_or_create_dpapi_config_key(
+    app_data_dir: &Path,
+) -> Result<Zeroizing<String>, CommandError> {
     use base64::Engine;
     let key_file = app_data_dir.join("config_key.dpapi");
     // Open directly rather than probing `exists()`: a PermissionDenied or

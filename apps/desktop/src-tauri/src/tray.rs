@@ -83,7 +83,10 @@ pub(crate) fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Erro
                 Ok(windows_proxy::RecoverOutcome::Nothing) => {}
                 Err(error) => {
                     repair_failed = true;
-                    emit_log(app.handle(), format!("Windows proxy recovery failed: {error}"));
+                    emit_log(
+                        app.handle(),
+                        format!("Windows proxy recovery failed: {error}"),
+                    );
                 }
             }
         }

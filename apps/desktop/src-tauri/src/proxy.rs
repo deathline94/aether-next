@@ -180,7 +180,6 @@ pub mod windows_proxy {
     /// `0x4` = PROXY_TYPE_AUTO_PROXY_URL (PAC), `0x8` = PROXY_TYPE_AUTO_DETECT (WPAD).
     const FLAG_USE_PROXY: u32 = 0x2;
     const FLAG_USE_SCRIPT: u32 = 0x4;
-    const FLAG_AUTO_DETECT: u32 = 0x8;
     const MIN_VERSION: u32 = 0x3C;
     const MAX_VERSION: u32 = 0x50;
 
@@ -218,8 +217,10 @@ pub mod windows_proxy {
         let flags = u32::from_le_bytes(blob[8..12].try_into().expect("4 bytes"));
         let use_proxy = flags & FLAG_USE_PROXY != 0;
         let use_script = flags & FLAG_USE_SCRIPT != 0;
-        let auto_detect = flags & FLAG_AUTO_DETECT != 0;
-        if !use_proxy && !use_script && !auto_detect {
+        // Bare FLAG_AUTO_DETECT (WPAD) without an explicit proxy server or PAC
+        // script leaves DefaultConnectionSettings in charge, so ignore WPAD-only
+        // bits (which Windows sets by default on idle adapters and VPN dials).
+        if !use_proxy && !use_script {
             return Ok(None);
         }
         let mut pos = 12usize;
@@ -254,11 +255,93 @@ pub mod windows_proxy {
                 via_script: false,
             }));
         }
-        Ok(Some(PerConnectionProxy {
-            connection: connection.to_string(),
-            effective: "auto-detect (WPAD)".to_string(),
-            via_script: false,
-        }))
+        Ok(None)
+    }
+
+    /// Lowercased active dial-up / RAS connection names from `RasEnumConnectionsW`.
+    ///
+    /// Returns `None` when enumeration cannot complete so callers fail closed.
+    fn active_ras_connection_names() -> Option<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+        use windows_sys::Win32::NetworkManagement::Rras::{RasEnumConnectionsW, RASCONNW};
+
+        // Windows 11 rasapi32 rejects the newer 1388-byte struct size with
+        // ERROR_INVALID_SIZE (632) and expects the Win7 size ending before
+        // `guidCorrelationId` (1372 bytes on x64). Try both in raw storage so
+        // entry stride always matches `dwSize`.
+        const ERROR_BUFFER_TOO_SMALL: u32 = 603;
+        const ERROR_INVALID_SIZE: u32 = 632;
+
+        let win7_size = core::mem::offset_of!(RASCONNW, guidCorrelationId);
+        let full_size = std::mem::size_of::<RASCONNW>();
+        let name_offset = core::mem::offset_of!(RASCONNW, szEntryName);
+
+        for stride in [win7_size, full_size] {
+            let mut count = 16usize;
+            for _ in 0..3 {
+                let words_len = (count * stride).div_ceil(4);
+                let mut words = vec![0u32; words_len];
+                let raw = unsafe {
+                    std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words_len * 4)
+                };
+                let size_bytes = (stride as u32).to_le_bytes();
+                for i in 0..count {
+                    let off = i * stride;
+                    raw[off..off + 4].copy_from_slice(&size_bytes);
+                }
+                let mut bytes = (count * stride) as u32;
+                let mut written = 0u32;
+                let rc = unsafe {
+                    RasEnumConnectionsW(
+                        words.as_mut_ptr().cast::<RASCONNW>(),
+                        &mut bytes,
+                        &mut written,
+                    )
+                };
+                match rc {
+                    0 => {
+                        let mut active = HashSet::with_capacity(written as usize);
+                        for i in 0..(written as usize).min(count) {
+                            let start = i * stride + name_offset;
+                            let mut units = Vec::with_capacity(257);
+                            for j in 0..257 {
+                                let lo = raw[start + j * 2];
+                                let hi = raw[start + j * 2 + 1];
+                                let ch = u16::from_le_bytes([lo, hi]);
+                                if ch == 0 {
+                                    break;
+                                }
+                                units.push(ch);
+                            }
+                            let name = String::from_utf16_lossy(&units).trim().to_lowercase();
+                            if !name.is_empty() {
+                                active.insert(name);
+                            }
+                        }
+                        return Some(active);
+                    }
+                    ERROR_BUFFER_TOO_SMALL => {
+                        count = (bytes as usize).div_ceil(stride).max(count * 2);
+                    }
+                    ERROR_INVALID_SIZE => break,
+                    _ => return None,
+                }
+            }
+        }
+        None
+    }
+
+    fn filter_active_connection_names(
+        conflicts: Vec<PerConnectionProxy>,
+        active_names: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<PerConnectionProxy> {
+        let Some(active) = active_names else {
+            return conflicts;
+        };
+        conflicts
+            .into_iter()
+            .filter(|c| active.contains(&c.connection.to_lowercase()))
+            .collect()
     }
 
     /// Which of this user's dial-up/VPN connections under
@@ -298,7 +381,8 @@ pub mod windows_proxy {
                 Err(why) => return Err(why),
             }
         }
-        Ok(out)
+        let active = active_ras_connection_names();
+        Ok(filter_active_connection_names(out, active.as_ref()))
     }
     /// Refuse to take over the system proxy on a machine whose connections decide
     /// their own route.
@@ -476,6 +560,41 @@ pub mod windows_proxy {
         #[test]
         fn a_machine_with_no_per_connection_proxy_is_not_blocked() {
             assert!(preflight_per_connection(Ok(Vec::new())).is_none());
+        }
+
+        #[test]
+        fn wpad_only_auto_detect_is_not_a_conflict() {
+            const FLAG_AUTO_DETECT: u32 = 0x8;
+            let b = blob(0x46, 0x1 | FLAG_AUTO_DETECT, None, None);
+            assert!(decode_connection_proxy(&b, "s1ppp.we-love-vitamin.com")
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn disconnected_ras_profiles_do_not_block_system_proxy() {
+            let mut active = std::collections::HashSet::new();
+            active.insert("active-vpn".to_string());
+            let candidates = vec![
+                PerConnectionProxy {
+                    connection: "144.126.151.157".to_string(),
+                    effective: "127.0.0.1:8080".to_string(),
+                    via_script: false,
+                },
+                PerConnectionProxy {
+                    connection: "Active-VPN".to_string(),
+                    effective: "198.51.100.2:3128".to_string(),
+                    via_script: false,
+                },
+            ];
+            let filtered = filter_active_connection_names(candidates.clone(), Some(&active));
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].connection, "Active-VPN");
+            assert_eq!(
+                filter_active_connection_names(candidates, None).len(),
+                2,
+                "unknown active set must fail closed"
+            );
         }
 
         #[test]
@@ -896,9 +1015,10 @@ pub mod windows_proxy {
     }
 
     fn clear_mirror() {
-        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags(JOURNAL_SUBKEY, winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE)
-        {
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(
+            JOURNAL_SUBKEY,
+            winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE,
+        ) {
             match key.delete_value(JOURNAL_VALUE) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
