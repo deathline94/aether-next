@@ -4,10 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
 import {
+  applyProtocolScopedPatch,
+  clearProtocolProfiles,
   describeRejectedState,
   parseSessionStats,
   RELEASES_PAGE,
   releasePageUrl,
+  syncProtocolProfile,
   useInlineUpdater,
   type InstallOutcome,
   type SessionStats,
@@ -201,6 +204,7 @@ export function useRuntime(
           // Merge, never replace: a field this build's shell does not send has to
           // fall back to the default the panels assume, not become `undefined`.
           const { settings: merged, corrected } = parseSettings(loadedSettings);
+          syncProtocolProfile(merged);
           settingsRef.current = merged;
           setSettings(merged);
           setSettingsLoadError(false);
@@ -367,7 +371,7 @@ export function useRuntime(
     if (settingsLocked) return;
     // A validation error describes the value being replaced, not the new one.
     setSaveError(null);
-    setSettings((prev) => ({ ...prev, ...patch }));
+    setSettings((prev) => applyProtocolScopedPatch(prev, patch));
   }, [settingsLocked]);
 
   // Persist as an effect of settings changing — keeps the state updater pure.
@@ -430,7 +434,11 @@ export function useRuntime(
         await safeDisconnect();
         await new Promise((r) => setTimeout(r, 400));
       }
-      const nextSettings: Settings = { ...settings, protocol: protocol as Settings["protocol"], transport: transport as Settings["transport"], peer };
+      const nextSettings: Settings = applyProtocolScopedPatch(settings, {
+        protocol: protocol as Settings["protocol"],
+        transport: transport as Settings["transport"],
+        peer,
+      });
       // Keep UI state in sync with what the engine actually runs — otherwise
       // the Connection tab reports the previous protocol.
       setSettings(nextSettings);
@@ -479,6 +487,7 @@ export function useRuntime(
       if (loaded) {
         // The same merge as hydration: "Retry" must not be a second, weaker path.
         const { settings: merged, corrected } = parseSettings(loaded);
+        syncProtocolProfile(merged);
         settingsRef.current = merged;
         setSettings(merged);
         setSettingsLoadError(false);
@@ -509,6 +518,8 @@ export function useRuntime(
     try {
       const reset = await invoke<Settings>("reset_settings");
       const { settings: merged } = parseSettings(reset);
+      clearProtocolProfiles();
+      syncProtocolProfile(merged);
       settingsRef.current = merged;
       setSettings(merged);
       setSaveError(null);

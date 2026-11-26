@@ -421,6 +421,14 @@ export function formatUptimeClock(secs: number): string {
 export { useOnline } from "./hooks/useOnline";
 export { useTheme, type ThemeMode } from "./hooks/useTheme";
 export {
+  applyProtocolScopedPatch,
+  clearProtocolProfiles,
+  protocolProfileKey,
+  syncProtocolProfile,
+  type ProtocolScopedSettings,
+  type ProtocolTuning,
+} from "./protocolProfiles";
+export {
   useInlineUpdater,
   type InlineUpdaterDeps,
   type InlineUpdaterState,

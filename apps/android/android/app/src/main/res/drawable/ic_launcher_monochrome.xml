@@ -6,10 +6,10 @@
     android:viewportHeight="108"
     android:tint="#FFFFFF">
     <group
-        android:translateX="27.6"
-        android:translateY="27.6"
-        android:scaleX="2.2"
-        android:scaleY="2.2">
+        android:translateX="19.8"
+        android:translateY="16.8"
+        android:scaleX="2.85"
+        android:scaleY="2.85">
         <path
             android:fillColor="#00000000"
             android:strokeColor="#FFFFFF"

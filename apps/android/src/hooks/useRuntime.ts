@@ -9,8 +9,11 @@ import type { RuntimeState, Settings } from "../types";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 import {
+  applyProtocolScopedPatch,
+  clearProtocolProfiles,
   describeRejectedState,
   parseSessionStats,
+  syncProtocolProfile,
   useInlineUpdater,
   type InstallOutcome,
   type SessionStats,
@@ -128,6 +131,7 @@ export function useRuntime(
       const parsed = loaded === null ? null : parseSettingsPayload(loaded);
       if (parsed?.ok) {
         const { settings: merged, corrected } = parsed;
+        syncProtocolProfile(merged);
         settingsRef.current = merged;
         setSettings(merged);
         // A readable payload is not yet a readable *profile*: while the shell reports
@@ -368,7 +372,7 @@ export function useRuntime(
     if (settingsLocked) return;
     // A validation error describes the value being replaced, not the new one.
     setSaveError(null);
-    setSettings((prev) => ({ ...prev, ...patch }));
+    setSettings((prev) => applyProtocolScopedPatch(prev, patch));
   }, [settingsLocked]);
 
   // Persist as an effect of settings changing — keeps the state updater pure.
@@ -439,7 +443,7 @@ export function useRuntime(
         await new Promise((r) => setTimeout(r, 400));
       }
       // Pin the chosen endpoint so the engine skips scanning and dials it directly.
-      const nextSettings: Settings = { ...settings, protocol, transport, peer };
+      const nextSettings: Settings = applyProtocolScopedPatch(settings, { protocol, transport, peer });
       setSettings(nextSettings);
       // No endpoint until the shell reports one: nothing has been reached yet, so
       // naming `peer` here would present it as the address carrying traffic.
@@ -512,7 +516,10 @@ export function useRuntime(
    * takes the form out of "reading from disk" and onto the defaults now on disk.
    */
   const resetSettings = useCallback(async () => {
-    if (await resetCorruptReport()) await retrySettings();
+    if (await resetCorruptReport()) {
+      clearProtocolProfiles();
+      await retrySettings();
+    }
   }, [resetCorruptReport, retrySettings]);
 
   return {

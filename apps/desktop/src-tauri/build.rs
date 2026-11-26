@@ -231,5 +231,7 @@ fn main() {
     fs::write(&dest_path, code)
         .unwrap_or_else(|e| die(&format!("cannot write {}: {e}", dest_path.display()), ""));
 
+    println!("cargo:rerun-if-changed=icons/icon.ico");
+    println!("cargo:rerun-if-changed=icons/icon.png");
     tauri_build::build();
 }
