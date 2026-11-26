@@ -1165,11 +1165,6 @@ option:disabled { color: var(--muted); }
   gap: 8px;
 }
 
-.banner-action svg {
-  margin-right: 4px;
-  vertical-align: -2px;
-}
-
 .save-indicator {
   display: inline-flex;
   align-items: center;

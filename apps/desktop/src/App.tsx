@@ -101,6 +101,12 @@ export function App() {
     testResult,
     appVersion,
     updateAvailable,
+    updateInfo,
+    updateProgress,
+    updateChecking,
+    updateCheckError,
+    checkForUpdates,
+    installUpdate,
     connected,
     running,
     settingsLocked,
@@ -281,7 +287,11 @@ export function App() {
                 admin={admin}
                 online={online}
                 testResult={testResult}
+                appVersion={appVersion}
                 updateAvailable={updateAvailable}
+                updateInfo={updateInfo}
+                updateProgress={updateProgress}
+                installUpdate={installUpdate}
                 dismissUpdate={dismissUpdate}
                 toggleConnection={toggleConnection}
                 patchSettings={patchSettings}
@@ -353,6 +363,13 @@ export function App() {
                 saved={saved}
                 dirty={dirty}
                 saveError={saveError}
+                appVersion={appVersion}
+                updateInfo={updateInfo}
+                updateProgress={updateProgress}
+                updateChecking={updateChecking}
+                updateCheckError={updateCheckError}
+                onCheckUpdates={checkForUpdates}
+                onInstallUpdate={installUpdate}
                 patchSettings={patchSettings}
               />
             </ErrorBoundary>

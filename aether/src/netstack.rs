@@ -363,28 +363,16 @@ pub enum DataIn {
 pub struct TcpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<Vec<u8>>,
-    data_in: mpsc::Sender<DataIn>,
-    dead: Arc<AtomicBool>,
+    sender: TcpSender,
 }
 
 impl TcpConn {
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
-        check_live(&self.dead)?;
-        self.data_in
-            .send(DataIn::Tcp(self.id, data))
-            .await
-            .map_err(|_| AetherError::Other("netstack closed".into()))
+        self.sender.send(data).await
     }
 
     pub fn into_split(self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
-        (
-            TcpSender {
-                id: self.id,
-                data_in: self.data_in,
-                dead: self.dead,
-            },
-            self.from_stack,
-        )
+        (self.sender, self.from_stack)
     }
 }
 
@@ -398,33 +386,57 @@ fn check_live(dead: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-pub struct TcpSender {
+struct TcpSenderShared {
     id: usize,
     data_in: mpsc::Sender<DataIn>,
     dead: Arc<AtomicBool>,
+    closed: AtomicBool,
 }
 
-impl Clone for TcpSender {
-    fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            data_in: self.data_in.clone(),
-            dead: self.dead.clone(),
+impl Drop for TcpSenderShared {
+    fn drop(&mut self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            // Best-effort non-blocking close when the last TcpConn/TcpSender
+            // drops without calling `close()`, preventing TCP flow leaks.
+            let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
         }
     }
 }
 
+#[derive(Clone)]
+pub struct TcpSender {
+    shared: Arc<TcpSenderShared>,
+}
+
 impl TcpSender {
+    fn new(id: usize, data_in: mpsc::Sender<DataIn>, dead: Arc<AtomicBool>) -> Self {
+        Self {
+            shared: Arc::new(TcpSenderShared {
+                id,
+                data_in,
+                dead,
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
-        check_live(&self.dead)?;
-        self.data_in
-            .send(DataIn::Tcp(self.id, data))
+        check_live(&self.shared.dead)?;
+        self.shared
+            .data_in
+            .send(DataIn::Tcp(self.shared.id, data))
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))
     }
 
     pub async fn close(&self) {
-        let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
+        if !self.shared.closed.swap(true, Ordering::AcqRel) {
+            let _ = self
+                .shared
+                .data_in
+                .send(DataIn::TcpClose(self.shared.id))
+                .await;
+        }
     }
 }
 
@@ -1628,10 +1640,9 @@ fn service_tcp(s: &mut NetStack) {
                 st.established = true;
                 if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
                     let conn = TcpConn {
-                        dead: st.dead.clone(),
                         id,
                         from_stack: rx,
-                        data_in: data_in_tx.clone(),
+                        sender: TcpSender::new(id, data_in_tx.clone(), st.dead.clone()),
                     };
                     orphaned = resp.send(Ok(conn)).is_err();
                 }
@@ -1930,8 +1941,7 @@ mod tests {
         let conn = TcpConn {
             id: 3,
             from_stack: mpsc::channel(1).1,
-            data_in: tx,
-            dead: dead.clone(),
+            sender: TcpSender::new(3, tx, dead.clone()),
         };
         let (sender, _rx) = conn.into_split();
 
@@ -2583,5 +2593,42 @@ mod tests {
         };
         assert!(msg.contains("loopback"), "unexpected refusal: {msg}");
         assert!(stack.tcp_conns.is_empty(), "a refused connect took a slot");
+    }
+
+    #[test]
+    fn tcp_conn_and_sender_drop_emit_close_once_without_premature_close_on_split() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let conn = TcpConn {
+            id: 42,
+            from_stack: mpsc::channel(1).1,
+            sender: TcpSender::new(42, tx.clone(), Arc::new(AtomicBool::new(false))),
+        };
+        let (sender, _recv) = conn.into_split();
+        assert!(
+            rx.try_recv().is_err(),
+            "into_split must not prematurely send TcpClose"
+        );
+        let cloned = sender.clone();
+        drop(sender);
+        assert!(
+            rx.try_recv().is_err(),
+            "dropping one clone while another remains live must not close the flow"
+        );
+        drop(cloned);
+        assert!(
+            matches!(rx.try_recv(), Ok(DataIn::TcpClose(42))),
+            "dropping the final TcpSender must send DataIn::TcpClose(42)"
+        );
+
+        let unsplit = TcpConn {
+            id: 99,
+            from_stack: mpsc::channel(1).1,
+            sender: TcpSender::new(99, tx, Arc::new(AtomicBool::new(false))),
+        };
+        drop(unsplit);
+        assert!(
+            matches!(rx.try_recv(), Ok(DataIn::TcpClose(99))),
+            "dropping an unsplit TcpConn must send DataIn::TcpClose(99)"
+        );
     }
 }

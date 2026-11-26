@@ -363,19 +363,6 @@ option:disabled { color: var(--muted); }
   flex: 1;
 }
 
-.update-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 14px;
-  border-radius: var(--radius-card);
-  font-size: 13px;
-  background: var(--emerald-dim);
-  border: 1px solid var(--emerald-border);
-  color: var(--fg);
-}
-
 .tactical-input-wrapper .input-affix-icon {
   position: absolute;
   left: 10px;
@@ -735,12 +722,6 @@ option:disabled { color: var(--muted); }
 .proxy-addr {
   font-size: 13px;
   color: var(--fg);
-}
-
-.banner-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
 }
 
 /* Shared Section Chrome */

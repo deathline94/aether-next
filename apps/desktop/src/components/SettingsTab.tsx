@@ -12,7 +12,12 @@ import {
   X,
 } from "lucide-react";
 import { memo, useEffect, useState } from "react";
-import { noiseIsInert } from "@aether/ui";
+import {
+  noiseIsInert,
+  UpdateSettingsRow,
+  type UpdateInfo,
+  type UpdateProgress,
+} from "@aether/ui";
 import {
   IP_FAMILY_OPTIONS,
   NOIZE_OPTIONS,
@@ -56,6 +61,13 @@ interface SettingsTabProps {
   saved: boolean;
   dirty?: boolean;
   saveError?: IpcError | null;
+  appVersion?: string;
+  updateInfo?: UpdateInfo | null;
+  updateProgress?: UpdateProgress | null;
+  updateChecking?: boolean;
+  updateCheckError?: string | null;
+  onCheckUpdates?: () => void | Promise<void>;
+  onInstallUpdate?: () => void | Promise<void>;
   patchSettings: (patch: Partial<Settings>) => void;
 }
 
@@ -69,6 +81,13 @@ function SettingsTabImpl({
   saved,
   dirty = false,
   saveError,
+  appVersion = "1.3.16",
+  updateInfo = null,
+  updateProgress = null,
+  updateChecking = false,
+  updateCheckError = null,
+  onCheckUpdates,
+  onInstallUpdate,
   patchSettings,
 }: SettingsTabProps) {
   const portsCollide = settings.httpPort === settings.socksPort;
@@ -502,6 +521,18 @@ function SettingsTabImpl({
             />
           </div>
         </div>
+
+        {onCheckUpdates && (
+          <UpdateSettingsRow
+            appVersion={appVersion}
+            updateInfo={updateInfo}
+            updateProgress={updateProgress}
+            updateChecking={updateChecking}
+            updateCheckError={updateCheckError}
+            onCheck={onCheckUpdates}
+            onInstall={onInstallUpdate}
+          />
+        )}
       </section>
 
       {saveError && (

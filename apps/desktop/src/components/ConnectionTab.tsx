@@ -1,7 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUpRight, Check, CircleAlert, WifiOff, X } from "lucide-react";
+import { Check, CircleAlert, WifiOff, X } from "lucide-react";
 import { memo } from "react";
-import { formatThroughputRate, formatUptimeClock, type SessionStats } from "@aether/ui";
+import {
+  formatThroughputRate,
+  formatUptimeClock,
+  InlineUpdateBanner,
+  releasePageUrl,
+  type SessionStats,
+  type UpdateInfo,
+  type UpdateProgress,
+} from "@aether/ui";
 import { CopyButton } from "./ui";
 import {
   connectionTestCopy,
@@ -16,7 +24,6 @@ import {
 } from "@aether/ui/statusCopy";
 import type { PlatformCapabilities } from "@aether/ui/statusCopy";
 import type { RuntimeState, Settings } from "../types";
-import { releasePageUrl } from "../updateCheck";
 
 export const PLATFORM: PlatformCapabilities = {
   canSetSystemProxy: true,
@@ -42,6 +49,9 @@ interface ConnectionTabProps {
   testResult: string | null;
   appVersion?: string;
   updateAvailable?: { version: string; url: string } | null;
+  updateInfo?: UpdateInfo | null;
+  updateProgress?: UpdateProgress | null;
+  installUpdate?: () => void | Promise<void>;
   dismissUpdate?: () => void;
   toggleConnection: () => void;
   patchSettings: (patch: Partial<Settings>) => void;
@@ -79,7 +89,11 @@ function ConnectionTabImpl({
   settingsLoaded,
   online = true,
   testResult,
+  appVersion = "0.0.0",
   updateAvailable = null,
+  updateInfo = null,
+  updateProgress = null,
+  installUpdate,
   dismissUpdate,
   toggleConnection,
   patchSettings,
@@ -97,6 +111,22 @@ function ConnectionTabImpl({
     ? `${formatThroughputRate(stats.downBps)} ↓ · ${formatThroughputRate(stats.upBps)} ↑`
     : "—";
 
+  const effectiveUpdate: UpdateInfo | null =
+    updateInfo ??
+    (updateAvailable
+      ? {
+          available: true,
+          currentVersion: appVersion,
+          latestVersion: updateAvailable.version.replace(/^v/, ""),
+          releaseUrl: updateAvailable.url,
+          assetName: "",
+          assetUrl: "",
+          assetSize: 0,
+          sha256: null,
+          notes: "",
+        }
+      : null);
+
   return (
     <div className="home-view">
       {!online && (
@@ -108,24 +138,13 @@ function ConnectionTabImpl({
         </div>
       )}
 
-      {updateAvailable && (
-        <div className="update-banner" role="status">
-          <div className="error-banner-content">
-            <ArrowUpRight size={16} aria-hidden="true" />
-            <span>
-              <strong>{updateAvailable.version}</strong> is available
-            </span>
-          </div>
-          <div className="banner-actions">
-            <button type="button" className="banner-action" onClick={() => void invoke("plugin:opener|open_url", { url: releasePageUrl(updateAvailable.url) })}>
-              View release
-            </button>
-            <button type="button" className="error-banner-dismiss" onClick={dismissUpdate} aria-label="Dismiss update">
-              <X size={14} aria-hidden="true" />
-            </button>
-          </div>
-        </div>
-      )}
+      <InlineUpdateBanner
+        updateInfo={effectiveUpdate}
+        updateProgress={updateProgress}
+        onInstall={effectiveUpdate?.assetUrl && installUpdate ? installUpdate : undefined}
+        onOpenRelease={(url) => void invoke("plugin:opener|open_url", { url: releasePageUrl(url) })}
+        onDismiss={dismissUpdate}
+      />
 
       {runtime.status === "error" && (
         <div className="error-banner" role="alert">

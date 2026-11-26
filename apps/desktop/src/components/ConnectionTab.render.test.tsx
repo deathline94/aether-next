@@ -169,4 +169,43 @@ describe("the update banner's opener", () => {
     fireEvent.click(screen.getByRole("button", { name: "View release" }));
     expect(invoke).toHaveBeenCalledWith("plugin:opener|open_url", { url: RELEASES_PAGE });
   });
+
+  it("triggers inline download and install when assetUrl and handler are provided", () => {
+    const installUpdate = vi.fn();
+    render(
+      <ConnectionTab
+        settings={defaults}
+        runtime={{ ...initialRuntime, status: "connected", detail: "Session is up." }}
+        busy={false}
+        testBusy={false}
+        connected
+        running
+        settingsLocked
+        settingsLoaded
+        admin
+        testResult={null}
+        appVersion="1.3.16"
+        updateInfo={{
+          available: true,
+          currentVersion: "1.3.16",
+          latestVersion: "1.3.17",
+          releaseUrl: RELEASES_PAGE,
+          assetName: "AetherNext-windows-x64-setup.exe",
+          assetUrl: "https://github.com/deathline94/aether-next/releases/download/v1.3.17/AetherNext-windows-x64-setup.exe",
+          assetSize: 6_700_000,
+          sha256: "a".repeat(64),
+          notes: "",
+        }}
+        installUpdate={installUpdate}
+        dismissUpdate={vi.fn()}
+        toggleConnection={vi.fn()}
+        patchSettings={vi.fn()}
+        runTest={vi.fn()}
+        dismissError={vi.fn()}
+        appendLog={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Download & install" }));
+    expect(installUpdate).toHaveBeenCalledTimes(1);
+  });
 });

@@ -1,6 +1,14 @@
 import { ChevronRight, CircleAlert, WifiOff, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
-import { formatThroughputRate, formatUptimeClock, noiseIsInert, type SessionStats } from "@aether/ui";
+import {
+  formatThroughputRate,
+  formatUptimeClock,
+  InlineUpdateBanner,
+  noiseIsInert,
+  type SessionStats,
+  type UpdateInfo,
+  type UpdateProgress,
+} from "@aether/ui";
 import { AetherMark, CopyButton } from "./ui";
 import {
   connectionTestCopy,
@@ -77,6 +85,10 @@ interface ConnectionTabProps {
   online?: boolean;
   testResult: TestOutcome | null;
   appVersion?: string;
+  updateInfo?: UpdateInfo | null;
+  updateProgress?: UpdateProgress | null;
+  installUpdate?: () => void | Promise<void>;
+  dismissUpdate?: () => void;
   toggleConnection: () => void;
   patchSettings: (patch: Partial<Settings>) => void;
   runTest: () => void;
@@ -96,6 +108,10 @@ function ConnectionTabImpl({
   settingsLoaded,
   online = true,
   testResult,
+  updateInfo = null,
+  updateProgress = null,
+  installUpdate,
+  dismissUpdate,
   toggleConnection,
   patchSettings,
   runTest,
@@ -144,6 +160,13 @@ function ConnectionTabImpl({
           </div>
         </div>
       )}
+
+      <InlineUpdateBanner
+        updateInfo={updateInfo}
+        updateProgress={updateProgress}
+        onInstall={updateInfo?.assetUrl && installUpdate ? installUpdate : undefined}
+        onDismiss={dismissUpdate}
+      />
 
       {runtime.status === "error" && (
         <div className="error-banner" role="alert">

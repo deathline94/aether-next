@@ -242,7 +242,8 @@ export async function invoke<T = unknown>(
     // A dispatched command answers with a token; the page keeps running while the
     // shell works, and the settled envelope is collected below.
     if (isPending(data)) {
-      return awaitResult<T>(data.pending, data.pollMs ?? 120, SETTLE_BUDGET_MS);
+      const budget = cmd === "download_and_install_update" ? 300_000 : SETTLE_BUDGET_MS;
+      return awaitResult<T>(data.pending, data.pollMs ?? 120, budget);
     }
     return data as T;
   }
@@ -360,6 +361,23 @@ async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>): Promi
       return {
         detail: "OK via http://127.0.0.1:1820 · ip=mock loc=?",
         latencyMs: 42,
+      } as T;
+    case "check_update":
+      return {
+        available: false,
+        currentVersion: packageVersion,
+        latestVersion: packageVersion,
+        releaseUrl: "https://github.com/deathline94/aether-next/releases",
+        assetName: "",
+        assetUrl: "",
+        assetSize: 0,
+        sha256: null,
+        notes: "",
+      } as T;
+    case "download_and_install_update":
+      return {
+        status: "installing",
+        path: "mock://AetherNext-android-universal.apk",
       } as T;
     case "app_info":
       return {

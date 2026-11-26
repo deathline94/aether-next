@@ -30,6 +30,7 @@ mod state;
 mod supervision;
 pub(crate) mod tray;
 mod trust;
+mod updater;
 
 pub use acl::restrict_directory_acl;
 pub use error::CommandError;
@@ -207,6 +208,39 @@ async fn stop_scan(app: AppHandle) -> Result<(), CommandError> {
     command_blocking("stop_scan", move || scan::stop_scan_blocking(app)).await
 }
 
+#[tauri::command]
+async fn check_update(
+    http_port: Option<u16>,
+    use_local_proxy: bool,
+) -> Result<updater::UpdateInfo, CommandError> {
+    command_blocking("check_update", move || {
+        updater::check_update_blocking(http_port, use_local_proxy)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn download_and_install_update(
+    app: AppHandle,
+    asset_url: String,
+    asset_name: String,
+    sha256: Option<String>,
+    http_port: Option<u16>,
+    use_local_proxy: bool,
+) -> Result<updater::InstallOutcome, CommandError> {
+    command_blocking("download_and_install_update", move || {
+        updater::download_and_install_blocking(
+            app,
+            asset_url,
+            asset_name,
+            sha256,
+            http_port,
+            use_local_proxy,
+        )
+    })
+    .await
+}
+
 /* ------------------------------------------------------------ composition */
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -246,7 +280,9 @@ pub fn run() {
             test_connection,
             diagnostics,
             scan,
-            stop_scan
+            stop_scan,
+            check_update,
+            download_and_install_update
         ])
         .build(tauri::generate_context!());
     match app {

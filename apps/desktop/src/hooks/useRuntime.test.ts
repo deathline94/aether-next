@@ -472,14 +472,27 @@ describe("desktop useRuntime update check", () => {
   });
 
   it("does not copy a release URL the API hands it", async () => {
-    // The banner's URL comes from api.github.com's JSON; it used to reach
-    // plugin:opener, and window.open, unchecked.
-    const fetchMock = vi.fn().mockResolvedValue({
-      json: async () => ({ tag_name: "v9.9.9", html_url: "javascript:alert(1)" }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
     const emit = captureState();
-    stubInvoke(shellSettings());
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "get_settings") return shellSettings();
+      if (command === "get_state") return null;
+      if (command === "is_admin") return false;
+      if (command === "app_info") return { version: "1.2.9" };
+      if (command === "check_update") {
+        return {
+          available: true,
+          currentVersion: "1.2.9",
+          latestVersion: "9.9.9",
+          releaseUrl: "javascript:alert(1)",
+          assetName: "AetherNext-windows-x64-setup.exe",
+          assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-windows-x64-setup.exe",
+          assetSize: 6700000,
+          sha256: null,
+          notes: "",
+        };
+      }
+      return null;
+    });
 
     const { result } = renderHook(() => useRuntime(appendLog));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
@@ -491,37 +504,60 @@ describe("desktop useRuntime update check", () => {
   });
 
   it("does not contact the release host before a tunnel exists", async () => {
-    const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
-    vi.stubGlobal("fetch", fetchMock);
     stubInvoke(shellSettings());
 
     const { result } = renderHook(() => useRuntime(appendLog));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
     expect(result.current.connected).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("check_update", expect.anything());
   });
 
-  it("checks once the session is up, and aborts a check that outlives the view", async () => {
-    const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
-    vi.stubGlobal("fetch", fetchMock);
+  it("checks through the local proxy in proxy-only mode and supports inline install", async () => {
     const emit = captureState();
-    stubInvoke(shellSettings());
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === "get_settings") return shellSettings({ routingMode: "proxy-only", httpPort: 1820 });
+      if (command === "get_state") return null;
+      if (command === "is_admin") return false;
+      if (command === "app_info") return { version: "1.2.9" };
+      if (command === "check_update") {
+        return {
+          available: true,
+          currentVersion: "1.2.9",
+          latestVersion: "9.9.9",
+          releaseUrl: "https://github.com/deathline94/aether-next/releases/tag/v9.9.9",
+          assetName: "AetherNext-windows-x64-setup.exe",
+          assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-windows-x64-setup.exe",
+          assetSize: 6700000,
+          sha256: "a".repeat(64),
+          notes: "",
+        };
+      }
+      if (command === "download_and_install_update") {
+        return { status: "installing", path: "C:\\temp\\AetherNext-windows-x64-setup.exe" };
+      }
+      return null;
+    });
 
     const { result } = renderHook(() => useRuntime(appendLog));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
 
     emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.updateInfo?.available).toBe(true));
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("check_update", {
+      httpPort: 1820,
+      useLocalProxy: true,
+    });
 
-    const call = fetchMock.mock.calls[0];
-    if (!call) throw new Error("the release host was never contacted");
-    const url = String(call[0]);
-    expect(url).toContain("api.github.com");
-    const init = call[1] as RequestInit | undefined;
-    expect(init?.signal).toBeInstanceOf(AbortSignal);
-    expect(init?.signal?.aborted).toBe(false);
-
-    cleanup();
-    expect(init?.signal?.aborted).toBe(true);
+    await act(async () => {
+      await result.current.installUpdate();
+    });
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("download_and_install_update", {
+      assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-windows-x64-setup.exe",
+      assetName: "AetherNext-windows-x64-setup.exe",
+      sha256: "a".repeat(64),
+      httpPort: 1820,
+      useLocalProxy: true,
+    });
+    expect(result.current.updateProgress?.stage).toBe("installing");
   });
 });

@@ -87,6 +87,13 @@ function App() {
     admin,
     testResult,
     appVersion,
+    updateInfo,
+    updateProgress,
+    updateChecking,
+    updateCheckError,
+    checkForUpdates,
+    installUpdate,
+    dismissUpdate,
     settingsCorrupt,
     settingsCorruptionNotice,
     resetSettings,
@@ -210,6 +217,10 @@ function App() {
               online={online}
               testResult={testResult}
               appVersion={appVersion}
+              updateInfo={updateInfo}
+              updateProgress={updateProgress}
+              installUpdate={installUpdate}
+              dismissUpdate={dismissUpdate}
               toggleConnection={toggleConnection}
               patchSettings={patchSettings}
               runTest={runTest}
@@ -280,6 +291,12 @@ function App() {
               saveError={saveError}
               admin={admin}
               appVersion={appVersion}
+              updateInfo={updateInfo}
+              updateProgress={updateProgress}
+              updateChecking={updateChecking}
+              updateCheckError={updateCheckError}
+              onCheckUpdates={checkForUpdates}
+              onInstallUpdate={installUpdate}
               patchSettings={patchSettings}
               corrupt={
                 settingsCorrupt

@@ -573,6 +573,68 @@ select:disabled {
   font-weight: 600;
 }
 
+.banner-action svg {
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-card);
+  font-size: 13px;
+  background: var(--emerald-dim);
+  border: 1px solid var(--emerald-border);
+  color: var(--fg);
+}
+
+.update-banner-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 200px;
+}
+
+.update-banner-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.update-banner-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.update-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  overflow: hidden;
+}
+
+.update-progress-fill {
+  height: 100%;
+  background: var(--emerald);
+  transition: width var(--duration-fast) ease;
+}
+
+.banner-actions,
+.update-row-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .banner-action {
   min-height: 30px;
   padding: 4px 12px;

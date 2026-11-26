@@ -3,9 +3,16 @@ import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { defaults, initialRuntime, parseRuntimeState, parseSettings } from "../types";
 import type { RuntimeState, Settings } from "../types";
-import { describeRejectedState, parseSessionStats, type SessionStats } from "@aether/ui";
+import {
+  describeRejectedState,
+  parseSessionStats,
+  RELEASES_PAGE,
+  releasePageUrl,
+  useInlineUpdater,
+  type InstallOutcome,
+  type SessionStats,
+} from "@aether/ui";
 import { setupDesktopPreview } from "../previewBridge";
-import { RELEASES_PAGE, releasePageUrl, startUpdateCheck } from "../updateCheck";
 import { errorMessage, ipcError } from "../ipcError";
 import type { IpcError } from "../ipcError";
 
@@ -77,8 +84,6 @@ export function useRuntime(
   const [admin, setAdmin] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
-  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; url: string } | null>(null);
-  const [updateDismissed, setUpdateDismissed] = useState(false);
 
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -275,26 +280,33 @@ export function useRuntime(
     };
   }, [runtime.status, appendLog]);
 
-  // "A new version exists", nothing more.
-  //
-  // This is an unauthenticated `api.github.com` fetch with a swallowed error, so
-  // the 60-requests-per-hour IP limit means the banner can simply never appear —
-  // it is advisory and its absence is not evidence of being up to date.
-  //
-  // `tauri-plugin-updater` is deliberately not adopted: it needs
-  // `createUpdaterArtifacts`, a literal minisign public key compiled in, an
-  // endpoint template, an `updater:default` capability and a CI-generated
-  // manifest, and with no key custody (the signing key would have to live in the
-  // repo or be generated per run) the result would be an auto-updater that is
-  // misconfigured by construction — the one component of this app that could
-  // install arbitrary code as the user, without a witness anyone reviewed.
-  const checkedOnceRef = useRef(false);
-  useEffect(() => {
-    if (!appVersion || appVersion === FALLBACK_VERSION) return;
-    if (!connected || settings.routingMode === "proxy-only" || checkedOnceRef.current) return;
-    checkedOnceRef.current = true;
-    return startUpdateCheck(appVersion, setUpdateAvailable);
-  }, [appVersion, connected, settings.routingMode]);
+  const checkUpdateCmd = useCallback(
+    (args: { httpPort: number; useLocalProxy: boolean }) => invoke<unknown>("check_update", args),
+    [],
+  );
+  const downloadInstallCmd = useCallback(
+    (args: {
+      assetUrl: string;
+      assetName: string;
+      sha256: string | null;
+      httpPort: number;
+      useLocalProxy: boolean;
+    }) => invoke<InstallOutcome>("download_and_install_update", args),
+    [],
+  );
+
+  const updater = useInlineUpdater({
+    appVersion,
+    fallbackVersion: FALLBACK_VERSION,
+    connected,
+    routingMode: settings.routingMode,
+    httpPort: settings.httpPort,
+    checkUpdateCmd,
+    downloadInstallCmd,
+    listenEvent: listen,
+    formatError: errorMessage,
+    appendLog,
+  });
 
   /**
    * Stop the current session without letting a partial teardown block the next
@@ -461,8 +473,6 @@ export function useRuntime(
     setRuntime(initialRuntime);
   }, []);
 
-  const dismissUpdate = useCallback(() => setUpdateDismissed(true), []);
-
   const retrySettings = useCallback(async () => {
     try {
       const loaded = await invoke<Settings>("get_settings");
@@ -518,8 +528,18 @@ export function useRuntime(
 
   return {
     settings, setSettings, runtime, stats, setRuntime, busy, setBusy, testBusy,
-    saved, dirty, saveError, admin, testResult, appVersion: appVersion ?? "…", updateAvailable: updateDismissed ? null : updateAvailable,
+    saved, dirty, saveError, admin, testResult, appVersion: appVersion ?? "…",
+    updateAvailable: updater.updateInfo?.available
+      ? { version: `v${updater.updateInfo.latestVersion}`, url: updater.updateInfo.releaseUrl }
+      : null,
+    updateInfo: updater.updateInfo,
+    updateProgress: updater.updateProgress,
+    updateChecking: updater.updateChecking,
+    updateCheckError: updater.updateCheckError,
+    checkForUpdates: updater.checkForUpdates,
+    installUpdate: updater.installUpdate,
+    dismissUpdate: updater.dismissUpdate,
     connected, running, settingsLocked, settingsLoaded, settingsLoadError, retrySettings, resetSettings,
-    patchSettings, toggleConnection, connectToPeer, runTest, dismissError, dismissUpdate,
+    patchSettings, toggleConnection, connectToPeer, runTest, dismissError,
   };
 }

@@ -86,6 +86,8 @@ class AetherBridge(
         "scan" -> handleScan(args)
         "stop_scan" -> handleStopScan()
         "test_connection" -> handleTestConnection(args)
+        "check_update" -> handleCheckUpdate(args)
+        "download_and_install_update" -> handleDownloadAndInstallUpdate(args)
         "app_info" -> handleAppInfo()
         "get_result" -> handleGetResult(args)
         else -> throw BridgeError("unknown_command", "unknown command $cmd")
@@ -191,6 +193,21 @@ class AetherBridge(
         return session.testConnection(s)
     }
 
+    internal fun handleCheckUpdate(args: JSONObject): Any {
+        val port = if (args.has("httpPort") && !args.isNull("httpPort")) args.optInt("httpPort") else null
+        val useProxy = args.optBoolean("useLocalProxy", false)
+        return session.checkUpdate(port, useProxy)
+    }
+
+    internal fun handleDownloadAndInstallUpdate(args: JSONObject): Any {
+        val assetUrl = args.optString("assetUrl", "")
+        val assetName = args.optString("assetName", "")
+        val sha256 = if (args.has("sha256") && !args.isNull("sha256")) args.optString("sha256") else null
+        val port = if (args.has("httpPort") && !args.isNull("httpPort")) args.optInt("httpPort") else null
+        val useProxy = args.optBoolean("useLocalProxy", false)
+        return session.downloadAndInstallUpdate(assetUrl, assetName, sha256, port, useProxy)
+    }
+
     internal fun handleAppInfo(): Any =
         JSONObject()
             .put("name", "Aether Next")
@@ -209,6 +226,13 @@ class AetherBridge(
         const val RESULT_TTL_MS = 120_000L
 
         /** Commands dispatched to [commandWorker] instead of the JavaBridge thread. */
-        val ASYNC_COMMANDS: Set<String> = setOf("connect", "disconnect", "scan", "test_connection")
+        val ASYNC_COMMANDS: Set<String> = setOf(
+            "connect",
+            "disconnect",
+            "scan",
+            "test_connection",
+            "check_update",
+            "download_and_install_update",
+        )
     }
 }

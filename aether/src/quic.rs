@@ -135,9 +135,9 @@ fn h3_trace_on() -> bool {
     crate::runtime_env::flag("AETHER_H3_TRACE")
 }
 
-/// Attach qlog (when `AETHER_QLOG_DIR` is set) and TLS keylog (`SSLKEYLOGFILE`) to
-/// a fresh connection for offline decryption/analysis. Must be called right
-/// after `quiche::connect`, before the first flush, or early events are lost.
+/// Attach qlog (when `AETHER_QLOG_DIR` is set) and TLS keylog (`AETHER_TLS_KEYLOG=1`
+/// inside `AETHER_QLOG_DIR`) to a fresh connection for offline decryption/analysis.
+/// Must be called right after `quiche::connect`, before the first flush, or early events are lost.
 ///
 /// Every filesystem call goes through `spawn_blocking`: this runs inside the
 /// tunnel loop, on the task that has to answer the peer's retransmits, and a
@@ -166,23 +166,24 @@ async fn maybe_enable_diagnostics(conn: &mut quiche::Connection, tag: &str) {
             }
         }
     }
-    let keylog = crate::runtime_env::var("AETHER_SSLKEYLOGFILE");
-    if let Some(path) = keylog {
-        let path = path.trim().to_string();
-        if !path.is_empty() {
-            let shown = path.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                open_private_file(std::path::Path::new(&path), true)
-            })
-            .await;
-            match opened {
-                Ok(Ok(f)) => {
-                    conn.set_keylog(Box::new(f));
-                    log::info!("[h3] keylog -> {shown}");
+    if let Some(path) = crate::runtime_env::keylog_target() {
+        let shown = path.display().to_string();
+        let opened = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                Ok(Err(e)) => log::debug!("[h3] keylog open failed: {e}"),
-                Err(e) => log::debug!("[h3] keylog setup task failed: {e}"),
             }
+            open_private_file(&path, true)
+        })
+        .await;
+        match opened {
+            Ok(Ok(f)) => {
+                conn.set_keylog(Box::new(f));
+                log::info!("[h3] keylog -> {shown}");
+            }
+            Ok(Err(e)) => log::debug!("[h3] keylog open failed: {e}"),
+            Err(e) => log::debug!("[h3] keylog setup task failed: {e}"),
         }
     }
 }

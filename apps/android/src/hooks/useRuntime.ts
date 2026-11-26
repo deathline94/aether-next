@@ -11,6 +11,8 @@ import type { IpcError } from "../ipcError";
 import {
   describeRejectedState,
   parseSessionStats,
+  useInlineUpdater,
+  type InstallOutcome,
   type SessionStats,
 } from "@aether/ui";
 
@@ -82,6 +84,34 @@ export function useRuntime(
   const connected = runtime.status === "connected";
   const running = runtime.status === "connecting" || connected;
   const settingsLocked = running || !settingsLoaded;
+
+  const checkUpdateCmd = useCallback(
+    (args: { httpPort: number; useLocalProxy: boolean }) => invoke<unknown>("check_update", args),
+    [],
+  );
+  const downloadInstallCmd = useCallback(
+    (args: {
+      assetUrl: string;
+      assetName: string;
+      sha256: string | null;
+      httpPort: number;
+      useLocalProxy: boolean;
+    }) => invoke<InstallOutcome>("download_and_install_update", args),
+    [],
+  );
+
+  const updater = useInlineUpdater({
+    appVersion,
+    fallbackVersion: FALLBACK_VERSION,
+    connected,
+    routingMode: settings.routingMode,
+    httpPort: settings.httpPort,
+    checkUpdateCmd,
+    downloadInstallCmd,
+    listenEvent: listen,
+    formatError: errorMessage,
+    appendLog,
+  });
 
   /**
    * Put a `get_settings` reply into state, or say why it could not go in.
@@ -493,6 +523,13 @@ export function useRuntime(
     settings, runtime, stats, busy, testBusy, saved: saveState, saveState, saveError,
     admin, testResult,
     appVersion: appVersion ?? "…",
+    updateInfo: updater.updateInfo,
+    updateProgress: updater.updateProgress,
+    updateChecking: updater.updateChecking,
+    updateCheckError: updater.updateCheckError,
+    checkForUpdates: updater.checkForUpdates,
+    installUpdate: updater.installUpdate,
+    dismissUpdate: updater.dismissUpdate,
     // The stored profile's health and its remedy, as the shell reported them (ITEM 10).
     settingsCorrupt, settingsCorruption, settingsCorruptionNotice,
     resetSettings, resetSettingsBusy, resetSettingsError,

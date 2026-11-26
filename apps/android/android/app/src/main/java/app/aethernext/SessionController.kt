@@ -208,6 +208,7 @@ class SessionController(
     }
 
     private val httpClient = okhttp3.OkHttpClient()
+    private val appUpdater by lazy { AppUpdater(httpClient) }
     private val backgroundExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "aether-session-bg").apply { isDaemon = true }
     }
@@ -599,6 +600,26 @@ class SessionController(
     fun validate(s: Settings) {
         validateSettings(s)
     }
+
+    fun checkUpdate(httpPort: Int?, useLocalProxy: Boolean): JSONObject =
+        appUpdater.checkUpdate(BuildConfig.VERSION_NAME, httpPort, useLocalProxy)
+
+    fun downloadAndInstallUpdate(
+        assetUrl: String,
+        assetName: String,
+        sha256: String?,
+        httpPort: Int?,
+        useLocalProxy: Boolean,
+    ): JSONObject = appUpdater.downloadAndInstall(
+        context = context,
+        currentVersion = BuildConfig.VERSION_NAME,
+        assetUrl = assetUrl,
+        assetName = assetName,
+        expectedSha256 = sha256,
+        httpPort = httpPort,
+        useLocalProxy = useLocalProxy,
+        onProgress = { payload -> emit("update-progress", payload) },
+    )
 
     /**
      * One line of engine output.

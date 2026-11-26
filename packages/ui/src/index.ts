@@ -419,4 +419,25 @@ export function formatUptimeClock(secs: number): string {
 }
 
 export { useOnline } from "./hooks/useOnline";
+export {
+  useInlineUpdater,
+  type InlineUpdaterDeps,
+  type InlineUpdaterState,
+} from "./hooks/useInlineUpdater";
+export {
+  InlineUpdateBanner,
+  UpdateSettingsRow,
+  type InlineUpdateBannerProps,
+  type UpdateSettingsRowProps,
+} from "./components/UpdateBanner";
+export {
+  RELEASES_PAGE,
+  releasePageUrl,
+  parseUpdateInfo,
+  parseUpdateProgress,
+  type UpdateStage,
+  type UpdateInfo,
+  type UpdateProgress,
+  type InstallOutcome,
+} from "./update";
 
