@@ -129,7 +129,38 @@ pub fn semver_gt(candidate: &str, current: &str) -> bool {
     }
 }
 
-pub fn select_windows_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsInstallKind {
+    Portable,
+    Setup,
+}
+
+/// Detect whether the running desktop binary belongs to a portable archive or
+/// an NSIS setup installation so auto-update picks the matching release asset.
+pub fn detect_windows_install_kind(exe_path: &Path) -> WindowsInstallKind {
+    if let Some(dir) = exe_path.parent() {
+        if dir.join("uninstall.exe").is_file() {
+            return WindowsInstallKind::Setup;
+        }
+        if dir.join("engine").join("aether.exe").is_file() {
+            return WindowsInstallKind::Portable;
+        }
+    }
+    if exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("AetherNext-Desktop.exe"))
+    {
+        return WindowsInstallKind::Portable;
+    }
+    WindowsInstallKind::Setup
+}
+
+pub fn select_windows_asset(
+    assets: &[serde_json::Value],
+    kind: WindowsInstallKind,
+) -> Option<(String, String, u64)> {
+    let mut setup: Option<(String, String, u64)> = None;
     let mut portable: Option<(String, String, u64)> = None;
     for asset in assets {
         let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -141,19 +172,24 @@ pub fn select_windows_asset(assets: &[serde_json::Value]) -> Option<(String, Str
         if name.is_empty() || url.is_empty() || validate_download_url(url).is_err() {
             continue;
         }
-        if name.eq_ignore_ascii_case("AetherNext-windows-x64-setup.exe")
-            || (name.ends_with("-setup.exe") && name.to_ascii_lowercase().contains("windows"))
+        let lower = name.to_ascii_lowercase();
+        if setup.is_none()
+            && (name.eq_ignore_ascii_case("AetherNext-windows-x64-setup.exe")
+                || (lower.ends_with("-setup.exe") && lower.contains("windows")))
         {
-            return Some((name.to_string(), url.to_string(), size));
+            setup = Some((name.to_string(), url.to_string(), size));
         }
         if portable.is_none()
             && (name.eq_ignore_ascii_case("AetherNext-portable-windows-x64.zip")
-                || (name.ends_with(".zip") && name.to_ascii_lowercase().contains("windows")))
+                || (lower.ends_with(".zip") && lower.contains("windows")))
         {
             portable = Some((name.to_string(), url.to_string(), size));
         }
     }
-    portable
+    match kind {
+        WindowsInstallKind::Portable => portable.or(setup),
+        WindowsInstallKind::Setup => setup.or(portable),
+    }
 }
 
 pub fn parse_sha256sums(body: &str, asset_name: &str) -> Option<String> {
@@ -316,7 +352,12 @@ pub(crate) fn check_update_blocking(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
-    let (asset_name, asset_url, asset_size) = select_windows_asset(assets).unwrap_or_default();
+    let install_kind = std::env::current_exe()
+        .ok()
+        .map(|p| detect_windows_install_kind(&p))
+        .unwrap_or(WindowsInstallKind::Setup);
+    let (asset_name, asset_url, asset_size) =
+        select_windows_asset(assets, install_kind).unwrap_or_default();
     let available = semver_gt(&latest_version, current) && !asset_url.is_empty();
 
     let sha256 = if available {
@@ -539,7 +580,154 @@ pub(crate) fn download_and_install_blocking(
     }
 
     let dest_str = dest.to_string_lossy().to_string();
-    emit_progress(&app, "installing", 100, 100, "Launching installer...");
+    let is_portable_zip = asset_name.to_ascii_lowercase().ends_with(".zip");
+
+    #[cfg(windows)]
+    if is_portable_zip {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        let current_exe = std::env::current_exe().map_err(|e| {
+            CommandError::new(
+                "portable_exe_unknown",
+                format!("Could not locate current executable: {e}"),
+            )
+        })?;
+        let target_dir = current_exe.parent().ok_or_else(|| {
+            CommandError::new(
+                "portable_dir_unknown",
+                "Could not resolve portable application directory.",
+            )
+        })?;
+
+        // Probe folder write access before stopping an active tunnel session.
+        let write_probe = target_dir.join(".aether-update-write-test");
+        File::create(&write_probe)
+            .and_then(|f| {
+                drop(f);
+                fs::remove_file(&write_probe)
+            })
+            .map_err(|e| {
+                CommandError::new(
+                    "portable_dir_read_only",
+                    format!(
+                        "Cannot write portable update to {}: {e}",
+                        target_dir.display()
+                    ),
+                )
+            })?;
+
+        emit_progress(
+            &app,
+            "installing",
+            100,
+            100,
+            "Stopping tunnel and applying portable update...",
+        );
+        crate::scan::stop_scan_child(&app.state::<crate::state::AppState>().scan_child);
+        let _ = crate::supervision::disconnect_blocking(app.clone());
+
+        let script_path = dir.join("apply-portable-update.ps1");
+        let script = r#"param(
+    [Parameter(Mandatory=$true)][int]$ParentPid,
+    [Parameter(Mandatory=$true)][string]$ZipPath,
+    [Parameter(Mandatory=$true)][string]$TargetDir,
+    [Parameter(Mandatory=$true)][string]$LaunchExe
+)
+$ErrorActionPreference = 'Stop'
+for ($i = 0; $i -lt 80; $i++) {
+    if (-not (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 250
+}
+Start-Sleep -Milliseconds 250
+$stage = Join-Path ([System.IO.Path]::GetDirectoryName($ZipPath)) ('stage-' + [System.Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+try {
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $stage -Force
+    $srcRoot = $stage
+    $topExes = @(Get-ChildItem -LiteralPath $stage -Filter '*.exe' -File)
+    if ($topExes.Count -eq 0) {
+        $subDirs = @(Get-ChildItem -LiteralPath $stage -Directory)
+        if ($subDirs.Count -eq 1) { $srcRoot = $subDirs[0].FullName }
+    }
+    $hasExe = @(Get-ChildItem -LiteralPath $srcRoot -Filter '*.exe' -File).Count -gt 0
+    if (-not $hasExe) { throw 'Portable update archive contains no executable.' }
+    $copied = $false
+    for ($try = 0; $try -lt 15; $try++) {
+        try {
+            Copy-Item -Path (Join-Path $srcRoot '*') -Destination $TargetDir -Recurse -Force -ErrorAction Stop
+            $copied = $true
+            break
+        } catch {
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    if (-not $copied) { throw 'Timed out replacing portable update files.' }
+    $toLaunch = if (Test-Path -LiteralPath $LaunchExe) {
+        $LaunchExe
+    } else {
+        $firstExe = Get-ChildItem -LiteralPath $TargetDir -Filter '*.exe' -File | Select-Object -First 1
+        if ($firstExe) { $firstExe.FullName } else { $LaunchExe }
+    }
+    if (Test-Path -LiteralPath $toLaunch) {
+        Start-Process -FilePath $toLaunch -WorkingDirectory $TargetDir
+    }
+} finally {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+}
+"#;
+        fs::write(&script_path, script.as_bytes()).map_err(CommandError::from)?;
+
+        let powershell = crate::acl::system32(r"WindowsPowerShell\v1.0\powershell.exe")?;
+        let mut cmd = std::process::Command::new(&powershell);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .args(["-ParentPid", &std::process::id().to_string()])
+        .arg("-ZipPath")
+        .arg(&dest)
+        .arg("-TargetDir")
+        .arg(target_dir)
+        .arg("-LaunchExe")
+        .arg(&current_exe)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        cmd.spawn().map_err(|e| {
+            let msg = format!("Could not start portable updater helper: {e}");
+            emit_progress(&app, "error", 0, 0, &msg);
+            CommandError::new("portable_updater_spawn_failed", msg)
+        })?;
+
+        let exit_app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            exit_app.exit(0);
+        });
+
+        return Ok(InstallOutcome {
+            status: "restarting".to_string(),
+            path: dest_str,
+        });
+    }
+
+    let _ = is_portable_zip;
+    emit_progress(
+        &app,
+        "installing",
+        100,
+        100,
+        "Stopping tunnel and launching installer...",
+    );
+    crate::scan::stop_scan_child(&app.state::<crate::state::AppState>().scan_child);
+    let _ = crate::supervision::disconnect_blocking(app.clone());
     app.opener()
         .open_path(&dest_str, None::<&str>)
         .map_err(|e| {
@@ -548,8 +736,14 @@ pub(crate) fn download_and_install_blocking(
             CommandError::new("open_installer_failed", msg)
         })?;
 
+    let exit_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        exit_app.exit(0);
+    });
+
     Ok(InstallOutcome {
-        status: "installing".to_string(),
+        status: "restarting".to_string(),
         path: dest_str,
     })
 }
@@ -570,7 +764,37 @@ mod tests {
     }
 
     #[test]
-    fn select_windows_asset_prefers_setup_exe() {
+    fn detect_windows_install_kind_distinguishes_portable_and_setup() {
+        let base = std::env::temp_dir().join("aether-install-kind-test");
+        let _ = fs::remove_dir_all(&base);
+
+        let portable_dir = base.join("portable");
+        fs::create_dir_all(portable_dir.join("engine")).unwrap();
+        fs::write(portable_dir.join("engine").join("aether.exe"), b"").unwrap();
+        assert_eq!(
+            detect_windows_install_kind(&portable_dir.join("AetherNext-Desktop.exe")),
+            WindowsInstallKind::Portable
+        );
+
+        let setup_dir = base.join("setup");
+        fs::create_dir_all(&setup_dir).unwrap();
+        fs::write(setup_dir.join("uninstall.exe"), b"").unwrap();
+        assert_eq!(
+            detect_windows_install_kind(&setup_dir.join("Aether Next.exe")),
+            WindowsInstallKind::Setup
+        );
+
+        let named_portable = base.join("named").join("AetherNext-Desktop.exe");
+        assert_eq!(
+            detect_windows_install_kind(&named_portable),
+            WindowsInstallKind::Portable
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn select_windows_asset_respects_install_kind() {
         let assets = vec![
             serde_json::json!({
                 "name": "AetherNext-portable-windows-x64.zip",
@@ -583,8 +807,13 @@ mod tests {
                 "size": 6700000
             }),
         ];
-        let picked = select_windows_asset(&assets).expect("setup exe selected");
-        assert_eq!(picked.0, "AetherNext-windows-x64-setup.exe");
+        let picked_setup =
+            select_windows_asset(&assets, WindowsInstallKind::Setup).expect("setup exe selected");
+        assert_eq!(picked_setup.0, "AetherNext-windows-x64-setup.exe");
+
+        let picked_portable = select_windows_asset(&assets, WindowsInstallKind::Portable)
+            .expect("portable zip selected");
+        assert_eq!(picked_portable.0, "AetherNext-portable-windows-x64.zip");
     }
 
     #[test]

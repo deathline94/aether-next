@@ -175,6 +175,7 @@ class AppUpdater(
                 if (!part.renameTo(dest)) {
                     throw Exception("Could not finalize downloaded APK file.")
                 }
+                cleanupStaleApks(context, keepName = assetName)
             } catch (e: Exception) {
                 part.delete()
                 onProgress(progressPayload("error", 0L, 0L, 0, e.message ?: "Update download failed"))
@@ -390,6 +391,17 @@ class AppUpdater(
                 }
             }
             return cpre.size > cupre.size
+        }
+
+        fun cleanupStaleApks(context: Context, keepName: String? = null) {
+            val dir = File(context.cacheDir, "updates")
+            val files = dir.listFiles() ?: return
+            for (f in files) {
+                if (keepName != null && f.name == keepName) continue
+                if (f.name.endsWith(".apk", ignoreCase = true) || f.name.endsWith(".part", ignoreCase = true)) {
+                    f.delete()
+                }
+            }
         }
 
         fun sha256FileHex(file: File): String? = try {

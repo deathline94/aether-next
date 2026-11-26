@@ -29,8 +29,27 @@ import androidx.core.app.NotificationCompat
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
-        handleBoot(context)
+        when (intent?.action) {
+            Intent.ACTION_BOOT_COMPLETED -> handleBoot(context)
+            Intent.ACTION_MY_PACKAGE_REPLACED -> handlePackageReplaced(context)
+        }
+    }
+
+    internal fun handlePackageReplaced(context: Context) {
+        AppUpdater.cleanupStaleApks(context)
+        if (!BootHandoff.canNotify(context)) return
+        val launch = Intent(context, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        try {
+            postNotification(
+                context,
+                launch,
+                "Aether Next updated to v${BuildConfig.VERSION_NAME} — tap to open",
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "post-update notification skipped: ${e.message}")
+        }
     }
 
     /**
@@ -54,7 +73,7 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         val posted = try {
-            postTapToStart(context, launch)
+            postNotification(context, launch, context.getString(R.string.notif_tap_to_start))
         } catch (e: Exception) {
             Log.e(TAG, "boot notification failed: ${e.message}", e)
             false
@@ -71,7 +90,7 @@ class BootReceiver : BroadcastReceiver() {
     }
 
     /** @return false when the manager refused the notification outright. */
-    private fun postTapToStart(context: Context, launch: Intent): Boolean {
+    private fun postNotification(context: Context, launch: Intent, bodyText: String): Boolean {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -90,7 +109,7 @@ class BootReceiver : BroadcastReceiver() {
         )
         val notification = NotificationCompat.Builder(context, CHANNEL)
             .setContentTitle(context.getString(R.string.app_name))
-            .setContentText(context.getString(R.string.notif_tap_to_start))
+            .setContentText(bodyText)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)

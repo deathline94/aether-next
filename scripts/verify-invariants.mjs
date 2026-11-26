@@ -648,6 +648,8 @@ const NON_ENGINE_SPAWNS = [
 
   ['apps/desktop/src-tauri/src/trust.rs', 'shell', 'PowerShell, used to read a certificate; it is consulted, never trusted as the payload'],
 
+  ['apps/desktop/src-tauri/src/updater.rs', 'powershell', 'Windows PowerShell invoked from System32 to extract and swap a SHA-256 verified portable update archive after process exit'],
+
 ];
 
 

@@ -59,21 +59,25 @@ export function InlineUpdateBanner({
   const busy =
     updateProgress?.stage === "downloading" ||
     updateProgress?.stage === "verifying";
+  const isInstalling = updateProgress?.stage === "installing";
+  const isRestarting =
+    isInstalling && Boolean(updateProgress?.message?.toLowerCase().includes("restarting"));
   const isError = updateProgress?.stage === "error";
   const needsPermission = updateProgress?.stage === "permission_required";
-  const isInstalling = updateProgress?.stage === "installing";
 
   const actionLabel = busy
     ? updateProgress?.stage === "verifying"
       ? "Verifying…"
       : `${updateProgress?.percent ?? 0}%`
-    : needsPermission
-      ? "Install update"
-      : isError
-        ? "Retry"
-        : isInstalling
-          ? "Launched"
-          : "Download & install";
+    : isRestarting
+      ? "Restarting…"
+      : needsPermission
+        ? "Install update"
+        : isError
+          ? "Retry"
+          : isInstalling
+            ? "Launched"
+            : "Download & install";
 
   return (
     <div className="update-banner" role="status">
@@ -84,8 +88,10 @@ export function InlineUpdateBanner({
             <span>
               <strong>v{updateInfo.latestVersion}</strong> is available
             </span>
-            {updateProgress && updateProgress.stage !== "idle" && updateProgress.message && (
+            {updateProgress && updateProgress.stage !== "idle" && updateProgress.message ? (
               <span className="update-banner-sub">{updateProgress.message}</span>
+            ) : (
+              updateInfo.assetName && <span className="update-banner-sub">{updateInfo.assetName}</span>
             )}
           </div>
         </div>
@@ -111,7 +117,7 @@ export function InlineUpdateBanner({
           <button
             type="button"
             className="banner-action"
-            disabled={busy}
+            disabled={busy || isInstalling}
             onClick={() => void onInstall()}
           >
             <DownloadIcon />
@@ -164,6 +170,9 @@ export function UpdateSettingsRow({
   const busy =
     updateProgress?.stage === "downloading" ||
     updateProgress?.stage === "verifying";
+  const isInstalling = updateProgress?.stage === "installing";
+  const isRestarting =
+    isInstalling && Boolean(updateProgress?.message?.toLowerCase().includes("restarting"));
 
   const statusLine = updateCheckError
     ? `Check failed: ${updateCheckError}`
@@ -186,23 +195,27 @@ export function UpdateSettingsRow({
           <button
             type="button"
             className="banner-action"
-            disabled={busy}
+            disabled={busy || isInstalling}
             onClick={() => void onInstall()}
           >
             <DownloadIcon />
             <span>
               {busy
                 ? `${updateProgress?.percent ?? 0}%`
-                : updateProgress?.stage === "permission_required"
-                  ? "Install update"
-                  : "Download & install"}
+                : isRestarting
+                  ? "Restarting…"
+                  : isInstalling
+                    ? "Launched"
+                    : updateProgress?.stage === "permission_required"
+                      ? "Install update"
+                      : "Download & install"}
             </span>
           </button>
         )}
         <button
           type="button"
           className="banner-action"
-          disabled={updateChecking || busy}
+          disabled={updateChecking || busy || isInstalling}
           onClick={() => void onCheck()}
         >
           <RefreshIcon />

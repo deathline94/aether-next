@@ -503,43 +503,44 @@ describe("desktop useRuntime update check", () => {
     expect(result.current.updateAvailable?.url).toBe(RELEASES_PAGE);
   });
 
-  it("does not contact the release host before a tunnel exists", async () => {
-    stubInvoke(shellSettings());
-
-    const { result } = renderHook(() => useRuntime(appendLog));
-    await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
-    expect(result.current.connected).toBe(false);
-    expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("check_update", expect.anything());
-  });
-
-  it("checks through the local proxy in proxy-only mode and supports inline install", async () => {
+  it("auto-checks on startup and retries through the proxy once connected if offline", async () => {
     const emit = captureState();
+    let checkCalls = 0;
     vi.mocked(invoke).mockImplementation(async (command: string) => {
       if (command === "get_settings") return shellSettings({ routingMode: "proxy-only", httpPort: 1820 });
       if (command === "get_state") return null;
       if (command === "is_admin") return false;
       if (command === "app_info") return { version: "1.2.9" };
       if (command === "check_update") {
+        checkCalls += 1;
+        if (checkCalls === 1) {
+          throw new Error("offline before tunnel");
+        }
         return {
           available: true,
           currentVersion: "1.2.9",
           latestVersion: "9.9.9",
           releaseUrl: "https://github.com/deathline94/aether-next/releases/tag/v9.9.9",
-          assetName: "AetherNext-windows-x64-setup.exe",
-          assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-windows-x64-setup.exe",
-          assetSize: 6700000,
+          assetName: "AetherNext-portable-windows-x64.zip",
+          assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-portable-windows-x64.zip",
+          assetSize: 9000000,
           sha256: "a".repeat(64),
           notes: "",
         };
       }
       if (command === "download_and_install_update") {
-        return { status: "installing", path: "C:\\temp\\AetherNext-windows-x64-setup.exe" };
+        return { status: "restarting", path: "C:\\temp\\AetherNext-portable-windows-x64.zip" };
       }
       return null;
     });
 
     const { result } = renderHook(() => useRuntime(appendLog));
     await waitFor(() => expect(result.current.settingsLoaded).toBe(true));
+    await waitFor(() => expect(checkCalls).toBe(1));
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith("check_update", {
+      httpPort: 1820,
+      useLocalProxy: false,
+    });
 
     emit({ status: "connected", detail: "ok", pid: 1, endpoint: null, handshakeRttMs: null });
     await waitFor(() => expect(result.current.updateInfo?.available).toBe(true));
@@ -552,12 +553,13 @@ describe("desktop useRuntime update check", () => {
       await result.current.installUpdate();
     });
     expect(vi.mocked(invoke)).toHaveBeenCalledWith("download_and_install_update", {
-      assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-windows-x64-setup.exe",
-      assetName: "AetherNext-windows-x64-setup.exe",
+      assetUrl: "https://github.com/deathline94/aether-next/releases/download/v9.9.9/AetherNext-portable-windows-x64.zip",
+      assetName: "AetherNext-portable-windows-x64.zip",
       sha256: "a".repeat(64),
       httpPort: 1820,
       useLocalProxy: true,
     });
     expect(result.current.updateProgress?.stage).toBe("installing");
+    expect(result.current.updateProgress?.message).toContain("restarting");
   });
 });

@@ -41,8 +41,28 @@ class AppUpdaterTest {
         val arm64 = AppUpdater.selectAndroidAsset(assets, arrayOf("arm64-v8a", "armeabi-v7a"))
         assertEquals("AetherNext-android-arm64-v8a.apk", arm64?.name)
 
-        val x86Fallback = AppUpdater.selectAndroidAsset(assets, arrayOf("x86_64"))
-        assertEquals("AetherNext-android-universal.apk", x86Fallback?.name)
+        assets
+            .put(
+                JSONObject()
+                    .put("name", "AetherNext-android-armeabi-v7a.apk")
+                    .put("browser_download_url", "https://github.com/deathline94/aether-next/releases/download/v1.3.17/AetherNext-android-armeabi-v7a.apk")
+                    .put("size", 14_000_000L),
+            )
+            .put(
+                JSONObject()
+                    .put("name", "AetherNext-android-x86_64.apk")
+                    .put("browser_download_url", "https://github.com/deathline94/aether-next/releases/download/v1.3.17/AetherNext-android-x86_64.apk")
+                    .put("size", 16_000_000L),
+            )
+
+        val armv7 = AppUpdater.selectAndroidAsset(assets, arrayOf("armeabi-v7a"))
+        assertEquals("AetherNext-android-armeabi-v7a.apk", armv7?.name)
+
+        val x8664 = AppUpdater.selectAndroidAsset(assets, arrayOf("x86_64"))
+        assertEquals("AetherNext-android-x86_64.apk", x8664?.name)
+
+        val fallback = AppUpdater.selectAndroidAsset(assets, arrayOf("mips64"))
+        assertEquals("AetherNext-android-universal.apk", fallback?.name)
     }
 
     @Test

@@ -62,7 +62,9 @@ export function useInlineUpdater({
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
 
-  const autoCheckedRef = useRef(false);
+  const startupCheckedRef = useRef(false);
+  const succeededCheckRef = useRef(false);
+  const connectedRetryRef = useRef(false);
   const checkingRef = useRef(false);
   const installingRef = useRef(false);
 
@@ -103,6 +105,7 @@ export function useInlineUpdater({
         }
         setUpdateInfo(parsed);
         setUpdateCheckError(null);
+        succeededCheckRef.current = true;
         if (parsed.available) {
           setUpdateDismissed(false);
           appendLog({
@@ -129,13 +132,19 @@ export function useInlineUpdater({
     [appendLog, checkUpdateCmd, connected, formatError, httpPort, routingMode],
   );
 
-  // Auto-check once per app session when a tunnel connects (all routing modes:
-  // proxy-only / system-proxy route through the local HTTP listener; TUN routes through TUN).
+  // Auto-check once on startup once real appVersion is hydrated, and retry once
+  // when a tunnel connects if the pre-tunnel startup check could not reach GitHub.
   useEffect(() => {
     if (!appVersion || appVersion === fallbackVersion) return;
-    if (!connected || autoCheckedRef.current) return;
-    autoCheckedRef.current = true;
-    void runCheck(true);
+    if (!startupCheckedRef.current) {
+      startupCheckedRef.current = true;
+      void runCheck(true);
+      return;
+    }
+    if (connected && !succeededCheckRef.current && !connectedRetryRef.current) {
+      connectedRetryRef.current = true;
+      void runCheck(true);
+    }
   }, [appVersion, connected, fallbackVersion, runCheck]);
 
   const checkForUpdates = useCallback(() => runCheck(false), [runCheck]);
@@ -166,6 +175,14 @@ export function useInlineUpdater({
           totalBytes: 100,
           percent: 100,
           message: "Allow 'Install unknown apps', then tap Install update.",
+        });
+      } else if (outcome?.status === "restarting") {
+        setUpdateProgress({
+          stage: "installing",
+          downloadedBytes: 100,
+          totalBytes: 100,
+          percent: 100,
+          message: "Applying update and restarting...",
         });
       } else {
         setUpdateProgress({
